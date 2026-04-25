@@ -626,6 +626,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq(
     float* partial = shared;
     float* acc = partial + blockDim.x;
     float* scalars = acc + head_dim;
+    float* q_shared = scalars + 4;
 
     const unsigned int group = num_attention_heads / num_kv_heads;
     const unsigned int kv_head = head / group;
@@ -633,6 +634,9 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq(
     float* out = output + (size_t(global_q) * num_attention_heads + head) * head_dim;
     const float scale = rsqrtf(float(head_dim));
 
+    for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
+        q_shared[dim] = f16_bits_to_float(q[dim]);
+    }
     for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
         acc[dim] = 0.0f;
     }
@@ -655,7 +659,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq(
 
         float dot = 0.0f;
         for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
-            dot += f16_bits_to_float(q[dim]) * f16_bits_to_float(k[dim]);
+            dot += q_shared[dim] * f16_bits_to_float(k[dim]);
         }
         partial[tid] = dot;
         __syncthreads();

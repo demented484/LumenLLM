@@ -476,11 +476,14 @@ impl CudaRuntime {
             self.config.prefill_attention,
             CudaPrefillAttentionKernel::WarpFlash
         ) && warp_eligible;
-        let shared_floats = if use_warp {
+        let mut shared_floats = if use_warp {
             (block_dim / 32) as usize * 3 + head_dim_usize + 4
         } else {
             block_dim as usize + head_dim_usize + 4
         };
+        if query_half.is_some() {
+            shared_floats += head_dim_usize;
+        }
         let cfg = LaunchConfig {
             grid_dim: (num_attention_heads, total_q, 1),
             block_dim: (block_dim, 1, 1),
