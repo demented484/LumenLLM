@@ -41,6 +41,10 @@ python3 tools/bench_vllm_generate.py --model ../models/Llama-3.1-8B-Instruct-NVF
 
 CUDA notes:
 
+- Blackwell FP4 prefill can use the CUTLASS resident layout (`CUDA_R_4F_E2M1`
+  payload plus UE4M3 scales) for Q/K/V/O and MLP projections. The CUTLASS
+  bridge does not own CUDA allocations; Rust allocates and lifetime-manages
+  payloads, scales, workspaces and outputs.
 - Experimental native MXFP4 repack/inference is opt-in via:
   - `cuda.native-mxfp4-repack`
   - `cuda.native-mxfp4-inference`
@@ -48,8 +52,20 @@ CUDA notes:
 - Native MXFP4 repack writes a per-model cache under `.aegis-cache/mxfp4-v1` so repeated benchmark runs do not spend most of their time repacking weights on the host. Set `AEGISLLM_NATIVE_MXFP4_CACHE=0` to disable it.
 - Chunked CUDA prefill uses `AEGIS_CUDA_PREFILL_CHUNK` for the token chunk size. The default is `128`; values are clamped to `1..=2048`.
 - CUDA prefill attention is selected by `cuda.prefill-attention` (`auto`, `flash-varlen`, `warp-flash`, `continuation`, or `reference`) or the legacy `other-parameters.flash-attention` boolean. Explicit `cuda.prefill-attention` wins over the legacy flag. `auto` keeps the correctness-first reference kernel for short chunks and switches to the paged varlen online-softmax path for longer chunks; `warp-flash` remains an explicit experimental opt-in.
-- The paged varlen prefill path uses an FA-compatible 256-token page table and a transient f16 query view while keeping f32 outputs for the surrounding residual/MLP path.
+- The paged varlen prefill path uses an FA-compatible 256-token page table and
+  a transient f16 query view while keeping f32 outputs for the surrounding
+  residual/MLP path. The current fast path is a single-sequence block-Q
+  online-softmax kernel with shared K/V reuse and warp reductions; multi-request
+  and mixed scheduler paths still fall back to the more general varlen kernel.
+- CUTLASS FP4 MLP prefill fuses SwiGLU directly into the down-projection FP4
+  activation layout, avoiding a transient f32 SwiGLU buffer before the down GEMM.
 - Set `AEGISLLM_CUDA_STAGE_TIMINGS=1` to print per-stage prefill timings plus QKV/MLP TFLOPS estimates.
+- Recent RTX 5070 Ti smoke numbers with the CUTLASS FP4 config and one generated
+  token: prompt-repeat 16 / 202 prompt tokens ≈ 4.4k prefill tok/s,
+  prompt-repeat 64 / 778 prompt tokens ≈ 2.6k prefill tok/s,
+  prompt-repeat 128 / 1546 prompt tokens ≈ 1.7k prefill tok/s. The long-context
+  drop is expected until the attention kernel grows a true block-K split/reduce
+  FlashAttention path.
 - Reports distinguish planned families from effective dispatch. With native MXFP4 disabled, planned native FP4 regions still run through the CUDA NVFP4 reference path.
 - KV cache defaults to f16 and is stored as f16 in the CUDA reference executor. q8/fp8 KV kernels are not implemented yet and are rejected by CUDA readiness.
 - The explicit storage/compute plan is still authoritative: full CUDA, full CPU, and host-orchestrated hybrid plans run without silently falling back to one backend.
