@@ -485,7 +485,8 @@ impl CudaRuntime {
             (block_dim / 32) as usize * 3 + head_dim_usize + 4
         } else if use_halfq_block4 {
             let q_block = 4_usize;
-            q_block * block_dim as usize + (q_block * 2 + 2) * head_dim_usize + q_block * 4
+            let nwarps = (block_dim / 32) as usize;
+            q_block * nwarps + (q_block * 2 + 2) * head_dim_usize + q_block * 4
         } else {
             block_dim as usize + head_dim_usize + 4
         };

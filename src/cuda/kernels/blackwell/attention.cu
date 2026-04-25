@@ -721,6 +721,9 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4(
     const unsigned int head = blockIdx.x;
     const unsigned int global_q_base = blockIdx.y * q_block;
     const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int nwarps = blockDim.x >> 5u;
     if (head >= num_attention_heads || global_q_base >= total_q || num_sequences != 1u) {
         return;
     }
@@ -761,7 +764,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4(
 
     extern __shared__ float shared[];
     float* partial = shared;
-    float* q_shared = partial + q_block * blockDim.x;
+    float* q_shared = partial + q_block * nwarps;
     float* k_shared = q_shared + q_block * head_dim;
     float* v_shared = k_shared + head_dim;
     float* acc = v_shared + head_dim;
@@ -811,25 +814,30 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4(
                     dot += q_shared[row * head_dim + dim] * k_shared[dim];
                 }
             }
-            partial[row * blockDim.x + tid] = dot;
+            #pragma unroll
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1) {
+                dot += __shfl_down_sync(0xffffffffu, dot, offset);
+            }
+            if (lane == 0u) {
+                partial[row * nwarps + warp] = dot;
+            }
         }
         __syncthreads();
 
-        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
-            if (tid < stride) {
-                #pragma unroll
-                for (unsigned int row = 0u; row < 4u; ++row) {
-                    partial[row * blockDim.x + tid] += partial[row * blockDim.x + tid + stride];
-                }
+        if (tid < q_block) {
+            float row_sum = 0.0f;
+            for (unsigned int w = 0u; w < nwarps; ++w) {
+                row_sum += partial[tid * nwarps + w];
             }
-            __syncthreads();
+            partial[tid * nwarps] = row_sum;
         }
+        __syncthreads();
 
         if (tid == 0u) {
             #pragma unroll
             for (unsigned int row = 0u; row < 4u; ++row) {
                 if (valid[row] && physical_valid && pos < visible_len[row]) {
-                    const float score = partial[row * blockDim.x] * scale;
+                    const float score = partial[row * nwarps] * scale;
                     const float old_m = scalars[row * 4u + 0u];
                     const float old_l = scalars[row * 4u + 1u];
                     const float new_m = fmaxf(old_m, score);
