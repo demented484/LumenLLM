@@ -475,12 +475,12 @@ impl CudaRuntime {
         let page_tokens = u32_arg("page_tokens", page_tokens_usize)?;
         let block_table_stride = u32_arg("block_table_stride", block_table_stride)?;
         let physical_slots = u32_arg("physical_slots", physical_slots)?;
-        let block_dim = 128_u32;
         let warp_eligible = head_dim_usize <= 256 && head_dim_usize % 32 == 0;
         let use_warp = matches!(
             self.config.prefill_attention,
             CudaPrefillAttentionKernel::WarpFlash
         ) && warp_eligible;
+        let block_dim = if use_halfq_block4 { 64_u32 } else { 128_u32 };
         let mut shared_floats = if use_warp {
             (block_dim / 32) as usize * 3 + head_dim_usize + 4
         } else if use_halfq_block4 {
