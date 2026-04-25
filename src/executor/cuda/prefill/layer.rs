@@ -398,19 +398,20 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.mlp_out,
         )?;
     } else if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.down_proj) {
-        runtime.swiglu_device_len(
+        runtime.swiglu_quantize_cutlass_nvfp4_activation_device(
             &prefill.gate,
             &prefill.up,
-            &mut prefill.swiglu,
-            params.batch * intermediate,
-        )?;
-        prefill_linear_cutlass_nvfp4_device(
-            runtime,
-            &layer.down_proj,
-            &prefill.swiglu,
             params.batch,
+            intermediate,
             &mut prefill.cutlass_payload,
             &mut prefill.cutlass_scales,
+        )?;
+        prefill_linear_cutlass_nvfp4_prepacked_device(
+            runtime,
+            &layer.down_proj,
+            &prefill.cutlass_payload,
+            &prefill.cutlass_scales,
+            params.batch,
             &mut prefill.cutlass_workspace,
             &mut prefill.mlp_out,
         )?;

@@ -295,6 +295,56 @@ __global__ void quantize_f32_to_e2m1_ue4m3_kernel(
   }
 }
 
+__global__ void swiglu_quantize_f32_to_e2m1_ue4m3_kernel(
+    const float* __restrict__ gate, const float* __restrict__ up, int rows,
+    int cols, uint8_t* __restrict__ payload, uint8_t* __restrict__ scales,
+    int scale_cols, int padded_scale_cols, int scale_k_tiles) {
+  int row = blockIdx.y;
+  int scale_col = blockIdx.x;
+  int lane = threadIdx.x;
+  if (scale_col >= padded_scale_cols) {
+    return;
+  }
+  if (row >= rows || scale_col >= scale_cols) {
+    if (lane == 0) {
+      scales[swizzled_scale_offset(row, scale_col, scale_k_tiles)] = 0;
+    }
+    return;
+  }
+
+  int col_base = scale_col * 16;
+  __shared__ float values[16];
+  __shared__ float decoded_scale_shared;
+  float value = 0.0f;
+  if (lane < 16) {
+    size_t offset = static_cast<size_t>(row) * cols + col_base + lane;
+    float x = gate[offset];
+    value = (x / (1.0f + expf(-x))) * up[offset];
+    values[lane] = value;
+  }
+  float amax = lane < 16 ? fabsf(value) : 0.0f;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffffu, amax, offset));
+  }
+
+  if (lane == 0) {
+    float scale = (amax > 0.0f) ? (amax / 6.0f) : 0.0f;
+    __nv_fp8_e4m3 encoded_scale(scale);
+    uint8_t scale_byte = reinterpret_cast<uint8_t&>(encoded_scale);
+    scales[swizzled_scale_offset(row, scale_col, scale_k_tiles)] = scale_byte;
+    decoded_scale_shared = static_cast<float>(encoded_scale);
+  }
+  __syncwarp();
+
+  if (lane < 8) {
+    unsigned lo = best_e2m1(values[lane * 2], decoded_scale_shared);
+    unsigned hi = best_e2m1(values[lane * 2 + 1], decoded_scale_shared);
+    payload[static_cast<size_t>(row) * (cols / 2) + scale_col * 8 + lane] =
+        static_cast<uint8_t>(lo | (hi << 4));
+  }
+}
+
 }  // namespace aegis_cutlass_bridge
 
 using namespace aegis_cutlass_bridge;
@@ -362,6 +412,37 @@ extern "C" int aegis_cutlass_fp4_quantize_f32(
   quantize_f32_to_e2m1_ue4m3_kernel<<<grid, block, 0,
                                       reinterpret_cast<cudaStream_t>(stream)>>>(
       input, rows, cols, payload, scales, scale_cols, padded_scale_cols,
+      scale_k_tiles);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    write_error(error, error_len, cudaGetErrorString(err));
+    return 3;
+  }
+  return 0;
+}
+
+extern "C" int aegis_cutlass_fp4_swiglu_quantize_f32(
+    const float* gate, const float* up, int rows, int cols, uint8_t* payload,
+    uint8_t* scales, void* stream, char* error, size_t error_len) {
+  if (gate == nullptr || up == nullptr || payload == nullptr || scales == nullptr) {
+    write_error(error, error_len,
+                "CUTLASS FP4 SwiGLU quantize received a null pointer");
+    return 1;
+  }
+  if (rows <= 0 || cols <= 0 || (cols % 32) != 0) {
+    write_error(error, error_len,
+                "CUTLASS FP4 SwiGLU quantize requires cols % 32 == 0");
+    return 2;
+  }
+  int scale_cols = cols / 16;
+  int padded_scale_cols = ((scale_cols + 3) / 4) * 4;
+  int scale_k_tiles = padded_scale_cols / 4;
+  int padded_rows = ((rows + 127) / 128) * 128;
+  dim3 grid(padded_scale_cols, padded_rows, 1);
+  dim3 block(32, 1, 1);
+  swiglu_quantize_f32_to_e2m1_ue4m3_kernel<<<
+      grid, block, 0, reinterpret_cast<cudaStream_t>(stream)>>>(
+      gate, up, rows, cols, payload, scales, scale_cols, padded_scale_cols,
       scale_k_tiles);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
