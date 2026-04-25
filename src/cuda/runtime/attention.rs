@@ -492,7 +492,7 @@ impl CudaRuntime {
             && num_prefill_tokens >= 4
             && head_dim_usize <= 256;
         let use_halfq_block4_split =
-            use_halfq_block4 && split_scratch_ready && split_count_usize > 1 && max_k >= 4096;
+            use_halfq_block4 && split_scratch_ready && split_count_usize > 1 && max_k >= 1024;
         let num_sequences = u32_arg("num_sequences", num_sequences)?;
         let total_q = u32_arg("num_prefill_tokens", num_prefill_tokens)?;
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;

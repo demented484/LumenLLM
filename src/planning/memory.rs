@@ -260,9 +260,20 @@ fn cuda_prefill_scratch_bytes(
         * mxfp4_vector_bytes_estimate(graph.intermediate_size.unwrap_or(graph.hidden_size)) as u64;
     let metadata_u32 = chunk * 3 + 3;
     let token_bytes = metadata_u32 * std::mem::size_of::<u32>() as u64;
+    let split_attention_f32 =
+        if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some() {
+            let q_block = 4_u64;
+            let split_tokens = 256_u64;
+            let q_blocks = chunk.div_ceil(q_block);
+            let splits = chunk.div_ceil(split_tokens).max(1);
+            let rows = q_blocks * graph.num_attention_heads as u64 * splits * q_block;
+            rows * (graph.head_dim as u64 + 2)
+        } else {
+            0
+        };
     Some((
         device,
-        f32_elements * std::mem::size_of::<f32>() as u64
+        (f32_elements + split_attention_f32) * std::mem::size_of::<f32>() as u64
             + mxfp4_hidden
             + mxfp4_intermediate
             + token_bytes,
