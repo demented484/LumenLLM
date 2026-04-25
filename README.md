@@ -57,6 +57,10 @@ CUDA notes:
   residual/MLP path. The current fast path is a single-sequence block-Q
   online-softmax kernel with shared K/V reuse and warp reductions; multi-request
   and mixed scheduler paths still fall back to the more general varlen kernel.
+- An experimental split-K prefill attention scaffold exists for future
+  long-context tuning. It is opt-in with
+  `AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION=1`; by default its large partial
+  accumulator scratch is not allocated.
 - CUTLASS FP4 MLP prefill fuses SwiGLU directly into the down-projection FP4
   activation layout, avoiding a transient f32 SwiGLU buffer before the down GEMM.
 - Set `AEGISLLM_CUDA_STAGE_TIMINGS=1` to print per-stage prefill timings plus QKV/MLP TFLOPS estimates.

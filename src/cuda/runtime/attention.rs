@@ -29,6 +29,8 @@ fn checked_sum(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
 }
 
 const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
+const FLASH_SPLIT_K_TOKENS: usize = 256;
+const FLASH_SPLIT_Q_BLOCK: usize = 4;
 
 impl CudaRuntime {
     pub fn attention_decode_device(
@@ -261,6 +263,9 @@ impl CudaRuntime {
         value_chunk: &DeviceBuffer<f32>,
         query: &DeviceBuffer<f32>,
         query_half: &mut DeviceBuffer<u16>,
+        split_acc: &mut DeviceBuffer<f32>,
+        split_m: &mut DeviceBuffer<f32>,
+        split_l: &mut DeviceBuffer<f32>,
         slot_mapping: &DeviceBuffer<u32>,
         cu_q: &DeviceBuffer<u32>,
         cu_k: &DeviceBuffer<u32>,
@@ -336,6 +341,7 @@ impl CudaRuntime {
                 value_cache,
                 query,
                 Some(query_half),
+                Some((split_acc, split_m, split_l)),
                 slot_mapping,
                 cu_q,
                 cu_k,
@@ -375,6 +381,11 @@ impl CudaRuntime {
         value_cache: &DeviceBuffer<u16>,
         query: &DeviceBuffer<f32>,
         query_half: Option<&DeviceBuffer<u16>>,
+        mut split_scratch: Option<(
+            &mut DeviceBuffer<f32>,
+            &mut DeviceBuffer<f32>,
+            &mut DeviceBuffer<f32>,
+        )>,
         slot_mapping: &DeviceBuffer<u32>,
         cu_q: &DeviceBuffer<u32>,
         cu_k: &DeviceBuffer<u32>,
@@ -462,17 +473,34 @@ impl CudaRuntime {
             ));
         }
         let head_dim_usize = head_dim;
+        let q_blocks_usize = num_prefill_tokens.div_ceil(FLASH_SPLIT_Q_BLOCK);
+        let split_count_usize = max_k.div_ceil(FLASH_SPLIT_K_TOKENS).max(1);
+        let split_rows = q_blocks_usize
+            .checked_mul(num_attention_heads)
+            .and_then(|value| value.checked_mul(split_count_usize))
+            .and_then(|value| value.checked_mul(FLASH_SPLIT_Q_BLOCK))
+            .ok_or_else(|| AegisError::InvalidPlan("split-K attention scratch overflow".into()))?;
+        let split_acc_len = split_rows
+            .checked_mul(head_dim_usize)
+            .ok_or_else(|| AegisError::InvalidPlan("split-K attention acc overflow".into()))?;
+        let split_scratch_ready = split_scratch.as_ref().is_some_and(|(acc, m, l)| {
+            acc.len() >= split_acc_len && m.len() >= split_rows && l.len() >= split_rows
+        });
         let use_halfq_block4 = query_half.is_some()
             && num_sequences == 1
             && num_decode_tokens == 0
             && num_prefill_tokens >= 4
             && head_dim_usize <= 256;
+        let use_halfq_block4_split =
+            use_halfq_block4 && split_scratch_ready && split_count_usize > 1 && max_k >= 4096;
         let num_sequences = u32_arg("num_sequences", num_sequences)?;
         let total_q = u32_arg("num_prefill_tokens", num_prefill_tokens)?;
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
         let page_tokens = u32_arg("page_tokens", page_tokens_usize)?;
+        let split_tokens = u32_arg("split_tokens", FLASH_SPLIT_K_TOKENS)?;
+        let split_count = u32_arg("split_count", split_count_usize)?;
         let block_table_stride = u32_arg("block_table_stride", block_table_stride)?;
         let physical_slots = u32_arg("physical_slots", physical_slots)?;
         let warp_eligible = head_dim_usize <= 256 && head_dim_usize % 32 == 0;
@@ -503,6 +531,82 @@ impl CudaRuntime {
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: (shared_floats * std::mem::size_of::<f32>()) as u32,
         };
+        if use_halfq_block4_split {
+            let Some(query_half) = query_half else {
+                return Err(AegisError::InvalidPlan(
+                    "split-K halfq attention requires query_half".into(),
+                ));
+            };
+            let Some((split_acc, split_m, split_l)) = split_scratch.as_mut() else {
+                return Err(AegisError::InvalidPlan(
+                    "split-K halfq attention requires scratch buffers".into(),
+                ));
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(
+                        &self
+                            .kernels
+                            .attention_prefill_paged_varlen_halfq_block4_split,
+                    )
+                    .arg(&key_cache.slice)
+                    .arg(&value_cache.slice)
+                    .arg(&query_half.slice)
+                    .arg(&slot_mapping.slice)
+                    .arg(&cu_q.slice)
+                    .arg(&context_lens.slice)
+                    .arg(&block_tables.slice)
+                    .arg(&num_sequences)
+                    .arg(&total_q)
+                    .arg(&num_attention_heads)
+                    .arg(&num_kv_heads)
+                    .arg(&head_dim)
+                    .arg(&page_tokens)
+                    .arg(&split_tokens)
+                    .arg(&split_count)
+                    .arg(&block_table_stride)
+                    .arg(&physical_slots)
+                    .arg(&mut split_acc.slice)
+                    .arg(&mut split_m.slice)
+                    .arg(&mut split_l.slice)
+                    .launch(LaunchConfig {
+                        grid_dim: (num_attention_heads, grid_q, split_count),
+                        block_dim: (block_dim, 1, 1),
+                        shared_mem_bytes: (shared_floats * std::mem::size_of::<f32>()) as u32,
+                    })
+            }
+            .map_err(map_cuda_err(
+                "launch split-K paged varlen prefill attention",
+            ))?;
+            unsafe {
+                self.stream
+                    .launch_builder(
+                        &self
+                            .kernels
+                            .attention_prefill_paged_varlen_halfq_block4_combine,
+                    )
+                    .arg(&split_acc.slice)
+                    .arg(&split_m.slice)
+                    .arg(&split_l.slice)
+                    .arg(&total_q)
+                    .arg(&num_attention_heads)
+                    .arg(&head_dim)
+                    .arg(&split_count)
+                    .arg(&mut output.slice)
+                    .launch(LaunchConfig {
+                        grid_dim: (num_attention_heads, grid_q, 1),
+                        block_dim: (block_dim, 1, 1),
+                        shared_mem_bytes: ((FLASH_SPLIT_Q_BLOCK * head_dim_usize
+                            + FLASH_SPLIT_Q_BLOCK * 4)
+                            * std::mem::size_of::<f32>())
+                            as u32,
+                    })
+            }
+            .map_err(map_cuda_err(
+                "launch combine split-K paged varlen prefill attention",
+            ))?;
+            return Ok(());
+        }
         if let Some(query_half) = query_half {
             let kernel = if use_halfq_block4 {
                 &self.kernels.attention_prefill_paged_varlen_halfq_block4

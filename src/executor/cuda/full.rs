@@ -18,6 +18,8 @@ use crate::tensor::layout::LinearResidentLayout;
 use crate::tensor::storage::TensorStorageLoader;
 
 const FLASH_COMPAT_PREFILL_KV_PAGE_TOKENS: usize = 256;
+const PREFILL_SPLIT_K_TOKENS: usize = 256;
+const PREFILL_SPLIT_Q_BLOCK: usize = 4;
 
 impl CudaLlamaExecutor {
     pub(super) fn from_artifact(
@@ -132,6 +134,8 @@ impl CudaLlamaExecutor {
             .unwrap_or(self.hidden_size);
         let cutlass_prefill_scratch =
             cutlass_prefill_scratch_bytes(self, self.prefill_chunk_size, intermediate)?;
+        let prefill_attention_scratch =
+            prefill_attention_split_scratch(self, self.prefill_chunk_size)?;
         let prefill = if self.prefill_chunk_size > 1 {
             let prefill_max_sequences = 1;
             let prefill_block_table_capacity = self
@@ -194,6 +198,13 @@ impl CudaLlamaExecutor {
                 q_half: self.runtime.alloc_u16(
                     self.prefill_chunk_size * self.num_attention_heads * self.head_dim,
                 )?,
+                attn_split_acc: self.runtime.alloc_f32(prefill_attention_scratch.acc_f32)?,
+                attn_split_m: self
+                    .runtime
+                    .alloc_f32(prefill_attention_scratch.stats_f32)?,
+                attn_split_l: self
+                    .runtime
+                    .alloc_f32(prefill_attention_scratch.stats_f32)?,
                 k: self.runtime.alloc_f32(self.prefill_chunk_size * kv_width)?,
                 v: self.runtime.alloc_f32(self.prefill_chunk_size * kv_width)?,
                 attn_context: self.runtime.alloc_f32(
@@ -275,6 +286,40 @@ impl CudaLlamaExecutor {
             prefill_timings: super::state::CudaPrefillStageTimings::from_env(),
         })
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrefillAttentionSplitScratchBytes {
+    acc_f32: usize,
+    stats_f32: usize,
+}
+
+fn prefill_attention_split_scratch(
+    executor: &CudaLlamaExecutor,
+    chunk_size: usize,
+) -> Result<PrefillAttentionSplitScratchBytes> {
+    if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_none() {
+        return Ok(PrefillAttentionSplitScratchBytes {
+            acc_f32: 1,
+            stats_f32: 1,
+        });
+    }
+    let q_blocks = chunk_size.div_ceil(PREFILL_SPLIT_Q_BLOCK);
+    let splits = chunk_size.div_ceil(PREFILL_SPLIT_K_TOKENS).max(1);
+    let rows = q_blocks
+        .checked_mul(executor.num_attention_heads)
+        .and_then(|value| value.checked_mul(splits))
+        .and_then(|value| value.checked_mul(PREFILL_SPLIT_Q_BLOCK))
+        .ok_or_else(|| {
+            AegisError::InvalidPlan("prefill split attention scratch overflow".into())
+        })?;
+    let acc_f32 = rows
+        .checked_mul(executor.head_dim)
+        .ok_or_else(|| AegisError::InvalidPlan("prefill split attention acc overflow".into()))?;
+    Ok(PrefillAttentionSplitScratchBytes {
+        acc_f32: acc_f32.max(1),
+        stats_f32: rows.max(1),
+    })
 }
 
 fn cuda_prefill_chunk_size(config: CudaRuntimeConfig) -> usize {
