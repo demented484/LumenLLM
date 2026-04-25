@@ -462,6 +462,11 @@ impl CudaRuntime {
             ));
         }
         let head_dim_usize = head_dim;
+        let use_halfq_block4 = query_half.is_some()
+            && num_sequences == 1
+            && num_decode_tokens == 0
+            && num_prefill_tokens >= 4
+            && head_dim_usize <= 256;
         let num_sequences = u32_arg("num_sequences", num_sequences)?;
         let total_q = u32_arg("num_prefill_tokens", num_prefill_tokens)?;
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
@@ -478,21 +483,34 @@ impl CudaRuntime {
         ) && warp_eligible;
         let mut shared_floats = if use_warp {
             (block_dim / 32) as usize * 3 + head_dim_usize + 4
+        } else if use_halfq_block4 {
+            let q_block = 4_usize;
+            q_block * block_dim as usize + (q_block * 2 + 2) * head_dim_usize + q_block * 4
         } else {
             block_dim as usize + head_dim_usize + 4
         };
-        if query_half.is_some() {
+        if query_half.is_some() && !use_halfq_block4 {
             shared_floats += head_dim_usize;
         }
+        let grid_q = if use_halfq_block4 {
+            total_q.div_ceil(4)
+        } else {
+            total_q
+        };
         let cfg = LaunchConfig {
-            grid_dim: (num_attention_heads, total_q, 1),
+            grid_dim: (num_attention_heads, grid_q, 1),
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: (shared_floats * std::mem::size_of::<f32>()) as u32,
         };
         if let Some(query_half) = query_half {
+            let kernel = if use_halfq_block4 {
+                &self.kernels.attention_prefill_paged_varlen_halfq_block4
+            } else {
+                &self.kernels.attention_prefill_paged_varlen_halfq
+            };
             unsafe {
                 self.stream
-                    .launch_builder(&self.kernels.attention_prefill_paged_varlen_halfq)
+                    .launch_builder(kernel)
                     .arg(&key_cache.slice)
                     .arg(&value_cache.slice)
                     .arg(&query_half.slice)
