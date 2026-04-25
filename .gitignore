@@ -1,0 +1,8 @@
+/target/
+/.aegis-cache/
+*.log
+*.pid
+*.tmp
+*.prof
+*.nsys-rep
+*.sqlite
