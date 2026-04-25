@@ -1,5 +1,6 @@
 mod compile;
 mod config;
+mod cutlass_bridge;
 mod functions;
 mod kernels;
 mod loader;

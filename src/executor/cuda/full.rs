@@ -128,6 +128,8 @@ impl CudaLlamaExecutor {
             .first()
             .map(|layer| layer.gate_proj.rows)
             .unwrap_or(self.hidden_size);
+        let cutlass_prefill_scratch =
+            cutlass_prefill_scratch_bytes(self, self.prefill_chunk_size, intermediate)?;
         let prefill = if self.prefill_chunk_size > 1 {
             let prefill_max_sequences = 1;
             let prefill_block_table_capacity = self.kv_context_size.div_ceil(16).max(1);
@@ -174,6 +176,13 @@ impl CudaLlamaExecutor {
                 mxfp4_intermediate: self.runtime.alloc_u8(
                     self.prefill_chunk_size * CudaRuntime::mxfp4_vector_bytes(intermediate)?,
                 )?,
+                cutlass_payload: self
+                    .runtime
+                    .alloc_u8(cutlass_prefill_scratch.payload_bytes)?,
+                cutlass_scales: self.runtime.alloc_u8(cutlass_prefill_scratch.scale_bytes)?,
+                cutlass_workspace: self
+                    .runtime
+                    .alloc_u8(cutlass_prefill_scratch.workspace_bytes)?,
                 q: self.runtime.alloc_f32(
                     self.prefill_chunk_size * self.num_attention_heads * self.head_dim,
                 )?,
@@ -262,4 +271,70 @@ impl CudaLlamaExecutor {
 
 fn cuda_prefill_chunk_size(config: CudaRuntimeConfig) -> usize {
     config.prefill_chunk_size.unwrap_or(128).clamp(1, 2048)
+}
+
+struct CutlassPrefillScratchBytes {
+    payload_bytes: usize,
+    scale_bytes: usize,
+    workspace_bytes: usize,
+}
+
+fn cutlass_prefill_scratch_bytes(
+    executor: &CudaLlamaExecutor,
+    chunk_size: usize,
+    intermediate: usize,
+) -> Result<CutlassPrefillScratchBytes> {
+    let max_input = executor.hidden_size.max(intermediate);
+    let payload_bytes =
+        CudaRuntime::cutlass_nvfp4_activation_payload_bytes(chunk_size, max_input).unwrap_or(1);
+    let scale_bytes =
+        CudaRuntime::cutlass_nvfp4_activation_scale_bytes(chunk_size, max_input).unwrap_or(1);
+    let workspace_bytes = if executor.layers.iter().any(layer_has_cutlass_linear) {
+        executor
+            .layers
+            .iter()
+            .flat_map(|layer| {
+                [
+                    &layer.q_proj,
+                    &layer.k_proj,
+                    &layer.v_proj,
+                    &layer.o_proj,
+                    &layer.gate_proj,
+                    &layer.up_proj,
+                    &layer.down_proj,
+                ]
+            })
+            .filter(|linear| executor.runtime.cutlass_nvfp4_inference_enabled_for(linear))
+            .map(|linear| {
+                executor
+                    .runtime
+                    .cutlass_nvfp4_workspace_bytes(chunk_size, linear.rows, linear.cols)
+            })
+            .try_fold(1usize, |max_bytes, bytes| {
+                bytes.map(|bytes| max_bytes.max(bytes))
+            })?
+    } else {
+        1
+    };
+    Ok(CutlassPrefillScratchBytes {
+        payload_bytes: payload_bytes.max(1),
+        scale_bytes: scale_bytes.max(1),
+        workspace_bytes: workspace_bytes.max(1),
+    })
+}
+
+fn layer_has_cutlass_linear(layer: &super::state::CudaLayer) -> bool {
+    [
+        &layer.q_proj,
+        &layer.k_proj,
+        &layer.v_proj,
+        &layer.o_proj,
+        &layer.gate_proj,
+        &layer.up_proj,
+        &layer.down_proj,
+    ]
+    .into_iter()
+    .any(|linear| {
+        linear.kernel_family == crate::planning::runtime::KernelFamily::CudaCutlassFp4TensorCores
+    })
 }

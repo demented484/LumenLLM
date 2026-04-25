@@ -8,6 +8,7 @@ use crate::error::{AegisError, Result};
 
 mod attention;
 mod blackwell;
+mod cutlass;
 mod gemm;
 mod graph;
 mod kv;

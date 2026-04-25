@@ -60,7 +60,7 @@ impl CudaExecutorProvider {
         };
         let attention_note = match cuda_config.prefill_attention {
             CudaPrefillAttentionKernel::Auto => {
-                "CUDA prefill attention is auto-selected; cache-only dense attention is used while shared memory is safe, with bounded continuation fallback for long prefixes".into()
+                "CUDA prefill attention is auto-selected; reference attention is used while shared memory is safe, with bounded continuation fallback for long prefixes".into()
             }
             CudaPrefillAttentionKernel::WarpFlash => {
                 "CUDA prefill attention prefers the warp cache-only kernel for eligible first chunks and falls back to bounded continuation otherwise".into()

@@ -47,7 +47,7 @@ CUDA notes:
   - CLI equivalents: `--native-mxfp4-repack` and `--native-mxfp4-inference`
 - Native MXFP4 repack writes a per-model cache under `.aegis-cache/mxfp4-v1` so repeated benchmark runs do not spend most of their time repacking weights on the host. Set `AEGISLLM_NATIVE_MXFP4_CACHE=0` to disable it.
 - Chunked CUDA prefill uses `AEGIS_CUDA_PREFILL_CHUNK` for the token chunk size. The default is `128`; values are clamped to `1..=2048`.
-- CUDA prefill attention is selected by `cuda.prefill-attention` (`auto`, `warp-flash`, `continuation`, or `reference`) or the legacy `other-parameters.flash-attention` boolean. Explicit `cuda.prefill-attention` wins over the legacy flag. `auto` uses cache-only dense attention while shared memory is safe and falls back to bounded-memory continuation for long prefixes.
+- CUDA prefill attention is selected by `cuda.prefill-attention` (`auto`, `warp-flash`, `continuation`, or `reference`) or the legacy `other-parameters.flash-attention` boolean. Explicit `cuda.prefill-attention` wins over the legacy flag. `auto` uses the correctness-first reference kernel while shared memory is safe and falls back to bounded-memory continuation for long prefixes; `warp-flash` remains an explicit experimental opt-in.
 - Set `AEGISLLM_CUDA_STAGE_TIMINGS=1` to print per-stage prefill timings plus QKV/MLP TFLOPS estimates.
 - Reports distinguish planned families from effective dispatch. With native MXFP4 disabled, planned native FP4 regions still run through the CUDA NVFP4 reference path.
 - KV cache defaults to f16 and is stored as f16 in the CUDA reference executor. q8/fp8 KV kernels are not implemented yet and are rejected by CUDA readiness.

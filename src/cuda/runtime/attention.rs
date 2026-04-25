@@ -169,7 +169,7 @@ impl CudaRuntime {
         let head_dim = u32_arg("head_dim", head_dim)?;
         let warp_eligible = start_position == 0 && head_dim % 32 == 0 && head_dim <= 256;
         let warp_parallel = match self.config.prefill_attention {
-            CudaPrefillAttentionKernel::Auto => warp_eligible,
+            CudaPrefillAttentionKernel::Auto => false,
             CudaPrefillAttentionKernel::WarpFlash => warp_eligible,
             CudaPrefillAttentionKernel::Reference => false,
             CudaPrefillAttentionKernel::Continuation => false,

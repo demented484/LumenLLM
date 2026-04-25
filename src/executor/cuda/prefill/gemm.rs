@@ -12,6 +12,13 @@ pub(super) fn prefill_linear_native_mxfp4_enabled(
     native_mxfp4_enabled(runtime, linear)
 }
 
+pub(super) fn prefill_linear_cutlass_nvfp4_enabled(
+    runtime: &CudaRuntime,
+    linear: &DeviceNvfp4Linear,
+) -> bool {
+    runtime.cutlass_nvfp4_inference_enabled_for(linear)
+}
+
 pub(super) fn prefill_linear_prepare_nvfp4_input(
     runtime: &CudaRuntime,
     linear: &DeviceNvfp4Linear,
@@ -59,6 +66,48 @@ pub(super) fn prefill_linear_batched_device_with_scratch(
         batch,
         quantized_input,
         input_mxfp4,
+        output,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prefill_linear_cutlass_nvfp4_device(
+    runtime: &CudaRuntime,
+    linear: &DeviceNvfp4Linear,
+    input: &DeviceBuffer<f32>,
+    batch: usize,
+    activation_payload: &mut DeviceBuffer<u8>,
+    activation_scales: &mut DeviceBuffer<u8>,
+    workspace: &mut DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    runtime.matmul_cutlass_nvfp4_prefill_device(
+        linear,
+        input,
+        batch,
+        activation_payload,
+        activation_scales,
+        workspace,
+        output,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prefill_linear_cutlass_nvfp4_prepacked_device(
+    runtime: &CudaRuntime,
+    linear: &DeviceNvfp4Linear,
+    activation_payload: &DeviceBuffer<u8>,
+    activation_scales: &DeviceBuffer<u8>,
+    batch: usize,
+    workspace: &mut DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    runtime.matmul_cutlass_nvfp4_prepacked_prefill_device(
+        linear,
+        activation_payload,
+        activation_scales,
+        batch,
+        workspace,
         output,
     )
 }

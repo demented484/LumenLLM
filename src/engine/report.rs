@@ -293,11 +293,12 @@ fn push_runtime_report(engine: &AegisEngine, lines: &mut Vec<String>) {
             + engine.runtime.count_family(KernelFamily::CpuSimd),
     ));
     let effective_native_mxfp4 = effective_native_mxfp4_regions(&engine.runtime, engine.cuda);
+    let effective_cutlass_nvfp4 = effective_cutlass_nvfp4_regions(&engine.runtime, engine.cuda);
     let effective_reference_nvfp4 =
         effective_cuda_nvfp4_reference_regions(&engine.runtime, engine.cuda);
     lines.push(format!(
-        "runtime-effective: cuda_native_mxfp4_regions={} cuda_nvfp4_reference_regions={}",
-        effective_native_mxfp4, effective_reference_nvfp4
+        "runtime-effective: cuda_native_mxfp4_regions={} cuda_cutlass_nvfp4_regions={} cuda_nvfp4_reference_regions={}",
+        effective_native_mxfp4, effective_cutlass_nvfp4, effective_reference_nvfp4
     ));
     lines.push(format!(
         "runtime-formats: nvfp4_regions={} fp8_regions={} dense_regions={}",
@@ -375,6 +376,13 @@ fn effective_native_mxfp4_regions(runtime: &RuntimePlan, cuda: CudaRuntimeConfig
     runtime.count_family(KernelFamily::CudaNativeFp4TensorCores)
 }
 
+fn effective_cutlass_nvfp4_regions(runtime: &RuntimePlan, cuda: CudaRuntimeConfig) -> usize {
+    if !cuda.cutlass_nvfp4_repack {
+        return 0;
+    }
+    runtime.count_family(KernelFamily::CudaCutlassFp4TensorCores)
+}
+
 fn effective_cuda_nvfp4_reference_regions(runtime: &RuntimePlan, cuda: CudaRuntimeConfig) -> usize {
     let planned_nvfp4_cuda = runtime
         .kernels
@@ -382,7 +390,9 @@ fn effective_cuda_nvfp4_reference_regions(runtime: &RuntimePlan, cuda: CudaRunti
         .filter(|kernel| matches!(kernel.device, crate::backend::BackendKind::Cuda { .. }))
         .filter(|kernel| kernel.quant_format == QuantFormat::Nvfp4)
         .count();
-    planned_nvfp4_cuda.saturating_sub(effective_native_mxfp4_regions(runtime, cuda))
+    planned_nvfp4_cuda
+        .saturating_sub(effective_native_mxfp4_regions(runtime, cuda))
+        .saturating_sub(effective_cutlass_nvfp4_regions(runtime, cuda))
 }
 
 fn region_summary(placement: &ResolvedPlacement) -> Vec<String> {
