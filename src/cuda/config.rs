@@ -16,6 +16,7 @@ pub enum CudaPrefillAttentionKernel {
     Reference,
     WarpFlash,
     Continuation,
+    FlashVarlen,
 }
 
 impl CudaRuntimeConfig {
@@ -43,8 +44,9 @@ impl CudaPrefillAttentionKernel {
             "warp" | "warp-flash" | "flash" | "flash-attention" | "on" | "true" => {
                 Ok(Self::WarpFlash)
             }
-            "continuation" | "varlen" | "online" | "online-softmax" | "flash-varlen" => {
-                Ok(Self::Continuation)
+            "continuation" | "online" | "online-softmax" => Ok(Self::Continuation),
+            "varlen" | "paged-varlen" | "flash-varlen" | "fa-varlen" | "flash-varlen-paged" => {
+                Ok(Self::FlashVarlen)
             }
             other => Err(AegisError::InvalidConfig(format!(
                 "unsupported CUDA prefill attention kernel `{other}`"

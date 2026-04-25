@@ -173,6 +173,7 @@ impl CudaRuntime {
             CudaPrefillAttentionKernel::WarpFlash => warp_eligible,
             CudaPrefillAttentionKernel::Reference => false,
             CudaPrefillAttentionKernel::Continuation => false,
+            CudaPrefillAttentionKernel::FlashVarlen => false,
         };
         let block_dim = if warp_parallel { 128 } else { 128 };
         let legacy_shared_bytes = (max_seq_len + block_dim as usize) * std::mem::size_of::<f32>();
@@ -259,7 +260,9 @@ impl CudaRuntime {
         query: &DeviceBuffer<f32>,
         slot_mapping: &DeviceBuffer<u32>,
         cu_q: &DeviceBuffer<u32>,
+        cu_k: &DeviceBuffer<u32>,
         context_lens: &DeviceBuffer<u32>,
+        block_tables: &DeviceBuffer<u32>,
         num_sequences: usize,
         start_position: usize,
         batch: usize,
@@ -297,6 +300,41 @@ impl CudaRuntime {
                 dense_metadata.batch(),
                 dense_metadata.context_len()
             )));
+        }
+        let flash_varlen_min_context = 128;
+        let use_flash_varlen = match self.config.prefill_attention {
+            CudaPrefillAttentionKernel::FlashVarlen => {
+                dense_metadata.context_len() >= flash_varlen_min_context
+            }
+            CudaPrefillAttentionKernel::Auto => {
+                dense_metadata.context_len() >= flash_varlen_min_context
+            }
+            CudaPrefillAttentionKernel::Reference
+            | CudaPrefillAttentionKernel::WarpFlash
+            | CudaPrefillAttentionKernel::Continuation => false,
+        };
+        if use_flash_varlen {
+            let block_table_stride = dense_metadata.context_len().div_ceil(16).max(1);
+            return self.attention_prefill_paged_varlen_device(
+                key_cache,
+                value_cache,
+                query,
+                slot_mapping,
+                cu_q,
+                cu_k,
+                context_lens,
+                block_tables,
+                num_sequences,
+                batch,
+                0,
+                batch,
+                dense_metadata.context_len(),
+                block_table_stride,
+                num_attention_heads,
+                num_kv_heads,
+                head_dim,
+                output,
+            );
         }
         self.attention_prefill_batched_device(
             key_cache,
@@ -413,7 +451,7 @@ impl CudaRuntime {
         let warp_eligible = head_dim_usize <= 256 && head_dim_usize % 32 == 0;
         let use_warp = matches!(
             self.config.prefill_attention,
-            CudaPrefillAttentionKernel::Auto | CudaPrefillAttentionKernel::WarpFlash
+            CudaPrefillAttentionKernel::WarpFlash
         ) && warp_eligible;
         let shared_floats = if use_warp {
             (block_dim / 32) as usize * 3 + head_dim_usize + 4

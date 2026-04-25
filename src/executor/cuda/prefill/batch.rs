@@ -76,6 +76,10 @@ impl CudaPrefillScratch {
             &mut self.positions,
             &mut self.slot_mapping,
         )?;
+        runtime.copy_u32_to_device(&self.cu_q_host, &mut self.cu_q)?;
+        runtime.copy_u32_to_device(&self.cu_k_host, &mut self.cu_k)?;
+        runtime.copy_u32_to_device(&self.context_lens_host, &mut self.context_lens)?;
+        runtime.copy_u32_to_device(&self.block_tables_host, &mut self.block_tables)?;
 
         Ok(CudaPrefillBatch {
             start_position,

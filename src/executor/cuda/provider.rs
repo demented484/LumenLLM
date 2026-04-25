@@ -60,7 +60,7 @@ impl CudaExecutorProvider {
         };
         let attention_note = match cuda_config.prefill_attention {
             CudaPrefillAttentionKernel::Auto => {
-                "CUDA prefill attention is auto-selected; reference attention is used while shared memory is safe, with bounded continuation fallback for long prefixes".into()
+                "CUDA prefill attention is auto-selected; reference attention is used for short correctness-sensitive chunks and paged varlen FlashAttention is used for longer chunks".into()
             }
             CudaPrefillAttentionKernel::WarpFlash => {
                 "CUDA prefill attention prefers the warp cache-only kernel for eligible first chunks and falls back to bounded continuation otherwise".into()
@@ -70,6 +70,9 @@ impl CudaExecutorProvider {
             }
             CudaPrefillAttentionKernel::Continuation => {
                 "CUDA prefill attention uses the varlen continuation kernel with bounded shared memory".into()
+            }
+            CudaPrefillAttentionKernel::FlashVarlen => {
+                "CUDA prefill attention uses the paged varlen online-softmax FlashAttention path".into()
             }
         };
         Ok(Self {
