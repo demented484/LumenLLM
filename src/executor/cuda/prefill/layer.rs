@@ -222,6 +222,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         &prefill.k,
         &prefill.v,
         &prefill.q,
+        &mut prefill.q_half,
         &prefill.slot_mapping,
         &prefill.cu_q,
         &prefill.cu_k,

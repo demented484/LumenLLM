@@ -17,6 +17,8 @@ use crate::planning::runtime::RuntimePlan;
 use crate::tensor::layout::LinearResidentLayout;
 use crate::tensor::storage::TensorStorageLoader;
 
+const FLASH_COMPAT_PREFILL_KV_PAGE_TOKENS: usize = 256;
+
 impl CudaLlamaExecutor {
     pub(super) fn from_artifact(
         artifact: &ModelArtifact,
@@ -132,7 +134,10 @@ impl CudaLlamaExecutor {
             cutlass_prefill_scratch_bytes(self, self.prefill_chunk_size, intermediate)?;
         let prefill = if self.prefill_chunk_size > 1 {
             let prefill_max_sequences = 1;
-            let prefill_block_table_capacity = self.kv_context_size.div_ceil(16).max(1);
+            let prefill_block_table_capacity = self
+                .kv_context_size
+                .div_ceil(FLASH_COMPAT_PREFILL_KV_PAGE_TOKENS)
+                .max(1);
             Some(CudaPrefillScratch {
                 chunk_size: self.prefill_chunk_size,
                 max_sequences: prefill_max_sequences,
@@ -184,6 +189,9 @@ impl CudaLlamaExecutor {
                     .runtime
                     .alloc_u8(cutlass_prefill_scratch.workspace_bytes)?,
                 q: self.runtime.alloc_f32(
+                    self.prefill_chunk_size * self.num_attention_heads * self.head_dim,
+                )?,
+                q_half: self.runtime.alloc_u16(
                     self.prefill_chunk_size * self.num_attention_heads * self.head_dim,
                 )?,
                 k: self.runtime.alloc_f32(self.prefill_chunk_size * kv_width)?,

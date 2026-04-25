@@ -29,6 +29,38 @@ fn validate_rope_shape(label: &str, num_heads: usize, head_dim: usize) -> Result
 }
 
 impl CudaRuntime {
+    pub fn f32_to_f16_device(
+        &self,
+        input: &DeviceBuffer<f32>,
+        len: usize,
+        output: &mut DeviceBuffer<u16>,
+    ) -> Result<()> {
+        if input.len() < len || output.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "f32->f16 conversion shape mismatch: input={} output={} len={}",
+                input.len(),
+                output.len(),
+                len
+            )));
+        }
+        let len = len as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.f32_to_f16)
+                .arg(&input.slice)
+                .arg(&len)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch f32 to f16"))?;
+        Ok(())
+    }
+
     pub fn rms_norm_device(
         &self,
         input: &DeviceBuffer<f32>,

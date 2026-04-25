@@ -477,6 +477,17 @@ extern "C" __device__ __forceinline__ float f16_bits_to_float(unsigned short val
     return __uint_as_float(sign | ((exp + 112u) << 23) | (mant << 13));
 }
 
+extern "C" __global__ void aegis_f32_to_f16(
+    const float* input,
+    const unsigned int len,
+    unsigned short* output
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        output[idx] = float_to_f16_bits(input[idx]);
+    }
+}
+
 extern "C" __global__ void aegis_kv_store(
     unsigned short* key_cache,
     unsigned short* value_cache,

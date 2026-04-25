@@ -1,4 +1,4 @@
-pub(super) const PREFILL_KV_PAGE_TOKENS: usize = 16;
+pub(super) const PREFILL_KV_PAGE_TOKENS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -116,7 +116,7 @@ mod tests {
     #[test]
     fn page_allocator_reuses_released_pages() {
         let mut allocator = PrefillKvPageAllocator::new(4, PREFILL_KV_PAGE_TOKENS);
-        let seq = allocator.allocate(PrefillSequenceId(7), 33).unwrap();
+        let seq = allocator.allocate(PrefillSequenceId(7), 513).unwrap();
         assert_eq!(seq.logical_pages, [0, 1, 2]);
         assert_eq!(allocator.free_pages(), 1);
         allocator.release(seq);
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn page_allocator_rejects_oversized_sequence() {
         let mut allocator = PrefillKvPageAllocator::new(2, PREFILL_KV_PAGE_TOKENS);
-        assert!(allocator.allocate(PrefillSequenceId(1), 48).is_none());
+        assert!(allocator.allocate(PrefillSequenceId(1), 513).is_none());
         assert_eq!(allocator.free_pages(), 2);
     }
 

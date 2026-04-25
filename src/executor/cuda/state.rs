@@ -152,6 +152,7 @@ pub(super) struct CudaPrefillScratch {
     pub(super) cutlass_scales: DeviceBuffer<u8>,
     pub(super) cutlass_workspace: DeviceBuffer<u8>,
     pub(super) q: DeviceBuffer<f32>,
+    pub(super) q_half: DeviceBuffer<u16>,
     pub(super) k: DeviceBuffer<f32>,
     pub(super) v: DeviceBuffer<f32>,
     pub(super) attn_context: DeviceBuffer<f32>,

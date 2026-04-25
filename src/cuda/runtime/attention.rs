@@ -28,6 +28,8 @@ fn checked_sum(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
     })
 }
 
+const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
+
 impl CudaRuntime {
     pub fn attention_decode_device(
         &self,
@@ -258,6 +260,7 @@ impl CudaRuntime {
         key_chunk: &DeviceBuffer<f32>,
         value_chunk: &DeviceBuffer<f32>,
         query: &DeviceBuffer<f32>,
+        query_half: &mut DeviceBuffer<u16>,
         slot_mapping: &DeviceBuffer<u32>,
         cu_q: &DeviceBuffer<u32>,
         cu_k: &DeviceBuffer<u32>,
@@ -314,11 +317,25 @@ impl CudaRuntime {
             | CudaPrefillAttentionKernel::Continuation => false,
         };
         if use_flash_varlen {
-            let block_table_stride = dense_metadata.context_len().div_ceil(16).max(1);
+            let q_len = checked_len(
+                "dense varlen query half conversion",
+                batch,
+                checked_len(
+                    "dense varlen query half width",
+                    num_attention_heads,
+                    head_dim,
+                )?,
+            )?;
+            self.f32_to_f16_device(query, q_len, query_half)?;
+            let block_table_stride = dense_metadata
+                .context_len()
+                .div_ceil(FLASH_COMPAT_PAGE_TOKENS)
+                .max(1);
             return self.attention_prefill_paged_varlen_device(
                 key_cache,
                 value_cache,
                 query,
+                Some(query_half),
                 slot_mapping,
                 cu_q,
                 cu_k,
@@ -357,6 +374,7 @@ impl CudaRuntime {
         key_cache: &DeviceBuffer<u16>,
         value_cache: &DeviceBuffer<u16>,
         query: &DeviceBuffer<f32>,
+        query_half: Option<&DeviceBuffer<u16>>,
         slot_mapping: &DeviceBuffer<u32>,
         cu_q: &DeviceBuffer<u32>,
         cu_k: &DeviceBuffer<u32>,
@@ -385,7 +403,7 @@ impl CudaRuntime {
                 num_sequences, max_q, max_k
             )));
         }
-        let page_tokens_usize = 16_usize;
+        let page_tokens_usize = FLASH_COMPAT_PAGE_TOKENS;
         let required_pages_per_sequence = max_k.div_ceil(page_tokens_usize).max(1);
         if block_table_stride < required_pages_per_sequence {
             return Err(AegisError::InvalidPlan(format!(
@@ -414,7 +432,12 @@ impl CudaRuntime {
         let q_width = checked_len("paged varlen q width", num_attention_heads, head_dim)?;
         let _ = checked_len("paged varlen kv width", num_kv_heads, head_dim)?;
         let q_tokens = checked_len("paged varlen query tokens", num_prefill_tokens, q_width)?;
-        if output.len() < q_tokens || query.len() < q_tokens {
+        if output.len() < q_tokens
+            || query
+                .len()
+                .max(query_half.map(|buffer| buffer.len()).unwrap_or(0))
+                < q_tokens
+        {
             return Err(AegisError::InvalidPlan(
                 "paged varlen prefill query/output shape mismatch".into(),
             ));
@@ -463,31 +486,55 @@ impl CudaRuntime {
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: (shared_floats * std::mem::size_of::<f32>()) as u32,
         };
-        let kernel = if use_warp {
-            &self.kernels.attention_prefill_paged_varlen_warp
+        if let Some(query_half) = query_half {
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.attention_prefill_paged_varlen_halfq)
+                    .arg(&key_cache.slice)
+                    .arg(&value_cache.slice)
+                    .arg(&query_half.slice)
+                    .arg(&slot_mapping.slice)
+                    .arg(&cu_q.slice)
+                    .arg(&context_lens.slice)
+                    .arg(&block_tables.slice)
+                    .arg(&num_sequences)
+                    .arg(&total_q)
+                    .arg(&num_attention_heads)
+                    .arg(&num_kv_heads)
+                    .arg(&head_dim)
+                    .arg(&page_tokens)
+                    .arg(&block_table_stride)
+                    .arg(&physical_slots)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
         } else {
-            &self.kernels.attention_prefill_paged_varlen
-        };
-        unsafe {
-            self.stream
-                .launch_builder(kernel)
-                .arg(&key_cache.slice)
-                .arg(&value_cache.slice)
-                .arg(&query.slice)
-                .arg(&slot_mapping.slice)
-                .arg(&cu_q.slice)
-                .arg(&context_lens.slice)
-                .arg(&block_tables.slice)
-                .arg(&num_sequences)
-                .arg(&total_q)
-                .arg(&num_attention_heads)
-                .arg(&num_kv_heads)
-                .arg(&head_dim)
-                .arg(&page_tokens)
-                .arg(&block_table_stride)
-                .arg(&physical_slots)
-                .arg(&mut output.slice)
-                .launch(cfg)
+            let kernel = if use_warp {
+                &self.kernels.attention_prefill_paged_varlen_warp
+            } else {
+                &self.kernels.attention_prefill_paged_varlen
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(kernel)
+                    .arg(&key_cache.slice)
+                    .arg(&value_cache.slice)
+                    .arg(&query.slice)
+                    .arg(&slot_mapping.slice)
+                    .arg(&cu_q.slice)
+                    .arg(&context_lens.slice)
+                    .arg(&block_tables.slice)
+                    .arg(&num_sequences)
+                    .arg(&total_q)
+                    .arg(&num_attention_heads)
+                    .arg(&num_kv_heads)
+                    .arg(&head_dim)
+                    .arg(&page_tokens)
+                    .arg(&block_table_stride)
+                    .arg(&physical_slots)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
         }
         .map_err(map_cuda_err("launch paged varlen prefill attention"))?;
         Ok(())

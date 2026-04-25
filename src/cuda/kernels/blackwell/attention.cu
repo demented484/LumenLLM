@@ -568,6 +568,133 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen(
     }
 }
 
+extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq(
+    const unsigned short* key_cache,
+    const unsigned short* value_cache,
+    const unsigned short* query,
+    const unsigned int* slot_mapping,
+    const unsigned int* cu_q,
+    const unsigned int* context_lens,
+    const unsigned int* block_tables,
+    const unsigned int num_sequences,
+    const unsigned int total_q,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int page_tokens,
+    const unsigned int block_table_stride,
+    const unsigned int physical_slots,
+    float* output
+) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int global_q = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    if (global_q >= total_q || head >= num_attention_heads) {
+        return;
+    }
+    const unsigned int current_slot = slot_mapping[global_q];
+    if (current_slot == 0xffffffffu) {
+        return;
+    }
+
+    unsigned int seq = 0u;
+    unsigned int q_start = 0u;
+    unsigned int q_end = 0u;
+    for (; seq < num_sequences; ++seq) {
+        q_start = cu_q[seq];
+        q_end = cu_q[seq + 1u];
+        if (global_q >= q_start && global_q < q_end) {
+            break;
+        }
+    }
+    if (seq >= num_sequences || q_end <= q_start) {
+        return;
+    }
+
+    const unsigned int q_in_seq = global_q - q_start;
+    const unsigned int q_len = q_end - q_start;
+    const unsigned int context_len = context_lens[seq];
+    const unsigned int hidden_future = q_len - q_in_seq - 1u;
+    const unsigned int visible_len = context_len > hidden_future
+        ? context_len - hidden_future
+        : 0u;
+    if (visible_len == 0u) {
+        return;
+    }
+
+    extern __shared__ float shared[];
+    float* partial = shared;
+    float* acc = partial + blockDim.x;
+    float* scalars = acc + head_dim;
+
+    const unsigned int group = num_attention_heads / num_kv_heads;
+    const unsigned int kv_head = head / group;
+    const unsigned short* q = query + (size_t(global_q) * num_attention_heads + head) * head_dim;
+    float* out = output + (size_t(global_q) * num_attention_heads + head) * head_dim;
+    const float scale = rsqrtf(float(head_dim));
+
+    for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
+        acc[dim] = 0.0f;
+    }
+    if (tid == 0u) {
+        scalars[0] = -3.402823466e38f;
+        scalars[1] = 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned int pos = 0u; pos < visible_len; ++pos) {
+        const unsigned int logical_page = page_tokens == 0u ? 0u : pos / page_tokens;
+        const unsigned int page_offset = page_tokens == 0u ? pos : pos - logical_page * page_tokens;
+        const unsigned int physical_page = block_tables[size_t(seq) * block_table_stride + logical_page];
+        const unsigned int physical_slot = physical_page * page_tokens + page_offset;
+        if (physical_slot >= physical_slots) {
+            continue;
+        }
+        const unsigned short* k =
+            key_cache + (size_t(physical_slot) * num_kv_heads + kv_head) * head_dim;
+
+        float dot = 0.0f;
+        for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
+            dot += f16_bits_to_float(q[dim]) * f16_bits_to_float(k[dim]);
+        }
+        partial[tid] = dot;
+        __syncthreads();
+        for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+            if (tid < stride) {
+                partial[tid] += partial[tid + stride];
+            }
+            __syncthreads();
+        }
+        if (tid == 0u) {
+            const float score = partial[0] * scale;
+            const float old_m = scalars[0];
+            const float old_l = scalars[1];
+            const float new_m = fmaxf(old_m, score);
+            const float alpha = old_l > 0.0f ? expf(old_m - new_m) : 0.0f;
+            const float beta = expf(score - new_m);
+            scalars[2] = alpha;
+            scalars[3] = beta;
+            scalars[0] = new_m;
+            scalars[1] = old_l * alpha + beta;
+        }
+        __syncthreads();
+
+        const float alpha = scalars[2];
+        const float beta = scalars[3];
+        const unsigned short* v =
+            value_cache + (size_t(physical_slot) * num_kv_heads + kv_head) * head_dim;
+        for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
+            acc[dim] = acc[dim] * alpha + beta * f16_bits_to_float(v[dim]);
+        }
+        __syncthreads();
+    }
+
+    const float denom = fmaxf(scalars[1], 1.0e-20f);
+    for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
+        out[dim] = acc[dim] / denom;
+    }
+}
+
 extern "C" __global__ void aegis_attention_prefill_paged_varlen_warp(
     const unsigned short* key_cache,
     const unsigned short* value_cache,
