@@ -18,8 +18,8 @@ use crate::tensor::layout::LinearResidentLayout;
 use crate::tensor::storage::TensorStorageLoader;
 
 const FLASH_COMPAT_PREFILL_KV_PAGE_TOKENS: usize = 256;
-const PREFILL_SPLIT_K_TOKENS: usize = 256;
-const PREFILL_SPLIT_Q_BLOCK: usize = 4;
+const PREFILL_SPLIT_K_TOKENS: usize = 2048;
+const PREFILL_SPLIT_Q_BLOCK: usize = 16;
 
 impl CudaLlamaExecutor {
     pub(super) fn from_artifact(

@@ -42,6 +42,7 @@ pub enum CudaAttentionEffectivePath {
     ReferenceContinuation,
     AegisDenseWarpTile,
     AegisDenseWmmaTile,
+    AegisDenseWmmaSplitK,
     AegisPagedVarlen,
     FlashAttention4PagedVarlen,
     WarpFlash,
@@ -156,6 +157,7 @@ impl CudaAttentionEffectivePath {
             Self::ReferenceContinuation => "reference/continuation",
             Self::AegisDenseWarpTile => "aegis-varlen/dense-warp-tile",
             Self::AegisDenseWmmaTile => "aegis-varlen/dense-wmma-tile",
+            Self::AegisDenseWmmaSplitK => "aegis-varlen/dense-wmma-split-k",
             Self::AegisPagedVarlen => "aegis-varlen/paged-varlen",
             Self::FlashAttention4PagedVarlen => "fa4/paged-varlen",
             Self::WarpFlash => "warp-flash/cache-only",
@@ -178,9 +180,19 @@ impl CudaPrefillAttentionSelection {
                     CudaAttentionBackend::auto_target_for_compute_capability(compute_capability);
                 let dense_warp_tile_eligible =
                     head_dim == 128 && context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT;
+                let dense_split_k_experimental =
+                    std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
+                        && head_dim == 128
+                        && context_len >= 4096;
                 let warp_eligible =
                     head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores;
-                let (logical_backend, effective_path, reason) = if dense_warp_tile_eligible {
+                let (logical_backend, effective_path, reason) = if dense_split_k_experimental {
+                    (
+                        CudaAttentionBackend::AegisVarlen,
+                        CudaAttentionEffectivePath::AegisDenseWmmaSplitK,
+                        "auto selected experimental split-K dense WMMA-tiled prefill attention",
+                    )
+                } else if dense_warp_tile_eligible {
                     (
                         CudaAttentionBackend::AegisVarlen,
                         CudaAttentionEffectivePath::AegisDenseWmmaTile,
@@ -257,7 +269,13 @@ impl CudaPrefillAttentionSelection {
                 logical_backend: CudaAttentionBackend::AegisVarlen,
                 effective_path: if head_dim == 128 && context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT
                 {
-                    CudaAttentionEffectivePath::AegisDenseWmmaTile
+                    if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
+                        && context_len >= 4096
+                    {
+                        CudaAttentionEffectivePath::AegisDenseWmmaSplitK
+                    } else {
+                        CudaAttentionEffectivePath::AegisDenseWmmaTile
+                    }
                 } else if head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores {
                     CudaAttentionEffectivePath::WarpFlash
                 } else {
