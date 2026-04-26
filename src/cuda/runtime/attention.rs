@@ -714,7 +714,8 @@ impl CudaRuntime {
             && num_sequences == 1
             && num_decode_tokens == 0
             && head_dim_usize <= 256;
-        let use_halfq_block4 = use_halfq_single_sequence && num_prefill_tokens >= 4;
+        let use_halfq_block4 =
+            use_halfq_single_sequence && num_prefill_tokens >= FLASH_SPLIT_Q_BLOCK;
         let use_fa4_hdim128 = use_halfq_single_sequence
             && head_dim_usize == 128
             && matches!(selected_backend, CudaAttentionBackend::FlashAttention4);
@@ -732,7 +733,7 @@ impl CudaRuntime {
             && !use_fa4_hdim128
             && split_scratch_ready
             && split_count_usize > 1
-            && max_k >= 1024;
+            && max_k >= 4096;
         let num_sequences = u32_arg("num_sequences", num_sequences)?;
         let total_q = u32_arg("total_query_tokens", total_query_tokens)?;
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
@@ -766,7 +767,7 @@ impl CudaRuntime {
                 + FA4_HDIM128_Q_BLOCK * 4
                 + FA4_HDIM128_K_TILE
         } else if use_halfq_block4 {
-            let q_block = 4_usize;
+            let q_block = FLASH_SPLIT_Q_BLOCK;
             let nwarps = (block_dim / 32) as usize;
             q_block * nwarps + (q_block * 2 + 2) * head_dim_usize + q_block * 4
         } else {
@@ -778,7 +779,7 @@ impl CudaRuntime {
         let grid_q = if use_fa4_hdim128 {
             total_q.div_ceil(FA4_HDIM128_Q_BLOCK as u32)
         } else if use_halfq_block4 {
-            total_q.div_ceil(4)
+            total_q.div_ceil(FLASH_SPLIT_Q_BLOCK as u32)
         } else {
             total_q
         };

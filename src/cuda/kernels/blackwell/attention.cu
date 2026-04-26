@@ -1213,7 +1213,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4(
     bool valid[4];
     unsigned int max_visible = 0u;
     #pragma unroll
-    for (unsigned int row = 0u; row < 4u; ++row) {
+    for (unsigned int row = 0u; row < q_block; ++row) {
         const unsigned int global_q = global_q_base + row;
         valid[row] = global_q < total_q
             && global_q >= q_start
@@ -1308,7 +1308,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4(
 
         if (tid == 0u) {
             #pragma unroll
-            for (unsigned int row = 0u; row < 4u; ++row) {
+            for (unsigned int row = 0u; row < q_block; ++row) {
                 if (valid[row] && physical_valid && pos < visible_len[row]) {
                     const float score = partial[row * nwarps] * scale;
                     const float old_m = scalars[row * 4u + 0u];
@@ -1403,7 +1403,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4_spl
     bool valid[4];
     bool any_valid = false;
     #pragma unroll
-    for (unsigned int row = 0u; row < 4u; ++row) {
+    for (unsigned int row = 0u; row < q_block; ++row) {
         const unsigned int global_q = global_q_base + row;
         valid[row] = global_q < total_q
             && global_q >= q_start
@@ -1514,7 +1514,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4_spl
 
         if (tid == 0u) {
             #pragma unroll
-            for (unsigned int row = 0u; row < 4u; ++row) {
+            for (unsigned int row = 0u; row < q_block; ++row) {
                 if (valid[row] && physical_valid && pos < visible_len[row]) {
                     const float score = partial[row * nwarps] * scale;
                     const float old_m = scalars[row * 4u + 0u];
@@ -1582,7 +1582,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4_com
     float* scalars = acc + q_block * head_dim;
     if (tid == 0u) {
         #pragma unroll
-        for (unsigned int row = 0u; row < 4u; ++row) {
+        for (unsigned int row = 0u; row < q_block; ++row) {
             scalars[row * 4u + 0u] = -3.402823466e38f;
             scalars[row * 4u + 1u] = 0.0f;
             scalars[row * 4u + 2u] = 1.0f;
@@ -1601,7 +1601,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4_com
             ((size_t(q_block_idx) * num_attention_heads + head) * split_count + split) * q_block;
         if (tid == 0u) {
             #pragma unroll
-            for (unsigned int row = 0u; row < 4u; ++row) {
+            for (unsigned int row = 0u; row < q_block; ++row) {
                 const float local_l = partial_l[stats_base + row];
                 if (local_l > 0.0f) {
                     const float local_m = partial_m[stats_base + row];
