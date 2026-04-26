@@ -1,3 +1,5 @@
+use std::ffi::c_void;
+
 use cudarc::driver::CudaSlice;
 
 use super::repack::CutlassNvfp4LinearLayout;
@@ -41,6 +43,55 @@ pub struct CudaAttentionRequest<'a> {
     pub num_q_heads: usize,
     pub num_kv_heads: usize,
     pub causal: bool,
+}
+
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum CudaSdpaMode {
+    Decode = 0,
+    Prefill = 1,
+    Varlen = 2,
+    Mixed = 3,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct CudaSdpaParamsV1 {
+    pub abi_version: u32,
+    pub mode: CudaSdpaMode,
+    pub flags: u32,
+    pub num_sequences: u32,
+    pub num_prefill_tokens: u32,
+    pub num_decode_tokens: u32,
+    pub max_q: u32,
+    pub max_k: u32,
+    pub num_q_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub page_tokens: u32,
+    pub block_table_stride: u32,
+    pub physical_slots: u32,
+    pub softmax_scale: f32,
+    pub reserved0: u32,
+    pub q: *const c_void,
+    pub k_cache: *const c_void,
+    pub v_cache: *const c_void,
+    pub output: *mut c_void,
+    pub cu_q: *const u32,
+    pub cu_k: *const u32,
+    pub context_lens: *const u32,
+    pub slot_mapping: *const u32,
+    pub block_tables: *const u32,
+}
+
+#[allow(dead_code)]
+impl CudaSdpaParamsV1 {
+    pub const ABI_VERSION: u32 = 1;
+    pub const FLAG_CAUSAL: u32 = 1 << 0;
+    pub const FLAG_PAGED_KV: u32 = 1 << 1;
+    pub const FLAG_GQA: u32 = 1 << 2;
 }
 
 #[derive(Debug)]
@@ -199,7 +250,23 @@ impl DensePrefillMetadataProof {
 
 #[cfg(test)]
 mod tests {
-    use super::DensePrefillMetadataProof;
+    use super::{CudaSdpaMode, CudaSdpaParamsV1, DensePrefillMetadataProof};
+
+    #[test]
+    fn sdpa_params_are_c_stable_enough_for_cuda_ffi() {
+        assert_eq!(CudaSdpaParamsV1::ABI_VERSION, 1);
+        assert_eq!(CudaSdpaMode::Decode as u32, 0);
+        assert_eq!(CudaSdpaMode::Prefill as u32, 1);
+        assert_eq!(CudaSdpaMode::Varlen as u32, 2);
+        assert_eq!(CudaSdpaMode::Mixed as u32, 3);
+        assert_eq!(CudaSdpaParamsV1::FLAG_CAUSAL, 1);
+        assert_eq!(CudaSdpaParamsV1::FLAG_PAGED_KV, 2);
+        assert_eq!(CudaSdpaParamsV1::FLAG_GQA, 4);
+        assert_eq!(
+            std::mem::size_of::<CudaSdpaParamsV1>() % std::mem::size_of::<usize>(),
+            0
+        );
+    }
 
     #[test]
     fn dense_prefill_metadata_proof_accepts_identity_span() {

@@ -25,6 +25,39 @@ fn print_generate_bench_text(metrics: &GenerateBenchMetrics, prompt_repeat: usiz
         "  backend={}",
         metrics.backend.as_deref().unwrap_or("unknown")
     );
+    println!(
+        "  attention_requested={}",
+        metrics.attention_requested.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  attention_auto_target={}",
+        metrics.attention_auto_target.as_deref().unwrap_or("none")
+    );
+    println!(
+        "  attention_logical_backend={}",
+        metrics
+            .attention_logical_backend
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    println!(
+        "  attention_effective_path={}",
+        metrics
+            .attention_effective_path
+            .as_deref()
+            .unwrap_or("unknown")
+    );
+    println!(
+        "  attention_reason={}",
+        metrics.attention_reason.as_deref().unwrap_or("unknown")
+    );
+    println!(
+        "  prefill_chunk_size={}",
+        metrics
+            .prefill_chunk_size
+            .map(|chunk| chunk.to_string())
+            .unwrap_or_else(|| "auto".into())
+    );
     println!("  prompt_repeat={prompt_repeat}");
     println!("  warmup_runs={}", metrics.warmup_runs);
     println!("  measured_runs={}", metrics.measured_runs);
@@ -100,6 +133,12 @@ fn print_generate_bench_json(metrics: &GenerateBenchMetrics, prompt_repeat: usiz
         json!({
             "command": "bench-generate",
             "backend": metrics.backend,
+            "attention_requested": metrics.attention_requested,
+            "attention_auto_target": metrics.attention_auto_target,
+            "attention_logical_backend": metrics.attention_logical_backend,
+            "attention_effective_path": metrics.attention_effective_path,
+            "attention_reason": metrics.attention_reason,
+            "prefill_chunk_size": metrics.prefill_chunk_size,
             "prompt_repeat": prompt_repeat,
             "warmup_runs": metrics.warmup_runs,
             "measured_runs": metrics.measured_runs,
@@ -120,14 +159,33 @@ fn print_generate_bench_json(metrics: &GenerateBenchMetrics, prompt_repeat: usiz
 
 fn print_generate_bench_csv(metrics: &GenerateBenchMetrics, prompt_repeat: usize) {
     println!(
-        "run_index,backend,prompt_repeat,warmup_runs,measured_runs,total_ms,tokenize_ms,prefill_ms,decode_ms,prompt_tokens,completion_tokens,prefill_tok_per_s,decode_tok_per_s,finish_reason"
+        "run_index,backend,attention_requested,attention_auto_target,attention_logical_backend,attention_effective_path,prefill_chunk_size,prompt_repeat,warmup_runs,measured_runs,total_ms,tokenize_ms,prefill_ms,decode_ms,prompt_tokens,completion_tokens,prefill_tok_per_s,decode_tok_per_s,finish_reason"
     );
     let backend = metrics.backend.as_deref().unwrap_or("unknown");
+    let attention_requested = metrics.attention_requested.as_deref().unwrap_or("unknown");
+    let attention_auto_target = metrics.attention_auto_target.as_deref().unwrap_or("none");
+    let attention_logical_backend = metrics
+        .attention_logical_backend
+        .as_deref()
+        .unwrap_or("unknown");
+    let attention_effective_path = metrics
+        .attention_effective_path
+        .as_deref()
+        .unwrap_or("unknown");
+    let prefill_chunk_size = metrics
+        .prefill_chunk_size
+        .map(|chunk| chunk.to_string())
+        .unwrap_or_else(|| "auto".into());
     for run in &metrics.runs {
         println!(
-            "{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{}",
+            "{},{},{},{},{},{},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{},{},{:.3},{:.3},{}",
             run.run_index,
             csv_escape(backend),
+            csv_escape(attention_requested),
+            csv_escape(attention_auto_target),
+            csv_escape(attention_logical_backend),
+            csv_escape(attention_effective_path),
+            csv_escape(&prefill_chunk_size),
             prompt_repeat,
             metrics.warmup_runs,
             metrics.measured_runs,

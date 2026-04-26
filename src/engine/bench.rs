@@ -24,6 +24,12 @@ pub struct GenerateBenchMetrics {
     pub completion_tokens: usize,
     pub finish_reason: String,
     pub backend: Option<String>,
+    pub attention_requested: Option<String>,
+    pub attention_auto_target: Option<String>,
+    pub attention_logical_backend: Option<String>,
+    pub attention_effective_path: Option<String>,
+    pub attention_reason: Option<String>,
+    pub prefill_chunk_size: Option<usize>,
     pub warmup_runs: usize,
     pub measured_runs: usize,
 }
@@ -55,6 +61,11 @@ pub fn run_generation_bench(
     let backend = engine
         .executor_info()
         .map(|info| format!("{} {:?}", info.name, info.backends));
+    let compute_capability = engine
+        .inventory
+        .gpus
+        .first()
+        .and_then(|gpu| gpu.compute_capability.as_deref());
 
     for _ in 0..request.warmup_runs {
         let _ = engine.generate_timed(request.generate.clone())?;
@@ -104,6 +115,42 @@ pub fn run_generation_bench(
         completion_tokens,
         finish_reason,
         backend,
+        attention_requested: Some(engine.cuda.prefill_attention.canonical_name().into()),
+        attention_auto_target: {
+            let selection = engine.cuda.prefill_attention_selection(
+                compute_capability,
+                prompt_tokens,
+                engine.graph.head_dim,
+            );
+            selection
+                .auto_target
+                .map(|backend| backend.canonical_name().to_string())
+        },
+        attention_logical_backend: {
+            let selection = engine.cuda.prefill_attention_selection(
+                compute_capability,
+                prompt_tokens,
+                engine.graph.head_dim,
+            );
+            Some(selection.logical_backend.canonical_name().into())
+        },
+        attention_effective_path: {
+            let selection = engine.cuda.prefill_attention_selection(
+                compute_capability,
+                prompt_tokens,
+                engine.graph.head_dim,
+            );
+            Some(selection.effective_path.canonical_name().into())
+        },
+        attention_reason: {
+            let selection = engine.cuda.prefill_attention_selection(
+                compute_capability,
+                prompt_tokens,
+                engine.graph.head_dim,
+            );
+            Some(selection.reason.into())
+        },
+        prefill_chunk_size: engine.cuda.prefill_chunk_size,
         warmup_runs: request.warmup_runs,
         measured_runs: request.measured_runs,
         runs,

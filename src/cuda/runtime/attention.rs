@@ -43,6 +43,8 @@ enum PrefillBatchedKernel {
     CacheOnly,
     Continuation,
     Warp,
+    SdpaCacheOnly,
+    SdpaOnline,
 }
 
 fn select_prefill_batched_kernel(
@@ -56,10 +58,18 @@ fn select_prefill_batched_kernel(
         return Ok(PrefillBatchedKernel::Warp);
     }
     if matches!(config, CudaPrefillAttentionKernel::Sdpa) {
+        let bounded_shared_bytes =
+            (CUDA_ATTENTION_BLOCK_DIM as usize + head_dim + 3) * std::mem::size_of::<f32>();
+        if legacy_shared_bytes > 48 * 1024 && bounded_shared_bytes > 48 * 1024 {
+            return Err(AegisError::InvalidPlan(format!(
+                "CUDA SDPA prefill attention requires {} bytes of bounded shared memory; head_dim={} is too large",
+                bounded_shared_bytes, head_dim
+            )));
+        }
         return Ok(if legacy_shared_bytes > 48 * 1024 {
-            PrefillBatchedKernel::Continuation
+            PrefillBatchedKernel::SdpaOnline
         } else {
-            PrefillBatchedKernel::CacheOnly
+            PrefillBatchedKernel::SdpaCacheOnly
         });
     }
     if matches!(config, CudaPrefillAttentionKernel::Continuation) {
@@ -195,7 +205,15 @@ impl CudaRuntime {
                 legacy_shared_bytes as u32
             },
         };
-        let kernel = if streaming {
+        let sdpa_requested = matches!(
+            self.config.prefill_attention,
+            CudaPrefillAttentionKernel::Sdpa
+        );
+        let kernel = if streaming && sdpa_requested {
+            &self.kernels.sdpa_decode_streaming
+        } else if sdpa_requested {
+            &self.kernels.sdpa_decode
+        } else if streaming {
             &self.kernels.attention_decode_streaming
         } else {
             &self.kernels.attention
@@ -283,7 +301,10 @@ impl CudaRuntime {
             head_dim as usize,
             legacy_shared_bytes,
         )?;
-        let continuation = matches!(selected_kernel, PrefillBatchedKernel::Continuation);
+        let continuation = matches!(
+            selected_kernel,
+            PrefillBatchedKernel::Continuation | PrefillBatchedKernel::SdpaOnline
+        );
         let cfg = LaunchConfig {
             grid_dim: (num_attention_heads, batch, 1),
             block_dim: (block_dim, 1, 1),
@@ -294,18 +315,21 @@ impl CudaRuntime {
                     + block_dim as usize * std::mem::size_of::<f32>()) as u32
             },
         };
-        let cache_only = matches!(
+        let cache_resident_signature = matches!(
             selected_kernel,
-            PrefillBatchedKernel::CacheOnly | PrefillBatchedKernel::Warp
+            PrefillBatchedKernel::CacheOnly
+                | PrefillBatchedKernel::Warp
+                | PrefillBatchedKernel::SdpaCacheOnly
+                | PrefillBatchedKernel::SdpaOnline
         );
-        let kernel = if matches!(selected_kernel, PrefillBatchedKernel::Warp) {
-            &self.kernels.attention_prefill_batched_warp
-        } else if continuation {
-            &self.kernels.attention_prefill_continuation
-        } else {
-            &self.kernels.attention_prefill_batched
+        let kernel = match selected_kernel {
+            PrefillBatchedKernel::Warp => &self.kernels.attention_prefill_batched_warp,
+            PrefillBatchedKernel::Continuation => &self.kernels.attention_prefill_continuation,
+            PrefillBatchedKernel::CacheOnly => &self.kernels.attention_prefill_batched,
+            PrefillBatchedKernel::SdpaCacheOnly => &self.kernels.sdpa_prefill_dense_cache,
+            PrefillBatchedKernel::SdpaOnline => &self.kernels.sdpa_prefill_dense_online,
         };
-        if cache_only {
+        if cache_resident_signature {
             unsafe {
                 self.stream
                     .launch_builder(kernel)
@@ -584,15 +608,38 @@ impl CudaRuntime {
                 num_prefill_tokens + num_decode_tokens
             )));
         }
+        let selected_backend = self.select_prefill_attention_backend(max_k)?;
+        if !matches!(
+            selected_backend,
+            CudaAttentionBackend::AegisVarlen
+                | CudaAttentionBackend::FlashAttention4
+                | CudaAttentionBackend::Sdpa
+        ) {
+            return Err(AegisError::InvalidPlan(format!(
+                "paged attention ABI was invoked for backend {}; expected aegis-varlen, fa4, or sdpa",
+                selected_backend.canonical_name()
+            )));
+        }
+        let sdpa_selected = matches!(selected_backend, CudaAttentionBackend::Sdpa);
+        let total_query_tokens = if sdpa_selected {
+            checked_sum(
+                "paged varlen mixed query tokens",
+                num_prefill_tokens,
+                num_decode_tokens,
+            )?
+        } else {
+            num_prefill_tokens
+        };
         let q_width = checked_len("paged varlen q width", num_attention_heads, head_dim)?;
         let _ = checked_len("paged varlen kv width", num_kv_heads, head_dim)?;
-        let q_tokens = checked_len("paged varlen query tokens", num_prefill_tokens, q_width)?;
+        let q_tokens = checked_len("paged varlen query tokens", total_query_tokens, q_width)?;
         if request.output.len() < q_tokens || query.len() < q_tokens {
             return Err(AegisError::InvalidPlan(
                 "paged varlen prefill query/output shape mismatch".into(),
             ));
         }
         if let Some(query_half) = query_half
+            && !sdpa_selected
             && query_half.len() < q_tokens
         {
             return Err(AegisError::InvalidPlan(format!(
@@ -620,18 +667,8 @@ impl CudaRuntime {
                 "paged varlen attention heads must be divisible by kv heads".into(),
             ));
         }
-        let selected_backend = self.select_prefill_attention_backend(max_k)?;
-        if !matches!(
-            selected_backend,
-            CudaAttentionBackend::AegisVarlen | CudaAttentionBackend::FlashAttention4
-        ) {
-            return Err(AegisError::InvalidPlan(format!(
-                "paged attention ABI was invoked for backend {}; expected aegis-varlen or fa4",
-                selected_backend.canonical_name()
-            )));
-        }
         let head_dim_usize = head_dim;
-        let q_blocks_usize = num_prefill_tokens.div_ceil(FLASH_SPLIT_Q_BLOCK);
+        let q_blocks_usize = total_query_tokens.div_ceil(FLASH_SPLIT_Q_BLOCK);
         let split_count_usize = max_k.div_ceil(FLASH_SPLIT_K_TOKENS).max(1);
         let split_rows = q_blocks_usize
             .checked_mul(num_attention_heads)
@@ -646,7 +683,8 @@ impl CudaRuntime {
                 && scratch.m.len() >= split_rows
                 && scratch.l.len() >= split_rows
         });
-        let use_halfq_single_sequence = query_half.is_some()
+        let native_query_half = if sdpa_selected { None } else { query_half };
+        let use_halfq_single_sequence = native_query_half.is_some()
             && num_sequences == 1
             && num_decode_tokens == 0
             && head_dim_usize <= 256;
@@ -670,7 +708,7 @@ impl CudaRuntime {
             && split_count_usize > 1
             && max_k >= 1024;
         let num_sequences = u32_arg("num_sequences", num_sequences)?;
-        let total_q = u32_arg("num_prefill_tokens", num_prefill_tokens)?;
+        let total_q = u32_arg("total_query_tokens", total_query_tokens)?;
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
@@ -708,7 +746,7 @@ impl CudaRuntime {
         } else {
             block_dim as usize + head_dim_usize + 4
         };
-        if query_half.is_some() && !use_halfq_block4 && !use_fa4_hdim128 {
+        if native_query_half.is_some() && !use_halfq_block4 && !use_fa4_hdim128 {
             shared_floats += head_dim_usize;
         }
         let grid_q = if use_fa4_hdim128 {
@@ -799,7 +837,7 @@ impl CudaRuntime {
             ))?;
             return Ok(());
         }
-        if let Some(query_half) = query_half {
+        if let Some(query_half) = native_query_half {
             let kernel = if use_halfq_block4 {
                 if use_fa4_hdim128 {
                     &self.kernels.attention_prefill_paged_varlen_fa4_hdim128
@@ -831,7 +869,9 @@ impl CudaRuntime {
                     .launch(cfg)
             }
         } else {
-            let kernel = if use_warp {
+            let kernel = if sdpa_selected {
+                &self.kernels.sdpa_prefill_paged_varlen
+            } else if use_warp {
                 &self.kernels.attention_prefill_paged_varlen_warp
             } else {
                 &self.kernels.attention_prefill_paged_varlen
@@ -873,7 +913,7 @@ mod tests {
         assert_eq!(
             select_prefill_batched_kernel(CudaPrefillAttentionKernel::Sdpa, 0, 128, 256 * 1024)
                 .unwrap(),
-            PrefillBatchedKernel::Continuation
+            PrefillBatchedKernel::SdpaOnline
         );
     }
 
@@ -881,7 +921,7 @@ mod tests {
     fn sdpa_prefill_keeps_dense_kernel_for_small_contexts() {
         assert_eq!(
             select_prefill_batched_kernel(CudaPrefillAttentionKernel::Sdpa, 0, 128, 1024).unwrap(),
-            PrefillBatchedKernel::CacheOnly
+            PrefillBatchedKernel::SdpaCacheOnly
         );
     }
 

@@ -1,6 +1,7 @@
 use super::helpers::{
     deterministic_input, find_cuda_linear, first_cuda_nvfp4_region, resident_layout_for_region,
 };
+use crate::cuda::CudaPrefillAttentionKernel;
 use crate::engine::quality::run_quality_smoke;
 use crate::engine::{AegisEngine, EngineConfig};
 use crate::error::{AegisError, Result};
@@ -111,6 +112,22 @@ pub(super) fn cuda_prefill_sweep(config: EngineConfig) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn cuda_sdpa_sweep(mut config: EngineConfig) -> Result<()> {
+    config.cuda.prefill_attention = CudaPrefillAttentionKernel::Sdpa;
+    println!("cuda-sdpa-sweep: requested=sdpa");
+    let configured_chunk = config.cuda.prefill_chunk_size.unwrap_or(128).clamp(1, 2048);
+    let mut chunks = vec![1];
+    if configured_chunk != 1 {
+        chunks.push(configured_chunk);
+    }
+    for chunk in chunks {
+        let mut chunk_config = config.clone();
+        chunk_config.cuda.prefill_chunk_size = Some(chunk);
+        cuda_prefill_compare_one_chunk(chunk_config, chunk)?;
+    }
+    Ok(())
+}
+
 fn cuda_prefill_compare_one_chunk(config: EngineConfig, configured_chunk: usize) -> Result<()> {
     let mut token_config = config.clone();
     token_config.cuda.prefill_chunk_size = Some(1);
@@ -139,12 +156,28 @@ fn cuda_prefill_compare_one_chunk(config: EngineConfig, configured_chunk: usize)
             .map(|request| token_engine.generate(request.clone()))
             .collect::<Result<Vec<_>>>()?
     };
-    let chunk_outputs = {
+    let (chunk_outputs, attention_requested, attention_logical, attention_effective) = {
         let chunk_engine = AegisEngine::build(config)?;
-        requests
+        let compute_capability = chunk_engine
+            .inventory
+            .gpus
+            .first()
+            .and_then(|gpu| gpu.compute_capability.as_deref());
+        let selection = chunk_engine.cuda.prefill_attention_selection(
+            compute_capability,
+            chunk_engine.placement.kv_cache.context_size,
+            chunk_engine.graph.head_dim,
+        );
+        let outputs = requests
             .iter()
             .map(|request| chunk_engine.generate(request.clone()))
-            .collect::<Result<Vec<_>>>()?
+            .collect::<Result<Vec<_>>>()?;
+        (
+            outputs,
+            selection.requested.canonical_name(),
+            selection.logical_backend.canonical_name(),
+            selection.effective_path.canonical_name(),
+        )
     };
 
     for ((prompt, token_output), chunk_output) in prompts
@@ -154,8 +187,11 @@ fn cuda_prefill_compare_one_chunk(config: EngineConfig, configured_chunk: usize)
     {
         ensure_prefill_match(prompt, token_output, chunk_output)?;
         println!(
-            "cuda-prefill-compare: chunk_size={} prompt_tokens={} completion_tokens={} text={:?}",
+            "cuda-prefill-compare: chunk_size={} requested={} logical_backend={} effective_path={} prompt_tokens={} completion_tokens={} text={:?}",
             configured_chunk,
+            attention_requested,
+            attention_logical,
+            attention_effective,
             chunk_output.prompt_tokens,
             chunk_output.completion_tokens,
             chunk_output.text

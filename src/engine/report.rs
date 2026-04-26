@@ -264,17 +264,39 @@ fn push_runtime_report(engine: &AegisEngine, lines: &mut Vec<String>) {
             .map(|bytes| bytes.to_string())
             .unwrap_or_else(|| "auto".into())
     ));
+    let compute_capability = engine
+        .inventory
+        .gpus
+        .first()
+        .and_then(|gpu| gpu.compute_capability.as_deref());
+    let attention = engine.cuda.prefill_attention_selection(
+        compute_capability,
+        engine.placement.kv_cache.context_size,
+        engine.graph.head_dim,
+    );
     lines.push(format!(
-        "cuda-runtime-config: native_mxfp4_repack={} cutlass_nvfp4_repack={} native_mxfp4_inference={} prefill_attention={:?} prefill_chunk_size={}",
+        "cuda-runtime-config: native_mxfp4_repack={} cutlass_nvfp4_repack={} native_mxfp4_inference={} prefill_attention={} prefill_chunk_size={}",
         engine.cuda.native_mxfp4_repack,
         engine.cuda.cutlass_nvfp4_repack,
         engine.cuda.native_mxfp4_inference,
-        engine.cuda.prefill_attention,
+        engine.cuda.prefill_attention.canonical_name(),
         engine
             .cuda
             .prefill_chunk_size
             .map(|chunk| chunk.to_string())
             .unwrap_or_else(|| "auto".into()),
+    ));
+    lines.push(format!(
+        "cuda-prefill-attention: requested={} auto_target={} logical_backend={} effective_path={} report_context={} reason={}",
+        attention.requested.canonical_name(),
+        attention
+            .auto_target
+            .map(|backend| backend.canonical_name())
+            .unwrap_or("none"),
+        attention.logical_backend.canonical_name(),
+        attention.effective_path.canonical_name(),
+        engine.placement.kv_cache.context_size,
+        attention.reason,
     ));
     lines.push(format!(
         "runtime: planned_native_fp4_tc_regions={} planned_cutlass_fp4_tc_regions={} planned_native_fp8_tc_regions={} cuda_dense_tc_regions={} cuda_quant_ref_regions={} cpu_regions={}",

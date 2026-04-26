@@ -30,6 +30,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("cuda-compare") => parse_cuda_compare(&args[1..]),
         Some("cuda-prefill-compare") => parse_cuda_prefill_compare(&args[1..]),
         Some("cuda-prefill-sweep") => parse_cuda_prefill_sweep(&args[1..]),
+        Some("cuda-sdpa-sweep") => parse_cuda_sdpa_sweep(&args[1..]),
         Some("generate") => parse_generate(&args[1..]),
         Some("bench-generate") => parse_bench_generate(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
@@ -104,6 +105,12 @@ fn parse_cuda_prefill_compare(args: &[String]) -> Result<Command> {
 
 fn parse_cuda_prefill_sweep(args: &[String]) -> Result<Command> {
     Ok(Command::CudaPrefillSweep(
+        parse_engine_flags(args)?.engine_config(true),
+    ))
+}
+
+fn parse_cuda_sdpa_sweep(args: &[String]) -> Result<Command> {
+    Ok(Command::CudaSdpaSweep(
         parse_engine_flags(args)?.engine_config(true),
     ))
 }
@@ -323,5 +330,5 @@ fn repeat_prompt(prompt: &str, repeat: usize) -> String {
 }
 
 fn usage() -> String {
-    "usage:\n  aegisllm inspect-hardware\n  aegisllm serve --config <parameters.json>\n  aegisllm show-plan --config <parameters.json>\n  aegisllm mvp-check --config <parameters.json>\n  aegisllm quality-smoke --config <parameters.json>\n  aegisllm storage-smoke --config <parameters.json>\n  aegisllm cpu-smoke --config <parameters.json>\n  aegisllm cpu-materialize-smoke --config <parameters.json>\n  aegisllm cuda-smoke --config <parameters.json>\n  aegisllm cuda-dense-smoke --config <parameters.json>\n  aegisllm cuda-chain-smoke --config <parameters.json>\n  aegisllm cuda-compare --config <parameters.json>\n  aegisllm cuda-prefill-compare --config <parameters.json>\n  aegisllm cuda-prefill-sweep --config <parameters.json>\n  aegisllm show-plan --model <path> [placement flags] [--native-mxfp4-repack] [--native-mxfp4-inference] [--cuda-prefill-attention auto|off|sdpa|fa2|fa3|fa4|aegis-varlen] [--cuda-prefill-chunk-size N]\n  aegisllm generate --model <path> --prompt <text> [--max-tokens N] [placement flags]\n  aegisllm bench-generate --config <parameters.json> --prompt <text> [--prompt-repeat N] [--max-tokens N] [--temperature T] [--format text|json|csv]".into()
+    "usage:\n  aegisllm inspect-hardware\n  aegisllm serve --config <parameters.json>\n  aegisllm show-plan --config <parameters.json>\n  aegisllm mvp-check --config <parameters.json>\n  aegisllm quality-smoke --config <parameters.json>\n  aegisllm storage-smoke --config <parameters.json>\n  aegisllm cpu-smoke --config <parameters.json>\n  aegisllm cpu-materialize-smoke --config <parameters.json>\n  aegisllm cuda-smoke --config <parameters.json>\n  aegisllm cuda-dense-smoke --config <parameters.json>\n  aegisllm cuda-chain-smoke --config <parameters.json>\n  aegisllm cuda-compare --config <parameters.json>\n  aegisllm cuda-prefill-compare --config <parameters.json>\n  aegisllm cuda-prefill-sweep --config <parameters.json>\n  aegisllm cuda-sdpa-sweep --config <parameters.json>\n  aegisllm show-plan --model <path> [placement flags] [--native-mxfp4-repack] [--native-mxfp4-inference] [--cuda-prefill-attention auto|off|sdpa|fa2|fa3|fa4|aegis-varlen] [--cuda-prefill-chunk-size N]\n  aegisllm generate --model <path> --prompt <text> [--max-tokens N] [placement flags]\n  aegisllm bench-generate --config <parameters.json> --prompt <text> [--prompt-repeat N] [--max-tokens N] [--temperature T] [--format text|json|csv]".into()
 }
