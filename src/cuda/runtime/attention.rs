@@ -442,6 +442,25 @@ impl CudaRuntime {
                     query_half.len()
                 )));
             }
+            if matches!(selected_backend, CudaAttentionBackend::AegisVarlen)
+                && query_half_ready
+                && num_sequences == 1
+                && head_dim <= 256
+                && batch >= FLASH_SPLIT_Q_BLOCK
+            {
+                return self.attention_prefill_dense_halfq_block4_device(
+                    key_cache,
+                    value_cache,
+                    query_half,
+                    start_position,
+                    batch,
+                    dense_metadata.context_len(),
+                    num_attention_heads,
+                    num_kv_heads,
+                    head_dim,
+                    output,
+                );
+            }
             let block_table_stride = dense_metadata
                 .context_len()
                 .div_ceil(FLASH_COMPAT_PAGE_TOKENS)
@@ -482,6 +501,86 @@ impl CudaRuntime {
             head_dim,
             output,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_prefill_dense_halfq_block4_device(
+        &self,
+        key_cache: &DeviceBuffer<u16>,
+        value_cache: &DeviceBuffer<u16>,
+        query_half: &DeviceBuffer<u16>,
+        start_position: usize,
+        batch: usize,
+        context_len: usize,
+        num_attention_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let q_width = checked_len("dense halfq q width", num_attention_heads, head_dim)?;
+        let q_tokens = checked_len("dense halfq q tokens", batch, q_width)?;
+        let kv_width = checked_len("dense halfq kv width", num_kv_heads, head_dim)?;
+        let cache_len = checked_len("dense halfq kv cache", context_len, kv_width)?;
+        if query_half.len() < q_tokens || output.len() < q_tokens {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense halfq attention q/output shape mismatch: query_half={} output={} required={}",
+                query_half.len(),
+                output.len(),
+                q_tokens
+            )));
+        }
+        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense halfq attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
+                key_cache.len(),
+                value_cache.len(),
+                cache_len
+            )));
+        }
+        if num_attention_heads % num_kv_heads != 0 {
+            return Err(AegisError::InvalidPlan(
+                "dense halfq attention heads must be divisible by kv heads".into(),
+            ));
+        }
+        let q_block = FLASH_SPLIT_Q_BLOCK;
+        let block_dim = 64_u32;
+        let nwarps = (block_dim / 32) as usize;
+        let shared_floats = q_block * nwarps + (q_block * 2 + 2) * head_dim + q_block * 4;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                u32_arg("num_attention_heads", num_attention_heads)?,
+                u32_arg("dense halfq q blocks", batch.div_ceil(q_block))?,
+                1,
+            ),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: validate_dynamic_shared_bytes(
+                "prefill_dense_halfq_block4",
+                shared_floats * std::mem::size_of::<f32>(),
+            )?,
+        };
+        let start_position = u32_arg("start_position", start_position)?;
+        let total_q = u32_arg("total_query_tokens", batch)?;
+        let context_len = u32_arg("context_len", context_len)?;
+        let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
+        let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
+        let head_dim = u32_arg("head_dim", head_dim)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.attention_prefill_dense_halfq_block4)
+                .arg(&key_cache.slice)
+                .arg(&value_cache.slice)
+                .arg(&query_half.slice)
+                .arg(&start_position)
+                .arg(&total_q)
+                .arg(&context_len)
+                .arg(&num_attention_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch dense halfq varlen prefill attention"))?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
