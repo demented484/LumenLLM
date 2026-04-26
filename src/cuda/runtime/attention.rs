@@ -1082,8 +1082,23 @@ impl CudaRuntime {
             ));
         }
         let half_values =
-            q_rows * head_dim + 2 * DENSE_WMMA_K_TILE * head_dim + q_rows * DENSE_WMMA_K_TILE;
-        let float_values = q_rows * DENSE_WMMA_K_TILE + q_rows * head_dim + q_rows * 3;
+            q_rows * head_dim + 2 * DENSE_WMMA_K_TILE * head_dim + q_rows * (DENSE_WMMA_K_TILE + 8);
+        let float_values = q_rows * (DENSE_WMMA_K_TILE + 8) + q_rows * (head_dim + 8) + q_rows * 3;
+        let shared_mem_bytes =
+            half_values * std::mem::size_of::<u16>() + float_values * std::mem::size_of::<f32>();
+        self.kernels
+            .attention_prefill_dense_halfq_wmma_hdim128_gqa4
+            .set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                i32::try_from(shared_mem_bytes).map_err(|_| {
+                    AegisError::InvalidPlan(format!(
+                        "dense gqa4 padded wmma shared memory exceeds i32: {shared_mem_bytes}"
+                    ))
+                })?,
+            )
+            .map_err(map_cuda_err(
+                "set gqa4 padded wmma max dynamic shared memory",
+            ))?;
         let cfg = LaunchConfig {
             grid_dim: (
                 u32_arg(
@@ -1097,11 +1112,7 @@ impl CudaRuntime {
                 1,
             ),
             block_dim: (256, 1, 1),
-            shared_mem_bytes: validate_dynamic_shared_bytes(
-                "prefill_dense_halfq_wmma_hdim128_gqa4",
-                half_values * std::mem::size_of::<u16>()
-                    + float_values * std::mem::size_of::<f32>(),
-            )?,
+            shared_mem_bytes: u32_arg("dense gqa4 padded wmma shared memory", shared_mem_bytes)?,
         };
         let start_position = u32_arg("start_position", start_position)?;
         let total_q = u32_arg("total_query_tokens", batch)?;
