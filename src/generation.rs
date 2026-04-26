@@ -29,6 +29,24 @@ pub struct TimedGenerateOutput {
     pub prefill_elapsed: Duration,
     pub decode_elapsed: Duration,
     pub total_elapsed: Duration,
+    pub prefill_stage_timings: Option<PrefillStageTimings>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PrefillStageTimings {
+    pub chunks: usize,
+    pub prepare_us: u128,
+    pub embed_us: u128,
+    pub qkv_us: u128,
+    pub qkv_tflops: f64,
+    pub rope_us: u128,
+    pub kv_store_us: u128,
+    pub attention_us: u128,
+    pub o_proj_us: u128,
+    pub mlp_us: u128,
+    pub mlp_tflops: f64,
+    pub layer_total_us: u128,
+    pub sample_us: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

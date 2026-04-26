@@ -30,6 +30,7 @@ pub fn generate_with_backend_timed<B: GenerationBackendPrimitives + ?Sized>(
     let prefill_start = Instant::now();
     let mut next = backend.prefill_prompt(state.as_mut(), &prompt_tokens, &request.sampling)?;
     let prefill_elapsed = prefill_start.elapsed();
+    let prefill_stage_timings = backend.prefill_stage_timings(state.as_mut());
 
     let decode_start = Instant::now();
     let mut generated = Vec::new();
@@ -57,6 +58,7 @@ pub fn generate_with_backend_timed<B: GenerationBackendPrimitives + ?Sized>(
         prefill_elapsed,
         decode_elapsed,
         total_elapsed: total_start.elapsed(),
+        prefill_stage_timings,
     })
 }
 

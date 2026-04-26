@@ -466,6 +466,7 @@ mod tests {
                 native_mxfp4_inference: false,
                 prefill_attention: Default::default(),
                 prefill_chunk_size: None,
+                prefill_stage_timings: false,
             },
         );
         let enabled = MemoryPlan::from_placement_runtime_and_cuda(
@@ -477,6 +478,7 @@ mod tests {
                 native_mxfp4_inference: false,
                 prefill_attention: Default::default(),
                 prefill_chunk_size: None,
+                prefill_stage_timings: false,
             },
         );
         let cutlass_sidecar = MemoryPlan::from_placement_runtime_and_cuda(
@@ -488,6 +490,7 @@ mod tests {
                 native_mxfp4_inference: false,
                 prefill_attention: Default::default(),
                 prefill_chunk_size: None,
+                prefill_stage_timings: false,
             },
         );
 

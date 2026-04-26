@@ -8,7 +8,7 @@ use crate::executor::traits::{
     ExecutorBackendInfo, ExecutorCapability, ExecutorProviderPlan, GenerationBackendPrimitives,
     GenerationState, ModelExecutorBackend,
 };
-use crate::generation::SamplingConfig;
+use crate::generation::{PrefillStageTimings, SamplingConfig};
 use crate::graph::ModelGraph;
 use crate::planning::placement::{ComputePlacement, ResolvedPlacement, StoragePlacement};
 use crate::planning::runtime::RuntimePlan;
@@ -210,6 +210,15 @@ impl GenerationBackendPrimitives for CudaExecutorProvider {
             ))
         })?;
         cuda.forward_next_token(cuda_state_mut(state)?, token_id, sampling)
+    }
+
+    fn prefill_stage_timings(
+        &self,
+        state: &mut dyn GenerationState,
+    ) -> Option<PrefillStageTimings> {
+        cuda_state_mut(state)
+            .ok()
+            .and_then(|state| state.prefill_timings.snapshot())
     }
 }
 

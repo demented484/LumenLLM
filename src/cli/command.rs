@@ -28,5 +28,14 @@ pub enum Command {
     CudaSdpaSweep(EngineConfig),
     Generate(EngineConfig, GenerateRequest),
     BenchGenerate(EngineConfig, BenchGenerateRequest, usize, BenchOutputFormat),
+    BenchGenerateSweep(
+        EngineConfig,
+        GenerateRequest,
+        Vec<usize>,
+        Vec<usize>,
+        usize,
+        usize,
+        BenchOutputFormat,
+    ),
     Serve(ServeConfig),
 }

@@ -109,6 +109,7 @@ pub(super) fn parse_engine_flags(args: &[String]) -> Result<ParsedEngineFlags> {
             "--native-mxfp4-repack" => cuda_runtime.native_mxfp4_repack = true,
             "--cutlass-nvfp4-repack" => cuda_runtime.cutlass_nvfp4_repack = true,
             "--native-mxfp4-inference" => cuda_runtime.native_mxfp4_inference = true,
+            "--cuda-stage-timings" => cuda_runtime.prefill_stage_timings = true,
             "--cuda-prefill-attention" => {
                 cuda_runtime.prefill_attention =
                     CudaPrefillAttentionKernel::parse(&take_value(args, &mut i, flag)?)?
@@ -224,6 +225,7 @@ pub(super) fn is_engine_flag(flag: &str) -> bool {
             | "--native-mxfp4-repack"
             | "--cutlass-nvfp4-repack"
             | "--native-mxfp4-inference"
+            | "--cuda-stage-timings"
             | "--cuda-prefill-attention"
             | "--cuda-prefill-chunk-size"
     )
@@ -233,7 +235,10 @@ pub(super) fn flag_takes_value(flag: &str) -> bool {
     is_engine_flag(flag)
         && !matches!(
             flag,
-            "--native-mxfp4-repack" | "--cutlass-nvfp4-repack" | "--native-mxfp4-inference"
+            "--native-mxfp4-repack"
+                | "--cutlass-nvfp4-repack"
+                | "--native-mxfp4-inference"
+                | "--cuda-stage-timings"
         )
 }
 

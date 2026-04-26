@@ -1,5 +1,7 @@
 pub(super) const PREFILL_KV_PAGE_TOKENS: usize = 256;
 
+use std::collections::{HashMap, HashSet};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(super) struct PrefillKvPageSpec {
@@ -62,6 +64,7 @@ impl PrefillSlotMapper {
 pub(super) struct PrefillKvPageAllocator {
     page_tokens: usize,
     free_pages: Vec<u32>,
+    active: HashMap<PrefillSequenceId, PrefillKvSequencePages>,
 }
 
 #[allow(dead_code)]
@@ -72,6 +75,7 @@ impl PrefillKvPageAllocator {
         Self {
             page_tokens,
             free_pages,
+            active: HashMap::new(),
         }
     }
 
@@ -88,6 +92,9 @@ impl PrefillKvPageAllocator {
         sequence: PrefillSequenceId,
         tokens: usize,
     ) -> Option<PrefillKvSequencePages> {
+        if self.active.contains_key(&sequence) {
+            return None;
+        }
         let need = self.pages_for_tokens(tokens);
         if self.free_pages.len() < need {
             return None;
@@ -96,14 +103,38 @@ impl PrefillKvPageAllocator {
         for _ in 0..need {
             logical_pages.push(self.free_pages.pop()?);
         }
-        Some(PrefillKvSequencePages {
+        let pages = PrefillKvSequencePages {
             sequence,
             logical_pages,
-        })
+        };
+        self.active.insert(sequence, pages.clone());
+        Some(pages)
     }
 
-    pub(super) fn release(&mut self, mut pages: PrefillKvSequencePages) {
-        self.free_pages.append(&mut pages.logical_pages);
+    pub(super) fn release(&mut self, pages: PrefillKvSequencePages) -> bool {
+        let Some(active) = self.active.remove(&pages.sequence) else {
+            return false;
+        };
+        if active.logical_pages != pages.logical_pages {
+            self.active.insert(active.sequence, active);
+            return false;
+        }
+        self.release_pages(active.logical_pages);
+        true
+    }
+
+    pub(super) fn release_sequence(&mut self, sequence: PrefillSequenceId) -> bool {
+        let Some(active) = self.active.remove(&sequence) else {
+            return false;
+        };
+        self.release_pages(active.logical_pages);
+        true
+    }
+
+    fn release_pages(&mut self, mut pages: Vec<u32>) {
+        self.free_pages.append(&mut pages);
+        let mut seen = HashSet::new();
+        self.free_pages.retain(|page| seen.insert(*page));
     }
 }
 
@@ -119,8 +150,18 @@ mod tests {
         let seq = allocator.allocate(PrefillSequenceId(7), 513).unwrap();
         assert_eq!(seq.logical_pages, [0, 1, 2]);
         assert_eq!(allocator.free_pages(), 1);
-        allocator.release(seq);
+        assert!(allocator.release(seq));
         assert_eq!(allocator.free_pages(), 4);
+    }
+
+    #[test]
+    fn page_allocator_rejects_double_release_and_duplicate_owner() {
+        let mut allocator = PrefillKvPageAllocator::new(2, PREFILL_KV_PAGE_TOKENS);
+        let seq = allocator.allocate(PrefillSequenceId(7), 1).unwrap();
+        assert!(allocator.allocate(PrefillSequenceId(7), 1).is_none());
+        assert!(allocator.release(seq.clone()));
+        assert!(!allocator.release(seq));
+        assert_eq!(allocator.free_pages(), 2);
     }
 
     #[test]

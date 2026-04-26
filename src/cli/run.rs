@@ -1,6 +1,6 @@
 use std::env;
 
-use super::generate::print_generate_bench;
+use super::generate::{print_generate_bench, print_generate_bench_sweep};
 use super::smoke::{
     cpu_materialize_smoke, cpu_smoke, cuda_chain_smoke, cuda_compare, cuda_dense_smoke,
     cuda_prefill_compare, cuda_prefill_sweep, cuda_sdpa_sweep, cuda_smoke, inspect_hardware,
@@ -43,6 +43,37 @@ pub fn run_env() -> Result<()> {
         Command::BenchGenerate(config, request, prompt_repeat, format) => {
             let metrics = run_generation_bench(config, request)?;
             print_generate_bench(&metrics, prompt_repeat, format);
+        }
+        Command::BenchGenerateSweep(
+            config,
+            request,
+            prompt_repeats,
+            chunk_sizes,
+            warmup_runs,
+            measured_runs,
+            format,
+        ) => {
+            let mut results = Vec::new();
+            for chunk_size in chunk_sizes {
+                for prompt_repeat in &prompt_repeats {
+                    let mut config = config.clone();
+                    config.cuda.prefill_chunk_size = Some(chunk_size);
+                    let mut generate = request.clone();
+                    generate.prompt = std::iter::repeat_n(generate.prompt.as_str(), *prompt_repeat)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let metrics = run_generation_bench(
+                        config,
+                        crate::engine::bench::BenchGenerateRequest {
+                            generate,
+                            warmup_runs,
+                            measured_runs,
+                        },
+                    )?;
+                    results.push((*prompt_repeat, metrics));
+                }
+            }
+            print_generate_bench_sweep(&results, format);
         }
         Command::Serve(config) => {
             let default_sampling = config.engine.generation;

@@ -3,7 +3,9 @@ use std::fmt::Debug;
 
 use crate::backend::BackendKind;
 use crate::error::Result;
-use crate::generation::{GenerateOutput, GenerateRequest, SamplingConfig, TimedGenerateOutput};
+use crate::generation::{
+    GenerateOutput, GenerateRequest, PrefillStageTimings, SamplingConfig, TimedGenerateOutput,
+};
 use crate::planning::placement::{ComputePlacement, StoragePlacement};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +81,12 @@ pub trait GenerationBackendPrimitives: Debug + Send + Sync {
     ) -> Result<usize> {
         let logits = self.forward_logits(state, token_id)?;
         super::generation::sample_next_token(&logits, sampling)
+    }
+    fn prefill_stage_timings(
+        &self,
+        _state: &mut dyn GenerationState,
+    ) -> Option<PrefillStageTimings> {
+        None
     }
 }
 

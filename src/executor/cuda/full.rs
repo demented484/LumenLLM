@@ -122,6 +122,7 @@ impl CudaLlamaExecutor {
             layers,
             kv_context_size: placement.kv_cache.context_size,
             prefill_chunk_size: cuda_prefill_chunk_size(cuda_config),
+            prefill_stage_timings_enabled: cuda_config.prefill_stage_timings,
         })
     }
 
@@ -283,7 +284,9 @@ impl CudaLlamaExecutor {
                 argmax_block_indices: self.runtime.alloc_u32(self.lm_head.rows.div_ceil(256))?,
             },
             prefill,
-            prefill_timings: super::state::CudaPrefillStageTimings::from_env(),
+            prefill_timings: super::state::CudaPrefillStageTimings::from_enabled(
+                self.prefill_stage_timings_enabled,
+            ),
         })
     }
 }

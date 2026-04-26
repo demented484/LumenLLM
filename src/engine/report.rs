@@ -275,7 +275,7 @@ fn push_runtime_report(engine: &AegisEngine, lines: &mut Vec<String>) {
         engine.graph.head_dim,
     );
     lines.push(format!(
-        "cuda-runtime-config: native_mxfp4_repack={} cutlass_nvfp4_repack={} native_mxfp4_inference={} prefill_attention={} prefill_chunk_size={}",
+        "cuda-runtime-config: native_mxfp4_repack={} cutlass_nvfp4_repack={} native_mxfp4_inference={} prefill_attention={} prefill_chunk_size={} prefill_stage_timings={}",
         engine.cuda.native_mxfp4_repack,
         engine.cuda.cutlass_nvfp4_repack,
         engine.cuda.native_mxfp4_inference,
@@ -285,6 +285,7 @@ fn push_runtime_report(engine: &AegisEngine, lines: &mut Vec<String>) {
             .prefill_chunk_size
             .map(|chunk| chunk.to_string())
             .unwrap_or_else(|| "auto".into()),
+        engine.cuda.prefill_stage_timings,
     ));
     lines.push(format!(
         "cuda-prefill-attention: requested={} auto_target={} logical_backend={} effective_path={} report_context={} reason={}",

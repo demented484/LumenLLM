@@ -193,6 +193,8 @@ fn parse_generate(args: &[String]) -> Result<Command> {
 fn parse_bench_generate(args: &[String]) -> Result<Command> {
     let mut generate_args = Vec::new();
     let mut prompt_repeat = 1;
+    let mut prompt_repeats = Vec::new();
+    let mut chunk_sizes = Vec::new();
     let mut warmup_runs = 0;
     let mut measured_runs = 1;
     let mut format = BenchOutputFormat::Text;
@@ -202,6 +204,12 @@ fn parse_bench_generate(args: &[String]) -> Result<Command> {
         let flag = &args[i];
         match flag.as_str() {
             "--prompt-repeat" => prompt_repeat = parse_value(args, &mut i, flag)?,
+            "--prompt-repeats" => {
+                prompt_repeats = parse_usize_list(&take_value(args, &mut i, flag)?, flag)?
+            }
+            "--chunk-sizes" => {
+                chunk_sizes = parse_usize_list(&take_value(args, &mut i, flag)?, flag)?
+            }
             "--warmup" | "--warmup-runs" => warmup_runs = parse_value(args, &mut i, flag)?,
             "--runs" | "--measured-runs" => measured_runs = parse_value(args, &mut i, flag)?,
             "--format" => format = parse_bench_format(&take_value(args, &mut i, flag)?)?,
@@ -229,9 +237,9 @@ fn parse_bench_generate(args: &[String]) -> Result<Command> {
         }
         i += 1;
     }
-    if prompt_repeat == 0 {
+    if prompt_repeat == 0 || prompt_repeats.iter().any(|&value| value == 0) {
         return Err(AegisError::InvalidConfig(
-            "bench-generate requires --prompt-repeat greater than 0".into(),
+            "bench-generate requires prompt repeat values greater than 0".into(),
         ));
     }
     if measured_runs == 0 {
@@ -241,6 +249,23 @@ fn parse_bench_generate(args: &[String]) -> Result<Command> {
     }
 
     let (config, mut request) = parse_generate_request(&generate_args, "bench-generate")?;
+    if !prompt_repeats.is_empty() || !chunk_sizes.is_empty() {
+        if prompt_repeats.is_empty() {
+            prompt_repeats.push(prompt_repeat);
+        }
+        if chunk_sizes.is_empty() {
+            chunk_sizes.push(config.cuda.prefill_chunk_size.unwrap_or(1));
+        }
+        return Ok(Command::BenchGenerateSweep(
+            config,
+            request,
+            prompt_repeats,
+            chunk_sizes,
+            warmup_runs,
+            measured_runs,
+            format,
+        ));
+    }
     request.prompt = repeat_prompt(&request.prompt, prompt_repeat);
     Ok(Command::BenchGenerate(
         config,
@@ -252,6 +277,19 @@ fn parse_bench_generate(args: &[String]) -> Result<Command> {
         prompt_repeat,
         format,
     ))
+}
+
+fn parse_usize_list(value: &str, flag: &str) -> Result<Vec<usize>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<usize>().map_err(|error| {
+                AegisError::InvalidConfig(format!("bad {flag} item `{part}`: {error}"))
+            })
+        })
+        .collect()
 }
 
 fn parse_bench_format(value: &str) -> Result<BenchOutputFormat> {

@@ -120,6 +120,8 @@ pub struct CudaSection {
     pub prefill_attention: Option<String>,
     #[serde(rename = "prefill-chunk-size")]
     pub prefill_chunk_size: Option<usize>,
+    #[serde(rename = "prefill-stage-timings")]
+    pub prefill_stage_timings: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -191,6 +193,9 @@ impl ParametersFile {
             }
             if let Some(value) = cuda.prefill_chunk_size {
                 cuda_runtime.prefill_chunk_size = Some(value);
+            }
+            if let Some(value) = cuda.prefill_stage_timings {
+                cuda_runtime.prefill_stage_timings = value;
             }
         }
         let model_path = self.model.path;

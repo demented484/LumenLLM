@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::error::{AegisError, Result};
-use crate::generation::GenerateRequest;
+use crate::generation::{GenerateRequest, PrefillStageTimings};
 
 use super::{AegisEngine, EngineConfig};
 
@@ -24,6 +24,7 @@ pub struct GenerateBenchMetrics {
     pub completion_tokens: usize,
     pub finish_reason: String,
     pub backend: Option<String>,
+    pub selection_context_tokens: usize,
     pub attention_requested: Option<String>,
     pub attention_auto_target: Option<String>,
     pub attention_logical_backend: Option<String>,
@@ -32,6 +33,7 @@ pub struct GenerateBenchMetrics {
     pub prefill_chunk_size: Option<usize>,
     pub warmup_runs: usize,
     pub measured_runs: usize,
+    pub average_prefill_stage_timings: Option<PrefillStageTimings>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +46,7 @@ pub struct GenerateBenchRun {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub finish_reason: String,
+    pub prefill_stage_timings: Option<PrefillStageTimings>,
 }
 
 pub fn run_generation_bench(
@@ -83,6 +86,7 @@ pub fn run_generation_bench(
             prompt_tokens: timed.output.prompt_tokens,
             completion_tokens: timed.output.completion_tokens,
             finish_reason: timed.output.finish_reason,
+            prefill_stage_timings: timed.prefill_stage_timings,
         });
     }
 
@@ -115,6 +119,7 @@ pub fn run_generation_bench(
         completion_tokens,
         finish_reason,
         backend,
+        selection_context_tokens: prompt_tokens,
         attention_requested: Some(engine.cuda.prefill_attention.canonical_name().into()),
         attention_auto_target: {
             let selection = engine.cuda.prefill_attention_selection(
@@ -153,6 +158,9 @@ pub fn run_generation_bench(
         prefill_chunk_size: engine.cuda.prefill_chunk_size,
         warmup_runs: request.warmup_runs,
         measured_runs: request.measured_runs,
+        average_prefill_stage_timings: average_stage_timings(
+            runs.iter().filter_map(|run| run.prefill_stage_timings),
+        ),
         runs,
     })
 }
@@ -169,4 +177,56 @@ fn average_duration(values: impl Iterator<Item = Duration>) -> Duration {
     } else {
         total / count
     }
+}
+
+fn average_stage_timings(
+    values: impl Iterator<Item = PrefillStageTimings>,
+) -> Option<PrefillStageTimings> {
+    let mut count = 0_u128;
+    let mut total = PrefillStageTimings {
+        chunks: 0,
+        prepare_us: 0,
+        embed_us: 0,
+        qkv_us: 0,
+        qkv_tflops: 0.0,
+        rope_us: 0,
+        kv_store_us: 0,
+        attention_us: 0,
+        o_proj_us: 0,
+        mlp_us: 0,
+        mlp_tflops: 0.0,
+        layer_total_us: 0,
+        sample_us: 0,
+    };
+    for value in values {
+        count += 1;
+        total.chunks += value.chunks;
+        total.prepare_us += value.prepare_us;
+        total.embed_us += value.embed_us;
+        total.qkv_us += value.qkv_us;
+        total.qkv_tflops = total.qkv_tflops.max(value.qkv_tflops);
+        total.rope_us += value.rope_us;
+        total.kv_store_us += value.kv_store_us;
+        total.attention_us += value.attention_us;
+        total.o_proj_us += value.o_proj_us;
+        total.mlp_us += value.mlp_us;
+        total.mlp_tflops = total.mlp_tflops.max(value.mlp_tflops);
+        total.layer_total_us += value.layer_total_us;
+        total.sample_us += value.sample_us;
+    }
+    (count > 0).then(|| PrefillStageTimings {
+        chunks: (total.chunks as u128 / count) as usize,
+        prepare_us: total.prepare_us / count,
+        embed_us: total.embed_us / count,
+        qkv_us: total.qkv_us / count,
+        qkv_tflops: total.qkv_tflops,
+        rope_us: total.rope_us / count,
+        kv_store_us: total.kv_store_us / count,
+        attention_us: total.attention_us / count,
+        o_proj_us: total.o_proj_us / count,
+        mlp_us: total.mlp_us / count,
+        mlp_tflops: total.mlp_tflops,
+        layer_total_us: total.layer_total_us / count,
+        sample_us: total.sample_us / count,
+    })
 }

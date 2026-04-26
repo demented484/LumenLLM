@@ -31,6 +31,15 @@ fn checked_sum(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
     })
 }
 
+fn validate_dynamic_shared_bytes(kernel: &str, bytes: usize) -> Result<u32> {
+    if bytes > 48 * 1024 {
+        return Err(AegisError::InvalidPlan(format!(
+            "CUDA kernel `{kernel}` requires {bytes} bytes of dynamic shared memory, exceeding the conservative 48KiB launch limit"
+        )));
+    }
+    Ok(bytes as u32)
+}
+
 const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
 const FLASH_SPLIT_K_TOKENS: usize = 256;
 const FLASH_SPLIT_Q_BLOCK: usize = 4;
@@ -200,9 +209,12 @@ impl CudaRuntime {
             grid_dim: (num_attention_heads, 1, 1),
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: if streaming {
-                ((block_dim as usize + head_dim as usize + 3) * std::mem::size_of::<f32>()) as u32
+                validate_dynamic_shared_bytes(
+                    "attention_decode_streaming",
+                    (block_dim as usize + head_dim as usize + 3) * std::mem::size_of::<f32>(),
+                )?
             } else {
-                legacy_shared_bytes as u32
+                validate_dynamic_shared_bytes("attention_decode", legacy_shared_bytes)?
             },
         };
         let sdpa_requested = matches!(
@@ -309,10 +321,16 @@ impl CudaRuntime {
             grid_dim: (num_attention_heads, batch, 1),
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: if continuation {
-                ((block_dim as usize + head_dim as usize + 3) * std::mem::size_of::<f32>()) as u32
+                validate_dynamic_shared_bytes(
+                    "prefill_dense_online",
+                    (block_dim as usize + head_dim as usize + 3) * std::mem::size_of::<f32>(),
+                )?
             } else {
-                (max_seq_len * std::mem::size_of::<f32>()
-                    + block_dim as usize * std::mem::size_of::<f32>()) as u32
+                validate_dynamic_shared_bytes(
+                    "prefill_dense_cache",
+                    max_seq_len * std::mem::size_of::<f32>()
+                        + block_dim as usize * std::mem::size_of::<f32>(),
+                )?
             },
         };
         let cache_resident_signature = matches!(
@@ -621,6 +639,11 @@ impl CudaRuntime {
             )));
         }
         let sdpa_selected = matches!(selected_backend, CudaAttentionBackend::Sdpa);
+        if sdpa_selected && num_decode_tokens > 0 {
+            return Err(AegisError::Unsupported(
+                "CUDA SDPA paged mixed prefill+decode requires per-row query mode metadata; scheduler descriptors can model mixed batches, but this kernel rejects decode rows until that ABI lands".into(),
+            ));
+        }
         let total_query_tokens = if sdpa_selected {
             checked_sum(
                 "paged varlen mixed query tokens",
@@ -759,7 +782,10 @@ impl CudaRuntime {
         let cfg = LaunchConfig {
             grid_dim: (num_attention_heads, grid_q, 1),
             block_dim: (block_dim, 1, 1),
-            shared_mem_bytes: (shared_floats * std::mem::size_of::<f32>()) as u32,
+            shared_mem_bytes: validate_dynamic_shared_bytes(
+                "prefill_paged_varlen",
+                shared_floats * std::mem::size_of::<f32>(),
+            )?,
         };
         if use_halfq_block4_split {
             let Some(query_half) = query_half else {

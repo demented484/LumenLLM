@@ -7,6 +7,7 @@ pub struct CudaRuntimeConfig {
     pub native_mxfp4_inference: bool,
     pub prefill_attention: CudaPrefillAttentionKernel,
     pub prefill_chunk_size: Option<usize>,
+    pub prefill_stage_timings: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -67,6 +68,7 @@ impl CudaRuntimeConfig {
             prefill_chunk_size: std::env::var("AEGIS_CUDA_PREFILL_CHUNK")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok()),
+            prefill_stage_timings: std::env::var_os("AEGISLLM_CUDA_STAGE_TIMINGS").is_some(),
         }
     }
 
@@ -217,13 +219,9 @@ impl CudaPrefillAttentionSelection {
                 requested,
                 auto_target: None,
                 logical_backend: CudaAttentionBackend::Reference,
-                effective_path: if oversized_dense_scores {
-                    CudaAttentionEffectivePath::ReferenceContinuation
-                } else {
-                    CudaAttentionEffectivePath::ReferenceCacheOnly
-                },
+                effective_path: CudaAttentionEffectivePath::ReferenceCacheOnly,
                 reason: if oversized_dense_scores {
-                    "reference requested and dense scores would exceed bounded shared memory"
+                    "reference requested but dense scores exceed bounded shared-memory policy; runtime rejects this shape unless sdpa, auto, or continuation is requested"
                 } else {
                     "reference requested"
                 },

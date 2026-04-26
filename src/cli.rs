@@ -64,6 +64,42 @@ mod tests {
     }
 
     #[test]
+    fn bench_generate_parses_prompt_and_chunk_sweep() {
+        let command = parse_args([
+            "bench-generate".to_string(),
+            "--model".to_string(),
+            "/tmp/model".to_string(),
+            "--prompt".to_string(),
+            "hello".to_string(),
+            "--prompt-repeats".to_string(),
+            "1,4,16".to_string(),
+            "--chunk-sizes".to_string(),
+            "1,128".to_string(),
+            "--format".to_string(),
+            "csv".to_string(),
+        ])
+        .expect("bench-generate sweep should parse");
+
+        let Command::BenchGenerateSweep(
+            config,
+            request,
+            prompt_repeats,
+            chunk_sizes,
+            _warmup,
+            _runs,
+            format,
+        ) = command
+        else {
+            panic!("expected bench-generate sweep command");
+        };
+        assert_eq!(config.model_path, PathBuf::from("/tmp/model"));
+        assert_eq!(request.prompt, "hello");
+        assert_eq!(prompt_repeats, [1, 4, 16]);
+        assert_eq!(chunk_sizes, [1, 128]);
+        assert_eq!(format, command::BenchOutputFormat::Csv);
+    }
+
+    #[test]
     fn cuda_device_flag_retargets_auto_policy() {
         let command = parse_args([
             "show-plan".to_string(),

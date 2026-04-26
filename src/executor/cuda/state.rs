@@ -1,5 +1,6 @@
 use super::rope::RopeConfig;
 use crate::cuda::{CudaRuntime, DeviceBf16Matrix, DeviceBuffer, DeviceNvfp4Linear};
+use crate::generation::PrefillStageTimings;
 
 #[derive(Debug)]
 pub(super) struct CudaLlamaExecutor {
@@ -16,6 +17,7 @@ pub(super) struct CudaLlamaExecutor {
     pub(super) layers: Vec<CudaLayer>,
     pub(super) kv_context_size: usize,
     pub(super) prefill_chunk_size: usize,
+    pub(super) prefill_stage_timings_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -187,9 +189,9 @@ pub(super) struct CudaPrefillStageTimings {
 }
 
 impl CudaPrefillStageTimings {
-    pub(super) fn from_env() -> Self {
+    pub(super) fn from_enabled(enabled: bool) -> Self {
         Self {
-            enabled: std::env::var_os("AEGISLLM_CUDA_STAGE_TIMINGS").is_some(),
+            enabled,
             ..Self::default()
         }
     }
@@ -200,6 +202,24 @@ impl CudaPrefillStageTimings {
             enabled,
             ..Self::default()
         };
+    }
+
+    pub(super) fn snapshot(self) -> Option<PrefillStageTimings> {
+        self.enabled.then_some(PrefillStageTimings {
+            chunks: self.chunks,
+            prepare_us: self.prepare_us,
+            embed_us: self.embed_us,
+            qkv_us: self.qkv_us,
+            qkv_tflops: self.qkv_tflops,
+            rope_us: self.rope_us,
+            kv_store_us: self.kv_store_us,
+            attention_us: self.attention_us,
+            o_proj_us: self.o_proj_us,
+            mlp_us: self.mlp_us,
+            mlp_tflops: self.mlp_tflops,
+            layer_total_us: self.layer_total_us,
+            sample_us: self.sample_us,
+        })
     }
 }
 
