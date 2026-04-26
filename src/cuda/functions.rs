@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{env, path::Path, sync::Arc};
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule};
 use cudarc::nvrtc::{CompileOptions, Ptx, compile_ptx_with_opts};
@@ -71,6 +71,7 @@ impl CudaKernelFunctions {
             CompileOptions {
                 arch: Some(nvrtc_arch_for_device(device_index)),
                 name: Some("aegis_blackwell_nvfp4.cu".into()),
+                include_paths: cuda_include_paths(),
                 ..Default::default()
             },
         )
@@ -175,6 +176,29 @@ impl CudaKernelFunctions {
             _module: module,
         })
     }
+}
+
+fn cuda_include_paths() -> Vec<String> {
+    let mut candidates = Vec::new();
+    for var in ["CUDA_PATH", "CUDA_HOME"] {
+        if let Ok(root) = env::var(var) {
+            candidates.push(format!("{root}/include"));
+            candidates.push(format!("{root}/targets/x86_64-linux/include"));
+        }
+    }
+    candidates.extend(
+        [
+            "/opt/cuda/targets/x86_64-linux/include",
+            "/usr/local/cuda/include",
+            "/usr/include",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    candidates
+        .into_iter()
+        .filter(|path| Path::new(path).join("cuda_fp16.h").exists())
+        .collect()
 }
 
 fn load(module: &Arc<CudaModule>, name: &'static str) -> Result<CudaFunction> {

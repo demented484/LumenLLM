@@ -1,3 +1,5 @@
+#include <cuda_fp16.h>
+
 extern "C" __device__ __forceinline__ int decode_nvfp4_nibble(unsigned int nibble) {
     switch (nibble & 0xFu) {
         case 0u: return 0;

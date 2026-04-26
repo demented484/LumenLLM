@@ -44,6 +44,7 @@ fn validate_dynamic_shared_bytes(kernel: &str, bytes: usize) -> Result<u32> {
 const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
 const FLASH_SPLIT_K_TOKENS: usize = 256;
 const FLASH_SPLIT_Q_BLOCK: usize = 4;
+const DENSE_HALFQ_Q_BLOCK: usize = 4;
 const FA4_HDIM128_Q_BLOCK: usize = 8;
 const FA4_HDIM128_K_TILE: usize = 32;
 const CUDA_ATTENTION_BLOCK_DIM: u32 = 128;
@@ -62,7 +63,11 @@ fn select_prefill_batched_kernel(
     legacy_shared_bytes: usize,
 ) -> Result<PrefillBatchedKernel> {
     let warp_eligible = start_position == 0 && head_dim % 32 == 0 && head_dim <= 256;
-    if matches!(config, CudaPrefillAttentionKernel::WarpFlash) && warp_eligible {
+    if matches!(
+        config,
+        CudaPrefillAttentionKernel::Auto | CudaPrefillAttentionKernel::WarpFlash
+    ) && warp_eligible
+    {
         return Ok(PrefillBatchedKernel::Warp);
     }
     if matches!(config, CudaPrefillAttentionKernel::Continuation) {
@@ -409,6 +414,31 @@ impl CudaRuntime {
                 dense_metadata.context_len()
             )));
         }
+        let legacy_shared_bytes = (dense_metadata.context_len()
+            + CUDA_ATTENTION_BLOCK_DIM as usize)
+            * std::mem::size_of::<f32>();
+        if matches!(
+            self.config.prefill_attention,
+            CudaPrefillAttentionKernel::Auto | CudaPrefillAttentionKernel::WarpFlash
+        ) && start_position == 0
+            && head_dim % 32 == 0
+            && head_dim <= 256
+            && legacy_shared_bytes <= 48 * 1024
+        {
+            return self.attention_prefill_batched_device(
+                key_cache,
+                value_cache,
+                key_chunk,
+                value_chunk,
+                query,
+                start_position,
+                batch,
+                num_attention_heads,
+                num_kv_heads,
+                head_dim,
+                output,
+            );
+        }
         let selected_backend =
             self.select_prefill_attention_backend(dense_metadata.context_len(), head_dim)?;
         let use_varlen_attention = match selected_backend {
@@ -542,7 +572,7 @@ impl CudaRuntime {
                 "dense halfq attention heads must be divisible by kv heads".into(),
             ));
         }
-        let q_block = FLASH_SPLIT_Q_BLOCK;
+        let q_block = DENSE_HALFQ_Q_BLOCK;
         let block_dim = 64_u32;
         let nwarps = (block_dim / 32) as usize;
         let shared_floats = q_block * nwarps + (q_block * 2 + 2) * head_dim + q_block * 4;

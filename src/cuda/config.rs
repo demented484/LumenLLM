@@ -171,36 +171,46 @@ impl CudaPrefillAttentionSelection {
             CudaPrefillAttentionKernel::Auto => {
                 let auto_target =
                     CudaAttentionBackend::auto_target_for_compute_capability(compute_capability);
-                let (logical_backend, effective_path, reason) = match auto_target {
-                    CudaAttentionBackend::FlashAttention4
-                        if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
-                    {
-                        (
-                            CudaAttentionBackend::AegisVarlen,
-                            CudaAttentionEffectivePath::AegisPagedVarlen,
-                            "auto selected Blackwell-class attention; using Aegis paged-varlen path until FA4 is promoted",
-                        )
-                    }
-                    CudaAttentionBackend::FlashAttention2
-                    | CudaAttentionBackend::FlashAttention3
-                        if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
-                    {
-                        (
-                            CudaAttentionBackend::AegisVarlen,
-                            CudaAttentionEffectivePath::AegisPagedVarlen,
-                            "auto selected flash attention generation; using Aegis paged-varlen path for long context",
-                        )
-                    }
-                    _ if oversized_dense_scores => (
+                let warp_eligible =
+                    head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores;
+                let (logical_backend, effective_path, reason) = if warp_eligible {
+                    (
                         CudaAttentionBackend::Reference,
-                        CudaAttentionEffectivePath::ReferenceContinuation,
-                        "dense score buffer exceeds bounded shared-memory policy",
-                    ),
-                    _ => (
-                        CudaAttentionBackend::Reference,
-                        CudaAttentionEffectivePath::ReferenceCacheOnly,
-                        "short context uses dense cache-only reference path",
-                    ),
+                        CudaAttentionEffectivePath::WarpFlash,
+                        "auto selected warp-flash for first-prefill; continuation chunks fall back to paged-varlen or bounded reference as needed",
+                    )
+                } else {
+                    match auto_target {
+                        CudaAttentionBackend::FlashAttention4
+                            if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
+                        {
+                            (
+                                CudaAttentionBackend::AegisVarlen,
+                                CudaAttentionEffectivePath::AegisPagedVarlen,
+                                "auto selected Blackwell-class attention; using Aegis paged-varlen path until FA4 is promoted",
+                            )
+                        }
+                        CudaAttentionBackend::FlashAttention2
+                        | CudaAttentionBackend::FlashAttention3
+                            if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
+                        {
+                            (
+                                CudaAttentionBackend::AegisVarlen,
+                                CudaAttentionEffectivePath::AegisPagedVarlen,
+                                "auto selected flash attention generation; using Aegis paged-varlen path for long context",
+                            )
+                        }
+                        _ if oversized_dense_scores => (
+                            CudaAttentionBackend::Reference,
+                            CudaAttentionEffectivePath::ReferenceContinuation,
+                            "dense score buffer exceeds bounded shared-memory policy",
+                        ),
+                        _ => (
+                            CudaAttentionBackend::Reference,
+                            CudaAttentionEffectivePath::ReferenceCacheOnly,
+                            "short context uses dense cache-only reference path",
+                        ),
+                    }
                 };
                 Self {
                     requested,
@@ -346,10 +356,10 @@ mod tests {
             selection.auto_target,
             Some(CudaAttentionBackend::FlashAttention4)
         );
-        assert_eq!(selection.logical_backend, CudaAttentionBackend::AegisVarlen);
+        assert_eq!(selection.logical_backend, CudaAttentionBackend::Reference);
         assert_eq!(
             selection.effective_path,
-            CudaAttentionEffectivePath::AegisPagedVarlen
+            CudaAttentionEffectivePath::WarpFlash
         );
     }
 }

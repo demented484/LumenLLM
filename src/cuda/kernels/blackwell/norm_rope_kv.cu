@@ -461,20 +461,7 @@ extern "C" __device__ __forceinline__ unsigned short float_to_f16_bits(float val
 }
 
 extern "C" __device__ __forceinline__ float f16_bits_to_float(unsigned short value) {
-    const unsigned int sign = (unsigned int)(value & 0x8000u) << 16;
-    const unsigned int exp = (unsigned int)(value >> 10) & 0x1fu;
-    const unsigned int mant = (unsigned int)value & 0x03ffu;
-    if (exp == 0u) {
-        if (mant == 0u) {
-            return __uint_as_float(sign);
-        }
-        const float magnitude = ldexpf((float)mant, -24);
-        return sign ? -magnitude : magnitude;
-    }
-    if (exp == 31u) {
-        return __uint_as_float(sign | 0x7f800000u | (mant << 13));
-    }
-    return __uint_as_float(sign | ((exp + 112u) << 23) | (mant << 13));
+    return __half2float(__ushort_as_half(value));
 }
 
 extern "C" __global__ void aegis_f32_to_f16(
