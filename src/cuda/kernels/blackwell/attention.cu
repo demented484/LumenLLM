@@ -1485,7 +1485,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_fa(
             if (score > -3.0e38f) {
                 weight = exp2f((score - new_m) * log2e);
             }
-            scores[row * k_tile + lane] = weight;
+            weights_half[row * k_tile + lane] = __float2half_rn(weight);
             const float tile_l = aegis_warp_reduce_sum(weight);
             if (lane == 0u) {
                 const float alpha = old_l > 0.0f ? exp2f((old_m - new_m) * log2e) : 0.0f;
@@ -1496,9 +1496,6 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_fa(
         }
         __syncthreads();
 
-        for (unsigned int idx = tid; idx < q_block * k_tile; idx += blockDim.x) {
-            weights_half[idx] = __float2half_rn(scores[idx]);
-        }
         for (unsigned int idx = tid; idx < q_block * hdim; idx += blockDim.x) {
             const unsigned int row = idx / hdim;
             const unsigned int global_q = global_q_base + row;
