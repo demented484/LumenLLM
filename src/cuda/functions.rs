@@ -59,6 +59,7 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) attention_prefill_dense_halfq_warp_tile_hdim128: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_fa: CudaFunction,
+    pub(crate) attention_prefill_dense_halfq_wmma_hdim128_cluster2: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_q32: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_split: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_combine: CudaFunction,
@@ -174,6 +175,10 @@ impl CudaKernelFunctions {
                 &module,
                 "aegis_attention_prefill_dense_halfq_wmma_hdim128_fa",
             )?,
+            attention_prefill_dense_halfq_wmma_hdim128_cluster2: load(
+                &module,
+                "aegis_attention_prefill_dense_halfq_wmma_hdim128_cluster2",
+            )?,
             attention_prefill_dense_halfq_wmma_hdim128_q32: load(
                 &module,
                 "aegis_attention_prefill_dense_halfq_wmma_hdim128_q32",
@@ -216,12 +221,15 @@ fn cuda_include_paths() -> Vec<String> {
         if let Ok(root) = env::var(var) {
             candidates.push(format!("{root}/include"));
             candidates.push(format!("{root}/targets/x86_64-linux/include"));
+            candidates.push(format!("{root}/targets/x86_64-linux/include/cccl"));
         }
     }
     candidates.extend(
         [
             "/opt/cuda/targets/x86_64-linux/include",
+            "/opt/cuda/targets/x86_64-linux/include/cccl",
             "/usr/local/cuda/include",
+            "/usr/local/cuda/targets/x86_64-linux/include/cccl",
             "/usr/include",
         ]
         .into_iter()
@@ -229,7 +237,10 @@ fn cuda_include_paths() -> Vec<String> {
     );
     candidates
         .into_iter()
-        .filter(|path| Path::new(path).join("cuda_fp16.h").exists())
+        .filter(|path| {
+            let path = Path::new(path);
+            path.join("cuda_fp16.h").exists() || path.join("cuda/std/type_traits").exists()
+        })
         .collect()
 }
 

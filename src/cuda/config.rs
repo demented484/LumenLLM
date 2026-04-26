@@ -43,6 +43,7 @@ pub enum CudaAttentionEffectivePath {
     AegisDenseWarpTile,
     AegisDenseWmmaTile,
     AegisDenseWmmaFaPipeline,
+    AegisDenseWmmaCluster2,
     AegisDenseWmmaPersistentQ32,
     AegisDenseWmmaSplitK,
     AegisPagedVarlen,
@@ -160,6 +161,7 @@ impl CudaAttentionEffectivePath {
             Self::AegisDenseWarpTile => "aegis-varlen/dense-warp-tile",
             Self::AegisDenseWmmaTile => "aegis-varlen/dense-wmma-tile",
             Self::AegisDenseWmmaFaPipeline => "aegis-varlen/dense-wmma-fa-pipeline",
+            Self::AegisDenseWmmaCluster2 => "aegis-varlen/dense-wmma-cluster2",
             Self::AegisDenseWmmaPersistentQ32 => "aegis-varlen/dense-wmma-persistent-q32",
             Self::AegisDenseWmmaSplitK => "aegis-varlen/dense-wmma-split-k",
             Self::AegisPagedVarlen => "aegis-varlen/paged-varlen",
@@ -192,6 +194,10 @@ impl CudaPrefillAttentionSelection {
                     std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_PERSISTENT_ATTENTION").is_some()
                         && head_dim == 128
                         && context_len >= 1024;
+                let dense_cluster2_experimental =
+                    std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_CLUSTER_ATTENTION").is_some()
+                        && head_dim == 128
+                        && context_len >= 1024;
                 let warp_eligible =
                     head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores;
                 let (logical_backend, effective_path, reason) = if dense_split_k_experimental {
@@ -199,6 +205,12 @@ impl CudaPrefillAttentionSelection {
                         CudaAttentionBackend::AegisVarlen,
                         CudaAttentionEffectivePath::AegisDenseWmmaSplitK,
                         "auto selected experimental split-K dense WMMA-tiled prefill attention",
+                    )
+                } else if dense_cluster2_experimental {
+                    (
+                        CudaAttentionBackend::AegisVarlen,
+                        CudaAttentionEffectivePath::AegisDenseWmmaCluster2,
+                        "auto selected experimental cluster2 dense WMMA-tiled prefill attention",
                     )
                 } else if dense_q32_experimental {
                     (
@@ -287,6 +299,11 @@ impl CudaPrefillAttentionSelection {
                         && context_len >= 4096
                     {
                         CudaAttentionEffectivePath::AegisDenseWmmaSplitK
+                    } else if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_CLUSTER_ATTENTION")
+                        .is_some()
+                        && context_len >= 1024
+                    {
+                        CudaAttentionEffectivePath::AegisDenseWmmaCluster2
                     } else if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_PERSISTENT_ATTENTION").is_some()
                         && context_len >= 1024
                     {
