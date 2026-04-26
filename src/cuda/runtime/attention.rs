@@ -1,4 +1,4 @@
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{LaunchConfig, PushKernelArg, sys::CUfunction_attribute_enum};
 
 use super::{CudaRuntime, map_cuda_err};
 use crate::cuda::{
@@ -48,6 +48,7 @@ const TILED_HALFQ_Q_BLOCK: usize = 4;
 const DENSE_WARP_TILE_Q_BLOCK: usize = 16;
 const DENSE_WARP_TILE_K_TILE: usize = 32;
 const DENSE_WMMA_Q_BLOCK: usize = 16;
+const DENSE_WMMA_Q32_BLOCK: usize = 32;
 const DENSE_WMMA_K_TILE: usize = 32;
 const DENSE_WMMA_SPLIT_K_TOKENS: usize = 2048;
 const FA4_HDIM128_Q_BLOCK: usize = 8;
@@ -491,6 +492,18 @@ impl CudaRuntime {
                     num_kv_heads,
                     output,
                 )
+            } else if dense_wmma_q32_enabled() && dense_metadata.context_len() >= 1024 {
+                self.attention_prefill_dense_halfq_wmma_hdim128_q32_device(
+                    key_cache,
+                    value_cache,
+                    query_half,
+                    start_position,
+                    batch,
+                    dense_metadata.context_len(),
+                    num_attention_heads,
+                    num_kv_heads,
+                    output,
+                )
             } else {
                 self.attention_prefill_dense_halfq_wmma_hdim128_device(
                     key_cache,
@@ -865,6 +878,101 @@ impl CudaRuntime {
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch dense halfq wmma prefill attention"))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_prefill_dense_halfq_wmma_hdim128_q32_device(
+        &self,
+        key_cache: &DeviceBuffer<u16>,
+        value_cache: &DeviceBuffer<u16>,
+        query_half: &DeviceBuffer<u16>,
+        start_position: usize,
+        batch: usize,
+        context_len: usize,
+        num_attention_heads: usize,
+        num_kv_heads: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let head_dim = 128usize;
+        let q_width = checked_len("dense q32 wmma q width", num_attention_heads, head_dim)?;
+        let q_tokens = checked_len("dense q32 wmma q tokens", batch, q_width)?;
+        let kv_width = checked_len("dense q32 wmma kv width", num_kv_heads, head_dim)?;
+        let cache_len = checked_len("dense q32 wmma kv cache", context_len, kv_width)?;
+        if query_half.len() < q_tokens || output.len() < q_tokens {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense q32 wmma attention q/output shape mismatch: query_half={} output={} required={}",
+                query_half.len(),
+                output.len(),
+                q_tokens
+            )));
+        }
+        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense q32 wmma attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
+                key_cache.len(),
+                value_cache.len(),
+                cache_len
+            )));
+        }
+        let half_values = DENSE_WMMA_Q32_BLOCK * head_dim
+            + 2 * DENSE_WMMA_K_TILE * head_dim
+            + DENSE_WMMA_Q32_BLOCK * DENSE_WMMA_K_TILE;
+        let float_values = DENSE_WMMA_Q32_BLOCK * DENSE_WMMA_K_TILE
+            + DENSE_WMMA_Q32_BLOCK * head_dim
+            + DENSE_WMMA_Q32_BLOCK * head_dim
+            + DENSE_WMMA_Q32_BLOCK * 3;
+        let shared_mem_bytes =
+            half_values * std::mem::size_of::<u16>() + float_values * std::mem::size_of::<f32>();
+        self.kernels
+            .attention_prefill_dense_halfq_wmma_hdim128_q32
+            .set_attribute(
+                CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                i32::try_from(shared_mem_bytes).map_err(|_| {
+                    AegisError::InvalidPlan(format!(
+                        "dense q32 wmma shared memory exceeds i32: {shared_mem_bytes}"
+                    ))
+                })?,
+            )
+            .map_err(map_cuda_err("set q32 wmma max dynamic shared memory"))?;
+        let start_position = u32_arg("start_position", start_position)?;
+        let total_q = u32_arg("total_query_tokens", batch)?;
+        let context_len = u32_arg("context_len", context_len)?;
+        let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
+        let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
+        let head_dim = u32_arg("head_dim", head_dim)?;
+        unsafe {
+            self.stream
+                .launch_builder(
+                    &self
+                        .kernels
+                        .attention_prefill_dense_halfq_wmma_hdim128_q32,
+                )
+                .arg(&key_cache.slice)
+                .arg(&value_cache.slice)
+                .arg(&query_half.slice)
+                .arg(&start_position)
+                .arg(&total_q)
+                .arg(&context_len)
+                .arg(&num_attention_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&mut output.slice)
+                .launch(LaunchConfig {
+                    grid_dim: (
+                        num_attention_heads,
+                        u32_arg("dense q32 wmma q blocks", batch.div_ceil(DENSE_WMMA_Q32_BLOCK))?,
+                        1,
+                    ),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: u32::try_from(shared_mem_bytes).map_err(|_| {
+                        AegisError::InvalidPlan(format!(
+                            "dense q32 wmma shared memory exceeds u32: {shared_mem_bytes}"
+                        ))
+                    })?,
+                })
+        }
+        .map_err(map_cuda_err("launch dense q32 halfq wmma prefill attention"))?;
         Ok(())
     }
 
@@ -1442,6 +1550,10 @@ impl CudaRuntime {
 
 fn dense_wmma_split_k_enabled() -> bool {
     std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
+}
+
+fn dense_wmma_q32_enabled() -> bool {
+    std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_PERSISTENT_ATTENTION").is_some()
 }
 
 fn dense_wmma_split_scratch_ready(

@@ -42,6 +42,7 @@ pub enum CudaAttentionEffectivePath {
     ReferenceContinuation,
     AegisDenseWarpTile,
     AegisDenseWmmaTile,
+    AegisDenseWmmaPersistentQ32,
     AegisDenseWmmaSplitK,
     AegisPagedVarlen,
     FlashAttention4PagedVarlen,
@@ -157,6 +158,7 @@ impl CudaAttentionEffectivePath {
             Self::ReferenceContinuation => "reference/continuation",
             Self::AegisDenseWarpTile => "aegis-varlen/dense-warp-tile",
             Self::AegisDenseWmmaTile => "aegis-varlen/dense-wmma-tile",
+            Self::AegisDenseWmmaPersistentQ32 => "aegis-varlen/dense-wmma-persistent-q32",
             Self::AegisDenseWmmaSplitK => "aegis-varlen/dense-wmma-split-k",
             Self::AegisPagedVarlen => "aegis-varlen/paged-varlen",
             Self::FlashAttention4PagedVarlen => "fa4/paged-varlen",
@@ -184,6 +186,10 @@ impl CudaPrefillAttentionSelection {
                     std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
                         && head_dim == 128
                         && context_len >= 4096;
+                let dense_q32_experimental =
+                    std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_PERSISTENT_ATTENTION").is_some()
+                        && head_dim == 128
+                        && context_len >= 1024;
                 let warp_eligible =
                     head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores;
                 let (logical_backend, effective_path, reason) = if dense_split_k_experimental {
@@ -191,6 +197,12 @@ impl CudaPrefillAttentionSelection {
                         CudaAttentionBackend::AegisVarlen,
                         CudaAttentionEffectivePath::AegisDenseWmmaSplitK,
                         "auto selected experimental split-K dense WMMA-tiled prefill attention",
+                    )
+                } else if dense_q32_experimental {
+                    (
+                        CudaAttentionBackend::AegisVarlen,
+                        CudaAttentionEffectivePath::AegisDenseWmmaPersistentQ32,
+                        "auto selected experimental q32 persistent dense WMMA-tiled prefill attention",
                     )
                 } else if dense_warp_tile_eligible {
                     (
@@ -273,6 +285,10 @@ impl CudaPrefillAttentionSelection {
                         && context_len >= 4096
                     {
                         CudaAttentionEffectivePath::AegisDenseWmmaSplitK
+                    } else if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_PERSISTENT_ATTENTION").is_some()
+                        && context_len >= 1024
+                    {
+                        CudaAttentionEffectivePath::AegisDenseWmmaPersistentQ32
                     } else {
                         CudaAttentionEffectivePath::AegisDenseWmmaTile
                     }
