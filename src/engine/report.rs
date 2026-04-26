@@ -273,6 +273,8 @@ fn push_runtime_report(engine: &AegisEngine, lines: &mut Vec<String>) {
         compute_capability,
         engine.placement.kv_cache.context_size,
         engine.graph.head_dim,
+        engine.graph.num_attention_heads,
+        engine.graph.num_kv_heads,
     );
     lines.push(format!(
         "cuda-runtime-config: native_mxfp4_repack={} cutlass_nvfp4_repack={} native_mxfp4_inference={} prefill_attention={} prefill_chunk_size={} prefill_stage_timings={}",

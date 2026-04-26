@@ -178,6 +178,8 @@ fn cuda_prefill_compare_one_chunk(config: EngineConfig, configured_chunk: usize)
             compute_capability,
             selection_context_tokens,
             chunk_engine.graph.head_dim,
+            chunk_engine.graph.num_attention_heads,
+            chunk_engine.graph.num_kv_heads,
         );
         (
             outputs,

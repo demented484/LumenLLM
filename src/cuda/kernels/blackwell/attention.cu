@@ -1540,6 +1540,196 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_fa(
     }
 }
 
+extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4(
+    const unsigned short* __restrict__ key_cache,
+    const unsigned short* __restrict__ value_cache,
+    const unsigned short* __restrict__ query,
+    const unsigned int start_position,
+    const unsigned int total_q,
+    const unsigned int context_len,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    float* __restrict__ output
+) {
+    constexpr unsigned int hdim = 128u;
+    constexpr unsigned int q_tokens = 8u;
+    constexpr unsigned int local_heads_max = 4u;
+    constexpr unsigned int q_rows = q_tokens * local_heads_max;
+    constexpr unsigned int k_tile = 32u;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    if (head_dim != hdim || num_kv_heads == 0u || num_attention_heads % num_kv_heads != 0u || blockDim.x < 256u) {
+        return;
+    }
+
+    const unsigned int group = num_attention_heads / num_kv_heads;
+    const unsigned int group_tiles = (group + local_heads_max - 1u) / local_heads_max;
+    const unsigned int kv_head = blockIdx.x / group_tiles;
+    const unsigned int local_head_base = (blockIdx.x - kv_head * group_tiles) * local_heads_max;
+    const unsigned int global_q_base = blockIdx.y * q_tokens;
+    if (kv_head >= num_kv_heads || global_q_base >= total_q) {
+        return;
+    }
+
+    const unsigned int last_q_in_block = min(total_q, global_q_base + q_tokens) - 1u;
+    const unsigned int block_max_visible = min(context_len, start_position + last_q_in_block + 1u);
+    if (block_max_visible == 0u) {
+        return;
+    }
+
+    extern __shared__ __align__(16) unsigned char smem[];
+    unsigned short* q_shared = reinterpret_cast<unsigned short*>(smem);
+    unsigned short* k_shared = q_shared + q_rows * hdim;
+    unsigned short* v_shared = k_shared + k_tile * hdim;
+    float* scores = reinterpret_cast<float*>(v_shared + k_tile * hdim);
+    float* acc = scores + q_rows * k_tile;
+    float* scalars = acc + q_rows * hdim;
+    half* weights_half = reinterpret_cast<half*>(scalars + q_rows * 3u);
+
+    const float scale = rsqrtf(float(hdim));
+    const float log2e = 1.4426950408889634f;
+
+    for (unsigned int idx = tid; idx < q_rows * hdim; idx += blockDim.x) {
+        const unsigned int row = idx / hdim;
+        const unsigned int dim = idx - row * hdim;
+        const unsigned int local_head = row / q_tokens;
+        const unsigned int token = row - local_head * q_tokens;
+        const unsigned int head = kv_head * group + local_head_base + local_head;
+        const unsigned int global_q = global_q_base + token;
+        q_shared[idx] = (local_head_base + local_head < group && head < num_attention_heads && global_q < total_q)
+            ? query[(size_t(global_q) * num_attention_heads + head) * hdim + dim]
+            : 0u;
+        acc[idx] = 0.0f;
+    }
+    for (unsigned int row = tid; row < q_rows; row += blockDim.x) {
+        scalars[row * 3u + 0u] = -3.402823466e38f;
+        scalars[row * 3u + 1u] = 0.0f;
+        scalars[row * 3u + 2u] = 0.0f;
+    }
+    __syncthreads();
+
+    for (unsigned int tile_start = 0u; tile_start < block_max_visible; tile_start += k_tile) {
+        const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
+        for (unsigned int idx = tid; idx < k_tile * hdim; idx += blockDim.x) {
+            const unsigned int col = idx / hdim;
+            const unsigned int dim = idx - col * hdim;
+            const unsigned int pos = tile_start + col;
+            const bool valid_k = col < tile_count;
+            const size_t kv_offset =
+                (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
+            k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
+            v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
+        }
+        __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+        if (warp < 4u) {
+            using namespace nvcuda;
+            const unsigned int row_block = warp >> 1u;
+            const unsigned int n_off = (warp & 1u) * 16u;
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+            wmma::fill_fragment(c_frag, 0.0f);
+#pragma unroll
+            for (unsigned int kk = 0u; kk < hdim; kk += 16u) {
+                const half* a_ptr = reinterpret_cast<const half*>(q_shared + row_block * 16u * hdim + kk);
+                const half* b_ptr = reinterpret_cast<const half*>(k_shared + n_off * hdim + kk);
+                wmma::load_matrix_sync(a_frag, a_ptr, hdim);
+                wmma::load_matrix_sync(b_frag, b_ptr, hdim);
+                wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+            }
+            wmma::store_matrix_sync(scores + row_block * 16u * k_tile + n_off, c_frag, k_tile, wmma::mem_row_major);
+        }
+#endif
+        __syncthreads();
+
+        const unsigned int nwarps = blockDim.x >> 5u;
+        for (unsigned int row = warp; row < q_rows; row += nwarps) {
+            const unsigned int local_head = row / q_tokens;
+            const unsigned int token = row - local_head * q_tokens;
+            const unsigned int head = kv_head * group + local_head_base + local_head;
+            const unsigned int global_q = global_q_base + token;
+            const bool valid_q = local_head_base + local_head < group && head < num_attention_heads && global_q < total_q;
+            const unsigned int visible_len = valid_q
+                ? min(context_len, start_position + global_q + 1u)
+                : 0u;
+            const float old_m = scalars[row * 3u + 0u];
+            const float old_l = scalars[row * 3u + 1u];
+            const unsigned int pos = tile_start + lane;
+            float score = (valid_q && lane < tile_count && pos < visible_len)
+                ? scores[row * k_tile + lane] * scale
+                : -3.402823466e38f;
+            const float tile_m = aegis_warp_reduce_max(score);
+            const float new_m = fmaxf(old_m, tile_m);
+            float weight = 0.0f;
+            if (score > -3.0e38f) {
+                weight = exp2f((score - new_m) * log2e);
+            }
+            weights_half[row * k_tile + lane] = __float2half_rn(weight);
+            const float tile_l = aegis_warp_reduce_sum(weight);
+            if (lane == 0u) {
+                const float alpha = old_l > 0.0f ? exp2f((old_m - new_m) * log2e) : 0.0f;
+                scalars[row * 3u + 0u] = new_m;
+                scalars[row * 3u + 1u] = old_l * alpha + tile_l;
+                scalars[row * 3u + 2u] = alpha;
+            }
+        }
+        __syncthreads();
+
+        for (unsigned int idx = tid; idx < q_rows * hdim; idx += blockDim.x) {
+            const unsigned int row = idx / hdim;
+            const unsigned int local_head = row / q_tokens;
+            const unsigned int token = row - local_head * q_tokens;
+            const unsigned int head = kv_head * group + local_head_base + local_head;
+            const unsigned int global_q = global_q_base + token;
+            if (local_head_base + local_head < group && head < num_attention_heads && global_q < total_q) {
+                acc[idx] *= scalars[row * 3u + 2u];
+            }
+        }
+        __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+        if (warp < 8u) {
+            using namespace nvcuda;
+            const unsigned int n_off = warp * 16u;
+            for (unsigned int row_base = 0u; row_base < q_rows; row_base += 16u) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv_frag;
+                wmma::load_matrix_sync(pv_frag, acc + row_base * hdim + n_off, hdim, wmma::mem_row_major);
+#pragma unroll
+                for (unsigned int kk = 0u; kk < k_tile; kk += 16u) {
+                    const half* p_ptr = weights_half + row_base * k_tile + kk;
+                    const half* v_ptr = reinterpret_cast<const half*>(v_shared + kk * hdim + n_off);
+                    wmma::load_matrix_sync(p_frag, p_ptr, k_tile);
+                    wmma::load_matrix_sync(v_frag, v_ptr, hdim);
+                    wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+                }
+                wmma::store_matrix_sync(acc + row_base * hdim + n_off, pv_frag, hdim, wmma::mem_row_major);
+            }
+        }
+#endif
+        __syncthreads();
+    }
+
+    for (unsigned int idx = tid; idx < q_rows * hdim; idx += blockDim.x) {
+        const unsigned int row = idx / hdim;
+        const unsigned int dim = idx - row * hdim;
+        const unsigned int local_head = row / q_tokens;
+        const unsigned int token = row - local_head * q_tokens;
+        const unsigned int head = kv_head * group + local_head_base + local_head;
+        const unsigned int global_q = global_q_base + token;
+        if (local_head_base + local_head >= group || head >= num_attention_heads || global_q >= total_q) {
+            continue;
+        }
+        const float denom = fmaxf(scalars[row * 3u + 1u], 1.0e-20f);
+        output[(size_t(global_q) * num_attention_heads + head) * hdim + dim] = acc[idx] / denom;
+    }
+}
+
 extern "C" __global__ __cluster_dims__(2, 1, 1)
 void aegis_attention_prefill_dense_halfq_wmma_hdim128_cluster2(
     const unsigned short* __restrict__ key_cache,

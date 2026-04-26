@@ -126,6 +126,8 @@ pub fn run_generation_bench(
                 compute_capability,
                 prompt_tokens,
                 engine.graph.head_dim,
+                engine.graph.num_attention_heads,
+                engine.graph.num_kv_heads,
             );
             selection
                 .auto_target
@@ -136,6 +138,8 @@ pub fn run_generation_bench(
                 compute_capability,
                 prompt_tokens,
                 engine.graph.head_dim,
+                engine.graph.num_attention_heads,
+                engine.graph.num_kv_heads,
             );
             Some(selection.logical_backend.canonical_name().into())
         },
@@ -144,6 +148,8 @@ pub fn run_generation_bench(
                 compute_capability,
                 prompt_tokens,
                 engine.graph.head_dim,
+                engine.graph.num_attention_heads,
+                engine.graph.num_kv_heads,
             );
             Some(selection.effective_path.canonical_name().into())
         },
@@ -152,6 +158,8 @@ pub fn run_generation_bench(
                 compute_capability,
                 prompt_tokens,
                 engine.graph.head_dim,
+                engine.graph.num_attention_heads,
+                engine.graph.num_kv_heads,
             );
             Some(selection.reason.into())
         },

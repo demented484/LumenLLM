@@ -43,6 +43,7 @@ pub enum CudaAttentionEffectivePath {
     AegisDenseWarpTile,
     AegisDenseWmmaTile,
     AegisDenseWmmaFaPipeline,
+    AegisDenseWmmaGqa4,
     AegisDenseWmmaCluster2,
     AegisDenseWmmaPersistentQ32,
     AegisDenseWmmaSplitK,
@@ -82,12 +83,16 @@ impl CudaRuntimeConfig {
         compute_capability: Option<&str>,
         context_len: usize,
         head_dim: usize,
+        num_attention_heads: usize,
+        num_kv_heads: usize,
     ) -> CudaPrefillAttentionSelection {
         CudaPrefillAttentionSelection::select(
             self.prefill_attention,
             compute_capability,
             context_len,
             head_dim,
+            num_attention_heads,
+            num_kv_heads,
         )
     }
 }
@@ -161,6 +166,7 @@ impl CudaAttentionEffectivePath {
             Self::AegisDenseWarpTile => "aegis-varlen/dense-warp-tile",
             Self::AegisDenseWmmaTile => "aegis-varlen/dense-wmma-tile",
             Self::AegisDenseWmmaFaPipeline => "aegis-varlen/dense-wmma-fa-pipeline",
+            Self::AegisDenseWmmaGqa4 => "aegis-varlen/dense-wmma-gqa4",
             Self::AegisDenseWmmaCluster2 => "aegis-varlen/dense-wmma-cluster2",
             Self::AegisDenseWmmaPersistentQ32 => "aegis-varlen/dense-wmma-persistent-q32",
             Self::AegisDenseWmmaSplitK => "aegis-varlen/dense-wmma-split-k",
@@ -177,15 +183,23 @@ impl CudaPrefillAttentionSelection {
         compute_capability: Option<&str>,
         context_len: usize,
         head_dim: usize,
+        num_attention_heads: usize,
+        num_kv_heads: usize,
     ) -> Self {
         let legacy_shared_bytes = (context_len + 128) * std::mem::size_of::<f32>();
         let oversized_dense_scores = legacy_shared_bytes > 48 * 1024;
+        let gqa_group = if num_kv_heads == 0 {
+            1
+        } else {
+            num_attention_heads / num_kv_heads
+        };
         match requested {
             CudaPrefillAttentionKernel::Auto => {
                 let auto_target =
                     CudaAttentionBackend::auto_target_for_compute_capability(compute_capability);
                 let dense_warp_tile_eligible =
                     head_dim == 128 && context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT;
+                let dense_gqa4_eligible = dense_warp_tile_eligible && gqa_group >= 4;
                 let dense_split_k_experimental =
                     std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
                         && head_dim == 128
@@ -217,6 +231,12 @@ impl CudaPrefillAttentionSelection {
                         CudaAttentionBackend::AegisVarlen,
                         CudaAttentionEffectivePath::AegisDenseWmmaPersistentQ32,
                         "auto selected experimental q32 persistent dense WMMA-tiled prefill attention",
+                    )
+                } else if dense_gqa4_eligible {
+                    (
+                        CudaAttentionBackend::AegisVarlen,
+                        CudaAttentionEffectivePath::AegisDenseWmmaGqa4,
+                        "auto selected GQA4 fused Aegis FA-style dense WMMA-tiled prefill attention",
                     )
                 } else if dense_warp_tile_eligible {
                     (
@@ -304,10 +324,13 @@ impl CudaPrefillAttentionSelection {
                         && context_len >= 1024
                     {
                         CudaAttentionEffectivePath::AegisDenseWmmaCluster2
-                    } else if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_PERSISTENT_ATTENTION").is_some()
+                    } else if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_PERSISTENT_ATTENTION")
+                        .is_some()
                         && context_len >= 1024
                     {
                         CudaAttentionEffectivePath::AegisDenseWmmaPersistentQ32
+                    } else if gqa_group >= 4 {
+                        CudaAttentionEffectivePath::AegisDenseWmmaGqa4
                     } else {
                         CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline
                     }
@@ -424,6 +447,8 @@ mod tests {
             Some("12.0"),
             128,
             128,
+            32,
+            32,
         );
         assert_eq!(
             selection.auto_target,
@@ -443,11 +468,30 @@ mod tests {
             Some("12.0"),
             1024,
             128,
+            32,
+            32,
         );
         assert_eq!(selection.logical_backend, CudaAttentionBackend::AegisVarlen);
         assert_eq!(
             selection.effective_path,
             CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline
+        );
+    }
+
+    #[test]
+    fn auto_policy_reports_gqa_fused_path_for_grouped_query_models() {
+        let selection = CudaPrefillAttentionSelection::select(
+            CudaPrefillAttentionKernel::Auto,
+            Some("12.0"),
+            1024,
+            128,
+            32,
+            8,
+        );
+        assert_eq!(selection.logical_backend, CudaAttentionBackend::AegisVarlen);
+        assert_eq!(
+            selection.effective_path,
+            CudaAttentionEffectivePath::AegisDenseWmmaGqa4
         );
     }
 }

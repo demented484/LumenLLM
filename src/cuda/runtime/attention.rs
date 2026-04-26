@@ -49,6 +49,8 @@ const DENSE_WARP_TILE_Q_BLOCK: usize = 16;
 const DENSE_WARP_TILE_K_TILE: usize = 32;
 const DENSE_WMMA_Q_BLOCK: usize = 16;
 const DENSE_WMMA_FA_Q_BLOCK: usize = 16;
+const DENSE_WMMA_GQA4_Q_TOKENS: usize = 8;
+const DENSE_WMMA_GQA4_HEADS: usize = 4;
 const DENSE_WMMA_Q32_BLOCK: usize = 32;
 const DENSE_WMMA_K_TILE: usize = 32;
 const DENSE_WMMA_SPLIT_K_TOKENS: usize = 2048;
@@ -507,6 +509,18 @@ impl CudaRuntime {
                 )
             } else if dense_wmma_q32_enabled() && dense_metadata.context_len() >= 1024 {
                 self.attention_prefill_dense_halfq_wmma_hdim128_q32_device(
+                    key_cache,
+                    value_cache,
+                    query_half,
+                    start_position,
+                    batch,
+                    dense_metadata.context_len(),
+                    num_attention_heads,
+                    num_kv_heads,
+                    output,
+                )
+            } else if num_attention_heads / num_kv_heads >= DENSE_WMMA_GQA4_HEADS {
+                self.attention_prefill_dense_halfq_wmma_hdim128_gqa4_device(
                     key_cache,
                     value_cache,
                     query_half,
@@ -993,6 +1007,103 @@ impl CudaRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn attention_prefill_dense_halfq_wmma_hdim128_gqa4_device(
+        &self,
+        key_cache: &DeviceBuffer<u16>,
+        value_cache: &DeviceBuffer<u16>,
+        query_half: &DeviceBuffer<u16>,
+        start_position: usize,
+        batch: usize,
+        context_len: usize,
+        num_attention_heads: usize,
+        num_kv_heads: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let head_dim = 128usize;
+        let group = num_attention_heads / num_kv_heads;
+        if group < DENSE_WMMA_GQA4_HEADS {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense gqa4 wmma attention requires GQA group >= {}, got {group}",
+                DENSE_WMMA_GQA4_HEADS
+            )));
+        }
+        let group_tiles = group.div_ceil(DENSE_WMMA_GQA4_HEADS);
+        let q_rows = DENSE_WMMA_GQA4_Q_TOKENS * DENSE_WMMA_GQA4_HEADS;
+        let q_width = checked_len("dense gqa4 wmma q width", num_attention_heads, head_dim)?;
+        let q_tokens = checked_len("dense gqa4 wmma q tokens", batch, q_width)?;
+        let kv_width = checked_len("dense gqa4 wmma kv width", num_kv_heads, head_dim)?;
+        let cache_len = checked_len("dense gqa4 wmma kv cache", context_len, kv_width)?;
+        if query_half.len() < q_tokens || output.len() < q_tokens {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense gqa4 wmma attention q/output shape mismatch: query_half={} output={} required={}",
+                query_half.len(),
+                output.len(),
+                q_tokens
+            )));
+        }
+        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense gqa4 wmma attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
+                key_cache.len(),
+                value_cache.len(),
+                cache_len
+            )));
+        }
+        if num_attention_heads % num_kv_heads != 0 {
+            return Err(AegisError::InvalidPlan(
+                "dense gqa4 wmma attention heads must be divisible by kv heads".into(),
+            ));
+        }
+        let half_values =
+            q_rows * head_dim + 2 * DENSE_WMMA_K_TILE * head_dim + q_rows * DENSE_WMMA_K_TILE;
+        let float_values = q_rows * DENSE_WMMA_K_TILE + q_rows * head_dim + q_rows * 3;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                u32_arg(
+                    "dense gqa4 wmma kv/group blocks",
+                    checked_len("dense gqa4 wmma group blocks", num_kv_heads, group_tiles)?,
+                )?,
+                u32_arg(
+                    "dense gqa4 wmma q blocks",
+                    batch.div_ceil(DENSE_WMMA_GQA4_Q_TOKENS),
+                )?,
+                1,
+            ),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: validate_dynamic_shared_bytes(
+                "prefill_dense_halfq_wmma_hdim128_gqa4",
+                half_values * std::mem::size_of::<u16>()
+                    + float_values * std::mem::size_of::<f32>(),
+            )?,
+        };
+        let start_position = u32_arg("start_position", start_position)?;
+        let total_q = u32_arg("total_query_tokens", batch)?;
+        let context_len = u32_arg("context_len", context_len)?;
+        let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
+        let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
+        let head_dim = u32_arg("head_dim", head_dim)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.attention_prefill_dense_halfq_wmma_hdim128_gqa4)
+                .arg(&key_cache.slice)
+                .arg(&value_cache.slice)
+                .arg(&query_half.slice)
+                .arg(&start_position)
+                .arg(&total_q)
+                .arg(&context_len)
+                .arg(&num_attention_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err(
+            "launch dense gqa4 halfq wmma prefill attention",
+        ))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn attention_prefill_dense_halfq_wmma_hdim128_cluster2_device(
         &self,
         key_cache: &DeviceBuffer<u16>,
@@ -1007,17 +1118,9 @@ impl CudaRuntime {
     ) -> Result<()> {
         let head_dim = 128usize;
         let cluster_blocks = 2usize;
-        let q_width = checked_len(
-            "dense cluster2 wmma q width",
-            num_attention_heads,
-            head_dim,
-        )?;
+        let q_width = checked_len("dense cluster2 wmma q width", num_attention_heads, head_dim)?;
         let q_tokens = checked_len("dense cluster2 wmma q tokens", batch, q_width)?;
-        let kv_width = checked_len(
-            "dense cluster2 wmma kv width",
-            num_kv_heads,
-            head_dim,
-        )?;
+        let kv_width = checked_len("dense cluster2 wmma kv width", num_kv_heads, head_dim)?;
         let cache_len = checked_len("dense cluster2 wmma kv cache", context_len, kv_width)?;
         if query_half.len() < q_tokens || output.len() < q_tokens {
             return Err(AegisError::InvalidPlan(format!(
@@ -1048,8 +1151,7 @@ impl CudaRuntime {
             + DENSE_WMMA_FA_Q_BLOCK * 3;
         let shared_mem_bytes = validate_dynamic_shared_bytes(
             "prefill_dense_halfq_wmma_hdim128_cluster2",
-            half_values * std::mem::size_of::<u16>()
-                + float_values * std::mem::size_of::<f32>(),
+            half_values * std::mem::size_of::<u16>() + float_values * std::mem::size_of::<f32>(),
         )?;
         let start_position = u32_arg("start_position", start_position)?;
         let total_q = u32_arg("total_query_tokens", batch)?;
@@ -1162,11 +1264,7 @@ impl CudaRuntime {
         let head_dim = u32_arg("head_dim", head_dim)?;
         unsafe {
             self.stream
-                .launch_builder(
-                    &self
-                        .kernels
-                        .attention_prefill_dense_halfq_wmma_hdim128_q32,
-                )
+                .launch_builder(&self.kernels.attention_prefill_dense_halfq_wmma_hdim128_q32)
                 .arg(&key_cache.slice)
                 .arg(&value_cache.slice)
                 .arg(&query_half.slice)
@@ -1180,7 +1278,10 @@ impl CudaRuntime {
                 .launch(LaunchConfig {
                     grid_dim: (
                         num_attention_heads,
-                        u32_arg("dense q32 wmma q blocks", batch.div_ceil(DENSE_WMMA_Q32_BLOCK))?,
+                        u32_arg(
+                            "dense q32 wmma q blocks",
+                            batch.div_ceil(DENSE_WMMA_Q32_BLOCK),
+                        )?,
                         1,
                     ),
                     block_dim: (256, 1, 1),
@@ -1191,7 +1292,9 @@ impl CudaRuntime {
                     })?,
                 })
         }
-        .map_err(map_cuda_err("launch dense q32 halfq wmma prefill attention"))?;
+        .map_err(map_cuda_err(
+            "launch dense q32 halfq wmma prefill attention",
+        ))?;
         Ok(())
     }
 
