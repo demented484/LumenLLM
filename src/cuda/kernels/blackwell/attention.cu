@@ -1036,6 +1036,144 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_block4(
     }
 }
 
+extern "C" __global__ void aegis_attention_prefill_dense_halfq_warp_tile_hdim128(
+    const unsigned short* __restrict__ key_cache,
+    const unsigned short* __restrict__ value_cache,
+    const unsigned short* __restrict__ query,
+    const unsigned int start_position,
+    const unsigned int total_q,
+    const unsigned int context_len,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    float* __restrict__ output
+) {
+    constexpr unsigned int hdim = 128u;
+    constexpr unsigned int q_block = 16u;
+    constexpr unsigned int k_tile = 32u;
+    const unsigned int head = blockIdx.x;
+    const unsigned int global_q_base = blockIdx.y * q_block;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int nwarps = blockDim.x >> 5u;
+    if (head_dim != hdim || head >= num_attention_heads || warp >= q_block || nwarps < q_block) {
+        return;
+    }
+
+    const unsigned int global_q = global_q_base + warp;
+    const bool valid_q = global_q < total_q;
+    const unsigned int last_q_in_block = min(total_q, global_q_base + q_block) - 1u;
+    const unsigned int block_max_visible = global_q_base < total_q
+        ? min(context_len, start_position + last_q_in_block + 1u)
+        : 0u;
+    const unsigned int visible_len = valid_q
+        ? min(context_len, start_position + global_q + 1u)
+        : 0u;
+    if (block_max_visible == 0u) {
+        return;
+    }
+
+    extern __shared__ __align__(16) unsigned char smem[];
+    unsigned short* k_shared = reinterpret_cast<unsigned short*>(smem);
+    unsigned short* v_shared = k_shared + k_tile * hdim;
+
+    const unsigned int group = num_attention_heads / num_kv_heads;
+    const unsigned int kv_head = head / group;
+    const float scale = rsqrtf(float(hdim));
+
+    float q_frag[4];
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (unsigned int i = 0u; i < 4u; ++i) {
+        const unsigned int dim = lane + i * 32u;
+        q_frag[i] = valid_q
+            ? f16_bits_to_float(
+                query[(size_t(global_q) * num_attention_heads + head) * hdim + dim])
+            : 0.0f;
+    }
+    float running_m = -3.402823466e38f;
+    float running_l = 0.0f;
+
+    for (unsigned int tile_start = 0u; tile_start < block_max_visible; tile_start += k_tile) {
+        const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
+        for (unsigned int idx = tid; idx < k_tile * hdim; idx += blockDim.x) {
+            const unsigned int col = idx / hdim;
+            const unsigned int dim = idx - col * hdim;
+            const unsigned int pos = tile_start + col;
+            const bool valid_k = col < tile_count;
+            const size_t kv_offset =
+                (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
+            k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
+            v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
+        }
+        __syncthreads();
+
+        float scores[k_tile];
+        float tile_m = running_m;
+#pragma unroll
+        for (unsigned int col = 0u; col < k_tile; ++col) {
+            float dot = 0.0f;
+            if (valid_q && col < tile_count && tile_start + col < visible_len) {
+#pragma unroll
+                for (unsigned int i = 0u; i < 4u; ++i) {
+                    const unsigned int dim = lane + i * 32u;
+                    dot += q_frag[i] *
+                        f16_bits_to_float(k_shared[col * hdim + dim]);
+                }
+            }
+#pragma unroll
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1) {
+                dot += __shfl_down_sync(0xffffffffu, dot, offset);
+            }
+            float score = lane == 0u && valid_q && col < tile_count && tile_start + col < visible_len
+                ? dot * scale
+                : -3.402823466e38f;
+            score = __shfl_sync(0xffffffffu, score, 0);
+            scores[col] = score;
+            tile_m = fmaxf(tile_m, score);
+        }
+
+        float tile_l = 0.0f;
+        float weights[k_tile];
+#pragma unroll
+        for (unsigned int col = 0u; col < k_tile; ++col) {
+            const float weight = scores[col] > -3.0e38f
+                ? expf(scores[col] - tile_m)
+                : 0.0f;
+            weights[col] = weight;
+            tile_l += weight;
+        }
+        const float alpha = running_l > 0.0f ? expf(running_m - tile_m) : 0.0f;
+
+#pragma unroll
+        for (unsigned int i = 0u; i < 4u; ++i) {
+            float tile_acc = 0.0f;
+            const unsigned int dim = lane + i * 32u;
+#pragma unroll
+            for (unsigned int col = 0u; col < k_tile; ++col) {
+                tile_acc += weights[col] *
+                    f16_bits_to_float(v_shared[col * hdim + dim]);
+            }
+            acc[i] = acc[i] * alpha + tile_acc;
+        }
+        running_m = tile_m;
+        running_l = running_l * alpha + tile_l;
+        __syncthreads();
+    }
+
+    const float inv_l = running_l > 0.0f ? 1.0f / running_l : 0.0f;
+    if (!valid_q) {
+        return;
+    }
+    float* out = output + (size_t(global_q) * num_attention_heads + head) * hdim;
+#pragma unroll
+    for (unsigned int i = 0u; i < 4u; ++i) {
+        const unsigned int dim = lane + i * 32u;
+        out[dim] = acc[i] * inv_l;
+    }
+}
+
 extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4_split(
     const unsigned short* key_cache,
     const unsigned short* value_cache,

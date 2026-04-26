@@ -45,6 +45,8 @@ const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
 const FLASH_SPLIT_K_TOKENS: usize = 256;
 const FLASH_SPLIT_Q_BLOCK: usize = 4;
 const TILED_HALFQ_Q_BLOCK: usize = 4;
+const DENSE_WARP_TILE_Q_BLOCK: usize = 16;
+const DENSE_WARP_TILE_K_TILE: usize = 32;
 const FA4_HDIM128_Q_BLOCK: usize = 8;
 const FA4_HDIM128_K_TILE: usize = 32;
 const CUDA_ATTENTION_BLOCK_DIM: u32 = 128;
@@ -421,6 +423,42 @@ impl CudaRuntime {
             * std::mem::size_of::<f32>();
         if matches!(
             self.config.prefill_attention,
+            CudaPrefillAttentionKernel::Auto | CudaPrefillAttentionKernel::AegisVarlen
+        ) && head_dim == 128
+            && batch >= DENSE_WARP_TILE_Q_BLOCK
+        {
+            let q_len = checked_len(
+                "dense warp-tile query half conversion",
+                batch,
+                checked_len(
+                    "dense warp-tile query half width",
+                    num_attention_heads,
+                    head_dim,
+                )?,
+            )?;
+            if !query_half_ready {
+                self.f32_to_f16_device(query, q_len, query_half)?;
+            } else if query_half.len() < q_len {
+                return Err(AegisError::InvalidPlan(format!(
+                    "dense warp-tile q_half shape mismatch: required={} actual={}",
+                    q_len,
+                    query_half.len()
+                )));
+            }
+            return self.attention_prefill_dense_halfq_warp_tile_hdim128_device(
+                key_cache,
+                value_cache,
+                query_half,
+                start_position,
+                batch,
+                dense_metadata.context_len(),
+                num_attention_heads,
+                num_kv_heads,
+                output,
+            );
+        }
+        if matches!(
+            self.config.prefill_attention,
             CudaPrefillAttentionKernel::Auto
                 | CudaPrefillAttentionKernel::AegisVarlen
                 | CudaPrefillAttentionKernel::WarpFlash
@@ -614,6 +652,87 @@ impl CudaRuntime {
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch dense halfq varlen prefill attention"))?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_prefill_dense_halfq_warp_tile_hdim128_device(
+        &self,
+        key_cache: &DeviceBuffer<u16>,
+        value_cache: &DeviceBuffer<u16>,
+        query_half: &DeviceBuffer<u16>,
+        start_position: usize,
+        batch: usize,
+        context_len: usize,
+        num_attention_heads: usize,
+        num_kv_heads: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let head_dim = 128usize;
+        let q_width = checked_len("dense warp-tile q width", num_attention_heads, head_dim)?;
+        let q_tokens = checked_len("dense warp-tile q tokens", batch, q_width)?;
+        let kv_width = checked_len("dense warp-tile kv width", num_kv_heads, head_dim)?;
+        let cache_len = checked_len("dense warp-tile kv cache", context_len, kv_width)?;
+        if query_half.len() < q_tokens || output.len() < q_tokens {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense warp-tile attention q/output shape mismatch: query_half={} output={} required={}",
+                query_half.len(),
+                output.len(),
+                q_tokens
+            )));
+        }
+        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense warp-tile attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
+                key_cache.len(),
+                value_cache.len(),
+                cache_len
+            )));
+        }
+        if num_attention_heads % num_kv_heads != 0 {
+            return Err(AegisError::InvalidPlan(
+                "dense warp-tile attention heads must be divisible by kv heads".into(),
+            ));
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (
+                u32_arg("num_attention_heads", num_attention_heads)?,
+                u32_arg(
+                    "dense warp-tile q blocks",
+                    batch.div_ceil(DENSE_WARP_TILE_Q_BLOCK),
+                )?,
+                1,
+            ),
+            block_dim: (512, 1, 1),
+            shared_mem_bytes: validate_dynamic_shared_bytes(
+                "prefill_dense_halfq_warp_tile_hdim128",
+                DENSE_WARP_TILE_K_TILE * head_dim * 2 * std::mem::size_of::<u16>(),
+            )?,
+        };
+        let start_position = u32_arg("start_position", start_position)?;
+        let total_q = u32_arg("total_query_tokens", batch)?;
+        let context_len = u32_arg("context_len", context_len)?;
+        let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
+        let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
+        let head_dim = u32_arg("head_dim", head_dim)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.attention_prefill_dense_halfq_warp_tile_hdim128)
+                .arg(&key_cache.slice)
+                .arg(&value_cache.slice)
+                .arg(&query_half.slice)
+                .arg(&start_position)
+                .arg(&total_q)
+                .arg(&context_len)
+                .arg(&num_attention_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err(
+            "launch dense halfq warp-tile prefill attention",
+        ))?;
         Ok(())
     }
 
