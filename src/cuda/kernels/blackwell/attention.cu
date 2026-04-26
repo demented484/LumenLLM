@@ -1,6 +1,22 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 
+__device__ __forceinline__ float aegis_warp_reduce_max(float value) {
+#pragma unroll
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+    }
+    return value;
+}
+
+__device__ __forceinline__ float aegis_warp_reduce_sum(float value) {
+#pragma unroll
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
 extern "C" __global__ void aegis_attention_decode(
     const unsigned short* key_cache,
     const unsigned short* value_cache,
@@ -1222,6 +1238,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
     const unsigned int group = num_attention_heads / num_kv_heads;
     const unsigned int kv_head = head / group;
     const float scale = rsqrtf(float(hdim));
+    const float log2e = 1.4426950408889634f;
 
     for (unsigned int idx = tid; idx < q_block * hdim; idx += blockDim.x) {
         const unsigned int row = idx / hdim;
@@ -1274,38 +1291,33 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
 #endif
         __syncthreads();
 
-        for (unsigned int row = tid; row < q_block; row += blockDim.x) {
+        const unsigned int nwarps = blockDim.x >> 5u;
+        for (unsigned int row = warp; row < q_block; row += nwarps) {
             const unsigned int global_q = global_q_base + row;
             const bool valid_q = global_q < total_q;
             const unsigned int visible_len = valid_q
                 ? min(context_len, start_position + global_q + 1u)
                 : 0u;
-            float tile_m = scalars[row * 3u + 0u];
-#pragma unroll
-            for (unsigned int col = 0u; col < k_tile; ++col) {
-                const unsigned int pos = tile_start + col;
-                float score = (valid_q && col < tile_count && pos < visible_len)
-                    ? scores[row * k_tile + col] * scale
-                    : -3.402823466e38f;
-                scores[row * k_tile + col] = score;
-                tile_m = fmaxf(tile_m, score);
-            }
             const float old_m = scalars[row * 3u + 0u];
             const float old_l = scalars[row * 3u + 1u];
-            float tile_l = 0.0f;
-#pragma unroll
-            for (unsigned int col = 0u; col < k_tile; ++col) {
-                float weight = 0.0f;
-                if (scores[row * k_tile + col] > -3.0e38f) {
-                    weight = expf(scores[row * k_tile + col] - tile_m);
-                }
-                scores[row * k_tile + col] = weight;
-                tile_l += weight;
+            const unsigned int pos = tile_start + lane;
+            float score = (valid_q && lane < tile_count && pos < visible_len)
+                ? scores[row * k_tile + lane] * scale
+                : -3.402823466e38f;
+            const float tile_m = aegis_warp_reduce_max(score);
+            const float new_m = fmaxf(old_m, tile_m);
+            float weight = 0.0f;
+            if (score > -3.0e38f) {
+                weight = exp2f((score - new_m) * log2e);
             }
-            const float alpha = old_l > 0.0f ? expf(old_m - tile_m) : 0.0f;
-            scalars[row * 3u + 0u] = tile_m;
-            scalars[row * 3u + 1u] = old_l * alpha + tile_l;
-            scalars[row * 3u + 2u] = alpha;
+            scores[row * k_tile + lane] = weight;
+            const float tile_l = aegis_warp_reduce_sum(weight);
+            if (lane == 0u) {
+                const float alpha = old_l > 0.0f ? exp2f((old_m - new_m) * log2e) : 0.0f;
+                scalars[row * 3u + 0u] = new_m;
+                scalars[row * 3u + 1u] = old_l * alpha + tile_l;
+                scalars[row * 3u + 2u] = alpha;
+            }
         }
         __syncthreads();
 
