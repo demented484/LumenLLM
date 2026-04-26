@@ -4,6 +4,7 @@ use super::{CudaRuntime, map_cuda_err};
 use crate::cuda::{
     CudaAttentionBackend, CudaAttentionRequest, CudaAttentionSplitScratch,
     CudaPrefillAttentionKernel, DensePrefillMetadataProof, DeviceBuffer,
+    config::CUDA_PREFILL_VARLEN_MIN_CONTEXT,
 };
 use crate::error::{AegisError, Result};
 
@@ -120,7 +121,7 @@ impl CudaRuntime {
                     CudaAttentionBackend::FlashAttention2
                     | CudaAttentionBackend::FlashAttention3
                     | CudaAttentionBackend::FlashAttention4
-                        if context_len >= 512 =>
+                        if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
                     {
                         CudaAttentionBackend::AegisVarlen
                     }
@@ -439,32 +440,37 @@ impl CudaRuntime {
                 dense_metadata.context_len()
             )));
         }
-        let flash_varlen_min_context = 128;
         let selected_backend =
             self.select_prefill_attention_backend(dense_metadata.context_len())?;
         let use_varlen_attention = match selected_backend {
             CudaAttentionBackend::AegisVarlen => {
-                dense_metadata.context_len() >= flash_varlen_min_context
+                dense_metadata.context_len() >= CUDA_PREFILL_VARLEN_MIN_CONTEXT
             }
             CudaAttentionBackend::FlashAttention4 => {
-                dense_metadata.context_len() >= flash_varlen_min_context
+                dense_metadata.context_len() >= CUDA_PREFILL_VARLEN_MIN_CONTEXT
             }
-            CudaAttentionBackend::Reference | CudaAttentionBackend::Sdpa => false,
+            CudaAttentionBackend::Sdpa => {
+                dense_metadata.context_len() >= CUDA_PREFILL_VARLEN_MIN_CONTEXT
+            }
+            CudaAttentionBackend::Reference => false,
             CudaAttentionBackend::FlashAttention2 | CudaAttentionBackend::FlashAttention3 => {
                 unreachable!("FA2/FA3 should not be selected until their kernels are implemented")
             }
         };
         if use_varlen_attention {
-            let q_len = checked_len(
-                "dense varlen query half conversion",
-                batch,
-                checked_len(
-                    "dense varlen query half width",
-                    num_attention_heads,
-                    head_dim,
-                )?,
-            )?;
-            self.f32_to_f16_device(query, q_len, query_half)?;
+            let native_half_query = !matches!(selected_backend, CudaAttentionBackend::Sdpa);
+            if native_half_query {
+                let q_len = checked_len(
+                    "dense varlen query half conversion",
+                    batch,
+                    checked_len(
+                        "dense varlen query half width",
+                        num_attention_heads,
+                        head_dim,
+                    )?,
+                )?;
+                self.f32_to_f16_device(query, q_len, query_half)?;
+            }
             let block_table_stride = dense_metadata
                 .context_len()
                 .div_ceil(FLASH_COMPAT_PAGE_TOKENS)
@@ -473,7 +479,7 @@ impl CudaRuntime {
                 key_cache,
                 value_cache,
                 query,
-                Some(query_half),
+                native_half_query.then_some(query_half),
                 Some((split_acc, split_m, split_l)),
                 slot_mapping,
                 cu_q,

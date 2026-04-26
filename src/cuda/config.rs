@@ -1,5 +1,7 @@
 use crate::error::{AegisError, Result};
 
+pub(crate) const CUDA_PREFILL_VARLEN_MIN_CONTEXT: usize = 128;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CudaRuntimeConfig {
     pub native_mxfp4_repack: bool,
@@ -41,6 +43,7 @@ pub enum CudaAttentionEffectivePath {
     ReferenceContinuation,
     SdpaCacheOnly,
     SdpaOnline,
+    SdpaPagedVarlen,
     AegisPagedVarlen,
     FlashAttention4PagedVarlen,
     WarpFlash,
@@ -160,6 +163,7 @@ impl CudaAttentionEffectivePath {
             Self::ReferenceContinuation => "reference/continuation",
             Self::SdpaCacheOnly => "sdpa/cache-only",
             Self::SdpaOnline => "sdpa/online",
+            Self::SdpaPagedVarlen => "sdpa/paged-varlen",
             Self::AegisPagedVarlen => "aegis-varlen/paged-varlen",
             Self::FlashAttention4PagedVarlen => "fa4/paged-varlen",
             Self::WarpFlash => "warp-flash/cache-only",
@@ -181,14 +185,18 @@ impl CudaPrefillAttentionSelection {
                 let auto_target =
                     CudaAttentionBackend::auto_target_for_compute_capability(compute_capability);
                 let (logical_backend, effective_path, reason) = match auto_target {
-                    CudaAttentionBackend::FlashAttention4 if context_len >= 512 => (
-                        CudaAttentionBackend::AegisVarlen,
-                        CudaAttentionEffectivePath::AegisPagedVarlen,
-                        "auto selected Blackwell-class attention; using validated paged-varlen path until FA4 is promoted",
-                    ),
+                    CudaAttentionBackend::FlashAttention4
+                        if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
+                    {
+                        (
+                            CudaAttentionBackend::AegisVarlen,
+                            CudaAttentionEffectivePath::AegisPagedVarlen,
+                            "auto selected Blackwell-class attention; using validated paged-varlen path until FA4 is promoted",
+                        )
+                    }
                     CudaAttentionBackend::FlashAttention2
                     | CudaAttentionBackend::FlashAttention3
-                        if context_len >= 512 =>
+                        if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
                     {
                         (
                             CudaAttentionBackend::AegisVarlen,
@@ -230,12 +238,16 @@ impl CudaPrefillAttentionSelection {
                 requested,
                 auto_target: None,
                 logical_backend: CudaAttentionBackend::Sdpa,
-                effective_path: if oversized_dense_scores {
+                effective_path: if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT {
+                    CudaAttentionEffectivePath::SdpaPagedVarlen
+                } else if oversized_dense_scores {
                     CudaAttentionEffectivePath::SdpaOnline
                 } else {
                     CudaAttentionEffectivePath::SdpaCacheOnly
                 },
-                reason: if oversized_dense_scores {
+                reason: if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT {
+                    "sdpa requested with paged-varlen prefill for long context"
+                } else if oversized_dense_scores {
                     "sdpa requested with long context; using online softmax SDPA symbol"
                 } else {
                     "sdpa requested with cache-resident dense causal prefill"
@@ -359,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn sdpa_policy_names_dense_and_online_paths() {
+    fn sdpa_policy_names_dense_and_paged_paths() {
         let short = CudaPrefillAttentionSelection::select(
             CudaPrefillAttentionKernel::Sdpa,
             Some("12.0"),
@@ -375,11 +387,14 @@ mod tests {
         let long = CudaPrefillAttentionSelection::select(
             CudaPrefillAttentionKernel::Sdpa,
             Some("12.0"),
-            32768,
+            128,
             128,
         );
         assert_eq!(long.logical_backend, CudaAttentionBackend::Sdpa);
-        assert_eq!(long.effective_path, CudaAttentionEffectivePath::SdpaOnline);
+        assert_eq!(
+            long.effective_path,
+            CudaAttentionEffectivePath::SdpaPagedVarlen
+        );
     }
 
     #[test]
@@ -387,7 +402,7 @@ mod tests {
         let selection = CudaPrefillAttentionSelection::select(
             CudaPrefillAttentionKernel::Auto,
             Some("12.0"),
-            2048,
+            128,
             128,
         );
         assert_eq!(

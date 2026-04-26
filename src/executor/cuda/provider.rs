@@ -66,7 +66,7 @@ impl CudaExecutorProvider {
                 "CUDA fast prefill attention is disabled; the reference path is used".into()
             }
             CudaPrefillAttentionKernel::Sdpa => {
-                "CUDA prefill attention uses the portable SDPA path, preserving the dense exact path for short prompts and falling back to bounded-memory causal prefill for long prompts".into()
+                "CUDA prefill attention uses the portable SDPA path, preserving the dense exact path for short prompts and switching long prompts to paged-varlen prefill".into()
             }
             CudaPrefillAttentionKernel::FlashAttention2 => {
                 "CUDA prefill attention requests the FA2 backend for Ampere/Ada-class GPUs".into()

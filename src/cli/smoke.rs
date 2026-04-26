@@ -158,20 +158,25 @@ fn cuda_prefill_compare_one_chunk(config: EngineConfig, configured_chunk: usize)
     };
     let (chunk_outputs, attention_requested, attention_logical, attention_effective) = {
         let chunk_engine = AegisEngine::build(config)?;
+        let outputs = requests
+            .iter()
+            .map(|request| chunk_engine.generate(request.clone()))
+            .collect::<Result<Vec<_>>>()?;
         let compute_capability = chunk_engine
             .inventory
             .gpus
             .first()
             .and_then(|gpu| gpu.compute_capability.as_deref());
+        let selection_context_tokens = outputs
+            .iter()
+            .map(|output| output.prompt_tokens)
+            .max()
+            .unwrap_or(0);
         let selection = chunk_engine.cuda.prefill_attention_selection(
             compute_capability,
-            chunk_engine.placement.kv_cache.context_size,
+            selection_context_tokens,
             chunk_engine.graph.head_dim,
         );
-        let outputs = requests
-            .iter()
-            .map(|request| chunk_engine.generate(request.clone()))
-            .collect::<Result<Vec<_>>>()?;
         (
             outputs,
             selection.requested.canonical_name(),
