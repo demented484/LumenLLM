@@ -60,7 +60,25 @@ impl CudaExecutorProvider {
         };
         let attention_note = match cuda_config.prefill_attention {
             CudaPrefillAttentionKernel::Auto => {
-                "CUDA prefill attention is auto-selected; reference attention is used for short correctness-sensitive chunks and paged varlen FlashAttention is used for longer chunks".into()
+                "CUDA prefill attention is auto-selected from the architecture policy, with correctness-preserving fallback to reference or Aegis varlen paths until production FA kernels are available".into()
+            }
+            CudaPrefillAttentionKernel::Off => {
+                "CUDA fast prefill attention is disabled; the reference path is used".into()
+            }
+            CudaPrefillAttentionKernel::Sdpa => {
+                "CUDA prefill attention uses the SDPA selector; it currently routes to the reference baseline until the CUDA SDPA kernel lands".into()
+            }
+            CudaPrefillAttentionKernel::FlashAttention2 => {
+                "CUDA prefill attention requests the FA2 backend for Ampere/Ada-class GPUs".into()
+            }
+            CudaPrefillAttentionKernel::FlashAttention3 => {
+                "CUDA prefill attention requests the FA3 backend for Hopper-class GPUs".into()
+            }
+            CudaPrefillAttentionKernel::FlashAttention4 => {
+                "CUDA prefill attention requests the Blackwell FA4 backend".into()
+            }
+            CudaPrefillAttentionKernel::AegisVarlen => {
+                "CUDA prefill attention uses the Aegis paged-varlen online-softmax path".into()
             }
             CudaPrefillAttentionKernel::WarpFlash => {
                 "CUDA prefill attention prefers the warp cache-only kernel for eligible first chunks and falls back to bounded continuation otherwise".into()
@@ -70,12 +88,6 @@ impl CudaExecutorProvider {
             }
             CudaPrefillAttentionKernel::Continuation => {
                 "CUDA prefill attention uses the varlen continuation kernel with bounded shared memory".into()
-            }
-            CudaPrefillAttentionKernel::FlashVarlen => {
-                "CUDA prefill attention uses the paged varlen online-softmax FlashAttention path".into()
-            }
-            CudaPrefillAttentionKernel::FlashAttention4 => {
-                "CUDA prefill attention uses the Blackwell FA4-style tiled paged-varlen path".into()
             }
         };
         Ok(Self {

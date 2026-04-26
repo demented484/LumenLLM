@@ -12,6 +12,38 @@ pub struct DeviceBuffer<T> {
 }
 
 #[derive(Debug)]
+pub struct CudaAttentionSplitScratch<'a> {
+    pub acc: &'a mut DeviceBuffer<f32>,
+    pub m: &'a mut DeviceBuffer<f32>,
+    pub l: &'a mut DeviceBuffer<f32>,
+}
+
+#[derive(Debug)]
+pub struct CudaAttentionRequest<'a> {
+    pub q: &'a DeviceBuffer<f32>,
+    pub q_half: Option<&'a DeviceBuffer<u16>>,
+    pub k_cache: &'a DeviceBuffer<u16>,
+    pub v_cache: &'a DeviceBuffer<u16>,
+    pub cu_q: &'a DeviceBuffer<u32>,
+    pub cu_k: &'a DeviceBuffer<u32>,
+    pub context_lens: &'a DeviceBuffer<u32>,
+    pub slot_mapping: &'a DeviceBuffer<u32>,
+    pub block_tables: &'a DeviceBuffer<u32>,
+    pub split_scratch: Option<CudaAttentionSplitScratch<'a>>,
+    pub output: &'a mut DeviceBuffer<f32>,
+    pub num_sequences: usize,
+    pub num_prefill_tokens: usize,
+    pub num_decode_tokens: usize,
+    pub max_q: usize,
+    pub max_k: usize,
+    pub block_table_stride: usize,
+    pub head_dim: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub causal: bool,
+}
+
+#[derive(Debug)]
 pub struct DeviceNvfp4Linear {
     pub name: String,
     pub rows: usize,

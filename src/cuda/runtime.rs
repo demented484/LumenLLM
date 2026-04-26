@@ -5,6 +5,7 @@ use cudarc::driver::{CudaContext, CudaStream};
 use super::config::CudaRuntimeConfig;
 use super::functions::CudaKernelFunctions;
 use crate::error::{AegisError, Result};
+use crate::hardware::HardwareInventory;
 
 mod attention;
 mod blackwell;
@@ -21,6 +22,7 @@ mod sampling;
 #[derive(Debug)]
 pub struct CudaRuntime {
     device_index: usize,
+    compute_capability: Option<String>,
     config: CudaRuntimeConfig,
     pub(super) stream: Arc<CudaStream>,
     kernels: CudaKernelFunctions,
@@ -36,9 +38,15 @@ impl CudaRuntime {
             CudaContext::new(device_index).map_err(map_cuda_err("create cuda context"))?;
         let stream = context.default_stream();
         let kernels = CudaKernelFunctions::load(&context, device_index)?;
+        let compute_capability = HardwareInventory::detect()
+            .gpus
+            .iter()
+            .find(|gpu| gpu.index == device_index)
+            .and_then(|gpu| gpu.compute_capability.clone());
 
         Ok(Self {
             device_index,
+            compute_capability,
             config,
             stream,
             kernels,
@@ -51,6 +59,10 @@ impl CudaRuntime {
 
     pub fn config(&self) -> CudaRuntimeConfig {
         self.config
+    }
+
+    pub fn compute_capability(&self) -> Option<&str> {
+        self.compute_capability.as_deref()
     }
 
     pub fn synchronize(&self) -> Result<()> {

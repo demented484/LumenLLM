@@ -1,9 +1,11 @@
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use super::{CudaRuntime, map_cuda_err};
-use crate::cuda::{CudaPrefillAttentionKernel, DensePrefillMetadataProof, DeviceBuffer};
+use crate::cuda::{
+    CudaAttentionBackend, CudaAttentionRequest, CudaAttentionSplitScratch,
+    CudaPrefillAttentionKernel, DensePrefillMetadataProof, DeviceBuffer,
+};
 use crate::error::{AegisError, Result};
-use crate::hardware::HardwareInventory;
 
 fn u32_arg(name: &str, value: usize) -> Result<u32> {
     u32::try_from(value).map_err(|_| {
@@ -33,16 +35,56 @@ const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
 const FLASH_SPLIT_K_TOKENS: usize = 256;
 const FLASH_SPLIT_Q_BLOCK: usize = 4;
 
-fn is_blackwell_device(device_index: usize) -> bool {
-    HardwareInventory::detect()
-        .gpus
-        .iter()
-        .find(|gpu| gpu.index == device_index)
-        .and_then(|gpu| gpu.compute_capability.as_deref())
-        .is_some_and(|compute_capability| compute_capability.starts_with("12."))
-}
-
 impl CudaRuntime {
+    fn select_prefill_attention_backend(&self, context_len: usize) -> Result<CudaAttentionBackend> {
+        match self.config.prefill_attention {
+            CudaPrefillAttentionKernel::Auto => {
+                let target = CudaAttentionBackend::auto_target_for_compute_capability(
+                    self.compute_capability(),
+                );
+                Ok(match target {
+                    // Production FA2/FA3/FA4 kernels are separate future backends. Until they
+                    // pass correctness and throughput gates, auto falls back to the fastest
+                    // available Aegis implementation for long prefixes and reference for short ones.
+                    CudaAttentionBackend::FlashAttention2
+                    | CudaAttentionBackend::FlashAttention3
+                    | CudaAttentionBackend::FlashAttention4
+                        if context_len >= 512 =>
+                    {
+                        CudaAttentionBackend::AegisVarlen
+                    }
+                    _ => CudaAttentionBackend::Reference,
+                })
+            }
+            CudaPrefillAttentionKernel::Off | CudaPrefillAttentionKernel::Reference => {
+                Ok(CudaAttentionBackend::Reference)
+            }
+            CudaPrefillAttentionKernel::Sdpa => Ok(CudaAttentionBackend::Sdpa),
+            CudaPrefillAttentionKernel::FlashAttention2 => Err(AegisError::Unsupported(
+                "cuda.prefill-attention=fa2 is reserved for the production Ampere/Ada FA2 backend; use aegis-varlen, sdpa, off, or auto until that kernel lands".into(),
+            )),
+            CudaPrefillAttentionKernel::FlashAttention3 => Err(AegisError::Unsupported(
+                "cuda.prefill-attention=fa3 is reserved for the production Hopper FA3 backend; use aegis-varlen, sdpa, off, or auto until that kernel lands".into(),
+            )),
+            CudaPrefillAttentionKernel::FlashAttention4 => {
+                if !self
+                    .compute_capability()
+                    .is_some_and(|compute_capability| compute_capability.starts_with("12."))
+                {
+                    return Err(AegisError::Unsupported(format!(
+                        "cuda.prefill-attention=fa4 requires a Blackwell/SM12.x CUDA device; device {} is not reported as Blackwell",
+                        self.device_index
+                    )));
+                }
+                Ok(CudaAttentionBackend::FlashAttention4)
+            }
+            CudaPrefillAttentionKernel::AegisVarlen => Ok(CudaAttentionBackend::AegisVarlen),
+            CudaPrefillAttentionKernel::WarpFlash | CudaPrefillAttentionKernel::Continuation => {
+                Ok(CudaAttentionBackend::Reference)
+            }
+        }
+    }
+
     pub fn attention_decode_device(
         &self,
         key_cache: &DeviceBuffer<u16>,
@@ -184,17 +226,23 @@ impl CudaRuntime {
         let warp_eligible = start_position == 0 && head_dim % 32 == 0 && head_dim <= 256;
         let warp_parallel = match self.config.prefill_attention {
             CudaPrefillAttentionKernel::Auto => false,
+            CudaPrefillAttentionKernel::Off => false,
+            CudaPrefillAttentionKernel::Sdpa => false,
+            CudaPrefillAttentionKernel::FlashAttention2 => false,
+            CudaPrefillAttentionKernel::FlashAttention3 => false,
             CudaPrefillAttentionKernel::WarpFlash => warp_eligible,
             CudaPrefillAttentionKernel::Reference => false,
             CudaPrefillAttentionKernel::Continuation => false,
-            CudaPrefillAttentionKernel::FlashVarlen => false,
+            CudaPrefillAttentionKernel::AegisVarlen => false,
             CudaPrefillAttentionKernel::FlashAttention4 => false,
         };
         let block_dim = if warp_parallel { 128 } else { 128 };
         let legacy_shared_bytes = (max_seq_len + block_dim as usize) * std::mem::size_of::<f32>();
         if matches!(
             self.config.prefill_attention,
-            CudaPrefillAttentionKernel::Reference
+            CudaPrefillAttentionKernel::Off
+                | CudaPrefillAttentionKernel::Reference
+                | CudaPrefillAttentionKernel::Sdpa
         ) && legacy_shared_bytes > 48 * 1024
         {
             return Err(AegisError::InvalidPlan(format!(
@@ -207,7 +255,9 @@ impl CudaRuntime {
             CudaPrefillAttentionKernel::Continuation
         ) || (!matches!(
             self.config.prefill_attention,
-            CudaPrefillAttentionKernel::Reference
+            CudaPrefillAttentionKernel::Off
+                | CudaPrefillAttentionKernel::Reference
+                | CudaPrefillAttentionKernel::Sdpa
         ) && !warp_parallel
             && legacy_shared_bytes > 48 * 1024);
         let cfg = LaunchConfig {
@@ -321,22 +371,21 @@ impl CudaRuntime {
             )));
         }
         let flash_varlen_min_context = 128;
-        let auto_flash_varlen_min_context = 512;
-        let use_flash_varlen = match self.config.prefill_attention {
-            CudaPrefillAttentionKernel::FlashVarlen => {
+        let selected_backend =
+            self.select_prefill_attention_backend(dense_metadata.context_len())?;
+        let use_varlen_attention = match selected_backend {
+            CudaAttentionBackend::AegisVarlen => {
                 dense_metadata.context_len() >= flash_varlen_min_context
             }
-            CudaPrefillAttentionKernel::Auto => {
-                dense_metadata.context_len() >= auto_flash_varlen_min_context
-            }
-            CudaPrefillAttentionKernel::FlashAttention4 => {
+            CudaAttentionBackend::FlashAttention4 => {
                 dense_metadata.context_len() >= flash_varlen_min_context
             }
-            CudaPrefillAttentionKernel::Reference
-            | CudaPrefillAttentionKernel::WarpFlash
-            | CudaPrefillAttentionKernel::Continuation => false,
+            CudaAttentionBackend::Reference | CudaAttentionBackend::Sdpa => false,
+            CudaAttentionBackend::FlashAttention2 | CudaAttentionBackend::FlashAttention3 => {
+                unreachable!("FA2/FA3 should not be selected until their kernels are implemented")
+            }
         };
-        if use_flash_varlen {
+        if use_varlen_attention {
             let q_len = checked_len(
                 "dense varlen query half conversion",
                 batch,
@@ -396,7 +445,7 @@ impl CudaRuntime {
         value_cache: &DeviceBuffer<u16>,
         query: &DeviceBuffer<f32>,
         query_half: Option<&DeviceBuffer<u16>>,
-        mut split_scratch: Option<(
+        split_scratch: Option<(
             &mut DeviceBuffer<f32>,
             &mut DeviceBuffer<f32>,
             &mut DeviceBuffer<f32>,
@@ -417,6 +466,59 @@ impl CudaRuntime {
         head_dim: usize,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
+        let mut request = CudaAttentionRequest {
+            q: query,
+            q_half: query_half,
+            k_cache: key_cache,
+            v_cache: value_cache,
+            cu_q,
+            cu_k,
+            context_lens,
+            slot_mapping,
+            block_tables,
+            split_scratch: split_scratch.map(|(acc, m, l)| CudaAttentionSplitScratch { acc, m, l }),
+            output,
+            num_sequences,
+            num_prefill_tokens,
+            num_decode_tokens,
+            max_q,
+            max_k,
+            block_table_stride,
+            head_dim,
+            num_q_heads: num_attention_heads,
+            num_kv_heads,
+            causal: true,
+        };
+        self.attention_prefill_request_device(&mut request)
+    }
+
+    pub fn attention_prefill_request_device(
+        &self,
+        request: &mut CudaAttentionRequest<'_>,
+    ) -> Result<()> {
+        let key_cache = request.k_cache;
+        let value_cache = request.v_cache;
+        let query = request.q;
+        let query_half = request.q_half;
+        let slot_mapping = request.slot_mapping;
+        let cu_q = request.cu_q;
+        let cu_k = request.cu_k;
+        let context_lens = request.context_lens;
+        let block_tables = request.block_tables;
+        let num_sequences = request.num_sequences;
+        let num_prefill_tokens = request.num_prefill_tokens;
+        let num_decode_tokens = request.num_decode_tokens;
+        let max_q = request.max_q;
+        let max_k = request.max_k;
+        let block_table_stride = request.block_table_stride;
+        let num_attention_heads = request.num_q_heads;
+        let num_kv_heads = request.num_kv_heads;
+        let head_dim = request.head_dim;
+        if !request.causal {
+            return Err(AegisError::Unsupported(
+                "CUDA prefill attention ABI currently requires causal=true".into(),
+            ));
+        }
         if num_kv_heads == 0 || num_attention_heads == 0 || head_dim == 0 {
             return Err(AegisError::InvalidPlan(format!(
                 "paged varlen prefill dimensions must be non-zero: q_heads={} kv_heads={} head_dim={}",
@@ -458,7 +560,7 @@ impl CudaRuntime {
         let q_width = checked_len("paged varlen q width", num_attention_heads, head_dim)?;
         let _ = checked_len("paged varlen kv width", num_kv_heads, head_dim)?;
         let q_tokens = checked_len("paged varlen query tokens", num_prefill_tokens, q_width)?;
-        if output.len() < q_tokens
+        if request.output.len() < q_tokens
             || query
                 .len()
                 .max(query_half.map(|buffer| buffer.len()).unwrap_or(0))
@@ -487,6 +589,16 @@ impl CudaRuntime {
                 "paged varlen attention heads must be divisible by kv heads".into(),
             ));
         }
+        let selected_backend = self.select_prefill_attention_backend(max_k)?;
+        if !matches!(
+            selected_backend,
+            CudaAttentionBackend::AegisVarlen | CudaAttentionBackend::FlashAttention4
+        ) {
+            return Err(AegisError::InvalidPlan(format!(
+                "paged attention ABI was invoked for backend {}; expected aegis-varlen or fa4",
+                selected_backend.canonical_name()
+            )));
+        }
         let head_dim_usize = head_dim;
         let q_blocks_usize = num_prefill_tokens.div_ceil(FLASH_SPLIT_Q_BLOCK);
         let split_count_usize = max_k.div_ceil(FLASH_SPLIT_K_TOKENS).max(1);
@@ -498,30 +610,19 @@ impl CudaRuntime {
         let split_acc_len = split_rows
             .checked_mul(head_dim_usize)
             .ok_or_else(|| AegisError::InvalidPlan("split-K attention acc overflow".into()))?;
-        let split_scratch_ready = split_scratch.as_ref().is_some_and(|(acc, m, l)| {
-            acc.len() >= split_acc_len && m.len() >= split_rows && l.len() >= split_rows
+        let split_scratch_ready = request.split_scratch.as_ref().is_some_and(|scratch| {
+            scratch.acc.len() >= split_acc_len
+                && scratch.m.len() >= split_rows
+                && scratch.l.len() >= split_rows
         });
         let use_halfq_block4 = query_half.is_some()
             && num_sequences == 1
             && num_decode_tokens == 0
             && num_prefill_tokens >= 4
             && head_dim_usize <= 256;
-        let blackwell_device = is_blackwell_device(self.device_index);
         let use_fa4_tile16 = use_halfq_block4
             && head_dim_usize % 32 == 0
-            && match self.config.prefill_attention {
-                CudaPrefillAttentionKernel::FlashAttention4 => {
-                    if !blackwell_device {
-                        return Err(AegisError::Unsupported(format!(
-                            "cuda.prefill-attention=fa4 requires a Blackwell/SM12.x CUDA device; device {} is not reported as Blackwell",
-                            self.device_index
-                        )));
-                    }
-                    true
-                }
-                CudaPrefillAttentionKernel::Auto => false,
-                _ => false,
-            };
+            && matches!(selected_backend, CudaAttentionBackend::FlashAttention4);
         let use_halfq_block4_split = use_halfq_block4
             && !use_fa4_tile16
             && split_scratch_ready
@@ -586,7 +687,7 @@ impl CudaRuntime {
                     "split-K halfq attention requires query_half".into(),
                 ));
             };
-            let Some((split_acc, split_m, split_l)) = split_scratch.as_mut() else {
+            let Some(split_scratch) = request.split_scratch.as_mut() else {
                 return Err(AegisError::InvalidPlan(
                     "split-K halfq attention requires scratch buffers".into(),
                 ));
@@ -615,9 +716,9 @@ impl CudaRuntime {
                     .arg(&split_count)
                     .arg(&block_table_stride)
                     .arg(&physical_slots)
-                    .arg(&mut split_acc.slice)
-                    .arg(&mut split_m.slice)
-                    .arg(&mut split_l.slice)
+                    .arg(&mut split_scratch.acc.slice)
+                    .arg(&mut split_scratch.m.slice)
+                    .arg(&mut split_scratch.l.slice)
                     .launch(LaunchConfig {
                         grid_dim: (num_attention_heads, grid_q, split_count),
                         block_dim: (block_dim, 1, 1),
@@ -634,14 +735,14 @@ impl CudaRuntime {
                             .kernels
                             .attention_prefill_paged_varlen_halfq_block4_combine,
                     )
-                    .arg(&split_acc.slice)
-                    .arg(&split_m.slice)
-                    .arg(&split_l.slice)
+                    .arg(&split_scratch.acc.slice)
+                    .arg(&split_scratch.m.slice)
+                    .arg(&split_scratch.l.slice)
                     .arg(&total_q)
                     .arg(&num_attention_heads)
                     .arg(&head_dim)
                     .arg(&split_count)
-                    .arg(&mut output.slice)
+                    .arg(&mut request.output.slice)
                     .launch(LaunchConfig {
                         grid_dim: (num_attention_heads, grid_q, 1),
                         block_dim: (block_dim, 1, 1),
@@ -684,7 +785,7 @@ impl CudaRuntime {
                     .arg(&page_tokens)
                     .arg(&block_table_stride)
                     .arg(&physical_slots)
-                    .arg(&mut output.slice)
+                    .arg(&mut request.output.slice)
                     .launch(cfg)
             }
         } else {
@@ -711,7 +812,7 @@ impl CudaRuntime {
                     .arg(&page_tokens)
                     .arg(&block_table_stride)
                     .arg(&physical_slots)
-                    .arg(&mut output.slice)
+                    .arg(&mut request.output.slice)
                     .launch(cfg)
             }
         }
