@@ -36,6 +36,56 @@ const FLASH_SPLIT_K_TOKENS: usize = 256;
 const FLASH_SPLIT_Q_BLOCK: usize = 4;
 const FA4_HDIM128_Q_BLOCK: usize = 8;
 const FA4_HDIM128_K_TILE: usize = 32;
+const CUDA_ATTENTION_BLOCK_DIM: u32 = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillBatchedKernel {
+    CacheOnly,
+    Continuation,
+    Warp,
+}
+
+fn select_prefill_batched_kernel(
+    config: CudaPrefillAttentionKernel,
+    start_position: usize,
+    head_dim: usize,
+    legacy_shared_bytes: usize,
+) -> Result<PrefillBatchedKernel> {
+    let warp_eligible = start_position == 0 && head_dim % 32 == 0 && head_dim <= 256;
+    if matches!(config, CudaPrefillAttentionKernel::WarpFlash) && warp_eligible {
+        return Ok(PrefillBatchedKernel::Warp);
+    }
+    if matches!(config, CudaPrefillAttentionKernel::Sdpa) {
+        return Ok(if legacy_shared_bytes > 48 * 1024 {
+            PrefillBatchedKernel::Continuation
+        } else {
+            PrefillBatchedKernel::CacheOnly
+        });
+    }
+    if matches!(config, CudaPrefillAttentionKernel::Continuation) {
+        return Ok(PrefillBatchedKernel::Continuation);
+    }
+    if matches!(
+        config,
+        CudaPrefillAttentionKernel::Off | CudaPrefillAttentionKernel::Reference
+    ) && legacy_shared_bytes > 48 * 1024
+    {
+        return Err(AegisError::InvalidPlan(format!(
+            "CUDA reference prefill attention requires {} bytes of dynamic shared memory; use cuda.prefill-attention=sdpa, auto, or continuation for long prefixes",
+            legacy_shared_bytes
+        )));
+    }
+    if !matches!(
+        config,
+        CudaPrefillAttentionKernel::Off
+            | CudaPrefillAttentionKernel::Reference
+            | CudaPrefillAttentionKernel::Sdpa
+    ) && legacy_shared_bytes > 48 * 1024
+    {
+        return Ok(PrefillBatchedKernel::Continuation);
+    }
+    Ok(PrefillBatchedKernel::CacheOnly)
+}
 
 impl CudaRuntime {
     fn select_prefill_attention_backend(&self, context_len: usize) -> Result<CudaAttentionBackend> {
@@ -132,7 +182,7 @@ impl CudaRuntime {
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
-        let block_dim = 128u32;
+        let block_dim = CUDA_ATTENTION_BLOCK_DIM;
         let legacy_shared_bytes = seq_len as usize * std::mem::size_of::<f32>()
             + block_dim as usize * std::mem::size_of::<f32>();
         let streaming = legacy_shared_bytes > 48 * 1024;
@@ -225,43 +275,15 @@ impl CudaRuntime {
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
-        let warp_eligible = start_position == 0 && head_dim % 32 == 0 && head_dim <= 256;
-        let warp_parallel = match self.config.prefill_attention {
-            CudaPrefillAttentionKernel::Auto => false,
-            CudaPrefillAttentionKernel::Off => false,
-            CudaPrefillAttentionKernel::Sdpa => false,
-            CudaPrefillAttentionKernel::FlashAttention2 => false,
-            CudaPrefillAttentionKernel::FlashAttention3 => false,
-            CudaPrefillAttentionKernel::WarpFlash => warp_eligible,
-            CudaPrefillAttentionKernel::Reference => false,
-            CudaPrefillAttentionKernel::Continuation => false,
-            CudaPrefillAttentionKernel::AegisVarlen => false,
-            CudaPrefillAttentionKernel::FlashAttention4 => false,
-        };
-        let block_dim = if warp_parallel { 128 } else { 128 };
+        let block_dim = CUDA_ATTENTION_BLOCK_DIM;
         let legacy_shared_bytes = (max_seq_len + block_dim as usize) * std::mem::size_of::<f32>();
-        if matches!(
+        let selected_kernel = select_prefill_batched_kernel(
             self.config.prefill_attention,
-            CudaPrefillAttentionKernel::Off
-                | CudaPrefillAttentionKernel::Reference
-                | CudaPrefillAttentionKernel::Sdpa
-        ) && legacy_shared_bytes > 48 * 1024
-        {
-            return Err(AegisError::InvalidPlan(format!(
-                "CUDA reference prefill attention requires {} bytes of dynamic shared memory; use cuda.prefill-attention=auto or continuation for long prefixes",
-                legacy_shared_bytes
-            )));
-        }
-        let continuation = matches!(
-            self.config.prefill_attention,
-            CudaPrefillAttentionKernel::Continuation
-        ) || (!matches!(
-            self.config.prefill_attention,
-            CudaPrefillAttentionKernel::Off
-                | CudaPrefillAttentionKernel::Reference
-                | CudaPrefillAttentionKernel::Sdpa
-        ) && !warp_parallel
-            && legacy_shared_bytes > 48 * 1024);
+            start_position as usize,
+            head_dim as usize,
+            legacy_shared_bytes,
+        )?;
+        let continuation = matches!(selected_kernel, PrefillBatchedKernel::Continuation);
         let cfg = LaunchConfig {
             grid_dim: (num_attention_heads, batch, 1),
             block_dim: (block_dim, 1, 1),
@@ -272,8 +294,11 @@ impl CudaRuntime {
                     + block_dim as usize * std::mem::size_of::<f32>()) as u32
             },
         };
-        let cache_only = !continuation || warp_parallel;
-        let kernel = if warp_parallel {
+        let cache_only = matches!(
+            selected_kernel,
+            PrefillBatchedKernel::CacheOnly | PrefillBatchedKernel::Warp
+        );
+        let kernel = if matches!(selected_kernel, PrefillBatchedKernel::Warp) {
             &self.kernels.attention_prefill_batched_warp
         } else if continuation {
             &self.kernels.attention_prefill_continuation
@@ -835,5 +860,49 @@ impl CudaRuntime {
         }
         .map_err(map_cuda_err("launch paged varlen prefill attention"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PrefillBatchedKernel, select_prefill_batched_kernel};
+    use crate::cuda::CudaPrefillAttentionKernel;
+
+    #[test]
+    fn sdpa_prefill_uses_bounded_memory_kernel() {
+        assert_eq!(
+            select_prefill_batched_kernel(CudaPrefillAttentionKernel::Sdpa, 0, 128, 256 * 1024)
+                .unwrap(),
+            PrefillBatchedKernel::Continuation
+        );
+    }
+
+    #[test]
+    fn sdpa_prefill_keeps_dense_kernel_for_small_contexts() {
+        assert_eq!(
+            select_prefill_batched_kernel(CudaPrefillAttentionKernel::Sdpa, 0, 128, 1024).unwrap(),
+            PrefillBatchedKernel::CacheOnly
+        );
+    }
+
+    #[test]
+    fn reference_prefill_rejects_oversized_shared_memory() {
+        let error = select_prefill_batched_kernel(
+            CudaPrefillAttentionKernel::Reference,
+            0,
+            128,
+            256 * 1024,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cuda.prefill-attention=sdpa"));
+    }
+
+    #[test]
+    fn warp_flash_still_prefers_warp_kernel_when_eligible() {
+        assert_eq!(
+            select_prefill_batched_kernel(CudaPrefillAttentionKernel::WarpFlash, 0, 128, 1024)
+                .unwrap(),
+            PrefillBatchedKernel::Warp
+        );
     }
 }
