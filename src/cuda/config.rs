@@ -1,6 +1,7 @@
 use crate::error::{AegisError, Result};
 
 pub(crate) const CUDA_PREFILL_VARLEN_MIN_CONTEXT: usize = 128;
+pub(crate) const CUDA_PREFILL_CHUNK_MAX: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CudaRuntimeConfig {
@@ -177,7 +178,7 @@ impl CudaPrefillAttentionSelection {
                     (
                         CudaAttentionBackend::Reference,
                         CudaAttentionEffectivePath::WarpFlash,
-                        "auto selected warp-flash for first-prefill; continuation chunks fall back to paged-varlen or bounded reference as needed",
+                        "auto selected dense first-prefill warp specialization; continuation chunks fall back to paged-varlen or bounded reference as needed",
                     )
                 } else {
                     match auto_target {
@@ -242,8 +243,13 @@ impl CudaPrefillAttentionSelection {
                 requested,
                 auto_target: None,
                 logical_backend: CudaAttentionBackend::AegisVarlen,
-                effective_path: CudaAttentionEffectivePath::AegisPagedVarlen,
-                reason: "aegis paged-varlen requested explicitly",
+                effective_path: if head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores
+                {
+                    CudaAttentionEffectivePath::WarpFlash
+                } else {
+                    CudaAttentionEffectivePath::AegisPagedVarlen
+                },
+                reason: "aegis-varlen requested; dense identity first-prefill uses the warp specialization, paged batches use paged-varlen",
             },
             CudaPrefillAttentionKernel::WarpFlash => Self {
                 requested,
@@ -357,6 +363,21 @@ mod tests {
             Some(CudaAttentionBackend::FlashAttention4)
         );
         assert_eq!(selection.logical_backend, CudaAttentionBackend::Reference);
+        assert_eq!(
+            selection.effective_path,
+            CudaAttentionEffectivePath::WarpFlash
+        );
+    }
+
+    #[test]
+    fn explicit_varlen_reports_dense_first_prefill_specialization() {
+        let selection = CudaPrefillAttentionSelection::select(
+            CudaPrefillAttentionKernel::AegisVarlen,
+            Some("12.0"),
+            1024,
+            128,
+        );
+        assert_eq!(selection.logical_backend, CudaAttentionBackend::AegisVarlen);
         assert_eq!(
             selection.effective_path,
             CudaAttentionEffectivePath::WarpFlash

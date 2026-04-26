@@ -1,5 +1,5 @@
 use crate::backend::BackendKind;
-use crate::cuda::CudaRuntimeConfig;
+use crate::cuda::{CUDA_PREFILL_CHUNK_MAX, CudaRuntimeConfig};
 use crate::graph::ModelGraph;
 use crate::hardware::HardwareInventory;
 use crate::planning::placement::{
@@ -233,7 +233,10 @@ fn cuda_prefill_scratch_bytes(
     graph: &ModelGraph,
     cuda: CudaRuntimeConfig,
 ) -> Option<(usize, u64)> {
-    let chunk = cuda.prefill_chunk_size.unwrap_or(128).clamp(1, 2048);
+    let chunk = cuda
+        .prefill_chunk_size
+        .unwrap_or(128)
+        .clamp(1, CUDA_PREFILL_CHUNK_MAX);
     if chunk <= 1 {
         return None;
     }

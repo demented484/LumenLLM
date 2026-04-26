@@ -44,7 +44,7 @@ fn validate_dynamic_shared_bytes(kernel: &str, bytes: usize) -> Result<u32> {
 const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
 const FLASH_SPLIT_K_TOKENS: usize = 256;
 const FLASH_SPLIT_Q_BLOCK: usize = 4;
-const DENSE_HALFQ_Q_BLOCK: usize = 4;
+const TILED_HALFQ_Q_BLOCK: usize = 4;
 const FA4_HDIM128_Q_BLOCK: usize = 8;
 const FA4_HDIM128_K_TILE: usize = 32;
 const CUDA_ATTENTION_BLOCK_DIM: u32 = 128;
@@ -65,7 +65,9 @@ fn select_prefill_batched_kernel(
     let warp_eligible = start_position == 0 && head_dim % 32 == 0 && head_dim <= 256;
     if matches!(
         config,
-        CudaPrefillAttentionKernel::Auto | CudaPrefillAttentionKernel::WarpFlash
+        CudaPrefillAttentionKernel::Auto
+            | CudaPrefillAttentionKernel::AegisVarlen
+            | CudaPrefillAttentionKernel::WarpFlash
     ) && warp_eligible
     {
         return Ok(PrefillBatchedKernel::Warp);
@@ -419,7 +421,9 @@ impl CudaRuntime {
             * std::mem::size_of::<f32>();
         if matches!(
             self.config.prefill_attention,
-            CudaPrefillAttentionKernel::Auto | CudaPrefillAttentionKernel::WarpFlash
+            CudaPrefillAttentionKernel::Auto
+                | CudaPrefillAttentionKernel::AegisVarlen
+                | CudaPrefillAttentionKernel::WarpFlash
         ) && start_position == 0
             && head_dim % 32 == 0
             && head_dim <= 256
@@ -476,7 +480,7 @@ impl CudaRuntime {
                 && query_half_ready
                 && num_sequences == 1
                 && head_dim <= 256
-                && batch >= FLASH_SPLIT_Q_BLOCK
+                && batch >= TILED_HALFQ_Q_BLOCK
             {
                 return self.attention_prefill_dense_halfq_block4_device(
                     key_cache,
@@ -572,7 +576,7 @@ impl CudaRuntime {
                 "dense halfq attention heads must be divisible by kv heads".into(),
             ));
         }
-        let q_block = DENSE_HALFQ_Q_BLOCK;
+        let q_block = TILED_HALFQ_Q_BLOCK;
         let block_dim = 64_u32;
         let nwarps = (block_dim / 32) as usize;
         let shared_floats = q_block * nwarps + (q_block * 2 + 2) * head_dim + q_block * 4;
@@ -812,7 +816,7 @@ impl CudaRuntime {
             && num_decode_tokens == 0
             && head_dim_usize <= 256;
         let use_halfq_block4 =
-            use_halfq_single_sequence && num_prefill_tokens >= FLASH_SPLIT_Q_BLOCK;
+            use_halfq_single_sequence && num_prefill_tokens >= TILED_HALFQ_Q_BLOCK;
         let mut use_fa4_hdim128 = use_halfq_single_sequence
             && head_dim_usize == 128
             && matches!(selected_backend, CudaAttentionBackend::FlashAttention4);
@@ -855,7 +859,7 @@ impl CudaRuntime {
         let block_dim = if use_fa4_hdim128 {
             128_u32
         } else if use_halfq_block4 {
-            64_u32
+            128_u32
         } else {
             128_u32
         };
@@ -870,7 +874,11 @@ impl CudaRuntime {
                 + FA4_HDIM128_Q_BLOCK * 4
                 + FA4_HDIM128_K_TILE
         } else if use_halfq_block4 {
-            let q_block = FLASH_SPLIT_Q_BLOCK;
+            let q_block = if use_halfq_block4_split {
+                FLASH_SPLIT_Q_BLOCK
+            } else {
+                TILED_HALFQ_Q_BLOCK
+            };
             let nwarps = (block_dim / 32) as usize;
             q_block * nwarps + (q_block * 2 + 2) * head_dim_usize + q_block * 4
         } else {
@@ -881,8 +889,10 @@ impl CudaRuntime {
         }
         let grid_q = if use_fa4_hdim128 {
             total_q.div_ceil(FA4_HDIM128_Q_BLOCK as u32)
-        } else if use_halfq_block4 {
+        } else if use_halfq_block4_split {
             total_q.div_ceil(FLASH_SPLIT_Q_BLOCK as u32)
+        } else if use_halfq_block4 {
+            total_q.div_ceil(TILED_HALFQ_Q_BLOCK as u32)
         } else {
             total_q
         };
@@ -1059,6 +1069,15 @@ mod tests {
     fn warp_flash_still_prefers_warp_kernel_when_eligible() {
         assert_eq!(
             select_prefill_batched_kernel(CudaPrefillAttentionKernel::WarpFlash, 0, 128, 1024)
+                .unwrap(),
+            PrefillBatchedKernel::Warp
+        );
+    }
+
+    #[test]
+    fn varlen_first_prefill_uses_warp_specialization_when_dense() {
+        assert_eq!(
+            select_prefill_batched_kernel(CudaPrefillAttentionKernel::AegisVarlen, 0, 128, 1024)
                 .unwrap(),
             PrefillBatchedKernel::Warp
         );

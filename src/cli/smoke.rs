@@ -1,6 +1,7 @@
 use super::helpers::{
     deterministic_input, find_cuda_linear, first_cuda_nvfp4_region, resident_layout_for_region,
 };
+use crate::cuda::CUDA_PREFILL_CHUNK_MAX;
 use crate::engine::quality::run_quality_smoke;
 use crate::engine::{AegisEngine, EngineConfig};
 use crate::error::{AegisError, Result};
@@ -97,12 +98,30 @@ pub(super) fn quality_smoke(config: EngineConfig) -> Result<()> {
 }
 
 pub(super) fn cuda_prefill_compare(config: EngineConfig) -> Result<()> {
-    let configured_chunk = config.cuda.prefill_chunk_size.unwrap_or(128).clamp(1, 2048);
+    let configured_chunk = config
+        .cuda
+        .prefill_chunk_size
+        .unwrap_or(128)
+        .clamp(1, CUDA_PREFILL_CHUNK_MAX);
     cuda_prefill_compare_one_chunk(config, configured_chunk)
 }
 
 pub(super) fn cuda_prefill_sweep(config: EngineConfig) -> Result<()> {
-    let chunks = [1, 2, 3, 7, 8, 16, 31, 32, 64, 128, 512, 2048];
+    let chunks = [
+        1,
+        2,
+        3,
+        7,
+        8,
+        16,
+        31,
+        32,
+        64,
+        128,
+        512,
+        2048,
+        CUDA_PREFILL_CHUNK_MAX,
+    ];
     for chunk in chunks {
         let mut chunk_config = config.clone();
         chunk_config.cuda.prefill_chunk_size = Some(chunk);

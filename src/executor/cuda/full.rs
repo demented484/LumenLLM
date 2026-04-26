@@ -8,7 +8,7 @@ use super::state::{
     CudaLayerState, CudaLlamaExecutor, CudaLlamaState, CudaPrefillScratch, CudaScratch,
 };
 use crate::artifact::ModelArtifact;
-use crate::cuda::{CudaRuntime, CudaRuntimeConfig};
+use crate::cuda::{CUDA_PREFILL_CHUNK_MAX, CudaRuntime, CudaRuntimeConfig};
 use crate::error::{AegisError, Result};
 use crate::executor::tensors::require_tensor;
 use crate::graph::{ModelGraph, RegionId};
@@ -339,7 +339,10 @@ fn prefill_attention_split_scratch(
 }
 
 fn cuda_prefill_chunk_size(config: CudaRuntimeConfig) -> usize {
-    config.prefill_chunk_size.unwrap_or(128).clamp(1, 2048)
+    config
+        .prefill_chunk_size
+        .unwrap_or(128)
+        .clamp(1, CUDA_PREFILL_CHUNK_MAX)
 }
 
 struct CutlassPrefillScratchBytes {
