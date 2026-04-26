@@ -620,11 +620,21 @@ impl CudaRuntime {
             && num_decode_tokens == 0
             && num_prefill_tokens >= 4
             && head_dim_usize <= 256;
-        let use_fa4_tile16 = use_halfq_block4
-            && head_dim_usize % 32 == 0
+        let use_fa4_hdim128 = use_halfq_block4
+            && head_dim_usize == 128
             && matches!(selected_backend, CudaAttentionBackend::FlashAttention4);
+        if matches!(selected_backend, CudaAttentionBackend::FlashAttention4) && !use_fa4_hdim128 {
+            return Err(AegisError::Unsupported(format!(
+                "cuda.prefill-attention=fa4 currently supports only single-sequence causal prefill with q_half, paged f16 KV cache, head_dim=128, no decode tokens, and at least 4 prefill tokens; got seqs={} prefill={} decode={} head_dim={} q_half={}",
+                request.num_sequences,
+                request.num_prefill_tokens,
+                request.num_decode_tokens,
+                request.head_dim,
+                request.q_half.is_some()
+            )));
+        }
         let use_halfq_block4_split = use_halfq_block4
-            && !use_fa4_tile16
+            && !use_fa4_hdim128
             && split_scratch_ready
             && split_count_usize > 1
             && max_k >= 1024;
@@ -643,7 +653,7 @@ impl CudaRuntime {
             self.config.prefill_attention,
             CudaPrefillAttentionKernel::WarpFlash
         ) && warp_eligible;
-        let block_dim = if use_fa4_tile16 {
+        let block_dim = if use_fa4_hdim128 {
             128_u32
         } else if use_halfq_block4 {
             64_u32
@@ -652,7 +662,7 @@ impl CudaRuntime {
         };
         let mut shared_floats = if use_warp {
             (block_dim / 32) as usize * 3 + head_dim_usize + 4
-        } else if use_fa4_tile16 {
+        } else if use_fa4_hdim128 {
             let q_block = 4_usize;
             let k_tile = 16_usize;
             let nwarps = (block_dim / 32) as usize;
@@ -759,8 +769,8 @@ impl CudaRuntime {
         }
         if let Some(query_half) = query_half {
             let kernel = if use_halfq_block4 {
-                if use_fa4_tile16 {
-                    &self.kernels.attention_prefill_paged_varlen_fa4_tile16
+                if use_fa4_hdim128 {
+                    &self.kernels.attention_prefill_paged_varlen_fa4_hdim128
                 } else {
                     &self.kernels.attention_prefill_paged_varlen_halfq_block4
                 }
