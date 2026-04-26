@@ -1,13 +1,14 @@
-// Aegis-native FlashAttention-4 scaffold for the first Blackwell production slice.
+// Aegis-native FlashAttention-4 forward slice for Blackwell.
 //
 // Scope:
 // - SM12.x dispatch is enforced in Rust.
 // - f16 Q/K/V cache, f32 output.
 // - head_dim == 128, causal single-sequence prefill, paged KV, GQA.
 //
-// This intentionally keeps ownership at the Aegis C ABI boundary. It ports the
-// FA4 forward shape (Q tile x K tile, online softmax, paged KV indirection) but
-// does not yet use Blackwell tcgen05/TMA warp specialization.
+// This keeps ownership at the Aegis C ABI boundary. It follows the FA4 forward
+// shape (larger Q/K tiles, shared-memory K/V staging, online softmax, paged KV
+// indirection) without pulling in CuTeDSL/CUTLASS or PyTorch runtime pieces. The
+// remaining gap to true FA4 is tensor-memory tcgen05/TMA warp specialization.
 extern "C" __global__ void aegis_attention_prefill_paged_varlen_fa4_hdim128(
     const unsigned short* __restrict__ key_cache,
     const unsigned short* __restrict__ value_cache,
@@ -26,8 +27,8 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_fa4_hdim128(
     const unsigned int physical_slots,
     float* __restrict__ output
 ) {
-    constexpr unsigned int q_block = 4u;
-    constexpr unsigned int k_tile = 16u;
+    constexpr unsigned int q_block = 8u;
+    constexpr unsigned int k_tile = 32u;
     constexpr unsigned int hdim = 128u;
 
     const unsigned int head = blockIdx.x;
@@ -54,7 +55,6 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_fa4_hdim128(
     const unsigned int kv_head = head / group;
     const float scale = rsqrtf(float(hdim));
     const unsigned int* block_table = block_tables;
-    (void)block_table_stride;
 
     unsigned int visible_len[q_block];
     bool valid[q_block];
@@ -79,7 +79,6 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_fa4_hdim128(
     if (max_visible == 0u) {
         return;
     }
-
     extern __shared__ float shared[];
     float* partial = shared;                              // q_block * k_tile * nwarps
     float* weights = partial + q_block * k_tile * nwarps; // q_block * k_tile
@@ -88,6 +87,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_fa4_hdim128(
     float* v_shared = k_shared + k_tile * hdim;           // k_tile * hdim
     float* acc = v_shared + k_tile * hdim;                // q_block * hdim
     float* scalars = acc + q_block * hdim;                // q_block * 4
+    float* kv_valid = scalars + q_block * 4;              // k_tile
 
 #pragma unroll
     for (unsigned int row = 0u; row < q_block; ++row) {
@@ -122,9 +122,15 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_fa4_hdim128(
             const unsigned int pos = tile_start + col;
             const unsigned int logical_page = pos / page_tokens;
             const unsigned int page_offset = pos - logical_page * page_tokens;
-            const unsigned int physical_page = block_table[logical_page];
-            const unsigned int physical_slot = physical_page * page_tokens + page_offset;
-            if (physical_slot < physical_slots) {
+            const unsigned int physical_page =
+                block_table[size_t(0) * block_table_stride + logical_page];
+            const size_t physical_slot =
+                size_t(physical_page) * size_t(page_tokens) + size_t(page_offset);
+            const bool valid_slot = physical_slot < size_t(physical_slots);
+            if (dim == 0u) {
+                kv_valid[col] = valid_slot ? 1.0f : 0.0f;
+            }
+            if (valid_slot) {
                 const size_t kv_offset =
                     (size_t(physical_slot) * num_kv_heads + kv_head) * hdim + dim;
                 k_shared[col * hdim + dim] = f16_bits_to_float(key_cache[kv_offset]);
@@ -142,7 +148,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_fa4_hdim128(
             for (unsigned int col = 0u; col < k_tile; ++col) {
                 const unsigned int pos = tile_start + col;
                 float dot = 0.0f;
-                if (col < tile_count && valid[row] && pos < visible_len[row]) {
+                if (col < tile_count && kv_valid[col] > 0.5f && valid[row] && pos < visible_len[row]) {
                     for (unsigned int dim = tid; dim < hdim; dim += blockDim.x) {
                         dot += q_shared[row * hdim + dim] * k_shared[col * hdim + dim];
                     }
@@ -167,7 +173,7 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_fa4_hdim128(
             const unsigned int col = idx - row * k_tile;
             const unsigned int pos = tile_start + col;
             weights[idx] =
-                (col < tile_count && valid[row] && pos < visible_len[row])
+                (col < tile_count && kv_valid[col] > 0.5f && valid[row] && pos < visible_len[row])
                     ? sum * scale
                     : -3.402823466e38f;
         }

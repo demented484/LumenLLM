@@ -21,6 +21,7 @@ struct ServerMetrics {
     requests_total: u64,
     generation_requests_total: u64,
     generation_errors_total: u64,
+    generation_rejected_total: u64,
     prompt_tokens_total: u64,
     completion_tokens_total: u64,
     generation_latency_ms_total: f64,
@@ -56,6 +57,13 @@ impl ServerState {
             }
             None => metrics.generation_errors_total += 1,
         }
+    }
+
+    fn record_generation_rejected(&self) {
+        let mut metrics = self.metrics.borrow_mut();
+        metrics.generation_requests_total += 1;
+        metrics.generation_errors_total += 1;
+        metrics.generation_rejected_total += 1;
     }
 }
 
@@ -256,16 +264,8 @@ fn generate_http_response(
     state: &ServerState,
 ) -> (u16, serde_json::Value) {
     if !readiness.runnable {
-        return (
-            503,
-            serde_json::json!({
-                "error": {
-                    "message": "executor plan is not runnable yet",
-                    "type": "executor_not_ready",
-                    "executor": readiness_json(readiness)
-                }
-            }),
-        );
+        state.record_generation_rejected();
+        return executor_not_ready(readiness);
     }
     let parsed = match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(value) => value,
@@ -378,6 +378,7 @@ fn generate_anthropic_response(
     state: &ServerState,
 ) -> (u16, serde_json::Value) {
     if !readiness.runnable {
+        state.record_generation_rejected();
         return executor_not_ready(readiness);
     }
     let parsed = match serde_json::from_slice::<serde_json::Value>(body) {
@@ -439,6 +440,7 @@ fn generate_google_response(
     state: &ServerState,
 ) -> (u16, serde_json::Value) {
     if !readiness.runnable {
+        state.record_generation_rejected();
         return executor_not_ready(readiness);
     }
     let parsed = match serde_json::from_slice::<serde_json::Value>(body) {
@@ -671,11 +673,13 @@ mod tests {
             }),
         );
         state.record_generation(Instant::now(), None);
+        state.record_generation_rejected();
 
         let metrics = metrics_json(&state);
         assert_eq!(metrics["requests_total"], 1);
-        assert_eq!(metrics["generation_requests_total"], 2);
-        assert_eq!(metrics["generation_errors_total"], 1);
+        assert_eq!(metrics["generation_requests_total"], 3);
+        assert_eq!(metrics["generation_errors_total"], 2);
+        assert_eq!(metrics["generation_rejected_total"], 1);
         assert_eq!(metrics["prompt_tokens_total"], 7);
         assert_eq!(metrics["completion_tokens_total"], 3);
         assert!(metrics["generation_latency_ms_avg"].as_f64().unwrap() >= 0.0);
@@ -817,15 +821,20 @@ fn readiness_json(readiness: &ExecutorReadiness) -> serde_json::Value {
 
 fn metrics_json(state: &ServerState) -> serde_json::Value {
     let metrics = state.metrics.borrow();
-    let average_generation_latency_ms = if metrics.generation_requests_total == 0 {
+    let measured_generation_requests = metrics
+        .generation_requests_total
+        .saturating_sub(metrics.generation_rejected_total);
+    let average_generation_latency_ms = if measured_generation_requests == 0 {
         None
     } else {
-        Some(metrics.generation_latency_ms_total / metrics.generation_requests_total as f64)
+        Some(metrics.generation_latency_ms_total / measured_generation_requests as f64)
     };
     serde_json::json!({
         "requests_total": metrics.requests_total,
         "generation_requests_total": metrics.generation_requests_total,
         "generation_errors_total": metrics.generation_errors_total,
+        "generation_rejected_total": metrics.generation_rejected_total,
+        "generation_measured_requests_total": measured_generation_requests,
         "prompt_tokens_total": metrics.prompt_tokens_total,
         "completion_tokens_total": metrics.completion_tokens_total,
         "generation_latency_ms_total": metrics.generation_latency_ms_total,

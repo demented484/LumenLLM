@@ -34,6 +34,8 @@ fn checked_sum(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
 const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
 const FLASH_SPLIT_K_TOKENS: usize = 256;
 const FLASH_SPLIT_Q_BLOCK: usize = 4;
+const FA4_HDIM128_Q_BLOCK: usize = 8;
+const FA4_HDIM128_K_TILE: usize = 32;
 
 impl CudaRuntime {
     fn select_prefill_attention_backend(&self, context_len: usize) -> Result<CudaAttentionBackend> {
@@ -560,15 +562,19 @@ impl CudaRuntime {
         let q_width = checked_len("paged varlen q width", num_attention_heads, head_dim)?;
         let _ = checked_len("paged varlen kv width", num_kv_heads, head_dim)?;
         let q_tokens = checked_len("paged varlen query tokens", num_prefill_tokens, q_width)?;
-        if request.output.len() < q_tokens
-            || query
-                .len()
-                .max(query_half.map(|buffer| buffer.len()).unwrap_or(0))
-                < q_tokens
-        {
+        if request.output.len() < q_tokens || query.len() < q_tokens {
             return Err(AegisError::InvalidPlan(
                 "paged varlen prefill query/output shape mismatch".into(),
             ));
+        }
+        if let Some(query_half) = query_half
+            && query_half.len() < q_tokens
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "paged varlen prefill q_half shape mismatch: required={} actual={}",
+                q_tokens,
+                query_half.len()
+            )));
         }
         let kv_width = checked_len("paged varlen kv width", num_kv_heads, head_dim)?;
         let physical_slots = key_cache.len() / kv_width;
@@ -615,17 +621,17 @@ impl CudaRuntime {
                 && scratch.m.len() >= split_rows
                 && scratch.l.len() >= split_rows
         });
-        let use_halfq_block4 = query_half.is_some()
+        let use_halfq_single_sequence = query_half.is_some()
             && num_sequences == 1
             && num_decode_tokens == 0
-            && num_prefill_tokens >= 4
             && head_dim_usize <= 256;
-        let use_fa4_hdim128 = use_halfq_block4
+        let use_halfq_block4 = use_halfq_single_sequence && num_prefill_tokens >= 4;
+        let use_fa4_hdim128 = use_halfq_single_sequence
             && head_dim_usize == 128
             && matches!(selected_backend, CudaAttentionBackend::FlashAttention4);
         if matches!(selected_backend, CudaAttentionBackend::FlashAttention4) && !use_fa4_hdim128 {
             return Err(AegisError::Unsupported(format!(
-                "cuda.prefill-attention=fa4 currently supports only single-sequence causal prefill with q_half, paged f16 KV cache, head_dim=128, no decode tokens, and at least 4 prefill tokens; got seqs={} prefill={} decode={} head_dim={} q_half={}",
+                "cuda.prefill-attention=fa4 currently supports only single-sequence causal prefill with q_half, paged f16 KV cache, head_dim=128, and no decode tokens; got seqs={} prefill={} decode={} head_dim={} q_half={}",
                 request.num_sequences,
                 request.num_prefill_tokens,
                 request.num_decode_tokens,
@@ -663,14 +669,13 @@ impl CudaRuntime {
         let mut shared_floats = if use_warp {
             (block_dim / 32) as usize * 3 + head_dim_usize + 4
         } else if use_fa4_hdim128 {
-            let q_block = 4_usize;
-            let k_tile = 16_usize;
             let nwarps = (block_dim / 32) as usize;
-            q_block * k_tile * (nwarps + 1)
-                + q_block * head_dim_usize
-                + k_tile * head_dim_usize * 2
-                + q_block * head_dim_usize
-                + q_block * 4
+            FA4_HDIM128_Q_BLOCK * FA4_HDIM128_K_TILE * (nwarps + 1)
+                + FA4_HDIM128_Q_BLOCK * head_dim_usize
+                + FA4_HDIM128_K_TILE * head_dim_usize * 2
+                + FA4_HDIM128_Q_BLOCK * head_dim_usize
+                + FA4_HDIM128_Q_BLOCK * 4
+                + FA4_HDIM128_K_TILE
         } else if use_halfq_block4 {
             let q_block = 4_usize;
             let nwarps = (block_dim / 32) as usize;
@@ -678,10 +683,12 @@ impl CudaRuntime {
         } else {
             block_dim as usize + head_dim_usize + 4
         };
-        if query_half.is_some() && !use_halfq_block4 {
+        if query_half.is_some() && !use_halfq_block4 && !use_fa4_hdim128 {
             shared_floats += head_dim_usize;
         }
-        let grid_q = if use_halfq_block4 {
+        let grid_q = if use_fa4_hdim128 {
+            total_q.div_ceil(FA4_HDIM128_Q_BLOCK as u32)
+        } else if use_halfq_block4 {
             total_q.div_ceil(4)
         } else {
             total_q
