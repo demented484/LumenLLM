@@ -31,7 +31,3 @@ pub(super) fn swiglu_into(gate: &[f32], up: &[f32], out: &mut [f32]) -> Result<(
 fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
-
-pub(super) fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
-}

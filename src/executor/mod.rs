@@ -1,3 +1,4 @@
+mod attention;
 mod cpu;
 mod cuda;
 mod generation;
