@@ -1,3 +1,4 @@
+#include <cuda_fp16.h>
 #include <mma.h>
 
 extern "C" __global__ void aegis_attention_decode(
@@ -1213,8 +1214,10 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
     unsigned short* k_shared = q_shared + q_block * hdim;
     unsigned short* v_shared = k_shared + k_tile * hdim;
     float* scores = reinterpret_cast<float*>(v_shared + k_tile * hdim);
-    float* acc = scores + q_block * k_tile;
+    float* tile_acc = scores + q_block * k_tile;
+    float* acc = tile_acc + q_block * hdim;
     float* scalars = acc + q_block * hdim;
+    half* weights_half = reinterpret_cast<half*>(scalars + q_block * 3u);
 
     const unsigned int group = num_attention_heads / num_kv_heads;
     const unsigned int kv_head = head / group;
@@ -1306,20 +1309,38 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
         }
         __syncthreads();
 
+        for (unsigned int idx = tid; idx < q_block * k_tile; idx += blockDim.x) {
+            weights_half[idx] = __float2half_rn(scores[idx]);
+        }
+        __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+        if (warp < 8u) {
+            using namespace nvcuda;
+            const unsigned int n_off = warp * 16u;
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv_frag;
+            wmma::fill_fragment(pv_frag, 0.0f);
+#pragma unroll
+            for (unsigned int kk = 0u; kk < k_tile; kk += 16u) {
+                const half* p_ptr = weights_half + kk;
+                const half* v_ptr = reinterpret_cast<const half*>(v_shared + kk * hdim + n_off);
+                wmma::load_matrix_sync(p_frag, p_ptr, k_tile);
+                wmma::load_matrix_sync(v_frag, v_ptr, hdim);
+                wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+            }
+            wmma::store_matrix_sync(tile_acc + n_off, pv_frag, hdim, wmma::mem_row_major);
+        }
+#endif
+        __syncthreads();
+
         for (unsigned int idx = tid; idx < q_block * hdim; idx += blockDim.x) {
             const unsigned int row = idx / hdim;
-            const unsigned int dim = idx - row * hdim;
             const unsigned int global_q = global_q_base + row;
-            if (global_q >= total_q) {
-                continue;
+            if (global_q < total_q) {
+                acc[idx] = acc[idx] * scalars[row * 3u + 2u] + tile_acc[idx];
             }
-            float tile_acc = 0.0f;
-#pragma unroll
-            for (unsigned int col = 0u; col < k_tile; ++col) {
-                tile_acc += scores[row * k_tile + col] *
-                    f16_bits_to_float(v_shared[col * hdim + dim]);
-            }
-            acc[idx] = acc[idx] * scalars[row * 3u + 2u] + tile_acc;
         }
         __syncthreads();
     }

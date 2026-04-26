@@ -796,8 +796,11 @@ impl CudaRuntime {
                 "dense wmma attention heads must be divisible by kv heads".into(),
             ));
         }
-        let half_values = DENSE_WMMA_Q_BLOCK * head_dim + 2 * DENSE_WMMA_K_TILE * head_dim;
+        let half_values = DENSE_WMMA_Q_BLOCK * head_dim
+            + 2 * DENSE_WMMA_K_TILE * head_dim
+            + DENSE_WMMA_Q_BLOCK * DENSE_WMMA_K_TILE;
         let float_values = DENSE_WMMA_Q_BLOCK * DENSE_WMMA_K_TILE
+            + DENSE_WMMA_Q_BLOCK * head_dim
             + DENSE_WMMA_Q_BLOCK * head_dim
             + DENSE_WMMA_Q_BLOCK * 3;
         let cfg = LaunchConfig {
