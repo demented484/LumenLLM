@@ -44,6 +44,7 @@ pub enum CudaAttentionEffectivePath {
     AegisDenseWmmaTile,
     AegisDenseWmmaFaPipeline,
     AegisDenseWmmaGqa4,
+    AegisDenseWmmaGqa4SplitK,
     AegisDenseWmmaCluster2,
     AegisDenseWmmaPersistentQ32,
     AegisDenseWmmaSplitK,
@@ -167,6 +168,7 @@ impl CudaAttentionEffectivePath {
             Self::AegisDenseWmmaTile => "aegis-varlen/dense-wmma-tile",
             Self::AegisDenseWmmaFaPipeline => "aegis-varlen/dense-wmma-fa-pipeline",
             Self::AegisDenseWmmaGqa4 => "aegis-varlen/dense-wmma-gqa4",
+            Self::AegisDenseWmmaGqa4SplitK => "aegis-varlen/dense-wmma-gqa4-stream-k",
             Self::AegisDenseWmmaCluster2 => "aegis-varlen/dense-wmma-cluster2",
             Self::AegisDenseWmmaPersistentQ32 => "aegis-varlen/dense-wmma-persistent-q32",
             Self::AegisDenseWmmaSplitK => "aegis-varlen/dense-wmma-split-k",
@@ -215,11 +217,19 @@ impl CudaPrefillAttentionSelection {
                 let warp_eligible =
                     head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores;
                 let (logical_backend, effective_path, reason) = if dense_split_k_experimental {
-                    (
-                        CudaAttentionBackend::AegisVarlen,
-                        CudaAttentionEffectivePath::AegisDenseWmmaSplitK,
-                        "auto selected experimental split-K dense WMMA-tiled prefill attention",
-                    )
+                    if dense_gqa4_eligible {
+                        (
+                            CudaAttentionBackend::AegisVarlen,
+                            CudaAttentionEffectivePath::AegisDenseWmmaGqa4SplitK,
+                            "auto selected experimental GQA4 stream-K dense WMMA-tiled prefill attention",
+                        )
+                    } else {
+                        (
+                            CudaAttentionBackend::AegisVarlen,
+                            CudaAttentionEffectivePath::AegisDenseWmmaSplitK,
+                            "auto selected experimental split-K dense WMMA-tiled prefill attention",
+                        )
+                    }
                 } else if dense_cluster2_experimental {
                     (
                         CudaAttentionBackend::AegisVarlen,
@@ -318,7 +328,11 @@ impl CudaPrefillAttentionSelection {
                     if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
                         && context_len >= 4096
                     {
-                        CudaAttentionEffectivePath::AegisDenseWmmaSplitK
+                        if gqa_group >= 4 {
+                            CudaAttentionEffectivePath::AegisDenseWmmaGqa4SplitK
+                        } else {
+                            CudaAttentionEffectivePath::AegisDenseWmmaSplitK
+                        }
                     } else if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_CLUSTER_ATTENTION")
                         .is_some()
                         && context_len >= 1024
