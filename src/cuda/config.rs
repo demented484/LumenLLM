@@ -41,6 +41,7 @@ pub enum CudaAttentionEffectivePath {
     ReferenceCacheOnly,
     ReferenceContinuation,
     AegisDenseWarpTile,
+    AegisDenseWmmaTile,
     AegisPagedVarlen,
     FlashAttention4PagedVarlen,
     WarpFlash,
@@ -154,6 +155,7 @@ impl CudaAttentionEffectivePath {
             Self::ReferenceCacheOnly => "reference/cache-only",
             Self::ReferenceContinuation => "reference/continuation",
             Self::AegisDenseWarpTile => "aegis-varlen/dense-warp-tile",
+            Self::AegisDenseWmmaTile => "aegis-varlen/dense-wmma-tile",
             Self::AegisPagedVarlen => "aegis-varlen/paged-varlen",
             Self::FlashAttention4PagedVarlen => "fa4/paged-varlen",
             Self::WarpFlash => "warp-flash/cache-only",
@@ -181,8 +183,8 @@ impl CudaPrefillAttentionSelection {
                 let (logical_backend, effective_path, reason) = if dense_warp_tile_eligible {
                     (
                         CudaAttentionBackend::AegisVarlen,
-                        CudaAttentionEffectivePath::AegisDenseWarpTile,
-                        "auto selected Aegis dense warp-tiled prefill attention for head_dim=128",
+                        CudaAttentionEffectivePath::AegisDenseWmmaTile,
+                        "auto selected Aegis dense WMMA-tiled prefill attention for head_dim=128",
                     )
                 } else if warp_eligible {
                     (
@@ -255,13 +257,13 @@ impl CudaPrefillAttentionSelection {
                 logical_backend: CudaAttentionBackend::AegisVarlen,
                 effective_path: if head_dim == 128 && context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT
                 {
-                    CudaAttentionEffectivePath::AegisDenseWarpTile
+                    CudaAttentionEffectivePath::AegisDenseWmmaTile
                 } else if head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores {
                     CudaAttentionEffectivePath::WarpFlash
                 } else {
                     CudaAttentionEffectivePath::AegisPagedVarlen
                 },
-                reason: "aegis-varlen requested; dense identity head_dim=128 prefill uses warp-tiled online attention, paged batches use paged-varlen",
+                reason: "aegis-varlen requested; dense identity head_dim=128 prefill uses WMMA-tiled online attention, paged batches use paged-varlen",
             },
             CudaPrefillAttentionKernel::WarpFlash => Self {
                 requested,
@@ -377,7 +379,7 @@ mod tests {
         assert_eq!(selection.logical_backend, CudaAttentionBackend::AegisVarlen);
         assert_eq!(
             selection.effective_path,
-            CudaAttentionEffectivePath::AegisDenseWarpTile
+            CudaAttentionEffectivePath::AegisDenseWmmaTile
         );
     }
 
@@ -392,7 +394,7 @@ mod tests {
         assert_eq!(selection.logical_backend, CudaAttentionBackend::AegisVarlen);
         assert_eq!(
             selection.effective_path,
-            CudaAttentionEffectivePath::AegisDenseWarpTile
+            CudaAttentionEffectivePath::AegisDenseWmmaTile
         );
     }
 }
