@@ -122,6 +122,38 @@ impl CudaLayerBlockExecutor {
             .next()
             .map(|layer| layer.gate_proj.rows)
             .unwrap_or(self.hidden_size);
+        let max_cutlass_input = self.hidden_size.max(intermediate);
+        let cutlass_payload =
+            CudaRuntime::cutlass_nvfp4_activation_payload_bytes(1, max_cutlass_input)
+                .unwrap_or(1)
+                .max(1);
+        let cutlass_scales =
+            CudaRuntime::cutlass_nvfp4_activation_scale_bytes(1, max_cutlass_input)
+                .unwrap_or(1)
+                .max(1);
+        let cutlass_workspace = self
+            .layers
+            .values()
+            .flat_map(|layer| {
+                [
+                    &layer.q_proj,
+                    &layer.k_proj,
+                    &layer.v_proj,
+                    &layer.o_proj,
+                    &layer.gate_proj,
+                    &layer.up_proj,
+                    &layer.down_proj,
+                ]
+            })
+            .filter(|linear| self.runtime.cutlass_nvfp4_inference_enabled_for(linear))
+            .map(|linear| {
+                self.runtime
+                    .cutlass_nvfp4_workspace_bytes(1, linear.rows, linear.cols)
+            })
+            .try_fold(1usize, |max_bytes, bytes| {
+                bytes.map(|bytes| max_bytes.max(bytes))
+            })?
+            .max(1);
         Ok(CudaLayerBlockState {
             hidden: self.runtime.alloc_f32(self.hidden_size)?,
             layers: self
@@ -150,6 +182,9 @@ impl CudaLayerBlockExecutor {
                 mxfp4_intermediate: self
                     .runtime
                     .alloc_u8(CudaRuntime::mxfp4_vector_bytes(intermediate)?)?,
+                cutlass_payload: self.runtime.alloc_u8(cutlass_payload)?,
+                cutlass_scales: self.runtime.alloc_u8(cutlass_scales)?,
+                cutlass_workspace: self.runtime.alloc_u8(cutlass_workspace)?,
                 q: self
                     .runtime
                     .alloc_f32(self.num_attention_heads * self.head_dim)?,

@@ -59,8 +59,11 @@ impl CudaRuntime {
     }
 
     pub fn cutlass_nvfp4_inference_enabled_for(&self, linear: &DeviceNvfp4Linear) -> bool {
-        linear.kernel_family == KernelFamily::CudaCutlassFp4TensorCores
-            && linear.cutlass_nvfp4.is_some()
+        linear.cutlass_nvfp4.is_some()
+            && matches!(
+                linear.kernel_family,
+                KernelFamily::CudaCutlassFp4TensorCores | KernelFamily::CudaNativeFp4TensorCores
+            )
     }
 
     pub fn quantize_cutlass_nvfp4_activation_device(

@@ -95,14 +95,26 @@ pub(super) fn forward_attention_device(
         head_dim,
         &mut scratch.attn_context,
     )?;
-    matvec_nvfp4_device_with_scratch(
-        runtime,
-        &layer.o_proj,
-        &scratch.attn_context,
-        &mut scratch.quant_hidden,
-        &mut scratch.mxfp4_hidden,
-        &mut scratch.attn_out,
-    )?;
+    if runtime.cutlass_nvfp4_inference_enabled_for(&layer.o_proj) {
+        runtime.matmul_cutlass_nvfp4_prefill_device(
+            &layer.o_proj,
+            &scratch.attn_context,
+            1,
+            &mut scratch.cutlass_payload,
+            &mut scratch.cutlass_scales,
+            &mut scratch.cutlass_workspace,
+            &mut scratch.attn_out,
+        )?;
+    } else {
+        matvec_nvfp4_device_with_scratch(
+            runtime,
+            &layer.o_proj,
+            &scratch.attn_context,
+            &mut scratch.quant_hidden,
+            &mut scratch.mxfp4_hidden,
+            &mut scratch.attn_out,
+        )?;
+    }
     runtime.add_device(hidden, &scratch.attn_out, &mut scratch.residual)?;
     Ok(())
 }

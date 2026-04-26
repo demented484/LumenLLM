@@ -169,7 +169,7 @@ impl CudaWeightLoader<'_> {
             Nvfp4LinearSpec::from_tensors(prefix, weight, scales, input_scale, output_scale)?;
         let packed_host = loader.load_for_store(weight, store)?;
         let scales_host = loader.load_for_store(scales, store)?;
-        let native_mxfp4 = if self.should_repack_native_mxfp4(kernel_family) {
+        let native_mxfp4 = if self.should_repack_native_mxfp4(prefix, kernel_family) {
             if spec.cols % 64 != 0 {
                 return Err(AegisError::InvalidPlan(format!(
                     "native MXFP4 tensor-core layout for `{}` requires cols divisible by 64, got {}",
@@ -196,31 +196,32 @@ impl CudaWeightLoader<'_> {
         } else {
             None
         };
-        let cutlass_nvfp4 = if self.should_repack_cutlass_nvfp4(kernel_family, resident_layout) {
-            let repacked = cached_repack_nvfp4_to_cutlass_e2m1_ue4m3_host(
-                &artifact.root,
-                &spec,
-                weight,
-                scales,
-                packed_host.as_bytes(),
-                scales_host.as_bytes(),
-            )?;
-            Some(DeviceCutlassNvfp4Linear {
-                layout: repacked.layout,
-                payload_e2m1: self
-                    .runtime
-                    .stream
-                    .clone_htod(&repacked.payload_e2m1)
-                    .map_err(map_cuda_err("htod cutlass nvfp4 payload"))?,
-                scales_ue4m3: self
-                    .runtime
-                    .stream
-                    .clone_htod(&repacked.scales_ue4m3)
-                    .map_err(map_cuda_err("htod cutlass nvfp4 scales"))?,
-            })
-        } else {
-            None
-        };
+        let cutlass_nvfp4 =
+            if self.should_repack_cutlass_nvfp4(prefix, kernel_family, resident_layout) {
+                let repacked = cached_repack_nvfp4_to_cutlass_e2m1_ue4m3_host(
+                    &artifact.root,
+                    &spec,
+                    weight,
+                    scales,
+                    packed_host.as_bytes(),
+                    scales_host.as_bytes(),
+                )?;
+                Some(DeviceCutlassNvfp4Linear {
+                    layout: repacked.layout,
+                    payload_e2m1: self
+                        .runtime
+                        .stream
+                        .clone_htod(&repacked.payload_e2m1)
+                        .map_err(map_cuda_err("htod cutlass nvfp4 payload"))?,
+                    scales_ue4m3: self
+                        .runtime
+                        .stream
+                        .clone_htod(&repacked.scales_ue4m3)
+                        .map_err(map_cuda_err("htod cutlass nvfp4 scales"))?,
+                })
+            } else {
+                None
+            };
 
         Ok(DeviceNvfp4Linear {
             name: spec.name,
@@ -492,21 +493,32 @@ impl CudaWeightLoader<'_> {
         }
     }
 
-    fn should_repack_native_mxfp4(&self, kernel_family: KernelFamily) -> bool {
+    fn should_repack_native_mxfp4(&self, prefix: &str, kernel_family: KernelFamily) -> bool {
         kernel_family == KernelFamily::CudaNativeFp4TensorCores
             && self.runtime.config().native_mxfp4_repack
+            && !(self.runtime.config().cutlass_nvfp4_repack
+                && native_layout_cutlass_prefill_sidecar(prefix))
     }
 
     fn should_repack_cutlass_nvfp4(
         &self,
+        prefix: &str,
         kernel_family: KernelFamily,
         resident_layout: LinearResidentLayout,
     ) -> bool {
         resident_layout == LinearResidentLayout::CudaR4fE2m1Ue4m3
             || kernel_family == KernelFamily::CudaCutlassFp4TensorCores
             || (kernel_family == KernelFamily::CudaNativeFp4TensorCores
-                && self.runtime.config().cutlass_nvfp4_repack)
+                && self.runtime.config().cutlass_nvfp4_repack
+                && native_layout_cutlass_prefill_sidecar(prefix))
     }
+}
+
+fn native_layout_cutlass_prefill_sidecar(prefix: &str) -> bool {
+    prefix.ends_with(".self_attn.o_proj")
+        || prefix.ends_with(".mlp.gate_proj")
+        || prefix.ends_with(".mlp.up_proj")
+        || prefix.ends_with(".mlp.down_proj")
 }
 
 fn read_scalar_f32_with_loader(

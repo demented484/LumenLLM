@@ -284,32 +284,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     )?;
 
     let mlp_start = Instant::now();
-    if prefill_linear_native_mxfp4_enabled(runtime, &layer.gate_proj)
-        && prefill_linear_native_mxfp4_enabled(runtime, &layer.up_proj)
-    {
-        runtime.rms_norm_batched_device(
-            &prefill.residual,
-            &layer.post_attention_norm_weight,
-            params.batch,
-            params.rms_norm_eps,
-            &mut prefill.post_normed,
-        )?;
-        runtime.quantize_mxfp4_input_batched_device(
-            &prefill.post_normed,
-            params.batch,
-            layer.gate_proj.cols,
-            &mut prefill.mxfp4_hidden,
-        )?;
-        prefill_gate_up_mxfp4_native_device(
-            runtime,
-            &layer.gate_proj,
-            &layer.up_proj,
-            &prefill.mxfp4_hidden,
-            params.batch,
-            &mut prefill.gate,
-            &mut prefill.up,
-        )?;
-    } else if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.gate_proj)
+    if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.gate_proj)
         && prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.up_proj)
     {
         runtime.rms_norm_batched_device(
@@ -342,6 +317,31 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &prefill.cutlass_scales,
             params.batch,
             &mut prefill.cutlass_workspace,
+            &mut prefill.up,
+        )?;
+    } else if prefill_linear_native_mxfp4_enabled(runtime, &layer.gate_proj)
+        && prefill_linear_native_mxfp4_enabled(runtime, &layer.up_proj)
+    {
+        runtime.rms_norm_batched_device(
+            &prefill.residual,
+            &layer.post_attention_norm_weight,
+            params.batch,
+            params.rms_norm_eps,
+            &mut prefill.post_normed,
+        )?;
+        runtime.quantize_mxfp4_input_batched_device(
+            &prefill.post_normed,
+            params.batch,
+            layer.gate_proj.cols,
+            &mut prefill.mxfp4_hidden,
+        )?;
+        prefill_gate_up_mxfp4_native_device(
+            runtime,
+            &layer.gate_proj,
+            &layer.up_proj,
+            &prefill.mxfp4_hidden,
+            params.batch,
+            &mut prefill.gate,
             &mut prefill.up,
         )?;
     } else {
@@ -382,21 +382,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.up,
         )?;
     }
-    if prefill_linear_native_mxfp4_enabled(runtime, &layer.down_proj) {
-        runtime.swiglu_mxfp4_quantize_batched_device(
-            &prefill.gate,
-            &prefill.up,
-            params.batch,
-            intermediate,
-            &mut prefill.mxfp4_intermediate,
-        )?;
-        runtime.matmul_mxfp4_native_prepacked_prefill_device(
-            &layer.down_proj,
-            &prefill.mxfp4_intermediate,
-            params.batch,
-            &mut prefill.mlp_out,
-        )?;
-    } else if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.down_proj) {
+    if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.down_proj) {
         runtime.swiglu_quantize_cutlass_nvfp4_activation_device(
             &prefill.gate,
             &prefill.up,
@@ -412,6 +398,20 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &prefill.cutlass_scales,
             params.batch,
             &mut prefill.cutlass_workspace,
+            &mut prefill.mlp_out,
+        )?;
+    } else if prefill_linear_native_mxfp4_enabled(runtime, &layer.down_proj) {
+        runtime.swiglu_mxfp4_quantize_batched_device(
+            &prefill.gate,
+            &prefill.up,
+            params.batch,
+            intermediate,
+            &mut prefill.mxfp4_intermediate,
+        )?;
+        runtime.matmul_mxfp4_native_prepacked_prefill_device(
+            &layer.down_proj,
+            &prefill.mxfp4_intermediate,
+            params.batch,
             &mut prefill.mlp_out,
         )?;
     } else {
