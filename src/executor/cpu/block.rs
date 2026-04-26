@@ -203,6 +203,16 @@ impl CpuLayerBlockExecutor {
                     seq_len: 0,
                 })
                 .collect(),
+            scratch: CpuScratch::new_for_shape(
+                self.hidden_size,
+                self.num_attention_heads * self.head_dim,
+                self.num_kv_heads * self.head_dim,
+                self.layers
+                    .values()
+                    .next()
+                    .map(|layer| layer.gate_proj.rows)
+                    .unwrap_or(self.hidden_size),
+            ),
         }
     }
 
@@ -221,12 +231,7 @@ impl CpuLayerBlockExecutor {
             .layers
             .get(&layer_idx)
             .ok_or_else(|| AegisError::InvalidPlan(format!("missing CPU layer `{layer_idx}`")))?;
-        let mut scratch = CpuScratch::new_for_shape(
-            self.hidden_size,
-            self.num_attention_heads * self.head_dim,
-            self.num_kv_heads * self.head_dim,
-            layer.gate_proj.rows,
-        );
+        let scratch = &mut state.scratch;
         rms_norm_into(
             hidden,
             &layer.input_norm_weight,
@@ -291,29 +296,23 @@ impl CpuLayerBlockExecutor {
             .down_proj
             .matvec_into(&scratch.swiglu, &mut scratch.mlp_out)?;
         add_into(&scratch.residual, &scratch.mlp_out, &mut scratch.hidden_out)?;
-        Ok(scratch.hidden_out)
+        Ok(scratch.hidden_out.clone())
     }
 
-    pub(in crate::executor) fn final_logits_host(&self, hidden: &[f32]) -> Result<Vec<f32>> {
-        let mut scratch = CpuScratch::new_for_shape(
-            self.hidden_size,
-            self.num_attention_heads * self.head_dim,
-            self.num_kv_heads * self.head_dim,
-            self.layers
-                .values()
-                .next()
-                .map(|layer| layer.gate_proj.rows)
-                .unwrap_or(self.hidden_size),
-        );
+    pub(in crate::executor) fn final_logits_host_with_state(
+        &self,
+        state: &mut CpuLlamaState,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>> {
         rms_norm_into(
             hidden,
             &self.final_norm,
             self.rms_norm_eps,
-            &mut scratch.final_hidden,
+            &mut state.scratch.final_hidden,
         );
         let mut logits = vec![0.0; self.lm_head.rows];
         self.lm_head
-            .matvec_into(&scratch.final_hidden, &mut logits)?;
+            .matvec_into(&state.scratch.final_hidden, &mut logits)?;
         Ok(logits)
     }
 }

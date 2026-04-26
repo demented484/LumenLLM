@@ -183,7 +183,7 @@ impl GenerationBackendPrimitives for HybridExecutorProvider {
         self.cpu
             .as_ref()
             .ok_or_else(|| self.not_initialized())?
-            .final_logits_host(&hidden)
+            .final_logits_host_with_state(&mut state.cpu, &hidden)
     }
 
     fn prefill_prompt(
@@ -206,7 +206,7 @@ impl GenerationBackendPrimitives for HybridExecutorProvider {
             .cpu
             .as_ref()
             .ok_or_else(|| self.not_initialized())?
-            .final_logits_host(&hidden)?;
+            .final_logits_host_with_state(&mut state.cpu, &hidden)?;
         super::generation::sample_next_token(&logits, sampling)
     }
 

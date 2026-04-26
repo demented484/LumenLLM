@@ -35,6 +35,7 @@ pub(super) struct CpuLayer {
 pub(in crate::executor) struct CpuLlamaState {
     pub(super) position: usize,
     pub(super) layers: Vec<CpuLayerState>,
+    pub(super) scratch: CpuScratch,
 }
 
 #[derive(Debug)]
@@ -72,6 +73,7 @@ impl CpuLlamaExecutor {
                     seq_len: 0,
                 })
                 .collect(),
+            scratch: CpuScratch::new(self),
         }
     }
 

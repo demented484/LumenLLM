@@ -44,8 +44,8 @@ impl CpuLlamaExecutor {
             )));
         }
         let mut hidden = self.embed_tokens.row(token_id)?;
-        let mut scratch = CpuScratch::new(self);
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let scratch = &mut state.scratch;
             rms_norm_into(
                 &hidden,
                 &layer.input_norm_weight,
@@ -121,7 +121,7 @@ impl CpuLlamaExecutor {
         token_id: usize,
     ) -> Result<Vec<f32>> {
         let hidden = self.forward_hidden(state, token_id)?;
-        self.final_logits_host(&hidden)
+        self.final_logits_host_with_scratch(&hidden, &mut state.scratch)
     }
 
     #[allow(dead_code)]
@@ -207,6 +207,14 @@ impl CpuLlamaExecutor {
     #[allow(dead_code)]
     pub(super) fn final_logits_host(&self, hidden: &[f32]) -> Result<Vec<f32>> {
         let mut scratch = CpuScratch::new(self);
+        self.final_logits_host_with_scratch(hidden, &mut scratch)
+    }
+
+    pub(super) fn final_logits_host_with_scratch(
+        &self,
+        hidden: &[f32],
+        scratch: &mut CpuScratch,
+    ) -> Result<Vec<f32>> {
         rms_norm_into(
             hidden,
             &self.final_norm,
