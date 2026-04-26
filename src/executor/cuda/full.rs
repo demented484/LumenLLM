@@ -308,7 +308,12 @@ fn prefill_attention_split_scratch(
         });
     }
     let q_blocks = chunk_size.div_ceil(PREFILL_SPLIT_Q_BLOCK);
-    let splits = chunk_size.div_ceil(PREFILL_SPLIT_K_TOKENS).max(1);
+    // Split-K scratch must cover the largest KV span a prefill chunk can see, not
+    // just the number of query rows in the current chunk.
+    let splits = executor
+        .kv_context_size
+        .div_ceil(PREFILL_SPLIT_K_TOKENS)
+        .max(1);
     let rows = q_blocks
         .checked_mul(executor.num_attention_heads)
         .and_then(|value| value.checked_mul(splits))

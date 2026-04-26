@@ -218,7 +218,7 @@ impl HostPrefillBatchDescriptor {
             CudaPrefillBatchKind::ContinuationPrefill
         };
         let page_count = end_position.div_ceil(PREFILL_KV_PAGE_TOKENS).max(1);
-        Ok(Self {
+        let out = Self {
             request_ids: vec![0],
             seq_ids: vec![0],
             token_ids: tokens.iter().map(|&token| token as u32).collect(),
@@ -237,7 +237,9 @@ impl HostPrefillBatchDescriptor {
             num_prefill_tokens: tokens.len(),
             num_decode_tokens: 0,
             kind,
-        })
+        };
+        out.validate_varlen_contract(PREFILL_KV_PAGE_TOKENS)?;
+        Ok(out)
     }
 
     #[allow(dead_code)]
@@ -293,7 +295,7 @@ impl HostPrefillBatchDescriptor {
                 .checked_add(sequence.token_ids.len() as u32)
                 .ok_or_else(|| AegisError::InvalidPlan("cu_q overflow".into()))?;
             out.cu_q.push(next_q);
-            out.cu_k.push(sequence.context_len as u32);
+            push_cu_k(&mut out, sequence.context_len)?;
             out.block_tables
                 .extend(padded_block_table(&sequence.block_table, max_blocks));
         }
@@ -306,6 +308,7 @@ impl HostPrefillBatchDescriptor {
         } else {
             CudaPrefillBatchKind::ContinuationPrefill
         };
+        out.validate_varlen_contract(page_tokens)?;
         Ok(out)
     }
 
@@ -368,12 +371,114 @@ impl HostPrefillBatchDescriptor {
                 .checked_add(1)
                 .ok_or_else(|| AegisError::InvalidPlan("cu_q overflow".into()))?;
             out.cu_q.push(next_q);
-            out.cu_k.push(sequence.context_len as u32);
+            push_cu_k(&mut out, sequence.context_len)?;
             out.block_tables
                 .extend(padded_block_table(&sequence.block_table, max_blocks));
         }
         out.num_decode_tokens = decode.len();
+        out.validate_varlen_contract(page_tokens)?;
         Ok(out)
+    }
+
+    fn validate_varlen_contract(&self, page_tokens: usize) -> Result<()> {
+        validate_page_tokens(page_tokens)?;
+        let total_query_tokens = self
+            .num_prefill_tokens
+            .checked_add(self.num_decode_tokens)
+            .ok_or_else(|| {
+                AegisError::InvalidPlan("prefill descriptor token count overflow".into())
+            })?;
+        let num_sequences = self.request_ids.len();
+        if num_sequences == 0
+            || self.seq_ids.len() != num_sequences
+            || self.context_lens.len() != num_sequences
+            || self.cu_q.len() != num_sequences + 1
+            || self.cu_k.len() != num_sequences + 1
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "bad prefill descriptor sequence metadata: seqs={} seq_ids={} context_lens={} cu_q={} cu_k={}",
+                num_sequences,
+                self.seq_ids.len(),
+                self.context_lens.len(),
+                self.cu_q.len(),
+                self.cu_k.len()
+            )));
+        }
+        if self.token_ids.len() != total_query_tokens
+            || self.positions.len() != total_query_tokens
+            || self.slot_mapping.len() != total_query_tokens
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "bad prefill descriptor token metadata: tokens={} positions={} slots={} expected={}",
+                self.token_ids.len(),
+                self.positions.len(),
+                self.slot_mapping.len(),
+                total_query_tokens
+            )));
+        }
+        validate_cumulative_offsets("cu_q", &self.cu_q, total_query_tokens)?;
+        let total_k = self
+            .context_lens
+            .iter()
+            .try_fold(0usize, |acc, &len| acc.checked_add(len as usize))
+            .ok_or_else(|| AegisError::InvalidPlan("cu_k total overflow".into()))?;
+        validate_cumulative_offsets("cu_k", &self.cu_k, total_k)?;
+        for seq in 0..num_sequences {
+            let q_len = (self.cu_q[seq + 1] - self.cu_q[seq]) as usize;
+            let k_len = (self.cu_k[seq + 1] - self.cu_k[seq]) as usize;
+            let context_len = self.context_lens[seq] as usize;
+            if k_len != context_len {
+                return Err(AegisError::InvalidPlan(format!(
+                    "prefill descriptor cu_k/context mismatch at sequence {seq}: cu_k_delta={} context_len={}",
+                    k_len, context_len
+                )));
+            }
+            if q_len > self.max_q || context_len > self.max_k {
+                return Err(AegisError::InvalidPlan(format!(
+                    "prefill descriptor max_q/max_k too small at sequence {seq}: q_len={} max_q={} context_len={} max_k={}",
+                    q_len, self.max_q, context_len, self.max_k
+                )));
+            }
+        }
+        let block_table_stride = self
+            .block_tables
+            .len()
+            .checked_div(num_sequences)
+            .ok_or_else(|| {
+                AegisError::InvalidPlan("prefill descriptor block table division failed".into())
+            })?;
+        if block_table_stride == 0 || block_table_stride * num_sequences != self.block_tables.len()
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "bad prefill descriptor block table shape: blocks={} seqs={}",
+                self.block_tables.len(),
+                num_sequences
+            )));
+        }
+        for seq in 0..num_sequences {
+            let context_len = self.context_lens[seq] as usize;
+            let required_pages = context_len.div_ceil(page_tokens).max(1);
+            if required_pages > block_table_stride {
+                return Err(AegisError::InvalidPlan(format!(
+                    "prefill descriptor block table stride too small at sequence {seq}: required_pages={} stride={}",
+                    required_pages, block_table_stride
+                )));
+            }
+            let row_start = seq * block_table_stride;
+            for page_idx in 0..required_pages {
+                if self.block_tables[row_start + page_idx] == u32::MAX {
+                    return Err(AegisError::InvalidPlan(format!(
+                        "prefill descriptor has missing physical page at sequence {seq} page {page_idx}"
+                    )));
+                }
+            }
+        }
+        if self.slot_mapping.contains(&u32::MAX) {
+            return Err(AegisError::InvalidPlan(
+                "prefill descriptor slot_mapping contains an unmapped sentinel".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn empty(kind: CudaPrefillBatchKind) -> Self {
@@ -425,9 +530,51 @@ fn push_prefill_sequence(
         .checked_add(sequence.token_ids.len() as u32)
         .ok_or_else(|| AegisError::InvalidPlan("cu_q overflow".into()))?;
     out.cu_q.push(next_q);
-    out.cu_k.push(sequence.context_len as u32);
+    push_cu_k(out, sequence.context_len)?;
     out.block_tables
         .extend(padded_block_table(&sequence.block_table, max_blocks));
+    Ok(())
+}
+
+fn push_cu_k(out: &mut HostPrefillBatchDescriptor, context_len: usize) -> Result<()> {
+    let context_len = u32::try_from(context_len).map_err(|_| {
+        AegisError::InvalidPlan(format!(
+            "prefill descriptor context length exceeds u32: {context_len}"
+        ))
+    })?;
+    let next_k = out
+        .cu_k
+        .last()
+        .copied()
+        .unwrap_or(0)
+        .checked_add(context_len)
+        .ok_or_else(|| AegisError::InvalidPlan("cu_k overflow".into()))?;
+    out.cu_k.push(next_k);
+    Ok(())
+}
+
+fn validate_cumulative_offsets(name: &str, offsets: &[u32], expected_total: usize) -> Result<()> {
+    let expected_total = u32::try_from(expected_total).map_err(|_| {
+        AegisError::InvalidPlan(format!(
+            "bad prefill descriptor {name}: expected total exceeds u32"
+        ))
+    })?;
+    if offsets.first().copied() != Some(0) || offsets.last().copied() != Some(expected_total) {
+        return Err(AegisError::InvalidPlan(format!(
+            "bad prefill descriptor {name}: first={:?} last={:?} expected_total={}",
+            offsets.first(),
+            offsets.last(),
+            expected_total
+        )));
+    }
+    for window in offsets.windows(2) {
+        if window[0] > window[1] {
+            return Err(AegisError::InvalidPlan(format!(
+                "bad prefill descriptor {name}: offsets are not monotonic: {:?}",
+                offsets
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -570,7 +717,7 @@ mod tests {
         assert_eq!(descriptor.request_ids, [7, 8]);
         assert_eq!(descriptor.seq_ids, [70, 80]);
         assert_eq!(descriptor.cu_q, [0, 2, 5]);
-        assert_eq!(descriptor.cu_k, [0, 2, 5]);
+        assert_eq!(descriptor.cu_k, [0, 2, 7]);
         assert_eq!(descriptor.context_lens, [2, 5]);
         assert_eq!(descriptor.slot_mapping, [20, 21, 38, 39, 8]);
         assert_eq!(descriptor.max_q, 3);
@@ -606,8 +753,26 @@ mod tests {
         assert_eq!(descriptor.num_prefill_tokens, 2);
         assert_eq!(descriptor.num_decode_tokens, 1);
         assert_eq!(descriptor.cu_q, [0, 2, 3]);
-        assert_eq!(descriptor.cu_k, [0, 6, 10]);
+        assert_eq!(descriptor.cu_k, [0, 6, 16]);
         assert_eq!(descriptor.slot_mapping, [12, 13, 42]);
         assert_eq!(descriptor.context_lens, [6, 10]);
+    }
+
+    #[test]
+    fn paged_descriptor_rejects_context_without_pages() {
+        let error = HostPrefillBatchDescriptor::paged_multi_sequence(
+            &[HostPrefillSequenceDescriptor {
+                request_id: 9,
+                seq_id: 90,
+                token_ids: vec![1],
+                start_position: 0,
+                context_len: 9,
+                block_table: vec![2],
+            }],
+            4,
+            16,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("block table stride too small"));
     }
 }

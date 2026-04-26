@@ -564,6 +564,17 @@ impl CudaRuntime {
                 num_sequences, max_q, max_k
             )));
         }
+        if num_prefill_tokens == 0 {
+            return Err(AegisError::InvalidPlan(
+                "paged varlen prefill requires at least one prefill query token; decode-only attention needs the decode ABI".into(),
+            ));
+        }
+        if num_decode_tokens > 0 {
+            return Err(AegisError::Unsupported(format!(
+                "paged varlen mixed prefill+decode is not implemented yet: prefill_tokens={} decode_tokens={}; scheduler descriptors can express mixed batches, but Aegis kernels currently execute prefill rows only",
+                num_prefill_tokens, num_decode_tokens
+            )));
+        }
         let page_tokens_usize = FLASH_COMPAT_PAGE_TOKENS;
         let required_pages_per_sequence = max_k.div_ceil(page_tokens_usize).max(1);
         if block_table_stride < required_pages_per_sequence {
