@@ -42,6 +42,7 @@ pub enum CudaAttentionEffectivePath {
     ReferenceContinuation,
     AegisDenseWarpTile,
     AegisDenseWmmaTile,
+    AegisDenseWmmaFaPipeline,
     AegisDenseWmmaPersistentQ32,
     AegisDenseWmmaSplitK,
     AegisPagedVarlen,
@@ -158,6 +159,7 @@ impl CudaAttentionEffectivePath {
             Self::ReferenceContinuation => "reference/continuation",
             Self::AegisDenseWarpTile => "aegis-varlen/dense-warp-tile",
             Self::AegisDenseWmmaTile => "aegis-varlen/dense-wmma-tile",
+            Self::AegisDenseWmmaFaPipeline => "aegis-varlen/dense-wmma-fa-pipeline",
             Self::AegisDenseWmmaPersistentQ32 => "aegis-varlen/dense-wmma-persistent-q32",
             Self::AegisDenseWmmaSplitK => "aegis-varlen/dense-wmma-split-k",
             Self::AegisPagedVarlen => "aegis-varlen/paged-varlen",
@@ -207,8 +209,8 @@ impl CudaPrefillAttentionSelection {
                 } else if dense_warp_tile_eligible {
                     (
                         CudaAttentionBackend::AegisVarlen,
-                        CudaAttentionEffectivePath::AegisDenseWmmaTile,
-                        "auto selected Aegis dense WMMA-tiled prefill attention for head_dim=128",
+                        CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline,
+                        "auto selected Aegis FA-style dense WMMA-tiled prefill attention for head_dim=128",
                     )
                 } else if warp_eligible {
                     (
@@ -290,7 +292,7 @@ impl CudaPrefillAttentionSelection {
                     {
                         CudaAttentionEffectivePath::AegisDenseWmmaPersistentQ32
                     } else {
-                        CudaAttentionEffectivePath::AegisDenseWmmaTile
+                        CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline
                     }
                 } else if head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores {
                     CudaAttentionEffectivePath::WarpFlash
@@ -413,7 +415,7 @@ mod tests {
         assert_eq!(selection.logical_backend, CudaAttentionBackend::AegisVarlen);
         assert_eq!(
             selection.effective_path,
-            CudaAttentionEffectivePath::AegisDenseWmmaTile
+            CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline
         );
     }
 
@@ -428,7 +430,7 @@ mod tests {
         assert_eq!(selection.logical_backend, CudaAttentionBackend::AegisVarlen);
         assert_eq!(
             selection.effective_path,
-            CudaAttentionEffectivePath::AegisDenseWmmaTile
+            CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline
         );
     }
 }

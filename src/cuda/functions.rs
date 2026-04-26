@@ -58,6 +58,7 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) attention_prefill_dense_halfq_block4: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_warp_tile_hdim128: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128: CudaFunction,
+    pub(crate) attention_prefill_dense_halfq_wmma_hdim128_fa: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_q32: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_split: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_combine: CudaFunction,
@@ -168,6 +169,10 @@ impl CudaKernelFunctions {
             attention_prefill_dense_halfq_wmma_hdim128: load(
                 &module,
                 "aegis_attention_prefill_dense_halfq_wmma_hdim128",
+            )?,
+            attention_prefill_dense_halfq_wmma_hdim128_fa: load(
+                &module,
+                "aegis_attention_prefill_dense_halfq_wmma_hdim128_fa",
             )?,
             attention_prefill_dense_halfq_wmma_hdim128_q32: load(
                 &module,
