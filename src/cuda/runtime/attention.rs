@@ -123,7 +123,7 @@ impl CudaRuntime {
                     | CudaAttentionBackend::FlashAttention4
                         if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
                     {
-                        CudaAttentionBackend::AegisVarlen
+                        CudaAttentionBackend::Sdpa
                     }
                     _ => CudaAttentionBackend::Reference,
                 })
@@ -458,19 +458,16 @@ impl CudaRuntime {
             }
         };
         if use_varlen_attention {
-            let native_half_query = !matches!(selected_backend, CudaAttentionBackend::Sdpa);
-            if native_half_query {
-                let q_len = checked_len(
-                    "dense varlen query half conversion",
-                    batch,
-                    checked_len(
-                        "dense varlen query half width",
-                        num_attention_heads,
-                        head_dim,
-                    )?,
-                )?;
-                self.f32_to_f16_device(query, q_len, query_half)?;
-            }
+            let q_len = checked_len(
+                "dense varlen query half conversion",
+                batch,
+                checked_len(
+                    "dense varlen query half width",
+                    num_attention_heads,
+                    head_dim,
+                )?,
+            )?;
+            self.f32_to_f16_device(query, q_len, query_half)?;
             let block_table_stride = dense_metadata
                 .context_len()
                 .div_ceil(FLASH_COMPAT_PAGE_TOKENS)
@@ -479,7 +476,7 @@ impl CudaRuntime {
                 key_cache,
                 value_cache,
                 query,
-                native_half_query.then_some(query_half),
+                Some(query_half),
                 Some((split_acc, split_m, split_l)),
                 slot_mapping,
                 cu_q,
@@ -712,7 +709,7 @@ impl CudaRuntime {
                 && scratch.m.len() >= split_rows
                 && scratch.l.len() >= split_rows
         });
-        let native_query_half = if sdpa_selected { None } else { query_half };
+        let native_query_half = query_half;
         let use_halfq_single_sequence = native_query_half.is_some()
             && num_sequences == 1
             && num_decode_tokens == 0
@@ -806,11 +803,13 @@ impl CudaRuntime {
             };
             unsafe {
                 self.stream
-                    .launch_builder(
+                    .launch_builder(if sdpa_selected {
+                        &self.kernels.sdpa_prefill_paged_varlen_halfq_block4_split
+                    } else {
                         &self
                             .kernels
-                            .attention_prefill_paged_varlen_halfq_block4_split,
-                    )
+                            .attention_prefill_paged_varlen_halfq_block4_split
+                    })
                     .arg(&key_cache.slice)
                     .arg(&value_cache.slice)
                     .arg(&query_half.slice)
@@ -842,11 +841,13 @@ impl CudaRuntime {
             ))?;
             unsafe {
                 self.stream
-                    .launch_builder(
+                    .launch_builder(if sdpa_selected {
+                        &self.kernels.sdpa_prefill_paged_varlen_halfq_block4_combine
+                    } else {
                         &self
                             .kernels
-                            .attention_prefill_paged_varlen_halfq_block4_combine,
-                    )
+                            .attention_prefill_paged_varlen_halfq_block4_combine
+                    })
                     .arg(&split_scratch.acc.slice)
                     .arg(&split_scratch.m.slice)
                     .arg(&split_scratch.l.slice)
@@ -873,9 +874,13 @@ impl CudaRuntime {
             let kernel = if use_halfq_block4 {
                 if use_fa4_hdim128 {
                     &self.kernels.attention_prefill_paged_varlen_fa4_hdim128
+                } else if sdpa_selected {
+                    &self.kernels.sdpa_prefill_paged_varlen_halfq_block4
                 } else {
                     &self.kernels.attention_prefill_paged_varlen_halfq_block4
                 }
+            } else if sdpa_selected {
+                &self.kernels.sdpa_prefill_paged_varlen_halfq
             } else {
                 &self.kernels.attention_prefill_paged_varlen_halfq
             };

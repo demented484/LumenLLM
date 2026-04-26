@@ -189,9 +189,9 @@ impl CudaPrefillAttentionSelection {
                         if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
                     {
                         (
-                            CudaAttentionBackend::AegisVarlen,
-                            CudaAttentionEffectivePath::AegisPagedVarlen,
-                            "auto selected Blackwell-class attention; using validated paged-varlen path until FA4 is promoted",
+                            CudaAttentionBackend::Sdpa,
+                            CudaAttentionEffectivePath::SdpaPagedVarlen,
+                            "auto selected Blackwell-class attention; using optimized SDPA paged-varlen path until FA4 is promoted",
                         )
                     }
                     CudaAttentionBackend::FlashAttention2
@@ -199,9 +199,9 @@ impl CudaPrefillAttentionSelection {
                         if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
                     {
                         (
-                            CudaAttentionBackend::AegisVarlen,
-                            CudaAttentionEffectivePath::AegisPagedVarlen,
-                            "auto selected flash attention generation; using validated paged-varlen path for long context",
+                            CudaAttentionBackend::Sdpa,
+                            CudaAttentionEffectivePath::SdpaPagedVarlen,
+                            "auto selected flash attention generation; using optimized SDPA paged-varlen path for long context",
                         )
                     }
                     _ if oversized_dense_scores => (
@@ -409,10 +409,10 @@ mod tests {
             selection.auto_target,
             Some(CudaAttentionBackend::FlashAttention4)
         );
-        assert_eq!(selection.logical_backend, CudaAttentionBackend::AegisVarlen);
+        assert_eq!(selection.logical_backend, CudaAttentionBackend::Sdpa);
         assert_eq!(
             selection.effective_path,
-            CudaAttentionEffectivePath::AegisPagedVarlen
+            CudaAttentionEffectivePath::SdpaPagedVarlen
         );
     }
 }

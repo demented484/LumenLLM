@@ -54,6 +54,10 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) sdpa_prefill_dense_cache: CudaFunction,
     pub(crate) sdpa_prefill_dense_online: CudaFunction,
     pub(crate) sdpa_prefill_paged_varlen: CudaFunction,
+    pub(crate) sdpa_prefill_paged_varlen_halfq: CudaFunction,
+    pub(crate) sdpa_prefill_paged_varlen_halfq_block4: CudaFunction,
+    pub(crate) sdpa_prefill_paged_varlen_halfq_block4_split: CudaFunction,
+    pub(crate) sdpa_prefill_paged_varlen_halfq_block4_combine: CudaFunction,
     pub(crate) attention_prefill_paged_varlen: CudaFunction,
     pub(crate) attention_prefill_paged_varlen_halfq: CudaFunction,
     pub(crate) attention_prefill_paged_varlen_halfq_block4: CudaFunction,
@@ -142,6 +146,25 @@ impl CudaKernelFunctions {
             sdpa_prefill_dense_cache: load(&module, "aegis_sdpa_prefill_dense_cache")?,
             sdpa_prefill_dense_online: load(&module, "aegis_sdpa_prefill_dense_online")?,
             sdpa_prefill_paged_varlen: load(&module, "aegis_sdpa_prefill_paged_varlen")?,
+            // The SDPA backend owns routing and reporting, but shares the optimized
+            // paged-varlen halfq primitives instead of falling back to the slow f32
+            // one-query kernel.
+            sdpa_prefill_paged_varlen_halfq: load(
+                &module,
+                "aegis_attention_prefill_paged_varlen_halfq",
+            )?,
+            sdpa_prefill_paged_varlen_halfq_block4: load(
+                &module,
+                "aegis_attention_prefill_paged_varlen_halfq_block4",
+            )?,
+            sdpa_prefill_paged_varlen_halfq_block4_split: load(
+                &module,
+                "aegis_attention_prefill_paged_varlen_halfq_block4_split",
+            )?,
+            sdpa_prefill_paged_varlen_halfq_block4_combine: load(
+                &module,
+                "aegis_attention_prefill_paged_varlen_halfq_block4_combine",
+            )?,
             attention_prefill_paged_varlen: load(&module, "aegis_attention_prefill_paged_varlen")?,
             attention_prefill_paged_varlen_halfq: load(
                 &module,
