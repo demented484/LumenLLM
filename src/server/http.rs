@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::time::Instant;
 
 use crate::engine::AegisEngine;
 use crate::error::{AegisError, Result};
@@ -12,6 +14,55 @@ struct HttpRequest {
     method: String,
     path: String,
     body: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct ServerMetrics {
+    requests_total: u64,
+    generation_requests_total: u64,
+    generation_errors_total: u64,
+    prompt_tokens_total: u64,
+    completion_tokens_total: u64,
+    generation_latency_ms_total: f64,
+    last_generation_latency_ms: Option<f64>,
+}
+
+#[derive(Debug)]
+struct ServerState {
+    metrics: RefCell<ServerMetrics>,
+}
+
+impl ServerState {
+    fn new() -> Self {
+        Self {
+            metrics: RefCell::new(ServerMetrics::default()),
+        }
+    }
+
+    fn record_request(&self) {
+        self.metrics.borrow_mut().requests_total += 1;
+    }
+
+    fn record_generation(&self, started: Instant, stats: Option<GenerateStats>) {
+        let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut metrics = self.metrics.borrow_mut();
+        metrics.generation_requests_total += 1;
+        metrics.generation_latency_ms_total += latency_ms;
+        metrics.last_generation_latency_ms = Some(latency_ms);
+        match stats {
+            Some(stats) => {
+                metrics.prompt_tokens_total += stats.prompt_tokens as u64;
+                metrics.completion_tokens_total += stats.completion_tokens as u64;
+            }
+            None => metrics.generation_errors_total += 1,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GenerateStats {
+    prompt_tokens: usize,
+    completion_tokens: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +92,7 @@ pub fn serve_http(
 ) -> Result<()> {
     let api = normalize_api_compatibility(&api)?;
     let listener = TcpListener::bind(format!("{host}:{port}"))?;
+    let state = ServerState::new();
     eprintln!(
         "serve: listening on http://{}:{} api={} runnable={} selected={}",
         host,
@@ -52,9 +104,14 @@ pub fn serve_http(
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
-                if let Err(error) =
-                    handle_http_connection(&mut stream, api, &engine, &readiness, default_sampling)
-                {
+                if let Err(error) = handle_http_connection(
+                    &mut stream,
+                    api,
+                    &engine,
+                    &readiness,
+                    default_sampling,
+                    &state,
+                ) {
                     let _ = write_json_response(
                         &mut stream,
                         500,
@@ -80,9 +137,12 @@ fn handle_http_connection(
     engine: &AegisEngine,
     readiness: &ExecutorReadiness,
     default_sampling: SamplingConfig,
+    state: &ServerState,
 ) -> Result<()> {
     let request = read_http_request(stream)?;
-    let (status, payload) = route_http_request(api, engine, readiness, request, default_sampling);
+    state.record_request();
+    let (status, payload) =
+        route_http_request(api, engine, readiness, request, default_sampling, state);
     write_json_response(stream, status, payload)
 }
 
@@ -92,9 +152,10 @@ fn route_http_request(
     readiness: &ExecutorReadiness,
     request: HttpRequest,
     default_sampling: SamplingConfig,
+    state: &ServerState,
 ) -> (u16, serde_json::Value) {
     match (request.method.as_str(), request.path.as_str()) {
-        ("GET", "/") | ("GET", "/health") => (
+        ("GET", "/") | ("GET", "/health") | ("GET", "/healthz") => (
             200,
             serde_json::json!({
                 "status": if readiness.runnable { "ok" } else { "degraded" },
@@ -108,6 +169,23 @@ fn route_http_request(
                     "generate_content": api == ServerApiCompatibility::Google
                 },
                 "executor": readiness_json(readiness),
+                "metrics": metrics_json(state),
+            }),
+        ),
+        ("GET", "/ready") | ("GET", "/readyz") => (
+            if readiness.runnable { 200 } else { 503 },
+            serde_json::json!({
+                "ready": readiness.runnable,
+                "executor": readiness_json(readiness),
+            }),
+        ),
+        ("GET", "/metrics") => (
+            200,
+            serde_json::json!({
+                "model": engine.placement.model,
+                "api": api.name(),
+                "executor": readiness_json(readiness),
+                "metrics": metrics_json(state),
             }),
         ),
         ("GET", "/v1/models") => (
@@ -127,20 +205,34 @@ fn route_http_request(
             }),
         ),
         ("POST", "/v1/completions") if api == ServerApiCompatibility::OpenAi => {
-            generate_http_response(engine, readiness, &request.body, false, default_sampling)
+            generate_http_response(
+                engine,
+                readiness,
+                &request.body,
+                false,
+                default_sampling,
+                state,
+            )
         }
         ("POST", "/v1/chat/completions") if api == ServerApiCompatibility::OpenAi => {
-            generate_http_response(engine, readiness, &request.body, true, default_sampling)
+            generate_http_response(
+                engine,
+                readiness,
+                &request.body,
+                true,
+                default_sampling,
+                state,
+            )
         }
         ("POST", "/v1/messages") if api == ServerApiCompatibility::Anthropic => {
-            generate_anthropic_response(engine, readiness, &request.body, default_sampling)
+            generate_anthropic_response(engine, readiness, &request.body, default_sampling, state)
         }
         ("POST", path)
             if api == ServerApiCompatibility::Google
                 && path.starts_with("/v1beta/models/")
                 && path.ends_with(":generateContent") =>
         {
-            generate_google_response(engine, readiness, &request.body, default_sampling)
+            generate_google_response(engine, readiness, &request.body, default_sampling, state)
         }
         ("OPTIONS", _) => (200, serde_json::json!({})),
         _ => (
@@ -161,6 +253,7 @@ fn generate_http_response(
     body: &[u8],
     chat: bool,
     default_sampling: SamplingConfig,
+    state: &ServerState,
 ) -> (u16, serde_json::Value) {
     if !readiness.runnable {
         return (
@@ -211,10 +304,17 @@ fn generate_http_response(
             top_k: json_usize(&parsed, "top_k", default_sampling.top_k),
         },
     };
+    let started = Instant::now();
     match engine.generate(request) {
-        Ok(output) if chat => (
-            200,
-            serde_json::json!({
+        Ok(output) if chat => {
+            let stats = GenerateStats {
+                prompt_tokens: output.prompt_tokens,
+                completion_tokens: output.completion_tokens,
+            };
+            state.record_generation(started, Some(stats));
+            (
+                200,
+                serde_json::json!({
                 "id": completion_id("chatcmpl"),
                 "object": "chat.completion",
                 "created": unix_timestamp(),
@@ -233,11 +333,18 @@ fn generate_http_response(
                     "completion_tokens": output.completion_tokens,
                     "total_tokens": output.prompt_tokens + output.completion_tokens
                 }
-            }),
-        ),
-        Ok(output) => (
-            200,
-            serde_json::json!({
+                }),
+            )
+        }
+        Ok(output) => {
+            let stats = GenerateStats {
+                prompt_tokens: output.prompt_tokens,
+                completion_tokens: output.completion_tokens,
+            };
+            state.record_generation(started, Some(stats));
+            (
+                200,
+                serde_json::json!({
                 "id": completion_id("cmpl"),
                 "object": "text_completion",
                 "created": unix_timestamp(),
@@ -253,9 +360,13 @@ fn generate_http_response(
                     "completion_tokens": output.completion_tokens,
                     "total_tokens": output.prompt_tokens + output.completion_tokens
                 }
-            }),
-        ),
-        Err(error) => json_error(503, error.to_string()),
+                }),
+            )
+        }
+        Err(error) => {
+            state.record_generation(started, None);
+            json_error(503, error.to_string())
+        }
     }
 }
 
@@ -264,6 +375,7 @@ fn generate_anthropic_response(
     readiness: &ExecutorReadiness,
     body: &[u8],
     default_sampling: SamplingConfig,
+    state: &ServerState,
 ) -> (u16, serde_json::Value) {
     if !readiness.runnable {
         return executor_not_ready(readiness);
@@ -285,10 +397,17 @@ fn generate_anthropic_response(
             top_k: json_usize(&parsed, "top_k", default_sampling.top_k),
         },
     };
+    let started = Instant::now();
     match engine.generate(request) {
-        Ok(output) => (
-            200,
-            serde_json::json!({
+        Ok(output) => {
+            let stats = GenerateStats {
+                prompt_tokens: output.prompt_tokens,
+                completion_tokens: output.completion_tokens,
+            };
+            state.record_generation(started, Some(stats));
+            (
+                200,
+                serde_json::json!({
                 "id": completion_id("msg"),
                 "type": "message",
                 "role": "assistant",
@@ -302,9 +421,13 @@ fn generate_anthropic_response(
                     "input_tokens": output.prompt_tokens,
                     "output_tokens": output.completion_tokens
                 }
-            }),
-        ),
-        Err(error) => json_error(500, error.to_string()),
+                }),
+            )
+        }
+        Err(error) => {
+            state.record_generation(started, None);
+            json_error(500, error.to_string())
+        }
     }
 }
 
@@ -313,6 +436,7 @@ fn generate_google_response(
     readiness: &ExecutorReadiness,
     body: &[u8],
     default_sampling: SamplingConfig,
+    state: &ServerState,
 ) -> (u16, serde_json::Value) {
     if !readiness.runnable {
         return executor_not_ready(readiness);
@@ -345,10 +469,17 @@ fn generate_google_response(
             top_k: json_usize(generation_config, "topK", default_sampling.top_k),
         },
     };
+    let started = Instant::now();
     match engine.generate(request) {
-        Ok(output) => (
-            200,
-            serde_json::json!({
+        Ok(output) => {
+            let stats = GenerateStats {
+                prompt_tokens: output.prompt_tokens,
+                completion_tokens: output.completion_tokens,
+            };
+            state.record_generation(started, Some(stats));
+            (
+                200,
+                serde_json::json!({
                 "candidates": [{
                     "content": {
                         "role": "model",
@@ -362,9 +493,13 @@ fn generate_google_response(
                     "totalTokenCount": output.prompt_tokens + output.completion_tokens
                 },
                 "modelVersion": engine.placement.model
-            }),
-        ),
-        Err(error) => json_error(500, error.to_string()),
+                }),
+            )
+        }
+        Err(error) => {
+            state.record_generation(started, None);
+            json_error(500, error.to_string())
+        }
     }
 }
 
@@ -414,6 +549,11 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
                 .flatten()
         })
         .unwrap_or(0);
+    if content_length > 16 * 1024 * 1024 {
+        return Err(AegisError::InvalidConfig(format!(
+            "http body exceeds 16 MiB limit: {content_length} bytes"
+        )));
+    }
     let body_start = header_end + 4;
     let total_len = body_start + content_length;
     while buffer.len() < total_len {
@@ -517,6 +657,28 @@ mod tests {
     fn openai_finish_reason_maps_internal_eos_to_stop() {
         assert_eq!(openai_finish_reason("eos_token"), "stop");
         assert_eq!(openai_finish_reason("length"), "length");
+    }
+
+    #[test]
+    fn server_metrics_record_success_and_error() {
+        let state = ServerState::new();
+        state.record_request();
+        state.record_generation(
+            Instant::now(),
+            Some(GenerateStats {
+                prompt_tokens: 7,
+                completion_tokens: 3,
+            }),
+        );
+        state.record_generation(Instant::now(), None);
+
+        let metrics = metrics_json(&state);
+        assert_eq!(metrics["requests_total"], 1);
+        assert_eq!(metrics["generation_requests_total"], 2);
+        assert_eq!(metrics["generation_errors_total"], 1);
+        assert_eq!(metrics["prompt_tokens_total"], 7);
+        assert_eq!(metrics["completion_tokens_total"], 3);
+        assert!(metrics["generation_latency_ms_avg"].as_f64().unwrap() >= 0.0);
     }
 }
 
@@ -650,6 +812,25 @@ fn readiness_json(readiness: &ExecutorReadiness) -> serde_json::Value {
         "planned_cpu_regions": readiness.planned_cpu_regions,
         "planned_cuda_regions": readiness.planned_cuda_regions,
         "limitations": readiness.limitations,
+    })
+}
+
+fn metrics_json(state: &ServerState) -> serde_json::Value {
+    let metrics = state.metrics.borrow();
+    let average_generation_latency_ms = if metrics.generation_requests_total == 0 {
+        None
+    } else {
+        Some(metrics.generation_latency_ms_total / metrics.generation_requests_total as f64)
+    };
+    serde_json::json!({
+        "requests_total": metrics.requests_total,
+        "generation_requests_total": metrics.generation_requests_total,
+        "generation_errors_total": metrics.generation_errors_total,
+        "prompt_tokens_total": metrics.prompt_tokens_total,
+        "completion_tokens_total": metrics.completion_tokens_total,
+        "generation_latency_ms_total": metrics.generation_latency_ms_total,
+        "generation_latency_ms_avg": average_generation_latency_ms,
+        "generation_latency_ms_last": metrics.last_generation_latency_ms,
     })
 }
 
