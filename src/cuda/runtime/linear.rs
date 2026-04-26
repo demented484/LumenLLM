@@ -22,6 +22,73 @@ fn checked_len(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
 }
 
 impl CudaRuntime {
+    #[allow(clippy::too_many_arguments)]
+    pub fn split_qkv_scaled_device(
+        &self,
+        qkv: &DeviceBuffer<f32>,
+        batch: usize,
+        q_rows: usize,
+        kv_rows: usize,
+        q_output_scale: f32,
+        k_output_scale: f32,
+        v_output_scale: f32,
+        q_output: &mut DeviceBuffer<f32>,
+        k_output: &mut DeviceBuffer<f32>,
+        v_output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let qkv_rows = q_rows
+            .checked_add(kv_rows)
+            .and_then(|rows| rows.checked_add(kv_rows))
+            .ok_or_else(|| AegisError::InvalidPlan("split qkv rows overflow".into()))?;
+        let expected_qkv = checked_len("split qkv input", batch, qkv_rows)?;
+        let expected_q = checked_len("split q output", batch, q_rows)?;
+        let expected_kv = checked_len("split kv output", batch, kv_rows)?;
+        if qkv.len() < expected_qkv
+            || q_output.len() < expected_q
+            || k_output.len() < expected_kv
+            || v_output.len() < expected_kv
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "split qkv buffers too small: qkv={} expected_qkv={} q={} expected_q={} k={} v={} expected_kv={}",
+                qkv.len(),
+                expected_qkv,
+                q_output.len(),
+                expected_q,
+                k_output.len(),
+                v_output.len(),
+                expected_kv
+            )));
+        }
+        let total = expected_qkv;
+        let block = 256u32;
+        let grid = ceil_div(u32_arg("split qkv elements", total)?, block).clamp(1, 65535);
+        let cfg = LaunchConfig {
+            grid_dim: (grid, 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let batch = u32_arg("batch", batch)?;
+        let q_rows = u32_arg("q_rows", q_rows)?;
+        let kv_rows = u32_arg("kv_rows", kv_rows)?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.split_qkv_scaled)
+                .arg(&qkv.slice)
+                .arg(&batch)
+                .arg(&q_rows)
+                .arg(&kv_rows)
+                .arg(&q_output_scale)
+                .arg(&k_output_scale)
+                .arg(&v_output_scale)
+                .arg(&mut q_output.slice)
+                .arg(&mut k_output.slice)
+                .arg(&mut v_output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch split qkv scaled"))?;
+        Ok(())
+    }
+
     pub fn matvec_nvfp4_reference_host(
         &self,
         linear: &DeviceNvfp4Linear,

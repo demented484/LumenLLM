@@ -108,6 +108,16 @@ pub(super) fn load_cuda_layer(
             resident_layout,
             loader,
         )?,
+        qkv_proj: cuda.load_cutlass_qkv_group_with_layout(
+            artifact,
+            &format!("{prefix}.self_attn.q_proj"),
+            &format!("{prefix}.self_attn.k_proj"),
+            &format!("{prefix}.self_attn.v_proj"),
+            placement.store,
+            residency,
+            resident_layout,
+            loader,
+        )?,
         o_proj: cuda.load_nvfp4_linear_with_layout(
             artifact,
             &format!("{prefix}.self_attn.o_proj"),

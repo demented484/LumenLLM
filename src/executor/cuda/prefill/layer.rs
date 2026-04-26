@@ -39,7 +39,47 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     let hidden_size = layer.o_proj.rows;
     let intermediate = layer.gate_proj.rows;
     let qkv_start = Instant::now();
-    if prefill_linear_native_mxfp4_enabled(runtime, &layer.q_proj)
+    if let Some(qkv_proj) = layer
+        .qkv_proj
+        .as_ref()
+        .filter(|linear| prefill_linear_cutlass_nvfp4_enabled(runtime, linear))
+    {
+        runtime.rms_norm_batched_device(
+            &prefill.hidden,
+            &layer.input_norm_weight,
+            params.batch,
+            params.rms_norm_eps,
+            &mut prefill.input_normed,
+        )?;
+        runtime.quantize_cutlass_nvfp4_activation_device(
+            &prefill.input_normed,
+            params.batch,
+            qkv_proj.cols,
+            &mut prefill.cutlass_payload,
+            &mut prefill.cutlass_scales,
+        )?;
+        prefill_linear_cutlass_nvfp4_prepacked_device(
+            runtime,
+            qkv_proj,
+            &prefill.cutlass_payload,
+            &prefill.cutlass_scales,
+            params.batch,
+            &mut prefill.cutlass_workspace,
+            &mut prefill.qkv,
+        )?;
+        runtime.split_qkv_scaled_device(
+            &prefill.qkv,
+            params.batch,
+            layer.q_proj.rows,
+            layer.k_proj.rows,
+            layer.q_proj.output_scale,
+            layer.k_proj.output_scale,
+            layer.v_proj.output_scale,
+            &mut prefill.q,
+            &mut prefill.k,
+            &mut prefill.v,
+        )?;
+    } else if prefill_linear_native_mxfp4_enabled(runtime, &layer.q_proj)
         && prefill_linear_native_mxfp4_enabled(runtime, &layer.k_proj)
         && prefill_linear_native_mxfp4_enabled(runtime, &layer.v_proj)
     {

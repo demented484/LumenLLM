@@ -1,5 +1,6 @@
 use super::repack::{
     cached_repack_nvfp4_to_cutlass_e2m1_ue4m3_host, cached_repack_nvfp4_to_mxfp4_host,
+    repack_nvfp4_to_cutlass_e2m1_ue4m3_host,
 };
 use super::runtime::{CudaRuntime, map_cuda_err};
 use super::types::{
@@ -247,6 +248,128 @@ impl CudaWeightLoader<'_> {
             native_mxfp4,
             cutlass_nvfp4,
         })
+    }
+
+    pub fn load_cutlass_qkv_group_with_layout(
+        &self,
+        artifact: &ModelArtifact,
+        q_prefix: &str,
+        k_prefix: &str,
+        v_prefix: &str,
+        store: StoragePlacement,
+        residency: TensorResidencyPlan,
+        resident_layout: LinearResidentLayout,
+        loader: &mut TensorStorageLoader,
+    ) -> Result<Option<DeviceNvfp4Linear>> {
+        if !self.runtime.config().cutlass_nvfp4_repack {
+            return Ok(None);
+        }
+        let kernel_family = cuda_nvfp4_kernel_family_for_layout(q_prefix, resident_layout)?;
+        if !matches!(
+            kernel_family,
+            KernelFamily::CudaCutlassFp4TensorCores | KernelFamily::CudaNativeFp4TensorCores
+        ) {
+            return Ok(None);
+        }
+
+        let q = load_nvfp4_linear_host_parts(artifact, q_prefix, store, loader)?;
+        let k = load_nvfp4_linear_host_parts(artifact, k_prefix, store, loader)?;
+        let v = load_nvfp4_linear_host_parts(artifact, v_prefix, store, loader)?;
+        if q.spec.cols != k.spec.cols || q.spec.cols != v.spec.cols {
+            return Err(AegisError::InvalidPlan(format!(
+                "CUTLASS QKV group shape mismatch: q={}x{} k={}x{} v={}x{}",
+                q.spec.rows, q.spec.cols, k.spec.rows, k.spec.cols, v.spec.rows, v.spec.cols
+            )));
+        }
+        if (q.spec.input_scale - k.spec.input_scale).abs() > 1.0e-12
+            || (q.spec.input_scale - v.spec.input_scale).abs() > 1.0e-12
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "CUTLASS QKV group requires equal input scales: q={} k={} v={}",
+                q.spec.input_scale, k.spec.input_scale, v.spec.input_scale
+            )));
+        }
+
+        let rows = q
+            .spec
+            .rows
+            .checked_add(k.spec.rows)
+            .and_then(|rows| rows.checked_add(v.spec.rows))
+            .ok_or_else(|| AegisError::InvalidPlan("CUTLASS QKV group rows overflow".into()))?;
+        let packed_bytes = q
+            .spec
+            .packed_bytes
+            .checked_add(k.spec.packed_bytes)
+            .and_then(|bytes| bytes.checked_add(v.spec.packed_bytes))
+            .ok_or_else(|| {
+                AegisError::InvalidPlan("CUTLASS QKV group packed bytes overflow".into())
+            })?;
+        let scale_bytes = q
+            .spec
+            .scale_bytes
+            .checked_add(k.spec.scale_bytes)
+            .and_then(|bytes| bytes.checked_add(v.spec.scale_bytes))
+            .ok_or_else(|| {
+                AegisError::InvalidPlan("CUTLASS QKV group scale bytes overflow".into())
+            })?;
+        let group_spec = Nvfp4LinearSpec {
+            name: format!("{q_prefix}+{k_prefix}+{v_prefix}"),
+            rows,
+            cols: q.spec.cols,
+            packed_bytes,
+            scale_bytes,
+            input_scale: q.spec.input_scale,
+            // The fused GEMM writes an unscaled accumulator. A tiny split kernel
+            // applies per-projection output scales while scattering to q/k/v.
+            output_scale: 1.0,
+        };
+
+        let mut packed = Vec::with_capacity(packed_bytes);
+        packed.extend_from_slice(q.packed.as_bytes());
+        packed.extend_from_slice(k.packed.as_bytes());
+        packed.extend_from_slice(v.packed.as_bytes());
+        let mut scales = Vec::with_capacity(scale_bytes);
+        scales.extend_from_slice(q.scales.as_bytes());
+        scales.extend_from_slice(k.scales.as_bytes());
+        scales.extend_from_slice(v.scales.as_bytes());
+        let repacked = repack_nvfp4_to_cutlass_e2m1_ue4m3_host(&group_spec, &packed, &scales)?;
+
+        Ok(Some(DeviceNvfp4Linear {
+            name: group_spec.name,
+            rows: group_spec.rows,
+            cols: group_spec.cols,
+            packed_bytes: group_spec.packed_bytes,
+            scale_bytes: group_spec.scale_bytes,
+            input_scale: group_spec.input_scale,
+            output_scale: group_spec.output_scale,
+            kernel_family,
+            resident_layout,
+            residency,
+            packed: self
+                .runtime
+                .stream
+                .clone_htod(&packed)
+                .map_err(map_cuda_err("htod qkv group nvfp4 packed weights"))?,
+            scales: self
+                .runtime
+                .stream
+                .clone_htod(&scales)
+                .map_err(map_cuda_err("htod qkv group nvfp4 scales"))?,
+            native_mxfp4: None,
+            cutlass_nvfp4: Some(DeviceCutlassNvfp4Linear {
+                layout: repacked.layout,
+                payload_e2m1: self
+                    .runtime
+                    .stream
+                    .clone_htod(&repacked.payload_e2m1)
+                    .map_err(map_cuda_err("htod qkv group cutlass nvfp4 payload"))?,
+                scales_ue4m3: self
+                    .runtime
+                    .stream
+                    .clone_htod(&repacked.scales_ue4m3)
+                    .map_err(map_cuda_err("htod qkv group cutlass nvfp4 scales"))?,
+            }),
+        }))
     }
 
     pub fn load_region_nvfp4_linears(
@@ -519,6 +642,48 @@ fn native_layout_cutlass_prefill_sidecar(prefix: &str) -> bool {
         || prefix.ends_with(".mlp.gate_proj")
         || prefix.ends_with(".mlp.up_proj")
         || prefix.ends_with(".mlp.down_proj")
+}
+
+struct Nvfp4LinearHostParts {
+    spec: Nvfp4LinearSpec,
+    packed: LoadedHostTensor,
+    scales: LoadedHostTensor,
+}
+
+fn load_nvfp4_linear_host_parts(
+    artifact: &ModelArtifact,
+    prefix: &str,
+    store: StoragePlacement,
+    loader: &mut TensorStorageLoader,
+) -> Result<Nvfp4LinearHostParts> {
+    let weight = artifact
+        .tensors
+        .get(&format!("{prefix}.weight"))
+        .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight`")))?;
+    let scales = artifact
+        .tensors
+        .get(&format!("{prefix}.weight_scale"))
+        .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`")))?;
+    let output_scale = artifact
+        .tensors
+        .get(&format!("{prefix}.weight_scale_2"))
+        .map(|tensor| read_scalar_f32_with_loader(loader, tensor, store))
+        .transpose()?
+        .unwrap_or(1.0);
+    let input_scale = artifact
+        .tensors
+        .get(&format!("{prefix}.input_scale"))
+        .map(|tensor| read_scalar_f32_with_loader(loader, tensor, store))
+        .transpose()?
+        .unwrap_or(1.0);
+    let spec = Nvfp4LinearSpec::from_tensors(prefix, weight, scales, input_scale, output_scale)?;
+    let packed = loader.load_for_store(weight, store)?;
+    let scales = loader.load_for_store(scales, store)?;
+    Ok(Nvfp4LinearHostParts {
+        spec,
+        packed,
+        scales,
+    })
 }
 
 fn read_scalar_f32_with_loader(

@@ -1057,6 +1057,38 @@ extern "C" __global__ void aegis_mxfp4_matmul_gate_up_native_tile_m16n32(
     );
 }
 
+extern "C" __global__ void aegis_split_qkv_scaled(
+    const float* __restrict__ qkv,
+    const unsigned int batch,
+    const unsigned int q_rows,
+    const unsigned int kv_rows,
+    const float q_output_scale,
+    const float k_output_scale,
+    const float v_output_scale,
+    float* __restrict__ q_output,
+    float* __restrict__ k_output,
+    float* __restrict__ v_output
+) {
+    const unsigned int qkv_rows = q_rows + kv_rows + kv_rows;
+    const size_t total = size_t(batch) * qkv_rows;
+    for (size_t idx = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total;
+         idx += size_t(blockDim.x) * gridDim.x) {
+        const unsigned int row = unsigned(idx % qkv_rows);
+        const unsigned int token = unsigned(idx / qkv_rows);
+        const float value = qkv[idx];
+        if (row < q_rows) {
+            q_output[size_t(token) * q_rows + row] = value * q_output_scale;
+        } else if (row < q_rows + kv_rows) {
+            const unsigned int k_row = row - q_rows;
+            k_output[size_t(token) * kv_rows + k_row] = value * k_output_scale;
+        } else {
+            const unsigned int v_row = row - q_rows - kv_rows;
+            v_output[size_t(token) * kv_rows + v_row] = value * v_output_scale;
+        }
+    }
+}
+
 extern "C" __global__ void aegis_blackwell_nvfp4_linear_probe(
     const unsigned char* packed,
     const unsigned char* scales,

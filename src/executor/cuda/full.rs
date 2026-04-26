@@ -128,6 +128,7 @@ impl CudaLlamaExecutor {
 
     pub(super) fn new_state(&self) -> Result<CudaLlamaState> {
         let kv_width = self.num_kv_heads * self.head_dim;
+        let qkv_width = self.num_attention_heads * self.head_dim + 2 * kv_width;
         let intermediate = self
             .layers
             .first()
@@ -194,6 +195,9 @@ impl CudaLlamaExecutor {
                 cutlass_workspace: self
                     .runtime
                     .alloc_u8(cutlass_prefill_scratch.workspace_bytes)?,
+                qkv: self
+                    .runtime
+                    .alloc_f32(self.prefill_chunk_size * qkv_width)?,
                 q: self.runtime.alloc_f32(
                     self.prefill_chunk_size * self.num_attention_heads * self.head_dim,
                 )?,
@@ -362,7 +366,7 @@ fn cutlass_prefill_scratch_bytes(
     let scale_bytes =
         CudaRuntime::cutlass_nvfp4_activation_scale_bytes(chunk_size, max_input).unwrap_or(1);
     let workspace_bytes = if executor.layers.iter().any(|layer| {
-        [
+        let linears = [
             &layer.q_proj,
             &layer.k_proj,
             &layer.v_proj,
@@ -370,15 +374,17 @@ fn cutlass_prefill_scratch_bytes(
             &layer.gate_proj,
             &layer.up_proj,
             &layer.down_proj,
-        ]
-        .into_iter()
-        .any(|linear| executor.runtime.cutlass_nvfp4_inference_enabled_for(linear))
+        ];
+        linears
+            .into_iter()
+            .chain(layer.qkv_proj.as_ref())
+            .any(|linear| executor.runtime.cutlass_nvfp4_inference_enabled_for(linear))
     }) {
         executor
             .layers
             .iter()
             .flat_map(|layer| {
-                [
+                let linears = [
                     &layer.q_proj,
                     &layer.k_proj,
                     &layer.v_proj,
@@ -386,7 +392,8 @@ fn cutlass_prefill_scratch_bytes(
                     &layer.gate_proj,
                     &layer.up_proj,
                     &layer.down_proj,
-                ]
+                ];
+                linears.into_iter().chain(layer.qkv_proj.as_ref())
             })
             .filter(|linear| executor.runtime.cutlass_nvfp4_inference_enabled_for(linear))
             .map(|linear| {
