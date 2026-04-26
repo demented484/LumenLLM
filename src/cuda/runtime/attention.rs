@@ -89,7 +89,11 @@ fn select_prefill_batched_kernel(
 }
 
 impl CudaRuntime {
-    fn select_prefill_attention_backend(&self, context_len: usize) -> Result<CudaAttentionBackend> {
+    fn select_prefill_attention_backend(
+        &self,
+        context_len: usize,
+        _head_dim: usize,
+    ) -> Result<CudaAttentionBackend> {
         match self.config.prefill_attention {
             CudaPrefillAttentionKernel::Auto => {
                 let target = CudaAttentionBackend::auto_target_for_compute_capability(
@@ -358,6 +362,7 @@ impl CudaRuntime {
         value_chunk: &DeviceBuffer<f32>,
         query: &DeviceBuffer<f32>,
         query_half: &mut DeviceBuffer<u16>,
+        query_half_ready: bool,
         split_acc: &mut DeviceBuffer<f32>,
         split_m: &mut DeviceBuffer<f32>,
         split_l: &mut DeviceBuffer<f32>,
@@ -405,7 +410,7 @@ impl CudaRuntime {
             )));
         }
         let selected_backend =
-            self.select_prefill_attention_backend(dense_metadata.context_len())?;
+            self.select_prefill_attention_backend(dense_metadata.context_len(), head_dim)?;
         let use_varlen_attention = match selected_backend {
             CudaAttentionBackend::AegisVarlen => {
                 dense_metadata.context_len() >= CUDA_PREFILL_VARLEN_MIN_CONTEXT
@@ -428,7 +433,15 @@ impl CudaRuntime {
                     head_dim,
                 )?,
             )?;
-            self.f32_to_f16_device(query, q_len, query_half)?;
+            if !query_half_ready {
+                self.f32_to_f16_device(query, q_len, query_half)?;
+            } else if query_half.len() < q_len {
+                return Err(AegisError::InvalidPlan(format!(
+                    "dense varlen prefill q_half shape mismatch: required={} actual={}",
+                    q_len,
+                    query_half.len()
+                )));
+            }
             let block_table_stride = dense_metadata
                 .context_len()
                 .div_ceil(FLASH_COMPAT_PAGE_TOKENS)
@@ -601,7 +614,7 @@ impl CudaRuntime {
                 num_prefill_tokens + num_decode_tokens
             )));
         }
-        let selected_backend = self.select_prefill_attention_backend(max_k)?;
+        let selected_backend = self.select_prefill_attention_backend(max_k, head_dim)?;
         if !matches!(
             selected_backend,
             CudaAttentionBackend::AegisVarlen | CudaAttentionBackend::FlashAttention4
@@ -671,18 +684,24 @@ impl CudaRuntime {
             && head_dim_usize <= 256;
         let use_halfq_block4 =
             use_halfq_single_sequence && num_prefill_tokens >= FLASH_SPLIT_Q_BLOCK;
-        let use_fa4_hdim128 = use_halfq_single_sequence
+        let mut use_fa4_hdim128 = use_halfq_single_sequence
             && head_dim_usize == 128
             && matches!(selected_backend, CudaAttentionBackend::FlashAttention4);
         if matches!(selected_backend, CudaAttentionBackend::FlashAttention4) && !use_fa4_hdim128 {
-            return Err(AegisError::Unsupported(format!(
-                "cuda.prefill-attention=fa4 currently supports only single-sequence causal prefill with q_half, paged f16 KV cache, head_dim=128, and no decode tokens; got seqs={} prefill={} decode={} head_dim={} q_half={}",
-                request.num_sequences,
-                request.num_prefill_tokens,
-                request.num_decode_tokens,
-                request.head_dim,
-                request.q_half.is_some()
-            )));
+            if matches!(
+                self.config.prefill_attention,
+                CudaPrefillAttentionKernel::FlashAttention4
+            ) {
+                return Err(AegisError::Unsupported(format!(
+                    "cuda.prefill-attention=fa4 currently supports only single-sequence causal prefill with q_half, paged f16 KV cache, head_dim=128, and no decode tokens; got seqs={} prefill={} decode={} head_dim={} q_half={}",
+                    request.num_sequences,
+                    request.num_prefill_tokens,
+                    request.num_decode_tokens,
+                    request.head_dim,
+                    request.q_half.is_some()
+                )));
+            }
+            use_fa4_hdim128 = false;
         }
         let use_halfq_block4_split = use_halfq_block4
             && !use_fa4_hdim128

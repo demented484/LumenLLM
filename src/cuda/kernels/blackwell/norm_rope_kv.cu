@@ -488,6 +488,50 @@ extern "C" __global__ void aegis_f32_to_f16(
     }
 }
 
+extern "C" __global__ void aegis_apply_rope_positions_batched_f16_out(
+    float* values,
+    const unsigned int* positions,
+    const unsigned int batch,
+    const unsigned int num_heads,
+    const unsigned int head_dim,
+    const float theta,
+    const float factor,
+    const float low_freq_factor,
+    const float high_freq_factor,
+    const unsigned int original_max_position_embeddings,
+    unsigned short* output
+) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int batch_idx = blockIdx.y;
+    const unsigned int i = threadIdx.x;
+    const unsigned int half_dim = head_dim / 2u;
+    if (batch_idx >= batch || head >= num_heads || i >= half_dim) {
+        return;
+    }
+    float* row = values + (size_t(batch_idx) * num_heads + head) * head_dim;
+    unsigned short* out = output + (size_t(batch_idx) * num_heads + head) * head_dim;
+    const float angle = float(positions[batch_idx]) * rope_inv_freq_device(
+        i,
+        head_dim,
+        theta,
+        factor,
+        low_freq_factor,
+        high_freq_factor,
+        float(original_max_position_embeddings)
+    );
+    float sinv;
+    float cosv;
+    sincosf(angle, &sinv, &cosv);
+    const float x0 = row[i];
+    const float x1 = row[i + half_dim];
+    const float y0 = x0 * cosv - x1 * sinv;
+    const float y1 = x0 * sinv + x1 * cosv;
+    row[i] = y0;
+    row[i + half_dim] = y1;
+    out[i] = float_to_f16_bits(y0);
+    out[i + half_dim] = float_to_f16_bits(y1);
+}
+
 extern "C" __global__ void aegis_kv_store(
     unsigned short* key_cache,
     unsigned short* value_cache,
@@ -543,5 +587,64 @@ extern "C" __global__ void aegis_kv_store_slots_batched(
             key_cache[dst] = float_to_f16_bits(key[src]);
             value_cache[dst] = float_to_f16_bits(value[src]);
         }
+    }
+}
+
+extern "C" __global__ void aegis_rope_kv_store_slots_batched(
+    unsigned short* key_cache,
+    unsigned short* value_cache,
+    float* key,
+    const float* value,
+    const unsigned int* positions,
+    const unsigned int* slot_mapping,
+    const unsigned int batch,
+    const unsigned int num_heads,
+    const unsigned int head_dim,
+    const unsigned int context_size,
+    const float theta,
+    const float factor,
+    const float low_freq_factor,
+    const float high_freq_factor,
+    const unsigned int original_max_position_embeddings
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int batch_idx = blockIdx.y;
+    const unsigned int width = num_heads * head_dim;
+    if (batch_idx >= batch || idx >= width) {
+        return;
+    }
+    const unsigned int slot = slot_mapping[batch_idx];
+    if (slot >= context_size) {
+        return;
+    }
+
+    const size_t src_base = size_t(batch_idx) * width;
+    const size_t dst_base = size_t(slot) * width;
+    const unsigned int dim = idx % head_dim;
+    const unsigned int half_dim = head_dim / 2u;
+
+    value_cache[dst_base + idx] = float_to_f16_bits(value[src_base + idx]);
+    if (dim < half_dim) {
+        const unsigned int pair_idx = idx + half_dim;
+        const float angle = float(positions[batch_idx]) * rope_inv_freq_device(
+            dim,
+            head_dim,
+            theta,
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            float(original_max_position_embeddings)
+        );
+        float sinv;
+        float cosv;
+        sincosf(angle, &sinv, &cosv);
+        const float x0 = key[src_base + idx];
+        const float x1 = key[src_base + pair_idx];
+        const float y0 = x0 * cosv - x1 * sinv;
+        const float y1 = x0 * sinv + x1 * cosv;
+        key[src_base + idx] = y0;
+        key[src_base + pair_idx] = y1;
+        key_cache[dst_base + idx] = float_to_f16_bits(y0);
+        key_cache[dst_base + pair_idx] = float_to_f16_bits(y1);
     }
 }

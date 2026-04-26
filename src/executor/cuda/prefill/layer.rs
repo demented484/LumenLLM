@@ -38,7 +38,6 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
 ) -> Result<()> {
     let hidden_size = layer.o_proj.rows;
     let intermediate = layer.gate_proj.rows;
-    let kv_width = params.num_kv_heads * params.head_dim;
     let qkv_start = Instant::now();
     if prefill_linear_native_mxfp4_enabled(runtime, &layer.q_proj)
         && prefill_linear_native_mxfp4_enabled(runtime, &layer.k_proj)
@@ -179,37 +178,33 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     })?;
 
     let rope_start = Instant::now();
-    runtime.apply_rope_positions_batched_device(
+    runtime.apply_rope_positions_batched_f16_out_device(
         &mut prefill.q,
         &prefill.positions,
         params.batch,
         params.num_attention_heads,
         params.head_dim,
         params.rope,
-    )?;
-    runtime.apply_rope_positions_batched_device(
-        &mut prefill.k,
-        &prefill.positions,
-        params.batch,
-        params.num_kv_heads,
-        params.head_dim,
-        params.rope,
+        &mut prefill.q_half,
     )?;
     record_prefill_stage(runtime, timings, rope_start, |timings, elapsed| {
         timings.rope_us += elapsed
     })?;
 
     let kv_store_start = Instant::now();
-    runtime.store_kv_slots_batched_device(
+    runtime.store_kv_slots_batched_rope_key_device(
         &mut layer_state.kv.keys,
         &mut layer_state.kv.values,
-        &prefill.k,
+        &mut prefill.k,
         &prefill.v,
+        &prefill.positions,
         &prefill.slot_mapping,
         params.batch,
-        kv_width,
+        params.num_kv_heads,
+        params.head_dim,
         params.kv_context_size,
         params.dense_metadata,
+        params.rope,
     )?;
     record_prefill_stage(runtime, timings, kv_store_start, |timings, elapsed| {
         timings.kv_store_us += elapsed
@@ -223,6 +218,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         &prefill.v,
         &prefill.q,
         &mut prefill.q_half,
+        true,
         &mut prefill.attn_split_acc,
         &mut prefill.attn_split_m,
         &mut prefill.attn_split_l,

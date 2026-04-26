@@ -460,6 +460,67 @@ impl CudaRuntime {
         Ok(())
     }
 
+    pub fn apply_rope_positions_batched_f16_out_device(
+        &self,
+        values: &mut DeviceBuffer<f32>,
+        positions: &DeviceBuffer<u32>,
+        batch: usize,
+        num_heads: usize,
+        head_dim: usize,
+        rope: DeviceRopeConfig,
+        output: &mut DeviceBuffer<u16>,
+    ) -> Result<()> {
+        validate_rope_shape("positions batched rope f16 output", num_heads, head_dim)?;
+        let expected_values = batch
+            .checked_mul(num_heads)
+            .and_then(|len| len.checked_mul(head_dim))
+            .ok_or_else(|| {
+                AegisError::InvalidPlan(format!(
+                    "positions batched rope f16 output length overflow: batch={} heads={} head_dim={}",
+                    batch, num_heads, head_dim
+                ))
+            })?;
+        if values.len() < expected_values
+            || output.len() < expected_values
+            || positions.len() < batch
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "positions batched rope f16 output shape mismatch: values={} output={} positions={} expected_values={} batch={}",
+                values.len(),
+                output.len(),
+                positions.len(),
+                expected_values,
+                batch
+            )));
+        }
+        let batch = u32_arg("batch", batch)?;
+        let num_heads = u32_arg("num_heads", num_heads)?;
+        let head_dim = u32_arg("head_dim", head_dim)?;
+        let cfg = LaunchConfig {
+            grid_dim: (num_heads, batch, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.rope_positions_batched_f16_out)
+                .arg(&mut values.slice)
+                .arg(&positions.slice)
+                .arg(&batch)
+                .arg(&num_heads)
+                .arg(&head_dim)
+                .arg(&rope.theta)
+                .arg(&rope.factor)
+                .arg(&rope.low_freq_factor)
+                .arg(&rope.high_freq_factor)
+                .arg(&rope.original_max_position_embeddings)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch positions batched rope f16 output"))?;
+        Ok(())
+    }
+
     pub fn copy_row_f32_device(
         &self,
         input: &DeviceBuffer<f32>,

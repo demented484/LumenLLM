@@ -1,7 +1,7 @@
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 use super::{CudaRuntime, ceil_div, map_cuda_err};
-use crate::cuda::{DensePrefillMetadataProof, DeviceBuffer};
+use crate::cuda::{DensePrefillMetadataProof, DeviceBuffer, DeviceRopeConfig};
 use crate::error::{AegisError, Result};
 
 fn u32_arg(name: &str, value: usize) -> Result<u32> {
@@ -235,6 +235,96 @@ impl CudaRuntime {
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch slot-mapped batched kv store"))?;
+        Ok(())
+    }
+
+    pub fn store_kv_slots_batched_rope_key_device(
+        &self,
+        key_cache: &mut DeviceBuffer<u16>,
+        value_cache: &mut DeviceBuffer<u16>,
+        key: &mut DeviceBuffer<f32>,
+        value: &DeviceBuffer<f32>,
+        positions: &DeviceBuffer<u32>,
+        slot_mapping: &DeviceBuffer<u32>,
+        batch: usize,
+        num_heads: usize,
+        head_dim: usize,
+        context_size: usize,
+        dense_metadata: DensePrefillMetadataProof,
+        rope: DeviceRopeConfig,
+    ) -> Result<()> {
+        if num_heads == 0 || head_dim == 0 || head_dim % 2 != 0 || head_dim > 256 {
+            return Err(AegisError::InvalidPlan(format!(
+                "slot-mapped roped kv store requires non-zero heads and even head_dim <= 256: heads={} head_dim={}",
+                num_heads, head_dim
+            )));
+        }
+        let kv_width = checked_len("slot-mapped roped kv width", num_heads, head_dim)?;
+        let vector_len = checked_len("slot-mapped roped key/value", batch, kv_width)?;
+        let cache_len = checked_len("slot-mapped roped cache", context_size, kv_width)?;
+        if dense_metadata.batch() != batch || dense_metadata.context_len() > context_size {
+            return Err(AegisError::InvalidPlan(format!(
+                "slot-mapped roped kv store requires matching dense identity proof: batch={} context={} proof_batch={} proof_context={}",
+                batch,
+                context_size,
+                dense_metadata.batch(),
+                dense_metadata.context_len()
+            )));
+        }
+        if key.len() < vector_len || value.len() < vector_len {
+            return Err(AegisError::InvalidPlan(
+                "slot-mapped roped kv store vector shape mismatch".into(),
+            ));
+        }
+        if positions.len() < batch
+            || slot_mapping.len() < batch
+            || key_cache.len() != cache_len
+            || value_cache.len() != cache_len
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "slot-mapped roped kv cache shape mismatch: key_cache={} value_cache={} key={} value={} positions={} slots={} batch={} context={} width={}",
+                key_cache.len(),
+                value_cache.len(),
+                key.len(),
+                value.len(),
+                positions.len(),
+                slot_mapping.len(),
+                batch,
+                context_size,
+                kv_width
+            )));
+        }
+        let batch = u32_arg("batch", batch)?;
+        let num_heads = u32_arg("num_heads", num_heads)?;
+        let head_dim = u32_arg("head_dim", head_dim)?;
+        let kv_width = u32_arg("kv_width", kv_width)?;
+        let context_size = u32_arg("context_size", context_size)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(kv_width, 256), batch, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.rope_kv_store_slots_batched)
+                .arg(&mut key_cache.slice)
+                .arg(&mut value_cache.slice)
+                .arg(&mut key.slice)
+                .arg(&value.slice)
+                .arg(&positions.slice)
+                .arg(&slot_mapping.slice)
+                .arg(&batch)
+                .arg(&num_heads)
+                .arg(&head_dim)
+                .arg(&context_size)
+                .arg(&rope.theta)
+                .arg(&rope.factor)
+                .arg(&rope.low_freq_factor)
+                .arg(&rope.high_freq_factor)
+                .arg(&rope.original_max_position_embeddings)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch slot-mapped roped batched kv store"))?;
         Ok(())
     }
 }
