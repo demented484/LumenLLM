@@ -17,6 +17,7 @@ pub enum CudaPrefillAttentionKernel {
     WarpFlash,
     Continuation,
     FlashVarlen,
+    FlashAttention4,
 }
 
 impl CudaRuntimeConfig {
@@ -48,9 +49,25 @@ impl CudaPrefillAttentionKernel {
             "varlen" | "paged-varlen" | "flash-varlen" | "fa-varlen" | "flash-varlen-paged" => {
                 Ok(Self::FlashVarlen)
             }
+            "fa4" | "flash4" | "flash-attention-4" | "flashattention4" => Ok(Self::FlashAttention4),
             other => Err(AegisError::InvalidConfig(format!(
                 "unsupported CUDA prefill attention kernel `{other}`"
             ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CudaPrefillAttentionKernel;
+
+    #[test]
+    fn parses_flash_attention_4_aliases() {
+        for alias in ["fa4", "flash4", "flash-attention-4", "flashattention4"] {
+            assert_eq!(
+                CudaPrefillAttentionKernel::parse(alias).expect("alias should parse"),
+                CudaPrefillAttentionKernel::FlashAttention4
+            );
         }
     }
 }

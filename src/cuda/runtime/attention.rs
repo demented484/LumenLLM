@@ -3,6 +3,7 @@ use cudarc::driver::{LaunchConfig, PushKernelArg};
 use super::{CudaRuntime, map_cuda_err};
 use crate::cuda::{CudaPrefillAttentionKernel, DensePrefillMetadataProof, DeviceBuffer};
 use crate::error::{AegisError, Result};
+use crate::hardware::HardwareInventory;
 
 fn u32_arg(name: &str, value: usize) -> Result<u32> {
     u32::try_from(value).map_err(|_| {
@@ -31,6 +32,15 @@ fn checked_sum(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
 const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
 const FLASH_SPLIT_K_TOKENS: usize = 256;
 const FLASH_SPLIT_Q_BLOCK: usize = 4;
+
+fn is_blackwell_device(device_index: usize) -> bool {
+    HardwareInventory::detect()
+        .gpus
+        .iter()
+        .find(|gpu| gpu.index == device_index)
+        .and_then(|gpu| gpu.compute_capability.as_deref())
+        .is_some_and(|compute_capability| compute_capability.starts_with("12."))
+}
 
 impl CudaRuntime {
     pub fn attention_decode_device(
@@ -178,6 +188,7 @@ impl CudaRuntime {
             CudaPrefillAttentionKernel::Reference => false,
             CudaPrefillAttentionKernel::Continuation => false,
             CudaPrefillAttentionKernel::FlashVarlen => false,
+            CudaPrefillAttentionKernel::FlashAttention4 => false,
         };
         let block_dim = if warp_parallel { 128 } else { 128 };
         let legacy_shared_bytes = (max_seq_len + block_dim as usize) * std::mem::size_of::<f32>();
@@ -310,11 +321,15 @@ impl CudaRuntime {
             )));
         }
         let flash_varlen_min_context = 128;
+        let auto_flash_varlen_min_context = 512;
         let use_flash_varlen = match self.config.prefill_attention {
             CudaPrefillAttentionKernel::FlashVarlen => {
                 dense_metadata.context_len() >= flash_varlen_min_context
             }
             CudaPrefillAttentionKernel::Auto => {
+                dense_metadata.context_len() >= auto_flash_varlen_min_context
+            }
+            CudaPrefillAttentionKernel::FlashAttention4 => {
                 dense_metadata.context_len() >= flash_varlen_min_context
             }
             CudaPrefillAttentionKernel::Reference
@@ -491,8 +506,27 @@ impl CudaRuntime {
             && num_decode_tokens == 0
             && num_prefill_tokens >= 4
             && head_dim_usize <= 256;
-        let use_halfq_block4_split =
-            use_halfq_block4 && split_scratch_ready && split_count_usize > 1 && max_k >= 1024;
+        let blackwell_device = is_blackwell_device(self.device_index);
+        let use_fa4_tile16 = use_halfq_block4
+            && head_dim_usize % 32 == 0
+            && match self.config.prefill_attention {
+                CudaPrefillAttentionKernel::FlashAttention4 => {
+                    if !blackwell_device {
+                        return Err(AegisError::Unsupported(format!(
+                            "cuda.prefill-attention=fa4 requires a Blackwell/SM12.x CUDA device; device {} is not reported as Blackwell",
+                            self.device_index
+                        )));
+                    }
+                    true
+                }
+                CudaPrefillAttentionKernel::Auto => false,
+                _ => false,
+            };
+        let use_halfq_block4_split = use_halfq_block4
+            && !use_fa4_tile16
+            && split_scratch_ready
+            && split_count_usize > 1
+            && max_k >= 1024;
         let num_sequences = u32_arg("num_sequences", num_sequences)?;
         let total_q = u32_arg("num_prefill_tokens", num_prefill_tokens)?;
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
@@ -508,9 +542,24 @@ impl CudaRuntime {
             self.config.prefill_attention,
             CudaPrefillAttentionKernel::WarpFlash
         ) && warp_eligible;
-        let block_dim = if use_halfq_block4 { 64_u32 } else { 128_u32 };
+        let block_dim = if use_fa4_tile16 {
+            128_u32
+        } else if use_halfq_block4 {
+            64_u32
+        } else {
+            128_u32
+        };
         let mut shared_floats = if use_warp {
             (block_dim / 32) as usize * 3 + head_dim_usize + 4
+        } else if use_fa4_tile16 {
+            let q_block = 4_usize;
+            let k_tile = 16_usize;
+            let nwarps = (block_dim / 32) as usize;
+            q_block * k_tile * (nwarps + 1)
+                + q_block * head_dim_usize
+                + k_tile * head_dim_usize * 2
+                + q_block * head_dim_usize
+                + q_block * 4
         } else if use_halfq_block4 {
             let q_block = 4_usize;
             let nwarps = (block_dim / 32) as usize;
@@ -609,7 +658,11 @@ impl CudaRuntime {
         }
         if let Some(query_half) = query_half {
             let kernel = if use_halfq_block4 {
-                &self.kernels.attention_prefill_paged_varlen_halfq_block4
+                if use_fa4_tile16 {
+                    &self.kernels.attention_prefill_paged_varlen_fa4_tile16
+                } else {
+                    &self.kernels.attention_prefill_paged_varlen_halfq_block4
+                }
             } else {
                 &self.kernels.attention_prefill_paged_varlen_halfq
             };

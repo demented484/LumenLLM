@@ -74,6 +74,9 @@ impl CudaExecutorProvider {
             CudaPrefillAttentionKernel::FlashVarlen => {
                 "CUDA prefill attention uses the paged varlen online-softmax FlashAttention path".into()
             }
+            CudaPrefillAttentionKernel::FlashAttention4 => {
+                "CUDA prefill attention uses the Blackwell FA4-style tiled paged-varlen path".into()
+            }
         };
         Ok(Self {
             device,

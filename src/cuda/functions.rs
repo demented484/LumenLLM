@@ -52,6 +52,7 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) attention_prefill_paged_varlen: CudaFunction,
     pub(crate) attention_prefill_paged_varlen_halfq: CudaFunction,
     pub(crate) attention_prefill_paged_varlen_halfq_block4: CudaFunction,
+    pub(crate) attention_prefill_paged_varlen_fa4_tile16: CudaFunction,
     pub(crate) attention_prefill_paged_varlen_halfq_block4_split: CudaFunction,
     pub(crate) attention_prefill_paged_varlen_halfq_block4_combine: CudaFunction,
     pub(crate) attention_prefill_paged_varlen_warp: CudaFunction,
@@ -139,6 +140,10 @@ impl CudaKernelFunctions {
             attention_prefill_paged_varlen_halfq_block4: load(
                 &module,
                 "aegis_attention_prefill_paged_varlen_halfq_block4",
+            )?,
+            attention_prefill_paged_varlen_fa4_tile16: load(
+                &module,
+                "aegis_attention_prefill_paged_varlen_fa4_tile16",
             )?,
             attention_prefill_paged_varlen_halfq_block4_split: load(
                 &module,
