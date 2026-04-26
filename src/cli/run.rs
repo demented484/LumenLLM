@@ -3,8 +3,8 @@ use std::env;
 use super::generate::{print_generate_bench, print_generate_bench_sweep};
 use super::smoke::{
     cpu_materialize_smoke, cpu_smoke, cuda_chain_smoke, cuda_compare, cuda_dense_smoke,
-    cuda_prefill_compare, cuda_prefill_sweep, cuda_sdpa_sweep, cuda_smoke, inspect_hardware,
-    mvp_check, quality_smoke, storage_smoke,
+    cuda_prefill_compare, cuda_prefill_sweep, cuda_smoke, inspect_hardware, mvp_check,
+    quality_smoke, storage_smoke,
 };
 use super::{Command, parse_args};
 use crate::engine::bench::run_generation_bench;
@@ -30,7 +30,6 @@ pub fn run_env() -> Result<()> {
         Command::CudaCompare(config) => cuda_compare(config)?,
         Command::CudaPrefillCompare(config) => cuda_prefill_compare(config)?,
         Command::CudaPrefillSweep(config) => cuda_prefill_sweep(config)?,
-        Command::CudaSdpaSweep(config) => cuda_sdpa_sweep(config)?,
         Command::Generate(config, request) => {
             let engine = AegisEngine::build(config)?;
             let output = engine.generate(request)?;

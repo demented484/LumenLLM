@@ -46,18 +46,9 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) kv_store_slots_batched: CudaFunction,
     pub(crate) attention: CudaFunction,
     pub(crate) attention_decode_streaming: CudaFunction,
-    pub(crate) sdpa_decode: CudaFunction,
-    pub(crate) sdpa_decode_streaming: CudaFunction,
     pub(crate) attention_prefill_batched: CudaFunction,
     pub(crate) attention_prefill_continuation: CudaFunction,
     pub(crate) attention_prefill_batched_warp: CudaFunction,
-    pub(crate) sdpa_prefill_dense_cache: CudaFunction,
-    pub(crate) sdpa_prefill_dense_online: CudaFunction,
-    pub(crate) sdpa_prefill_paged_varlen: CudaFunction,
-    pub(crate) sdpa_prefill_paged_varlen_halfq: CudaFunction,
-    pub(crate) sdpa_prefill_paged_varlen_halfq_block4: CudaFunction,
-    pub(crate) sdpa_prefill_paged_varlen_halfq_block4_split: CudaFunction,
-    pub(crate) sdpa_prefill_paged_varlen_halfq_block4_combine: CudaFunction,
     pub(crate) attention_prefill_paged_varlen: CudaFunction,
     pub(crate) attention_prefill_paged_varlen_halfq: CudaFunction,
     pub(crate) attention_prefill_paged_varlen_halfq_block4: CudaFunction,
@@ -138,33 +129,9 @@ impl CudaKernelFunctions {
             kv_store_slots_batched: load(&module, "aegis_kv_store_slots_batched")?,
             attention: load(&module, "aegis_attention_decode")?,
             attention_decode_streaming: load(&module, "aegis_attention_decode_streaming")?,
-            sdpa_decode: load(&module, "aegis_sdpa_decode")?,
-            sdpa_decode_streaming: load(&module, "aegis_sdpa_decode_streaming")?,
             attention_prefill_batched: load(&module, "aegis_attention_prefill_batched")?,
             attention_prefill_continuation: load(&module, "aegis_attention_prefill_continuation")?,
             attention_prefill_batched_warp: load(&module, "aegis_attention_prefill_batched_warp")?,
-            sdpa_prefill_dense_cache: load(&module, "aegis_sdpa_prefill_dense_cache")?,
-            sdpa_prefill_dense_online: load(&module, "aegis_sdpa_prefill_dense_online")?,
-            sdpa_prefill_paged_varlen: load(&module, "aegis_sdpa_prefill_paged_varlen")?,
-            // The SDPA backend owns routing and reporting, but shares the optimized
-            // paged-varlen halfq primitives instead of falling back to the slow f32
-            // one-query kernel.
-            sdpa_prefill_paged_varlen_halfq: load(
-                &module,
-                "aegis_attention_prefill_paged_varlen_halfq",
-            )?,
-            sdpa_prefill_paged_varlen_halfq_block4: load(
-                &module,
-                "aegis_attention_prefill_paged_varlen_halfq_block4",
-            )?,
-            sdpa_prefill_paged_varlen_halfq_block4_split: load(
-                &module,
-                "aegis_attention_prefill_paged_varlen_halfq_block4_split",
-            )?,
-            sdpa_prefill_paged_varlen_halfq_block4_combine: load(
-                &module,
-                "aegis_attention_prefill_paged_varlen_halfq_block4_combine",
-            )?,
             attention_prefill_paged_varlen: load(&module, "aegis_attention_prefill_paged_varlen")?,
             attention_prefill_paged_varlen_halfq: load(
                 &module,

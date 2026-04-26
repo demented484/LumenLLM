@@ -25,7 +25,6 @@ pub enum Command {
     CudaCompare(EngineConfig),
     CudaPrefillCompare(EngineConfig),
     CudaPrefillSweep(EngineConfig),
-    CudaSdpaSweep(EngineConfig),
     Generate(EngineConfig, GenerateRequest),
     BenchGenerate(EngineConfig, BenchGenerateRequest, usize, BenchOutputFormat),
     BenchGenerateSweep(

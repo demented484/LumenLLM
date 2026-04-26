@@ -48,7 +48,7 @@ pub struct CudaAttentionRequest<'a> {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub enum CudaSdpaMode {
+pub enum CudaAttentionMode {
     Decode = 0,
     Prefill = 1,
     Varlen = 2,
@@ -58,9 +58,9 @@ pub enum CudaSdpaMode {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
-pub struct CudaSdpaParamsV1 {
+pub struct CudaAttentionParamsV1 {
     pub abi_version: u32,
-    pub mode: CudaSdpaMode,
+    pub mode: CudaAttentionMode,
     pub flags: u32,
     pub num_sequences: u32,
     pub num_prefill_tokens: u32,
@@ -87,7 +87,7 @@ pub struct CudaSdpaParamsV1 {
 }
 
 #[allow(dead_code)]
-impl CudaSdpaParamsV1 {
+impl CudaAttentionParamsV1 {
     pub const ABI_VERSION: u32 = 1;
     pub const FLAG_CAUSAL: u32 = 1 << 0;
     pub const FLAG_PAGED_KV: u32 = 1 << 1;
@@ -250,20 +250,20 @@ impl DensePrefillMetadataProof {
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaSdpaMode, CudaSdpaParamsV1, DensePrefillMetadataProof};
+    use super::{CudaAttentionMode, CudaAttentionParamsV1, DensePrefillMetadataProof};
 
     #[test]
-    fn sdpa_params_are_c_stable_enough_for_cuda_ffi() {
-        assert_eq!(CudaSdpaParamsV1::ABI_VERSION, 1);
-        assert_eq!(CudaSdpaMode::Decode as u32, 0);
-        assert_eq!(CudaSdpaMode::Prefill as u32, 1);
-        assert_eq!(CudaSdpaMode::Varlen as u32, 2);
-        assert_eq!(CudaSdpaMode::Mixed as u32, 3);
-        assert_eq!(CudaSdpaParamsV1::FLAG_CAUSAL, 1);
-        assert_eq!(CudaSdpaParamsV1::FLAG_PAGED_KV, 2);
-        assert_eq!(CudaSdpaParamsV1::FLAG_GQA, 4);
+    fn attention_params_are_c_stable_enough_for_cuda_ffi() {
+        assert_eq!(CudaAttentionParamsV1::ABI_VERSION, 1);
+        assert_eq!(CudaAttentionMode::Decode as u32, 0);
+        assert_eq!(CudaAttentionMode::Prefill as u32, 1);
+        assert_eq!(CudaAttentionMode::Varlen as u32, 2);
+        assert_eq!(CudaAttentionMode::Mixed as u32, 3);
+        assert_eq!(CudaAttentionParamsV1::FLAG_CAUSAL, 1);
+        assert_eq!(CudaAttentionParamsV1::FLAG_PAGED_KV, 2);
+        assert_eq!(CudaAttentionParamsV1::FLAG_GQA, 4);
         assert_eq!(
-            std::mem::size_of::<CudaSdpaParamsV1>() % std::mem::size_of::<usize>(),
+            std::mem::size_of::<CudaAttentionParamsV1>() % std::mem::size_of::<usize>(),
             0
         );
     }

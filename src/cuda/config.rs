@@ -17,7 +17,6 @@ pub enum CudaPrefillAttentionKernel {
     #[default]
     Auto,
     Off,
-    Sdpa,
     FlashAttention2,
     FlashAttention3,
     FlashAttention4,
@@ -30,7 +29,6 @@ pub enum CudaPrefillAttentionKernel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CudaAttentionBackend {
     Reference,
-    Sdpa,
     FlashAttention2,
     FlashAttention3,
     FlashAttention4,
@@ -41,9 +39,6 @@ pub enum CudaAttentionBackend {
 pub enum CudaAttentionEffectivePath {
     ReferenceCacheOnly,
     ReferenceContinuation,
-    SdpaCacheOnly,
-    SdpaOnline,
-    SdpaPagedVarlen,
     AegisPagedVarlen,
     FlashAttention4PagedVarlen,
     WarpFlash,
@@ -96,9 +91,6 @@ impl CudaPrefillAttentionKernel {
             "auto" => Ok(Self::Auto),
             "off" | "false" | "none" | "disabled" => Ok(Self::Off),
             "reference" | "scalar" | "legacy" => Ok(Self::Reference),
-            "sdpa" | "spda" | "scaled-dot-product" | "scaled-dot-product-attention" => {
-                Ok(Self::Sdpa)
-            }
             "fa2" | "flash2" | "flash-attention-2" | "flashattention2" => Ok(Self::FlashAttention2),
             "fa3" | "flash3" | "flash-attention-3" | "flashattention3" => Ok(Self::FlashAttention3),
             "fa4" | "flash4" | "flash-attention-4" | "flashattention4" => Ok(Self::FlashAttention4),
@@ -118,7 +110,6 @@ impl CudaPrefillAttentionKernel {
         match self {
             Self::Auto => "auto",
             Self::Off => "off",
-            Self::Sdpa => "sdpa",
             Self::FlashAttention2 => "fa2",
             Self::FlashAttention3 => "fa3",
             Self::FlashAttention4 => "fa4",
@@ -140,14 +131,13 @@ impl CudaAttentionBackend {
         } else if cc.starts_with("8.") {
             Self::FlashAttention2
         } else {
-            Self::Sdpa
+            Self::AegisVarlen
         }
     }
 
     pub fn canonical_name(self) -> &'static str {
         match self {
             Self::Reference => "reference",
-            Self::Sdpa => "sdpa",
             Self::FlashAttention2 => "fa2",
             Self::FlashAttention3 => "fa3",
             Self::FlashAttention4 => "fa4",
@@ -161,9 +151,6 @@ impl CudaAttentionEffectivePath {
         match self {
             Self::ReferenceCacheOnly => "reference/cache-only",
             Self::ReferenceContinuation => "reference/continuation",
-            Self::SdpaCacheOnly => "sdpa/cache-only",
-            Self::SdpaOnline => "sdpa/online",
-            Self::SdpaPagedVarlen => "sdpa/paged-varlen",
             Self::AegisPagedVarlen => "aegis-varlen/paged-varlen",
             Self::FlashAttention4PagedVarlen => "fa4/paged-varlen",
             Self::WarpFlash => "warp-flash/cache-only",
@@ -189,9 +176,9 @@ impl CudaPrefillAttentionSelection {
                         if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
                     {
                         (
-                            CudaAttentionBackend::Sdpa,
-                            CudaAttentionEffectivePath::SdpaPagedVarlen,
-                            "auto selected Blackwell-class attention; using optimized SDPA paged-varlen path until FA4 is promoted",
+                            CudaAttentionBackend::AegisVarlen,
+                            CudaAttentionEffectivePath::AegisPagedVarlen,
+                            "auto selected Blackwell-class attention; using Aegis paged-varlen path until FA4 is promoted",
                         )
                     }
                     CudaAttentionBackend::FlashAttention2
@@ -199,9 +186,9 @@ impl CudaPrefillAttentionSelection {
                         if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT =>
                     {
                         (
-                            CudaAttentionBackend::Sdpa,
-                            CudaAttentionEffectivePath::SdpaPagedVarlen,
-                            "auto selected flash attention generation; using optimized SDPA paged-varlen path for long context",
+                            CudaAttentionBackend::AegisVarlen,
+                            CudaAttentionEffectivePath::AegisPagedVarlen,
+                            "auto selected flash attention generation; using Aegis paged-varlen path for long context",
                         )
                     }
                     _ if oversized_dense_scores => (
@@ -229,28 +216,9 @@ impl CudaPrefillAttentionSelection {
                 logical_backend: CudaAttentionBackend::Reference,
                 effective_path: CudaAttentionEffectivePath::ReferenceCacheOnly,
                 reason: if oversized_dense_scores {
-                    "reference requested but dense scores exceed bounded shared-memory policy; runtime rejects this shape unless sdpa, auto, or continuation is requested"
+                    "reference requested but dense scores exceed bounded shared-memory policy; runtime rejects this shape unless aegis-varlen, auto, or continuation is requested"
                 } else {
                     "reference requested"
-                },
-            },
-            CudaPrefillAttentionKernel::Sdpa => Self {
-                requested,
-                auto_target: None,
-                logical_backend: CudaAttentionBackend::Sdpa,
-                effective_path: if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT {
-                    CudaAttentionEffectivePath::SdpaPagedVarlen
-                } else if oversized_dense_scores {
-                    CudaAttentionEffectivePath::SdpaOnline
-                } else {
-                    CudaAttentionEffectivePath::SdpaCacheOnly
-                },
-                reason: if context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT {
-                    "sdpa requested with paged-varlen prefill for long context"
-                } else if oversized_dense_scores {
-                    "sdpa requested with long context; using online softmax SDPA symbol"
-                } else {
-                    "sdpa requested with cache-resident dense causal prefill"
                 },
             },
             CudaPrefillAttentionKernel::FlashAttention4 => Self {
@@ -329,10 +297,6 @@ mod tests {
             CudaPrefillAttentionKernel::Off
         );
         assert_eq!(
-            CudaPrefillAttentionKernel::parse("sdpa").unwrap(),
-            CudaPrefillAttentionKernel::Sdpa
-        );
-        assert_eq!(
             CudaPrefillAttentionKernel::parse("fa2").unwrap(),
             CudaPrefillAttentionKernel::FlashAttention2
         );
@@ -366,34 +330,7 @@ mod tests {
         );
         assert_eq!(
             CudaAttentionBackend::auto_target_for_compute_capability(None),
-            CudaAttentionBackend::Sdpa
-        );
-    }
-
-    #[test]
-    fn sdpa_policy_names_dense_and_paged_paths() {
-        let short = CudaPrefillAttentionSelection::select(
-            CudaPrefillAttentionKernel::Sdpa,
-            Some("12.0"),
-            64,
-            128,
-        );
-        assert_eq!(short.logical_backend, CudaAttentionBackend::Sdpa);
-        assert_eq!(
-            short.effective_path,
-            CudaAttentionEffectivePath::SdpaCacheOnly
-        );
-
-        let long = CudaPrefillAttentionSelection::select(
-            CudaPrefillAttentionKernel::Sdpa,
-            Some("12.0"),
-            128,
-            128,
-        );
-        assert_eq!(long.logical_backend, CudaAttentionBackend::Sdpa);
-        assert_eq!(
-            long.effective_path,
-            CudaAttentionEffectivePath::SdpaPagedVarlen
+            CudaAttentionBackend::AegisVarlen
         );
     }
 
@@ -409,10 +346,10 @@ mod tests {
             selection.auto_target,
             Some(CudaAttentionBackend::FlashAttention4)
         );
-        assert_eq!(selection.logical_backend, CudaAttentionBackend::Sdpa);
+        assert_eq!(selection.logical_backend, CudaAttentionBackend::AegisVarlen);
         assert_eq!(
             selection.effective_path,
-            CudaAttentionEffectivePath::SdpaPagedVarlen
+            CudaAttentionEffectivePath::AegisPagedVarlen
         );
     }
 }

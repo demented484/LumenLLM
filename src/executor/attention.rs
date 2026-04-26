@@ -3,7 +3,7 @@ use rayon::prelude::*;
 use crate::error::{AegisError, Result};
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct SdpaDecodeRequest<'a> {
+pub(super) struct ReferenceAttentionDecodeRequest<'a> {
     pub keys: &'a [f32],
     pub values: &'a [f32],
     pub seq_len: usize,
@@ -15,7 +15,7 @@ pub(super) struct SdpaDecodeRequest<'a> {
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
-pub(super) struct SdpaPrefillRequest<'a> {
+pub(super) struct ReferenceAttentionPrefillRequest<'a> {
     pub keys: &'a [f32],
     pub values: &'a [f32],
     pub start_position: usize,
@@ -26,24 +26,24 @@ pub(super) struct SdpaPrefillRequest<'a> {
     pub head_dim: usize,
 }
 
-impl SdpaDecodeRequest<'_> {
+impl ReferenceAttentionDecodeRequest<'_> {
     fn validate(self, out: &[f32]) -> Result<()> {
         if self.num_attention_heads == 0 || self.num_kv_heads == 0 || self.head_dim == 0 {
             return Err(AegisError::InvalidPlan(format!(
-                "SDPA dimensions must be non-zero: q_heads={} kv_heads={} head_dim={}",
+                "reference attention dimensions must be non-zero: q_heads={} kv_heads={} head_dim={}",
                 self.num_attention_heads, self.num_kv_heads, self.head_dim
             )));
         }
         if self.num_attention_heads % self.num_kv_heads != 0 {
             return Err(AegisError::InvalidPlan(
-                "SDPA attention heads must be divisible by kv heads".into(),
+                "reference attention attention heads must be divisible by kv heads".into(),
             ));
         }
         let q_width = self.num_attention_heads * self.head_dim;
         let kv_width = self.num_kv_heads * self.head_dim;
         if self.query.len() != q_width || out.len() != q_width {
             return Err(AegisError::InvalidPlan(format!(
-                "SDPA query/output shape mismatch: query={} output={} expected={}",
+                "reference attention query/output shape mismatch: query={} output={} expected={}",
                 self.query.len(),
                 out.len(),
                 q_width
@@ -51,13 +51,13 @@ impl SdpaDecodeRequest<'_> {
         }
         let required_kv = self.seq_len.checked_mul(kv_width).ok_or_else(|| {
             AegisError::InvalidPlan(format!(
-                "SDPA KV length overflow: seq_len={} kv_width={}",
+                "reference attention KV length overflow: seq_len={} kv_width={}",
                 self.seq_len, kv_width
             ))
         })?;
         if self.keys.len() < required_kv || self.values.len() < required_kv {
             return Err(AegisError::InvalidPlan(format!(
-                "SDPA KV cache too small: seq_len={} kv_width={} keys={} values={}",
+                "reference attention KV cache too small: seq_len={} kv_width={} keys={} values={}",
                 self.seq_len,
                 kv_width,
                 self.keys.len(),
@@ -69,30 +69,30 @@ impl SdpaDecodeRequest<'_> {
 }
 
 #[allow(dead_code)]
-impl SdpaPrefillRequest<'_> {
+impl ReferenceAttentionPrefillRequest<'_> {
     fn validate(self, out: &[f32]) -> Result<()> {
         if self.num_attention_heads == 0 || self.num_kv_heads == 0 || self.head_dim == 0 {
             return Err(AegisError::InvalidPlan(format!(
-                "SDPA prefill dimensions must be non-zero: q_heads={} kv_heads={} head_dim={}",
+                "reference attention prefill dimensions must be non-zero: q_heads={} kv_heads={} head_dim={}",
                 self.num_attention_heads, self.num_kv_heads, self.head_dim
             )));
         }
         if self.num_attention_heads % self.num_kv_heads != 0 {
             return Err(AegisError::InvalidPlan(
-                "SDPA prefill attention heads must be divisible by kv heads".into(),
+                "reference attention prefill attention heads must be divisible by kv heads".into(),
             ));
         }
         let q_width = self.num_attention_heads * self.head_dim;
         let kv_width = self.num_kv_heads * self.head_dim;
         let query_len = self.batch.checked_mul(q_width).ok_or_else(|| {
             AegisError::InvalidPlan(format!(
-                "SDPA prefill query length overflow: batch={} q_width={}",
+                "reference attention prefill query length overflow: batch={} q_width={}",
                 self.batch, q_width
             ))
         })?;
         if self.query.len() != query_len || out.len() != query_len {
             return Err(AegisError::InvalidPlan(format!(
-                "SDPA prefill query/output shape mismatch: query={} output={} expected={}",
+                "reference attention prefill query/output shape mismatch: query={} output={} expected={}",
                 self.query.len(),
                 out.len(),
                 query_len
@@ -100,19 +100,19 @@ impl SdpaPrefillRequest<'_> {
         }
         let max_seq_len = self.start_position.checked_add(self.batch).ok_or_else(|| {
             AegisError::InvalidPlan(format!(
-                "SDPA prefill max sequence overflow: start={} batch={}",
+                "reference attention prefill max sequence overflow: start={} batch={}",
                 self.start_position, self.batch
             ))
         })?;
         let required_kv = max_seq_len.checked_mul(kv_width).ok_or_else(|| {
             AegisError::InvalidPlan(format!(
-                "SDPA prefill KV length overflow: seq_len={} kv_width={}",
+                "reference attention prefill KV length overflow: seq_len={} kv_width={}",
                 max_seq_len, kv_width
             ))
         })?;
         if self.keys.len() < required_kv || self.values.len() < required_kv {
             return Err(AegisError::InvalidPlan(format!(
-                "SDPA prefill KV cache too small: seq_len={} kv_width={} keys={} values={}",
+                "reference attention prefill KV cache too small: seq_len={} kv_width={} keys={} values={}",
                 max_seq_len,
                 kv_width,
                 self.keys.len(),
@@ -123,21 +123,24 @@ impl SdpaPrefillRequest<'_> {
     }
 }
 
-pub(super) fn sdpa_decode_f32_into(request: SdpaDecodeRequest<'_>, out: &mut [f32]) -> Result<()> {
+pub(super) fn reference_attention_decode_f32_into(
+    request: ReferenceAttentionDecodeRequest<'_>,
+    out: &mut [f32],
+) -> Result<()> {
     request.validate(out)?;
     let group = request.num_attention_heads / request.num_kv_heads;
     let scale = 1.0 / (request.head_dim as f32).sqrt();
     out.par_chunks_mut(request.head_dim)
         .enumerate()
         .for_each(|(head, head_out)| {
-            sdpa_decode_head_f32_into(request, head, group, scale, head_out);
+            reference_attention_decode_head_f32_into(request, head, group, scale, head_out);
         });
     Ok(())
 }
 
 #[allow(dead_code)]
-pub(super) fn sdpa_prefill_f32_into(
-    request: SdpaPrefillRequest<'_>,
+pub(super) fn reference_attention_prefill_f32_into(
+    request: ReferenceAttentionPrefillRequest<'_>,
     out: &mut [f32],
 ) -> Result<()> {
     request.validate(out)?;
@@ -154,7 +157,7 @@ pub(super) fn sdpa_prefill_f32_into(
                 .enumerate()
                 .for_each(|(head, head_out)| {
                     let query_offset = query_base + head * request.head_dim;
-                    sdpa_head_f32_into(
+                    reference_attention_head_f32_into(
                         request.keys,
                         request.values,
                         seq_len,
@@ -170,8 +173,8 @@ pub(super) fn sdpa_prefill_f32_into(
     Ok(())
 }
 
-fn sdpa_decode_head_f32_into(
-    request: SdpaDecodeRequest<'_>,
+fn reference_attention_decode_head_f32_into(
+    request: ReferenceAttentionDecodeRequest<'_>,
     head: usize,
     group: usize,
     scale: f32,
@@ -179,7 +182,7 @@ fn sdpa_decode_head_f32_into(
 ) {
     let kv_head = head / group;
     let q = &request.query[head * request.head_dim..(head + 1) * request.head_dim];
-    sdpa_head_f32_into(
+    reference_attention_head_f32_into(
         request.keys,
         request.values,
         request.seq_len,
@@ -193,7 +196,7 @@ fn sdpa_decode_head_f32_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sdpa_head_f32_into(
+fn reference_attention_head_f32_into(
     keys: &[f32],
     values: &[f32],
     seq_len: usize,
@@ -244,18 +247,19 @@ fn dot_f32(lhs: &[f32], rhs: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        SdpaDecodeRequest, SdpaPrefillRequest, sdpa_decode_f32_into, sdpa_prefill_f32_into,
+        ReferenceAttentionDecodeRequest, ReferenceAttentionPrefillRequest,
+        reference_attention_decode_f32_into, reference_attention_prefill_f32_into,
     };
 
     #[test]
-    fn sdpa_decode_matches_manual_single_head() {
+    fn reference_attention_decode_matches_manual_single_head() {
         let inv_sqrt2 = 1.0_f32 / 2.0_f32.sqrt();
         let keys = [1.0, 0.0, 0.0, 1.0];
         let values = [10.0, 0.0, 0.0, 20.0];
         let query = [1.0, 0.0];
         let mut out = [0.0; 2];
-        sdpa_decode_f32_into(
-            SdpaDecodeRequest {
+        reference_attention_decode_f32_into(
+            ReferenceAttentionDecodeRequest {
                 keys: &keys,
                 values: &values,
                 seq_len: 2,
@@ -276,13 +280,13 @@ mod tests {
     }
 
     #[test]
-    fn sdpa_decode_supports_gqa_head_mapping() {
+    fn reference_attention_decode_supports_gqa_head_mapping() {
         let keys = [1.0, 0.0, 0.0, 1.0];
         let values = [1.0, 2.0, 3.0, 4.0];
         let query = [1.0, 0.0, 0.0, 1.0];
         let mut out = [0.0; 4];
-        sdpa_decode_f32_into(
-            SdpaDecodeRequest {
+        reference_attention_decode_f32_into(
+            ReferenceAttentionDecodeRequest {
                 keys: &keys,
                 values: &values,
                 seq_len: 1,
@@ -298,13 +302,13 @@ mod tests {
     }
 
     #[test]
-    fn sdpa_prefill_matches_decode_for_each_causal_row() {
+    fn reference_attention_prefill_matches_decode_for_each_causal_row() {
         let keys = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
         let values = [10.0, 0.0, 0.0, 20.0, 5.0, 5.0];
         let query = [1.0, 0.0, 0.0, 1.0];
         let mut prefill = [0.0; 4];
-        sdpa_prefill_f32_into(
-            SdpaPrefillRequest {
+        reference_attention_prefill_f32_into(
+            ReferenceAttentionPrefillRequest {
                 keys: &keys,
                 values: &values,
                 start_position: 0,
@@ -319,8 +323,8 @@ mod tests {
         .unwrap();
 
         let mut row0 = [0.0; 2];
-        sdpa_decode_f32_into(
-            SdpaDecodeRequest {
+        reference_attention_decode_f32_into(
+            ReferenceAttentionDecodeRequest {
                 keys: &keys,
                 values: &values,
                 seq_len: 1,
@@ -333,8 +337,8 @@ mod tests {
         )
         .unwrap();
         let mut row1 = [0.0; 2];
-        sdpa_decode_f32_into(
-            SdpaDecodeRequest {
+        reference_attention_decode_f32_into(
+            ReferenceAttentionDecodeRequest {
                 keys: &keys,
                 values: &values,
                 seq_len: 2,
@@ -351,10 +355,10 @@ mod tests {
     }
 
     #[test]
-    fn sdpa_decode_rejects_bad_shapes() {
+    fn reference_attention_decode_rejects_bad_shapes() {
         let mut out = [0.0; 2];
-        let error = sdpa_decode_f32_into(
-            SdpaDecodeRequest {
+        let error = reference_attention_decode_f32_into(
+            ReferenceAttentionDecodeRequest {
                 keys: &[0.0],
                 values: &[0.0],
                 seq_len: 1,

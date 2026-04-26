@@ -1,6 +1,8 @@
 use super::state::CpuLayerState;
 use crate::error::Result;
-use crate::executor::attention::{SdpaDecodeRequest, sdpa_decode_f32_into};
+use crate::executor::attention::{
+    ReferenceAttentionDecodeRequest, reference_attention_decode_f32_into,
+};
 
 pub(super) fn attention_into(
     state: &CpuLayerState,
@@ -10,8 +12,8 @@ pub(super) fn attention_into(
     head_dim: usize,
     out: &mut [f32],
 ) -> Result<()> {
-    sdpa_decode_f32_into(
-        SdpaDecodeRequest {
+    reference_attention_decode_f32_into(
+        ReferenceAttentionDecodeRequest {
             keys: &state.keys,
             values: &state.values,
             seq_len: state.seq_len,

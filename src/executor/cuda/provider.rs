@@ -60,13 +60,10 @@ impl CudaExecutorProvider {
         };
         let attention_note = match cuda_config.prefill_attention {
             CudaPrefillAttentionKernel::Auto => {
-                "CUDA prefill attention is auto-selected from the architecture policy, with correctness-preserving fallback to reference or optimized SDPA paged-varlen paths until production FA kernels are available".into()
+                "CUDA prefill attention is auto-selected from the architecture policy, with correctness-preserving fallback to reference or Aegis paged-varlen paths until production FA kernels are available".into()
             }
             CudaPrefillAttentionKernel::Off => {
                 "CUDA fast prefill attention is disabled; the reference path is used".into()
-            }
-            CudaPrefillAttentionKernel::Sdpa => {
-                "CUDA prefill attention uses the portable SDPA path, preserving the dense exact path for short prompts and switching long prompts to paged-varlen prefill".into()
             }
             CudaPrefillAttentionKernel::FlashAttention2 => {
                 "CUDA prefill attention requests the FA2 backend for Ampere/Ada-class GPUs".into()
