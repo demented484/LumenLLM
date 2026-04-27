@@ -271,6 +271,38 @@ impl CudaRuntime {
         Ok(())
     }
 
+    pub fn add_inplace_device_len(
+        &self,
+        a: &mut DeviceBuffer<f32>,
+        b: &DeviceBuffer<f32>,
+        len: usize,
+    ) -> Result<()> {
+        if a.len() < len || b.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "in-place vector add shape mismatch: a={} b={} len={}",
+                a.len(),
+                b.len(),
+                len
+            )));
+        }
+        let len = len as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.add_inplace)
+                .arg(&mut a.slice)
+                .arg(&b.slice)
+                .arg(&len)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch in-place vector add"))?;
+        Ok(())
+    }
+
     pub fn swiglu_device(
         &self,
         gate: &DeviceBuffer<f32>,

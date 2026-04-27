@@ -1,3 +1,4 @@
+use super::linear_ops::native_mxfp4_enabled;
 use super::loader::{
     CudaLayerShape, cuda_residency_for_store, first_existing_tensor, load_cuda_layer,
     runtime_layouts_by_region,
@@ -134,6 +135,32 @@ impl CudaLlamaExecutor {
             .first()
             .map(|layer| layer.gate_proj.rows)
             .unwrap_or(self.hidden_size);
+        let needs_fallback_down_scratch = self.layers.iter().any(|layer| {
+            !self
+                .runtime
+                .cutlass_nvfp4_inference_enabled_for(&layer.down_proj)
+                && !native_mxfp4_enabled(&self.runtime, &layer.down_proj)
+        });
+        let needs_mxfp4_down_scratch = needs_fallback_down_scratch
+            || self
+                .layers
+                .iter()
+                .any(|layer| native_mxfp4_enabled(&self.runtime, &layer.down_proj));
+        let quant_intermediate_len = if needs_fallback_down_scratch {
+            self.prefill_chunk_size * intermediate
+        } else {
+            1
+        };
+        let mxfp4_intermediate_len = if needs_mxfp4_down_scratch {
+            self.prefill_chunk_size * CudaRuntime::mxfp4_vector_bytes(intermediate)?
+        } else {
+            1
+        };
+        let swiglu_len = if needs_fallback_down_scratch {
+            self.prefill_chunk_size * intermediate
+        } else {
+            1
+        };
         let cutlass_prefill_scratch =
             cutlass_prefill_scratch_bytes(self, self.prefill_chunk_size, intermediate)?;
         let cutlass_decode_scratch = cutlass_prefill_scratch_bytes(self, 1, intermediate)?;
@@ -170,24 +197,18 @@ impl CudaLlamaExecutor {
                 hidden: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
-                hidden_out: self
-                    .runtime
-                    .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
+                hidden_out: self.runtime.alloc_f32(1)?,
                 input_normed: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
                 quant_hidden: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
-                quant_intermediate: self
-                    .runtime
-                    .alloc_f32(self.prefill_chunk_size * intermediate)?,
+                quant_intermediate: self.runtime.alloc_f32(quant_intermediate_len)?,
                 mxfp4_hidden: self.runtime.alloc_u8(
                     self.prefill_chunk_size * CudaRuntime::mxfp4_vector_bytes(self.hidden_size)?,
                 )?,
-                mxfp4_intermediate: self.runtime.alloc_u8(
-                    self.prefill_chunk_size * CudaRuntime::mxfp4_vector_bytes(intermediate)?,
-                )?,
+                mxfp4_intermediate: self.runtime.alloc_u8(mxfp4_intermediate_len)?,
                 cutlass_payload: self
                     .runtime
                     .alloc_u8(cutlass_prefill_scratch.payload_bytes)?,
@@ -219,21 +240,15 @@ impl CudaLlamaExecutor {
                 attn_out: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
-                residual: self
-                    .runtime
-                    .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
-                post_normed: self
-                    .runtime
-                    .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
+                residual: self.runtime.alloc_f32(1)?,
+                post_normed: self.runtime.alloc_f32(1)?,
                 gate: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * intermediate)?,
                 up: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * intermediate)?,
-                swiglu: self
-                    .runtime
-                    .alloc_f32(self.prefill_chunk_size * intermediate)?,
+                swiglu: self.runtime.alloc_f32(swiglu_len)?,
                 mlp_out: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,

@@ -1,7 +1,7 @@
 use crate::error::{AegisError, Result};
 
 pub(crate) const CUDA_PREFILL_VARLEN_MIN_CONTEXT: usize = 128;
-pub(crate) const CUDA_PREFILL_CHUNK_MAX: usize = 4096;
+pub(crate) const CUDA_PREFILL_CHUNK_MAX: usize = 8192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CudaRuntimeConfig {

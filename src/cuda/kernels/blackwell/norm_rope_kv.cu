@@ -264,6 +264,17 @@ extern "C" __global__ void aegis_vector_add(
     }
 }
 
+extern "C" __global__ void aegis_vector_add_inplace(
+    float* a,
+    const float* b,
+    const unsigned int len
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        a[idx] += b[idx];
+    }
+}
+
 extern "C" __global__ void aegis_swiglu(
     const float* gate,
     const float* up,

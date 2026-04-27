@@ -308,34 +308,26 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     })?;
 
     let batch_hidden = params.batch * hidden_size;
-    if prefill.hidden.len() < batch_hidden
-        || prefill.attn_out.len() < batch_hidden
-        || prefill.residual.len() < batch_hidden
-    {
+    if prefill.hidden.len() < batch_hidden || prefill.attn_out.len() < batch_hidden {
         return Err(AegisError::InvalidPlan(
             "CUDA prefill hidden scratch is too small".into(),
         ));
     }
-    runtime.add_device_len(
-        &prefill.hidden,
-        &prefill.attn_out,
-        &mut prefill.residual,
-        batch_hidden,
-    )?;
+    runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.attn_out, batch_hidden)?;
 
     let mlp_start = Instant::now();
     if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.gate_proj)
         && prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.up_proj)
     {
         runtime.rms_norm_batched_device(
-            &prefill.residual,
+            &prefill.hidden,
             &layer.post_attention_norm_weight,
             params.batch,
             params.rms_norm_eps,
-            &mut prefill.post_normed,
+            &mut prefill.input_normed,
         )?;
         runtime.quantize_cutlass_nvfp4_activation_device(
-            &prefill.post_normed,
+            &prefill.input_normed,
             params.batch,
             layer.gate_proj.cols,
             &mut prefill.cutlass_payload,
@@ -363,14 +355,14 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         && prefill_linear_native_mxfp4_enabled(runtime, &layer.up_proj)
     {
         runtime.rms_norm_batched_device(
-            &prefill.residual,
+            &prefill.hidden,
             &layer.post_attention_norm_weight,
             params.batch,
             params.rms_norm_eps,
-            &mut prefill.post_normed,
+            &mut prefill.input_normed,
         )?;
         runtime.quantize_mxfp4_input_batched_device(
-            &prefill.post_normed,
+            &prefill.input_normed,
             params.batch,
             layer.gate_proj.cols,
             &mut prefill.mxfp4_hidden,
@@ -386,18 +378,18 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         )?;
     } else {
         runtime.rms_norm_quant_nvfp4_batched_device(
-            &prefill.residual,
+            &prefill.hidden,
             &layer.post_attention_norm_weight,
             params.batch,
             params.rms_norm_eps,
             layer.gate_proj.input_scale,
-            &mut prefill.post_normed,
+            &mut prefill.input_normed,
             &mut prefill.quant_hidden,
         )?;
         prefill_linear_prepared_batched_device(
             runtime,
             &layer.gate_proj,
-            &prefill.post_normed,
+            &prefill.input_normed,
             &prefill.quant_hidden,
             params.batch,
             &mut prefill.mxfp4_hidden,
@@ -407,7 +399,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         prefill_linear_prepare_nvfp4_input(
             runtime,
             &layer.up_proj,
-            &prefill.post_normed,
+            &prefill.input_normed,
             params.batch,
             &mut quant_scale,
             &mut prefill.quant_hidden,
@@ -415,7 +407,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         prefill_linear_prepared_batched_device(
             runtime,
             &layer.up_proj,
-            &prefill.post_normed,
+            &prefill.input_normed,
             &prefill.quant_hidden,
             params.batch,
             &mut prefill.mxfp4_hidden,
@@ -471,12 +463,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.mlp_out,
         )?;
     }
-    runtime.add_device_len(
-        &prefill.residual,
-        &prefill.mlp_out,
-        &mut prefill.hidden_out,
-        batch_hidden,
-    )?;
+    runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.mlp_out, batch_hidden)?;
     let mlp_flops =
         prefill_gemm_flops(
             params.batch,
@@ -487,7 +474,6 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         timings.mlp_us += elapsed;
         timings.mlp_tflops = timings.mlp_tflops.max(tflops(mlp_flops, elapsed));
     })?;
-    std::mem::swap(&mut prefill.hidden, &mut prefill.hidden_out);
     Ok(())
 }
 
