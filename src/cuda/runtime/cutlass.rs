@@ -169,59 +169,6 @@ impl CudaRuntime {
         })
     }
 
-    pub fn swiglu_quantize_cutlass_nvfp4_grouped_activation_device(
-        &self,
-        gate_up: &DeviceBuffer<f32>,
-        rows: usize,
-        cols: usize,
-        gate_scale: f32,
-        up_scale: f32,
-        payload: &mut DeviceBuffer<u8>,
-        scales: &mut DeviceBuffer<u8>,
-    ) -> Result<()> {
-        let expected_input = checked_len("grouped SwiGLU activation input", rows, cols * 2)?;
-        let expected_payload = Self::cutlass_nvfp4_activation_payload_bytes(rows, cols)?;
-        let expected_scales = Self::cutlass_nvfp4_activation_scale_bytes(rows, cols)?;
-        if gate_up.len() < expected_input
-            || payload.len() < expected_payload
-            || scales.len() < expected_scales
-        {
-            return Err(AegisError::InvalidPlan(format!(
-                "CUTLASS NVFP4 grouped SwiGLU quant buffers too small: gate_up={} expected_input={} payload={} expected_payload={} scales={} expected_scales={}",
-                gate_up.len(),
-                expected_input,
-                payload.len(),
-                expected_payload,
-                scales.len(),
-                expected_scales
-            )));
-        }
-
-        let rows = i32_arg("rows", rows)?;
-        let cols = i32_arg("cols", cols)?;
-        let (gate_up_ptr, _gate_up_read) = gate_up.slice.device_ptr(&self.stream);
-        let (payload_ptr, _payload_write) = payload.slice.device_ptr_mut(&self.stream);
-        let (scales_ptr, _scales_write) = scales.slice.device_ptr_mut(&self.stream);
-        let stream = self.stream.cu_stream().cast::<c_void>();
-        unsafe {
-            cutlass_bridge::swiglu_quantize_grouped_f32(
-                gate_up_ptr as *const f32,
-                rows,
-                cols,
-                gate_scale,
-                up_scale,
-                payload_ptr as *mut u8,
-                scales_ptr as *mut u8,
-                stream,
-            )
-        }
-        .map_err(|error| {
-            AegisError::Unsupported(format!(
-                "CUTLASS FP4 grouped SwiGLU activation quantization failed: {error}"
-            ))
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_cutlass_nvfp4_prefill_device(
         &self,

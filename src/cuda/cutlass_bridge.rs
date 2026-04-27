@@ -73,18 +73,6 @@ unsafe extern "C" {
         error_len: usize,
     ) -> c_int;
 
-    fn aegis_cutlass_fp4_swiglu_quantize_grouped_f32(
-        gate_up: *const f32,
-        rows: c_int,
-        cols: c_int,
-        gate_scale: f32,
-        up_scale: f32,
-        payload: *mut u8,
-        scales: *mut u8,
-        stream: *mut c_void,
-        error: *mut c_char,
-        error_len: usize,
-    ) -> c_int;
 }
 
 pub(super) fn workspace_size(m: i32, n: i32, k: i32) -> Result<usize, String> {
@@ -228,34 +216,6 @@ pub(super) unsafe fn swiglu_quantize_f32(
             up,
             rows,
             cols,
-            payload,
-            scales,
-            stream,
-            error.as_mut_ptr(),
-            error.len(),
-        )
-    };
-    status(code, &error)
-}
-
-pub(super) unsafe fn swiglu_quantize_grouped_f32(
-    gate_up: *const f32,
-    rows: i32,
-    cols: i32,
-    gate_scale: f32,
-    up_scale: f32,
-    payload: *mut u8,
-    scales: *mut u8,
-    stream: *mut c_void,
-) -> Result<(), String> {
-    let mut error = ErrorBuffer::new();
-    let code = unsafe {
-        aegis_cutlass_fp4_swiglu_quantize_grouped_f32(
-            gate_up,
-            rows,
-            cols,
-            gate_scale,
-            up_scale,
             payload,
             scales,
             stream,

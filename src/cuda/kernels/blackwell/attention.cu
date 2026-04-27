@@ -1392,17 +1392,27 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_warp_tile_hdim128
     float running_m = -3.402823466e38f;
     float running_l = 0.0f;
 
+    const uint4 zero_vec = make_uint4(0u, 0u, 0u, 0u);
     for (unsigned int tile_start = 0u; tile_start < block_max_visible; tile_start += k_tile) {
         const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
-        for (unsigned int idx = tid; idx < k_tile * hdim; idx += blockDim.x) {
+        constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
+        constexpr unsigned int kv_vecs = k_tile * hdim / halfs_per_vec;
+        uint4* k_shared_vec = reinterpret_cast<uint4*>(k_shared);
+        uint4* v_shared_vec = reinterpret_cast<uint4*>(v_shared);
+        for (unsigned int vec = tid; vec < kv_vecs; vec += blockDim.x) {
+            const unsigned int idx = vec * halfs_per_vec;
             const unsigned int col = idx / hdim;
             const unsigned int dim = idx - col * hdim;
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
                 (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
-            k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
-            v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
+            k_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(key_cache + kv_offset)
+                : zero_vec;
+            v_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(value_cache + kv_offset)
+                : zero_vec;
         }
         __syncthreads();
 
@@ -1534,17 +1544,27 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
     }
     __syncthreads();
 
+    const uint4 zero_vec = make_uint4(0u, 0u, 0u, 0u);
     for (unsigned int tile_start = 0u; tile_start < block_max_visible; tile_start += k_tile) {
         const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
-        for (unsigned int idx = tid; idx < k_tile * hdim; idx += blockDim.x) {
+        constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
+        constexpr unsigned int kv_vecs = k_tile * hdim / halfs_per_vec;
+        uint4* k_shared_vec = reinterpret_cast<uint4*>(k_shared);
+        uint4* v_shared_vec = reinterpret_cast<uint4*>(v_shared);
+        for (unsigned int vec = tid; vec < kv_vecs; vec += blockDim.x) {
+            const unsigned int idx = vec * halfs_per_vec;
             const unsigned int col = idx / hdim;
             const unsigned int dim = idx - col * hdim;
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
                 (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
-            k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
-            v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
+            k_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(key_cache + kv_offset)
+                : zero_vec;
+            v_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(value_cache + kv_offset)
+                : zero_vec;
         }
         __syncthreads();
 
@@ -1709,17 +1729,27 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_fa(
     }
     __syncthreads();
 
+    const uint4 zero_vec = make_uint4(0u, 0u, 0u, 0u);
     for (unsigned int tile_start = 0u; tile_start < block_max_visible; tile_start += k_tile) {
         const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
-        for (unsigned int idx = tid; idx < k_tile * hdim; idx += blockDim.x) {
+        constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
+        constexpr unsigned int kv_vecs = k_tile * hdim / halfs_per_vec;
+        uint4* k_shared_vec = reinterpret_cast<uint4*>(k_shared);
+        uint4* v_shared_vec = reinterpret_cast<uint4*>(v_shared);
+        for (unsigned int vec = tid; vec < kv_vecs; vec += blockDim.x) {
+            const unsigned int idx = vec * halfs_per_vec;
             const unsigned int col = idx / hdim;
             const unsigned int dim = idx - col * hdim;
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
                 (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
-            k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
-            v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
+            k_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(key_cache + kv_offset)
+                : zero_vec;
+            v_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(value_cache + kv_offset)
+                : zero_vec;
         }
         __syncthreads();
 
@@ -1870,19 +1900,32 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
     const float scale = rsqrtf(float(hdim));
     const float log2e = 1.4426950408889634f;
 
-    for (unsigned int idx = tid; idx < q_rows * hdim; idx += blockDim.x) {
+    constexpr unsigned int q_halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
+    constexpr unsigned int q_vecs = q_rows * hdim / q_halfs_per_vec;
+    uint4* q_shared_vec = reinterpret_cast<uint4*>(q_shared);
+    const uint4 zero_q_vec = make_uint4(0u, 0u, 0u, 0u);
+    for (unsigned int vec = tid; vec < q_vecs; vec += blockDim.x) {
+        const unsigned int idx = vec * q_halfs_per_vec;
         const unsigned int row = idx / hdim;
         const unsigned int dim = idx - row * hdim;
         const unsigned int local_head = row / q_tokens;
         const unsigned int token = row - local_head * q_tokens;
         const unsigned int head = kv_head * group + local_head_base + local_head;
         const unsigned int global_q = global_q_base + token;
-        q_shared[idx] = (local_head_base + local_head < group && head < num_attention_heads && global_q < total_q)
-            ? query[(size_t(global_q) * num_attention_heads + head) * hdim + dim]
-            : 0u;
+        const bool valid_q = local_head_base + local_head < group
+            && head < num_attention_heads
+            && global_q < total_q;
+        const size_t query_offset =
+            (size_t(global_q) * num_attention_heads + head) * hdim + dim;
+        q_shared_vec[vec] = valid_q
+            ? *reinterpret_cast<const uint4*>(query + query_offset)
+            : zero_q_vec;
     }
-    for (unsigned int idx = tid; idx < q_rows * acc_stride; idx += blockDim.x) {
-        acc[idx] = 0.0f;
+    constexpr unsigned int acc_zero_vecs = q_rows * acc_stride / (sizeof(float4) / sizeof(float));
+    float4* acc_zero_vec = reinterpret_cast<float4*>(acc);
+    const float4 zero_acc_vec = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (unsigned int vec = tid; vec < acc_zero_vecs; vec += blockDim.x) {
+        acc_zero_vec[vec] = zero_acc_vec;
     }
     for (unsigned int row = tid; row < q_rows; row += blockDim.x) {
         scalars[row * 3u + 0u] = -3.402823466e38f;
@@ -1904,17 +1947,27 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
     }
 #endif
 
+    const uint4 zero_vec = make_uint4(0u, 0u, 0u, 0u);
     for (unsigned int tile_start = 0u; tile_start < block_max_visible; tile_start += k_tile) {
         const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
-        for (unsigned int idx = tid; idx < k_tile * hdim; idx += blockDim.x) {
+        constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
+        constexpr unsigned int kv_vecs = k_tile * hdim / halfs_per_vec;
+        uint4* k_shared_vec = reinterpret_cast<uint4*>(k_shared);
+        uint4* v_shared_vec = reinterpret_cast<uint4*>(v_shared);
+        for (unsigned int vec = tid; vec < kv_vecs; vec += blockDim.x) {
+            const unsigned int idx = vec * halfs_per_vec;
             const unsigned int col = idx / hdim;
             const unsigned int dim = idx - col * hdim;
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
                 (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
-            k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
-            v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
+            k_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(key_cache + kv_offset)
+                : zero_vec;
+            v_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(value_cache + kv_offset)
+                : zero_vec;
         }
         __syncthreads();
 
@@ -1969,7 +2022,10 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
         }
         __syncthreads();
 
-        for (unsigned int idx = tid; idx < q_rows * hdim; idx += blockDim.x) {
+        constexpr unsigned int floats_per_vec = sizeof(float4) / sizeof(float);
+        constexpr unsigned int acc_vecs = q_rows * hdim / floats_per_vec;
+        for (unsigned int vec = tid; vec < acc_vecs; vec += blockDim.x) {
+            const unsigned int idx = vec * floats_per_vec;
             const unsigned int row = idx / hdim;
             const unsigned int dim = idx - row * hdim;
             const unsigned int local_head = row / q_tokens;
@@ -1977,7 +2033,14 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
             const unsigned int head = kv_head * group + local_head_base + local_head;
             const unsigned int global_q = global_q_base + token;
             if (local_head_base + local_head < group && head < num_attention_heads && global_q < total_q) {
-                acc[row * acc_stride + dim] *= scalars[row * 3u + 2u];
+                float4* acc_vec = reinterpret_cast<float4*>(acc + row * acc_stride + dim);
+                float4 value = *acc_vec;
+                const float alpha = scalars[row * 3u + 2u];
+                value.x *= alpha;
+                value.y *= alpha;
+                value.z *= alpha;
+                value.w *= alpha;
+                *acc_vec = value;
             }
         }
         __syncthreads();
