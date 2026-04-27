@@ -333,22 +333,14 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.cutlass_payload,
             &mut prefill.cutlass_scales,
         )?;
-        prefill_linear_cutlass_nvfp4_prepacked_device(
-            runtime,
+        runtime.matmul_cutlass_nvfp4_pair_prepacked_prefill_device(
             &layer.gate_proj,
-            &prefill.cutlass_payload,
-            &prefill.cutlass_scales,
-            params.batch,
-            &mut prefill.cutlass_workspace,
-            &mut prefill.gate,
-        )?;
-        prefill_linear_cutlass_nvfp4_prepacked_device(
-            runtime,
             &layer.up_proj,
             &prefill.cutlass_payload,
             &prefill.cutlass_scales,
             params.batch,
             &mut prefill.cutlass_workspace,
+            &mut prefill.gate,
             &mut prefill.up,
         )?;
     } else if prefill_linear_native_mxfp4_enabled(runtime, &layer.gate_proj)

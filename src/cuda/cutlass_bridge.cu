@@ -345,6 +345,59 @@ __global__ void swiglu_quantize_f32_to_e2m1_ue4m3_kernel(
   }
 }
 
+__global__ void swiglu_quantize_grouped_f32_to_e2m1_ue4m3_kernel(
+    const float* __restrict__ gate_up, int rows, int cols, float gate_scale,
+    float up_scale, uint8_t* __restrict__ payload, uint8_t* __restrict__ scales,
+    int scale_cols, int padded_scale_cols, int scale_k_tiles) {
+  int row = blockIdx.y;
+  int scale_col = blockIdx.x;
+  int lane = threadIdx.x;
+  if (scale_col >= padded_scale_cols) {
+    return;
+  }
+  if (row >= rows || scale_col >= scale_cols) {
+    if (lane == 0) {
+      scales[swizzled_scale_offset(row, scale_col, scale_k_tiles)] = 0;
+    }
+    return;
+  }
+
+  int col_base = scale_col * 16;
+  __shared__ float values[16];
+  __shared__ float decoded_scale_shared;
+  float value = 0.0f;
+  if (lane < 16) {
+    size_t gate_offset = static_cast<size_t>(row) * (cols * 2) + col_base + lane;
+    size_t up_offset = gate_offset + cols;
+    float gate_value = gate_up[gate_offset] * gate_scale;
+    float up_value = gate_up[up_offset] * up_scale;
+    float sigmoid = 1.0f / (1.0f + expf(-gate_value));
+    value = gate_value * sigmoid * up_value;
+    values[lane] = value;
+  }
+  __syncthreads();
+
+  float amax = 0.0f;
+  if (lane == 0) {
+    for (int i = 0; i < 16; ++i) {
+      amax = fmaxf(amax, fabsf(values[i]));
+    }
+    float scale = (amax > 0.0f) ? (amax / 6.0f) : 0.0f;
+    __nv_fp8_e4m3 encoded_scale(scale);
+    uint8_t scale_byte = reinterpret_cast<uint8_t&>(encoded_scale);
+    scales[swizzled_scale_offset(row, scale_col, scale_k_tiles)] = scale_byte;
+    decoded_scale_shared = static_cast<float>(encoded_scale);
+  }
+  __syncthreads();
+
+  if (lane < 8) {
+    unsigned lo = best_e2m1(values[lane * 2], decoded_scale_shared);
+    unsigned hi = best_e2m1(values[lane * 2 + 1], decoded_scale_shared);
+    payload[static_cast<size_t>(row) * (cols / 2) + scale_col * 8 + lane] =
+        static_cast<uint8_t>(lo | (hi << 4));
+  }
+}
+
 }  // namespace aegis_cutlass_bridge
 
 using namespace aegis_cutlass_bridge;
@@ -388,6 +441,54 @@ extern "C" int aegis_cutlass_fp4_sm120_gemm_f32(
                          error, error_len);
 #else
   write_error(error, error_len, "CUTLASS SM120 FP4 support is not compiled");
+  return 1000;
+#endif
+}
+
+extern "C" int aegis_cutlass_fp4_sm120_gemm2_f32(
+    const void* a, const void* b0, const void* b1, const void* a_sf,
+    const void* b0_sf, const void* b1_sf, float* d0, float* d1,
+    void* workspace, size_t workspace_bytes, int m, int n0, int n1, int k,
+    float alpha0, float alpha1, void* stream, char* error, size_t error_len) {
+#if defined(__CUDA_ARCH_LIST__) || 1
+  using namespace aegis_cutlass_bridge;
+  int validation = validate_problem(m, n0, k, error, error_len);
+  if (validation != 0) {
+    return validation;
+  }
+  validation = validate_problem(m, n1, k, error, error_len);
+  if (validation != 0) {
+    return validation;
+  }
+  int code = select_run_gemm(a, b0, a_sf, b0_sf, d0, workspace,
+                             workspace_bytes, m, n0, k, alpha0,
+                             reinterpret_cast<cudaStream_t>(stream), error,
+                             error_len);
+  if (code != 0) {
+    return code;
+  }
+  return select_run_gemm(a, b1, a_sf, b1_sf, d1, workspace, workspace_bytes, m,
+                         n1, k, alpha1, reinterpret_cast<cudaStream_t>(stream),
+                         error, error_len);
+#else
+  (void)a;
+  (void)b0;
+  (void)b1;
+  (void)a_sf;
+  (void)b0_sf;
+  (void)b1_sf;
+  (void)d0;
+  (void)d1;
+  (void)workspace;
+  (void)workspace_bytes;
+  (void)m;
+  (void)n0;
+  (void)n1;
+  (void)k;
+  (void)alpha0;
+  (void)alpha1;
+  (void)stream;
+  write_error(error, error_len, "CUTLASS bridge was built without CUDA support");
   return 1000;
 #endif
 }
@@ -448,6 +549,33 @@ extern "C" int aegis_cutlass_fp4_swiglu_quantize_f32(
   if (err != cudaSuccess) {
     write_error(error, error_len, cudaGetErrorString(err));
     return 3;
+  }
+  return 0;
+}
+
+extern "C" int aegis_cutlass_fp4_swiglu_quantize_grouped_f32(
+    const float* gate_up, int rows, int cols, float gate_scale, float up_scale,
+    uint8_t* payload, uint8_t* scales, cudaStream_t stream, char* error,
+    size_t error_len) {
+  using namespace aegis_cutlass_bridge;
+  if (rows <= 0 || cols <= 0 || (cols % 32) != 0) {
+    write_error(error, error_len,
+                "grouped SwiGLU quantization requires positive rows and cols % 32 == 0");
+    return 1;
+  }
+  int scale_cols = cols / 16;
+  int padded_scale_cols = ((scale_cols + 3) / 4) * 4;
+  int scale_rows = ((rows + 127) / 128) * 128;
+  int scale_k_tiles = padded_scale_cols / 4;
+  dim3 grid(padded_scale_cols, scale_rows);
+  dim3 block(16);
+  swiglu_quantize_grouped_f32_to_e2m1_ue4m3_kernel<<<grid, block, 0, stream>>>(
+      gate_up, rows, cols, gate_scale, up_scale, payload, scales, scale_cols,
+      padded_scale_cols, scale_k_tiles);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    write_error(error, error_len, cudaGetErrorString(err));
+    return 2;
   }
   return 0;
 }

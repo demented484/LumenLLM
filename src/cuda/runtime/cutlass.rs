@@ -169,6 +169,59 @@ impl CudaRuntime {
         })
     }
 
+    pub fn swiglu_quantize_cutlass_nvfp4_grouped_activation_device(
+        &self,
+        gate_up: &DeviceBuffer<f32>,
+        rows: usize,
+        cols: usize,
+        gate_scale: f32,
+        up_scale: f32,
+        payload: &mut DeviceBuffer<u8>,
+        scales: &mut DeviceBuffer<u8>,
+    ) -> Result<()> {
+        let expected_input = checked_len("grouped SwiGLU activation input", rows, cols * 2)?;
+        let expected_payload = Self::cutlass_nvfp4_activation_payload_bytes(rows, cols)?;
+        let expected_scales = Self::cutlass_nvfp4_activation_scale_bytes(rows, cols)?;
+        if gate_up.len() < expected_input
+            || payload.len() < expected_payload
+            || scales.len() < expected_scales
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "CUTLASS NVFP4 grouped SwiGLU quant buffers too small: gate_up={} expected_input={} payload={} expected_payload={} scales={} expected_scales={}",
+                gate_up.len(),
+                expected_input,
+                payload.len(),
+                expected_payload,
+                scales.len(),
+                expected_scales
+            )));
+        }
+
+        let rows = i32_arg("rows", rows)?;
+        let cols = i32_arg("cols", cols)?;
+        let (gate_up_ptr, _gate_up_read) = gate_up.slice.device_ptr(&self.stream);
+        let (payload_ptr, _payload_write) = payload.slice.device_ptr_mut(&self.stream);
+        let (scales_ptr, _scales_write) = scales.slice.device_ptr_mut(&self.stream);
+        let stream = self.stream.cu_stream().cast::<c_void>();
+        unsafe {
+            cutlass_bridge::swiglu_quantize_grouped_f32(
+                gate_up_ptr as *const f32,
+                rows,
+                cols,
+                gate_scale,
+                up_scale,
+                payload_ptr as *mut u8,
+                scales_ptr as *mut u8,
+                stream,
+            )
+        }
+        .map_err(|error| {
+            AegisError::Unsupported(format!(
+                "CUTLASS FP4 grouped SwiGLU activation quantization failed: {error}"
+            ))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_cutlass_nvfp4_prefill_device(
         &self,
@@ -280,6 +333,110 @@ impl CudaRuntime {
             AegisError::Unsupported(format!(
                 "CUTLASS FP4 GEMM failed for `{}`: {error}",
                 linear.name
+            ))
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_cutlass_nvfp4_pair_prepacked_prefill_device(
+        &self,
+        first: &DeviceNvfp4Linear,
+        second: &DeviceNvfp4Linear,
+        activation_payload: &DeviceBuffer<u8>,
+        activation_scales: &DeviceBuffer<u8>,
+        batch: usize,
+        workspace: &mut DeviceBuffer<u8>,
+        first_output: &mut DeviceBuffer<f32>,
+        second_output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if first.cols != second.cols {
+            return Err(AegisError::InvalidPlan(format!(
+                "CUTLASS FP4 paired GEMM shape mismatch: first={}x{} second={}x{}",
+                first.rows, first.cols, second.rows, second.cols
+            )));
+        }
+        let Some(first_weight) = first.cutlass_nvfp4.as_ref() else {
+            return Err(AegisError::InvalidPlan(format!(
+                "CUTLASS FP4 paired GEMM requested for `{}`, but no resident layout was materialized",
+                first.name
+            )));
+        };
+        let Some(second_weight) = second.cutlass_nvfp4.as_ref() else {
+            return Err(AegisError::InvalidPlan(format!(
+                "CUTLASS FP4 paired GEMM requested for `{}`, but no resident layout was materialized",
+                second.name
+            )));
+        };
+        let expected_a = Self::cutlass_nvfp4_activation_payload_bytes(batch, first.cols)?;
+        let expected_a_sf = Self::cutlass_nvfp4_activation_scale_bytes(batch, first.cols)?;
+        let expected_first = checked_len("paired first output", batch, first.rows)?;
+        let expected_second = checked_len("paired second output", batch, second.rows)?;
+        if activation_payload.len() < expected_a
+            || activation_scales.len() < expected_a_sf
+            || first_output.len() < expected_first
+            || second_output.len() < expected_second
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "CUTLASS FP4 paired GEMM buffers too small: a={} expected_a={} a_sf={} expected_a_sf={} first_out={} expected_first={} second_out={} expected_second={}",
+                activation_payload.len(),
+                expected_a,
+                activation_scales.len(),
+                expected_a_sf,
+                first_output.len(),
+                expected_first,
+                second_output.len(),
+                expected_second
+            )));
+        }
+        let first_workspace = self.cutlass_nvfp4_workspace_bytes(batch, first.rows, first.cols)?;
+        let second_workspace =
+            self.cutlass_nvfp4_workspace_bytes(batch, second.rows, second.cols)?;
+        let workspace_required = first_workspace.max(second_workspace);
+        if workspace.len() < workspace_required.max(1) {
+            return Err(AegisError::InvalidPlan(format!(
+                "CUTLASS FP4 paired workspace too small: got={} required={}",
+                workspace.len(),
+                workspace_required
+            )));
+        }
+
+        let workspace_len = workspace.len();
+        let (a_ptr, _a_read) = activation_payload.slice.device_ptr(&self.stream);
+        let (a_sf_ptr, _a_sf_read) = activation_scales.slice.device_ptr(&self.stream);
+        let (first_b_ptr, _first_b_read) = first_weight.payload_e2m1.device_ptr(&self.stream);
+        let (first_b_sf_ptr, _first_b_sf_read) = first_weight.scales_ue4m3.device_ptr(&self.stream);
+        let (second_b_ptr, _second_b_read) = second_weight.payload_e2m1.device_ptr(&self.stream);
+        let (second_b_sf_ptr, _second_b_sf_read) =
+            second_weight.scales_ue4m3.device_ptr(&self.stream);
+        let (workspace_ptr, _workspace_write) = workspace.slice.device_ptr_mut(&self.stream);
+        let (first_d_ptr, _first_d_write) = first_output.slice.device_ptr_mut(&self.stream);
+        let (second_d_ptr, _second_d_write) = second_output.slice.device_ptr_mut(&self.stream);
+        let stream = self.stream.cu_stream().cast::<c_void>();
+        unsafe {
+            cutlass_bridge::gemm2_f32(
+                a_ptr as *const c_void,
+                first_b_ptr as *const c_void,
+                second_b_ptr as *const c_void,
+                a_sf_ptr as *const c_void,
+                first_b_sf_ptr as *const c_void,
+                second_b_sf_ptr as *const c_void,
+                first_d_ptr as *mut f32,
+                second_d_ptr as *mut f32,
+                workspace_ptr as *mut c_void,
+                workspace_len,
+                i32_arg("m", batch)?,
+                i32_arg("first n", first.rows)?,
+                i32_arg("second n", second.rows)?,
+                i32_arg("k", first.cols)?,
+                first.output_scale,
+                second.output_scale,
+                stream,
+            )
+        }
+        .map_err(|error| {
+            AegisError::Unsupported(format!(
+                "CUTLASS FP4 paired GEMM failed for `{}` + `{}`: {error}",
+                first.name, second.name
             ))
         })
     }

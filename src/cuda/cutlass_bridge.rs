@@ -28,6 +28,28 @@ unsafe extern "C" {
         error_len: usize,
     ) -> c_int;
 
+    fn aegis_cutlass_fp4_sm120_gemm2_f32(
+        a: *const c_void,
+        b0: *const c_void,
+        b1: *const c_void,
+        a_sf: *const c_void,
+        b0_sf: *const c_void,
+        b1_sf: *const c_void,
+        d0: *mut f32,
+        d1: *mut f32,
+        workspace: *mut c_void,
+        workspace_bytes: usize,
+        m: c_int,
+        n0: c_int,
+        n1: c_int,
+        k: c_int,
+        alpha0: f32,
+        alpha1: f32,
+        stream: *mut c_void,
+        error: *mut c_char,
+        error_len: usize,
+    ) -> c_int;
+
     fn aegis_cutlass_fp4_quantize_f32(
         input: *const f32,
         rows: c_int,
@@ -44,6 +66,19 @@ unsafe extern "C" {
         up: *const f32,
         rows: c_int,
         cols: c_int,
+        payload: *mut u8,
+        scales: *mut u8,
+        stream: *mut c_void,
+        error: *mut c_char,
+        error_len: usize,
+    ) -> c_int;
+
+    fn aegis_cutlass_fp4_swiglu_quantize_grouped_f32(
+        gate_up: *const f32,
+        rows: c_int,
+        cols: c_int,
+        gate_scale: f32,
+        up_scale: f32,
         payload: *mut u8,
         scales: *mut u8,
         stream: *mut c_void,
@@ -106,6 +141,53 @@ pub(super) unsafe fn gemm_f32(
     status(code, &error)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn gemm2_f32(
+    a: *const c_void,
+    b0: *const c_void,
+    b1: *const c_void,
+    a_sf: *const c_void,
+    b0_sf: *const c_void,
+    b1_sf: *const c_void,
+    d0: *mut f32,
+    d1: *mut f32,
+    workspace: *mut c_void,
+    workspace_bytes: usize,
+    m: i32,
+    n0: i32,
+    n1: i32,
+    k: i32,
+    alpha0: f32,
+    alpha1: f32,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let mut error = ErrorBuffer::new();
+    let code = unsafe {
+        aegis_cutlass_fp4_sm120_gemm2_f32(
+            a,
+            b0,
+            b1,
+            a_sf,
+            b0_sf,
+            b1_sf,
+            d0,
+            d1,
+            workspace,
+            workspace_bytes,
+            m,
+            n0,
+            n1,
+            k,
+            alpha0,
+            alpha1,
+            stream,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    status(code, &error)
+}
+
 pub(super) unsafe fn quantize_f32(
     input: *const f32,
     rows: i32,
@@ -146,6 +228,34 @@ pub(super) unsafe fn swiglu_quantize_f32(
             up,
             rows,
             cols,
+            payload,
+            scales,
+            stream,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    status(code, &error)
+}
+
+pub(super) unsafe fn swiglu_quantize_grouped_f32(
+    gate_up: *const f32,
+    rows: i32,
+    cols: i32,
+    gate_scale: f32,
+    up_scale: f32,
+    payload: *mut u8,
+    scales: *mut u8,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let mut error = ErrorBuffer::new();
+    let code = unsafe {
+        aegis_cutlass_fp4_swiglu_quantize_grouped_f32(
+            gate_up,
+            rows,
+            cols,
+            gate_scale,
+            up_scale,
             payload,
             scales,
             stream,

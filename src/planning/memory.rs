@@ -257,10 +257,24 @@ fn cuda_prefill_scratch_bytes(
     let kv_width = (graph.num_kv_heads * graph.head_dim) as u64;
     let chunk = chunk as u64;
 
-    let f32_elements = chunk * (8 * hidden + 2 * q_width + 2 * kv_width + 4 * intermediate);
+    let cutlass_prefill = cuda.cutlass_nvfp4_repack;
+    let intermediate_f32 = if cutlass_prefill {
+        // CUTLASS prefill keeps gate and up activations, then quantizes SwiGLU
+        // directly for the down projection. The fallback path additionally
+        // needs full-size quant_intermediate and swiglu scratch buffers.
+        2 * intermediate
+    } else {
+        4 * intermediate
+    };
+    let f32_elements = chunk * (8 * hidden + 2 * q_width + 2 * kv_width + intermediate_f32);
     let mxfp4_hidden = chunk * mxfp4_vector_bytes_estimate(graph.hidden_size) as u64;
-    let mxfp4_intermediate = chunk
-        * mxfp4_vector_bytes_estimate(graph.intermediate_size.unwrap_or(graph.hidden_size)) as u64;
+    let mxfp4_intermediate = if cutlass_prefill {
+        0
+    } else {
+        chunk
+            * mxfp4_vector_bytes_estimate(graph.intermediate_size.unwrap_or(graph.hidden_size))
+                as u64
+    };
     let metadata_u32 = chunk * 3 + 3;
     let token_bytes = metadata_u32 * std::mem::size_of::<u32>() as u64;
     let split_attention_f32 =
