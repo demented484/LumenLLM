@@ -901,6 +901,283 @@ extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_block4(
     }
 }
 
+extern "C" __global__ void aegis_attention_prefill_paged_varlen_halfq_wmma_hdim128_gqa4(
+    const unsigned short* __restrict__ key_cache,
+    const unsigned short* __restrict__ value_cache,
+    const unsigned short* __restrict__ query,
+    const unsigned int* __restrict__ slot_mapping,
+    const unsigned int* __restrict__ cu_q,
+    const unsigned int* __restrict__ context_lens,
+    const unsigned int* __restrict__ block_tables,
+    const unsigned int num_sequences,
+    const unsigned int total_q,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int page_tokens,
+    const unsigned int block_table_stride,
+    const unsigned int physical_slots,
+    float* __restrict__ output
+) {
+    constexpr unsigned int hdim = 128u;
+    constexpr unsigned int q_tokens = 8u;
+    constexpr unsigned int local_heads_max = 4u;
+    constexpr unsigned int q_rows = q_tokens * local_heads_max;
+    constexpr unsigned int k_tile = 32u;
+    constexpr unsigned int score_stride = k_tile + 8u;
+    constexpr unsigned int acc_stride = hdim + 8u;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    const unsigned int seq = blockIdx.z;
+    if (head_dim != hdim || page_tokens == 0u || num_kv_heads == 0u || num_attention_heads % num_kv_heads != 0u || blockDim.x < 256u || seq >= num_sequences) {
+        return;
+    }
+
+    const unsigned int group = num_attention_heads / num_kv_heads;
+    if (group < local_heads_max) {
+        return;
+    }
+    const unsigned int group_tiles = (group + local_heads_max - 1u) / local_heads_max;
+    const unsigned int kv_head = blockIdx.x / group_tiles;
+    const unsigned int local_head_base = (blockIdx.x - kv_head * group_tiles) * local_heads_max;
+    if (kv_head >= num_kv_heads) {
+        return;
+    }
+
+    const unsigned int q_start = cu_q[seq];
+    const unsigned int q_end = cu_q[seq + 1u];
+    if (q_end <= q_start || q_start >= total_q) {
+        return;
+    }
+    const unsigned int q_len = q_end - q_start;
+    const unsigned int global_q_base = q_start + blockIdx.y * q_tokens;
+    if (global_q_base >= q_end || global_q_base >= total_q) {
+        return;
+    }
+    const unsigned int context_len = context_lens[seq];
+
+    unsigned int block_max_visible = 0u;
+    #pragma unroll
+    for (unsigned int token = 0u; token < q_tokens; ++token) {
+        const unsigned int global_q = global_q_base + token;
+        if (global_q >= q_end || global_q >= total_q || slot_mapping[global_q] == 0xffffffffu) {
+            continue;
+        }
+        const unsigned int q_in_seq = global_q - q_start;
+        const unsigned int hidden_future = q_len - q_in_seq - 1u;
+        const unsigned int visible_len = context_len > hidden_future
+            ? context_len - hidden_future
+            : 0u;
+        block_max_visible = max(block_max_visible, visible_len);
+    }
+    if (block_max_visible == 0u) {
+        return;
+    }
+
+    extern __shared__ __align__(16) unsigned char smem[];
+    unsigned short* q_shared = reinterpret_cast<unsigned short*>(smem);
+    unsigned short* k_shared = q_shared + q_rows * hdim;
+    unsigned short* v_shared = k_shared + k_tile * hdim;
+    float* scores = reinterpret_cast<float*>(v_shared + k_tile * hdim);
+    float* acc = scores + q_rows * score_stride;
+    float* scalars = acc + q_rows * acc_stride;
+    half* weights_half = reinterpret_cast<half*>(scalars + q_rows * 3u);
+
+    const float scale = rsqrtf(float(hdim));
+    const float log2e = 1.4426950408889634f;
+
+    for (unsigned int idx = tid; idx < q_rows * hdim; idx += blockDim.x) {
+        const unsigned int row = idx / hdim;
+        const unsigned int dim = idx - row * hdim;
+        const unsigned int local_head = row / q_tokens;
+        const unsigned int token = row - local_head * q_tokens;
+        const unsigned int head = kv_head * group + local_head_base + local_head;
+        const unsigned int global_q = global_q_base + token;
+        q_shared[idx] = (local_head_base + local_head < group
+                && head < num_attention_heads
+                && global_q < q_end
+                && global_q < total_q
+                && slot_mapping[global_q] != 0xffffffffu)
+            ? query[(size_t(global_q) * num_attention_heads + head) * hdim + dim]
+            : 0u;
+    }
+    for (unsigned int idx = tid; idx < q_rows * acc_stride; idx += blockDim.x) {
+        acc[idx] = 0.0f;
+    }
+    for (unsigned int row = tid; row < q_rows; row += blockDim.x) {
+        scalars[row * 3u + 0u] = -3.402823466e38f;
+        scalars[row * 3u + 1u] = 0.0f;
+        scalars[row * 3u + 2u] = 0.0f;
+    }
+    __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> q_frag[8];
+    if (warp < 4u) {
+        const unsigned int row_block = warp >> 1u;
+#pragma unroll
+        for (unsigned int kk = 0u; kk < hdim; kk += 16u) {
+            const half* q_ptr = reinterpret_cast<const half*>(q_shared + row_block * 16u * hdim + kk);
+            wmma::load_matrix_sync(q_frag[kk / 16u], q_ptr, hdim);
+        }
+    }
+#endif
+
+    for (unsigned int tile_start = 0u; tile_start < block_max_visible; tile_start += k_tile) {
+        const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
+        for (unsigned int idx = tid; idx < k_tile * hdim; idx += blockDim.x) {
+            const unsigned int col = idx / hdim;
+            const unsigned int dim = idx - col * hdim;
+            const unsigned int pos = tile_start + col;
+            const unsigned int logical_page = pos / page_tokens;
+            const unsigned int page_offset = pos - logical_page * page_tokens;
+            const unsigned int physical_page =
+                block_tables[size_t(seq) * block_table_stride + logical_page];
+            const size_t physical_slot = size_t(physical_page) * page_tokens + page_offset;
+            const bool valid_k = col < tile_count
+                && pos < context_len
+                && physical_page != 0xffffffffu
+                && physical_slot < size_t(physical_slots);
+            const size_t kv_offset =
+                (physical_slot * num_kv_heads + kv_head) * hdim + dim;
+            k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
+            v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
+        }
+        __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+        if (warp < 4u) {
+            const unsigned int row_block = warp >> 1u;
+            const unsigned int n_off = (warp & 1u) * 16u;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+            wmma::fill_fragment(c_frag, 0.0f);
+#pragma unroll
+            for (unsigned int kk = 0u; kk < hdim; kk += 16u) {
+                const half* b_ptr = reinterpret_cast<const half*>(k_shared + n_off * hdim + kk);
+                wmma::load_matrix_sync(b_frag, b_ptr, hdim);
+                wmma::mma_sync(c_frag, q_frag[kk / 16u], b_frag, c_frag);
+            }
+            wmma::store_matrix_sync(scores + row_block * 16u * score_stride + n_off, c_frag, score_stride, wmma::mem_row_major);
+        }
+#endif
+        __syncthreads();
+
+        const unsigned int nwarps = blockDim.x >> 5u;
+        for (unsigned int row = warp; row < q_rows; row += nwarps) {
+            const unsigned int local_head = row / q_tokens;
+            const unsigned int token = row - local_head * q_tokens;
+            const unsigned int head = kv_head * group + local_head_base + local_head;
+            const unsigned int global_q = global_q_base + token;
+            bool valid_q = local_head_base + local_head < group
+                && head < num_attention_heads
+                && global_q < q_end
+                && global_q < total_q
+                && slot_mapping[global_q] != 0xffffffffu;
+            unsigned int visible_len = 0u;
+            if (valid_q) {
+                const unsigned int q_in_seq = global_q - q_start;
+                const unsigned int hidden_future = q_len - q_in_seq - 1u;
+                visible_len = context_len > hidden_future
+                    ? context_len - hidden_future
+                    : 0u;
+                valid_q = visible_len > 0u;
+            }
+            const float old_m = scalars[row * 3u + 0u];
+            const float old_l = scalars[row * 3u + 1u];
+            const unsigned int pos = tile_start + lane;
+            bool valid_pos = false;
+            if (lane < tile_count && pos < visible_len && pos < context_len) {
+                const unsigned int logical_page = pos / page_tokens;
+                const unsigned int page_offset = pos - logical_page * page_tokens;
+                const unsigned int physical_page =
+                    block_tables[size_t(seq) * block_table_stride + logical_page];
+                const size_t physical_slot = size_t(physical_page) * page_tokens + page_offset;
+                valid_pos = physical_page != 0xffffffffu && physical_slot < size_t(physical_slots);
+            }
+            float score = (valid_q && valid_pos)
+                ? scores[row * score_stride + lane] * scale
+                : -3.402823466e38f;
+            const float tile_m = aegis_warp_reduce_max(score);
+            const float new_m = fmaxf(old_m, tile_m);
+            float weight = 0.0f;
+            if (score > -3.0e38f) {
+                weight = exp2f((score - new_m) * log2e);
+            }
+            weights_half[row * score_stride + lane] = __float2half_rn(weight);
+            const float tile_l = aegis_warp_reduce_sum(weight);
+            if (lane == 0u) {
+                const float alpha = old_l > 0.0f ? exp2f((old_m - new_m) * log2e) : 0.0f;
+                scalars[row * 3u + 0u] = new_m;
+                scalars[row * 3u + 1u] = old_l * alpha + tile_l;
+                scalars[row * 3u + 2u] = alpha;
+            }
+        }
+        __syncthreads();
+
+        for (unsigned int idx = tid; idx < q_rows * hdim; idx += blockDim.x) {
+            const unsigned int row = idx / hdim;
+            const unsigned int dim = idx - row * hdim;
+            const unsigned int local_head = row / q_tokens;
+            const unsigned int token = row - local_head * q_tokens;
+            const unsigned int head = kv_head * group + local_head_base + local_head;
+            const unsigned int global_q = global_q_base + token;
+            if (local_head_base + local_head < group
+                    && head < num_attention_heads
+                    && global_q < q_end
+                    && global_q < total_q
+                    && slot_mapping[global_q] != 0xffffffffu) {
+                acc[row * acc_stride + dim] *= scalars[row * 3u + 2u];
+            }
+        }
+        __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+        if (warp < 8u) {
+            using namespace nvcuda;
+            const unsigned int n_off = warp * 16u;
+            for (unsigned int row_base = 0u; row_base < q_rows; row_base += 16u) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv_frag;
+                wmma::load_matrix_sync(pv_frag, acc + row_base * acc_stride + n_off, acc_stride, wmma::mem_row_major);
+#pragma unroll
+                for (unsigned int kk = 0u; kk < k_tile; kk += 16u) {
+                    const half* p_ptr = weights_half + row_base * score_stride + kk;
+                    const half* v_ptr = reinterpret_cast<const half*>(v_shared + kk * hdim + n_off);
+                    wmma::load_matrix_sync(p_frag, p_ptr, score_stride);
+                    wmma::load_matrix_sync(v_frag, v_ptr, hdim);
+                    wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+                }
+                wmma::store_matrix_sync(acc + row_base * acc_stride + n_off, pv_frag, acc_stride, wmma::mem_row_major);
+            }
+        }
+#endif
+        __syncthreads();
+    }
+
+    for (unsigned int idx = tid; idx < q_rows * hdim; idx += blockDim.x) {
+        const unsigned int row = idx / hdim;
+        const unsigned int dim = idx - row * hdim;
+        const unsigned int local_head = row / q_tokens;
+        const unsigned int token = row - local_head * q_tokens;
+        const unsigned int head = kv_head * group + local_head_base + local_head;
+        const unsigned int global_q = global_q_base + token;
+        if (local_head_base + local_head >= group
+                || head >= num_attention_heads
+                || global_q >= q_end
+                || global_q >= total_q
+                || slot_mapping[global_q] == 0xffffffffu) {
+            continue;
+        }
+        const float denom = fmaxf(scalars[row * 3u + 1u], 1.0e-20f);
+        output[(size_t(global_q) * num_attention_heads + head) * hdim + dim] =
+            acc[row * acc_stride + dim] / denom;
+    }
+}
+
 extern "C" __global__ void aegis_attention_prefill_dense_halfq_block4(
     const unsigned short* key_cache,
     const unsigned short* value_cache,

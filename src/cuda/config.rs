@@ -49,6 +49,7 @@ pub enum CudaAttentionEffectivePath {
     AegisDenseWmmaPersistentQ32,
     AegisDenseWmmaSplitK,
     AegisPagedVarlen,
+    AegisPagedWmmaGqa4,
     FlashAttention4PagedVarlen,
     WarpFlash,
 }
@@ -173,6 +174,7 @@ impl CudaAttentionEffectivePath {
             Self::AegisDenseWmmaPersistentQ32 => "aegis-varlen/dense-wmma-persistent-q32",
             Self::AegisDenseWmmaSplitK => "aegis-varlen/dense-wmma-split-k",
             Self::AegisPagedVarlen => "aegis-varlen/paged-varlen",
+            Self::AegisPagedWmmaGqa4 => "aegis-varlen/paged-wmma-gqa4",
             Self::FlashAttention4PagedVarlen => "fa4/paged-varlen",
             Self::WarpFlash => "warp-flash/cache-only",
         }
