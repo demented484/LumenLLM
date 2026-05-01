@@ -10,10 +10,15 @@ __device__ __forceinline__ void aegis_scale_wmma_accumulator_m16n16_rows(
     const unsigned int row_base
 ) {
     const unsigned int lane_row_base = (threadIdx.x & 31u) >> 2u;
+    // Each lane owns rows [lane_row_base] and [lane_row_base + 8].
+    const float a0 = scalars[(row_base + lane_row_base) * 3u + 2u];
+    const float a8 = scalars[(row_base + lane_row_base + 8u) * 3u + 2u];
+    // Warp-uniform early exit: all 32 lanes must agree that both rows are alpha=1.0
+    // before we can skip. Uses ballot so the branch is never divergent.
+    if (__ballot_sync(0xffffffffu, a0 == 1.0f & a8 == 1.0f) == 0xffffffffu) return;
 #pragma unroll
     for (unsigned int element = 0u; element < Fragment::num_elements; ++element) {
-        const unsigned int row_in_fragment = lane_row_base + ((element & 2u) ? 8u : 0u);
-        frag.x[element] *= scalars[(row_base + row_in_fragment) * 3u + 2u];
+        frag.x[element] *= (element & 2u) ? a8 : a0;
     }
 }
 
