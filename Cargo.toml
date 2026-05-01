@@ -14,6 +14,9 @@ serde_json = "1.0"
 thiserror = "2.0"
 tokenizers = "0.22"
 pulp = "0.21"
+wgpu = "23"
+bytemuck = { version = "1.18", features = ["derive"] }
+pollster = "0.4"
 
 [dev-dependencies]
 tempfile = "3.12"

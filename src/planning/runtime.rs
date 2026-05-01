@@ -331,7 +331,8 @@ impl KernelCandidate {
             (KernelDeviceClass::Cpu, BackendKind::Cpu) => true,
             (KernelDeviceClass::Cuda, BackendKind::Cuda { .. }) => true,
             (KernelDeviceClass::Cpu, BackendKind::Cuda { .. })
-            | (KernelDeviceClass::Cuda, BackendKind::Cpu) => false,
+            | (KernelDeviceClass::Cuda, BackendKind::Cpu)
+            | (_, BackendKind::Wgpu { .. }) => false,
         }
     }
 

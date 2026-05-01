@@ -72,7 +72,7 @@ impl LinearLayoutPolicy {
         source_bytes: u64,
     ) -> LinearLayoutPlan {
         let choice = match backend.kind {
-            BackendKind::Cpu => self.cpu,
+            BackendKind::Cpu | BackendKind::Wgpu { .. } => self.cpu,
             BackendKind::Cuda { .. } => self.cuda,
         };
         let (resident_layout, mut notes) =
@@ -196,7 +196,7 @@ fn plan_resident_layout(
     family: KernelFamily,
 ) -> (LinearResidentLayout, Vec<String>) {
     match backend.kind {
-        BackendKind::Cpu => plan_cpu_layout(choice, source_format),
+        BackendKind::Cpu | BackendKind::Wgpu { .. } => plan_cpu_layout(choice, source_format),
         BackendKind::Cuda { .. } => plan_cuda_layout(choice, backend, source_format, family),
     }
 }

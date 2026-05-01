@@ -315,7 +315,7 @@ fn effective_layout_extra_bytes(
 
 fn pool_for_backend_extra(device: BackendKind) -> AllocationPool {
     match device {
-        BackendKind::Cpu => AllocationPool::Ram,
+        BackendKind::Cpu | BackendKind::Wgpu { .. } => AllocationPool::Ram,
         BackendKind::Cuda { device } => AllocationPool::Vram { device },
     }
 }

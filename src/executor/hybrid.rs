@@ -319,7 +319,7 @@ impl HybridTopology {
         };
         for backend in backends {
             match backend {
-                BackendKind::Cpu => topology.has_cpu = true,
+                BackendKind::Cpu | BackendKind::Wgpu { .. } => topology.has_cpu = true,
                 BackendKind::Cuda { device } => {
                     topology.cuda_devices.insert(*device);
                 }

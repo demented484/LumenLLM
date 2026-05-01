@@ -8,6 +8,7 @@ use crate::tensor::quant::{QuantFormat, TensorCorePrecision};
 pub enum BackendKind {
     Cpu,
     Cuda { device: usize },
+    Wgpu { device: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +57,26 @@ impl BackendRegistry {
                     supports_flash_attention: true,
                     supports_paged_attention: true,
                     tensor_core_precisions,
+                },
+            );
+        }
+        let wgpu_instance = wgpu::Instance::default();
+        for (idx, adapter) in wgpu_instance
+            .enumerate_adapters(wgpu::Backends::PRIMARY)
+            .into_iter()
+            .enumerate()
+        {
+            let info = adapter.get_info();
+            backends.insert(
+                BackendKind::Wgpu { device: idx },
+                BackendDescriptor {
+                    kind: BackendKind::Wgpu { device: idx },
+                    label: format!("wgpu:{} {} {:?}", idx, info.name, info.backend),
+                    supports_fp4: false,
+                    supports_fp8: false,
+                    supports_flash_attention: false,
+                    supports_paged_attention: false,
+                    tensor_core_precisions: Vec::new(),
                 },
             );
         }

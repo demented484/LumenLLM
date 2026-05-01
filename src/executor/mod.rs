@@ -6,6 +6,8 @@ mod hybrid;
 mod nodes;
 mod tensors;
 mod traits;
+pub mod wgpu;
+
 
 use crate::artifact::ModelArtifact;
 use crate::backend::BackendKind;
@@ -19,6 +21,7 @@ use crate::planning::runtime::RuntimePlan;
 pub use cpu::CpuReferenceExecutor;
 pub use cuda::CudaExecutorProvider;
 pub use hybrid::HybridExecutorProvider;
+pub use wgpu::WgpuExecutorProvider;
 pub use nodes::{
     ActivationResidency, ActivationTransferNode, BackendPrimitiveKind, BackendPrimitiveNode,
     BackendPrimitivePlan, ExecutionNode, ExecutorGraphPlan, KvCacheNode, RegionExecutionNode,
