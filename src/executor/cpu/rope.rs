@@ -46,16 +46,18 @@ pub(super) fn apply_rope_in_place(
         )));
     }
     let half_dim = head_dim / 2;
+    // precompute cos/sin tables once for all heads at this position
+    let mut cos_table = vec![0.0_f32; half_dim];
+    let mut sin_table = vec![0.0_f32; half_dim];
+    for i in 0..half_dim {
+        let angle = position as f32 * rope_inv_freq(i, head_dim, rope);
+        let (s, c) = angle.sin_cos();
+        cos_table[i] = c;
+        sin_table[i] = s;
+    }
     for head in 0..num_heads {
         let row = &mut values[head * head_dim..(head + 1) * head_dim];
-        for i in 0..half_dim {
-            let angle = position as f32 * rope_inv_freq(i, head_dim, rope);
-            let (sin, cos) = angle.sin_cos();
-            let x0 = row[i];
-            let x1 = row[i + half_dim];
-            row[i] = x0 * cos - x1 * sin;
-            row[i + half_dim] = x0 * sin + x1 * cos;
-        }
+        super::simd::rope_apply_pair(row, &cos_table, &sin_table);
     }
     Ok(())
 }

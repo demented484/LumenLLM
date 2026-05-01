@@ -1,6 +1,7 @@
 use rayon::prelude::*;
 
 use crate::error::{AegisError, Result};
+use super::cpu::simd;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ReferenceAttentionDecodeRequest<'a> {
@@ -214,12 +215,10 @@ fn reference_attention_head_f32_into(
     for pos in 0..seq_len {
         let key_offset = (pos * num_kv_heads + kv_head) * head_dim;
         let k = &keys[key_offset..key_offset + head_dim];
-        let score = dot_f32(q, k) * scale;
+        let score = simd::dot_f32(q, k) * scale;
         if score > max_score {
             let rescale = (max_score - score).exp();
-            for value in out.iter_mut() {
-                *value *= rescale;
-            }
+            simd::scale_in_place(out, rescale);
             score_sum *= rescale;
             max_score = score;
         }
@@ -227,21 +226,13 @@ fn reference_attention_head_f32_into(
         score_sum += weight;
         let value_offset = (pos * num_kv_heads + kv_head) * head_dim;
         let v = &values[value_offset..value_offset + head_dim];
-        for dim in 0..head_dim {
-            out[dim] += weight * v[dim];
-        }
+        simd::axpy(out, v, weight);
     }
 
     if score_sum > 0.0 {
         let inv = 1.0 / score_sum;
-        for value in out.iter_mut() {
-            *value *= inv;
-        }
+        simd::scale_in_place(out, inv);
     }
-}
-
-fn dot_f32(lhs: &[f32], rhs: &[f32]) -> f32 {
-    lhs.iter().zip(rhs).map(|(a, b)| a * b).sum()
 }
 
 #[cfg(test)]
