@@ -6,10 +6,12 @@ use super::loader::{
 use super::planning::validate_cuda_placement;
 use super::rope::RopeConfig;
 use super::state::{
-    CudaLayerState, CudaLlamaExecutor, CudaLlamaState, CudaPrefillScratch, CudaScratch,
+    CudaLayer, CudaLayerState, CudaLlamaExecutor, CudaLlamaState, CudaPrefillScratch, CudaScratch,
 };
 use crate::artifact::ModelArtifact;
-use crate::cuda::{CUDA_PREFILL_CHUNK_MAX, CudaRuntime, CudaRuntimeConfig};
+use crate::cuda::{
+    CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, CudaRuntime, CudaRuntimeConfig,
+};
 use crate::error::{AegisError, Result};
 use crate::executor::tensors::require_tensor;
 use crate::graph::{ModelGraph, RegionId};
@@ -19,7 +21,7 @@ use crate::tensor::layout::LinearResidentLayout;
 use crate::tensor::storage::TensorStorageLoader;
 
 const FLASH_COMPAT_PREFILL_KV_PAGE_TOKENS: usize = 256;
-const PREFILL_SPLIT_K_TOKENS: usize = 2048;
+const PREFILL_SPLIT_K_TOKENS: usize = CUDA_PREFILL_DENSE_SPLIT_K_TOKENS;
 const PREFILL_SPLIT_Q_BLOCK: usize = 16;
 
 impl CudaLlamaExecutor {
@@ -141,11 +143,29 @@ impl CudaLlamaExecutor {
                 .cutlass_nvfp4_inference_enabled_for(&layer.down_proj)
                 && !native_mxfp4_enabled(&self.runtime, &layer.down_proj)
         });
+        let needs_quant_hidden_scratch = self
+            .layers
+            .iter()
+            .any(|layer| prefill_layer_needs_quant_hidden_scratch(&self.runtime, layer));
+        let needs_mxfp4_hidden_scratch = self
+            .layers
+            .iter()
+            .any(|layer| prefill_layer_needs_mxfp4_hidden_scratch(&self.runtime, layer));
         let needs_mxfp4_down_scratch = needs_fallback_down_scratch
             || self
                 .layers
                 .iter()
                 .any(|layer| native_mxfp4_enabled(&self.runtime, &layer.down_proj));
+        let quant_hidden_len = if needs_quant_hidden_scratch {
+            self.prefill_chunk_size * self.hidden_size
+        } else {
+            1
+        };
+        let mxfp4_hidden_len = if needs_mxfp4_hidden_scratch {
+            self.prefill_chunk_size * CudaRuntime::mxfp4_vector_bytes(self.hidden_size)?
+        } else {
+            1
+        };
         let quant_intermediate_len = if needs_fallback_down_scratch {
             self.prefill_chunk_size * intermediate
         } else {
@@ -153,11 +173,6 @@ impl CudaLlamaExecutor {
         };
         let mxfp4_intermediate_len = if needs_mxfp4_down_scratch {
             self.prefill_chunk_size * CudaRuntime::mxfp4_vector_bytes(intermediate)?
-        } else {
-            1
-        };
-        let swiglu_len = if needs_fallback_down_scratch {
-            self.prefill_chunk_size * intermediate
         } else {
             1
         };
@@ -197,17 +212,12 @@ impl CudaLlamaExecutor {
                 hidden: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
-                hidden_out: self.runtime.alloc_f32(1)?,
                 input_normed: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
-                quant_hidden: self
-                    .runtime
-                    .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
+                quant_hidden: self.runtime.alloc_f32(quant_hidden_len)?,
                 quant_intermediate: self.runtime.alloc_f32(quant_intermediate_len)?,
-                mxfp4_hidden: self.runtime.alloc_u8(
-                    self.prefill_chunk_size * CudaRuntime::mxfp4_vector_bytes(self.hidden_size)?,
-                )?,
+                mxfp4_hidden: self.runtime.alloc_u8(mxfp4_hidden_len)?,
                 mxfp4_intermediate: self.runtime.alloc_u8(mxfp4_intermediate_len)?,
                 cutlass_payload: self
                     .runtime
@@ -219,9 +229,8 @@ impl CudaLlamaExecutor {
                 qkv: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * qkv_width)?,
-                q: self.runtime.alloc_f32(
-                    self.prefill_chunk_size * self.num_attention_heads * self.head_dim,
-                )?,
+                // Q reuses the gate buffer until MLP starts.
+                q: self.runtime.alloc_f32(1)?,
                 q_half: self.runtime.alloc_u16(
                     self.prefill_chunk_size * self.num_attention_heads * self.head_dim,
                 )?,
@@ -232,26 +241,22 @@ impl CudaLlamaExecutor {
                 attn_split_l: self
                     .runtime
                     .alloc_f32(prefill_attention_scratch.stats_f32)?,
-                k: self.runtime.alloc_f32(self.prefill_chunk_size * kv_width)?,
+                // K reuses the up buffer until MLP starts.
+                k: self.runtime.alloc_f32(1)?,
                 v: self.runtime.alloc_f32(self.prefill_chunk_size * kv_width)?,
-                attn_context: self.runtime.alloc_f32(
-                    self.prefill_chunk_size * self.num_attention_heads * self.head_dim,
-                )?,
-                attn_out: self
-                    .runtime
-                    .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
-                residual: self.runtime.alloc_f32(1)?,
-                post_normed: self.runtime.alloc_f32(1)?,
+                // Reused output now lives in qkv after QKV split has consumed it.
+                attn_context: self.runtime.alloc_f32(1)?,
+                // Reused output now lives in input_normed after QKV/attention.
+                attn_out: self.runtime.alloc_f32(1)?,
                 gate: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * intermediate)?,
                 up: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * intermediate)?,
-                swiglu: self.runtime.alloc_f32(swiglu_len)?,
-                mlp_out: self
-                    .runtime
-                    .alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
+                swiglu: self.runtime.alloc_f32(1)?,
+                // Reused output now lives in input_normed after gate/up.
+                mlp_out: self.runtime.alloc_f32(1)?,
             })
         } else {
             None
@@ -318,6 +323,76 @@ impl CudaLlamaExecutor {
     }
 }
 
+fn prefill_layer_needs_quant_hidden_scratch(
+    runtime: &CudaRuntime,
+    layer: &CudaLayer,
+) -> bool {
+    let qkv_group_cutlass = layer
+        .qkv_proj
+        .as_ref()
+        .is_some_and(|linear| runtime.cutlass_nvfp4_inference_enabled_for(linear));
+    let qkv_all_cutlass = [&layer.q_proj, &layer.k_proj, &layer.v_proj]
+        .into_iter()
+        .all(|linear| runtime.cutlass_nvfp4_inference_enabled_for(linear));
+    let qkv_all_native = [&layer.q_proj, &layer.k_proj, &layer.v_proj]
+        .into_iter()
+        .all(|linear| native_mxfp4_enabled(runtime, linear));
+    let qkv_fallback_needs_quant = !qkv_group_cutlass
+        && !qkv_all_cutlass
+        && !qkv_all_native
+        && [&layer.q_proj, &layer.k_proj, &layer.v_proj]
+            .into_iter()
+            .any(|linear| !native_mxfp4_enabled(runtime, linear));
+
+    let o_needs_quant = !runtime.cutlass_nvfp4_inference_enabled_for(&layer.o_proj)
+        && !native_mxfp4_enabled(runtime, &layer.o_proj);
+
+    let gate_up_all_cutlass = [&layer.gate_proj, &layer.up_proj]
+        .into_iter()
+        .all(|linear| runtime.cutlass_nvfp4_inference_enabled_for(linear));
+    let gate_up_all_native = [&layer.gate_proj, &layer.up_proj]
+        .into_iter()
+        .all(|linear| native_mxfp4_enabled(runtime, linear));
+    let gate_up_fallback_needs_quant = !gate_up_all_cutlass
+        && !gate_up_all_native
+        && [&layer.gate_proj, &layer.up_proj]
+            .into_iter()
+            .any(|linear| !native_mxfp4_enabled(runtime, linear));
+
+    qkv_fallback_needs_quant || o_needs_quant || gate_up_fallback_needs_quant
+}
+
+fn prefill_layer_needs_mxfp4_hidden_scratch(
+    runtime: &CudaRuntime,
+    layer: &CudaLayer,
+) -> bool {
+    let qkv_group_cutlass = layer
+        .qkv_proj
+        .as_ref()
+        .is_some_and(|linear| runtime.cutlass_nvfp4_inference_enabled_for(linear));
+    let qkv_all_cutlass = [&layer.q_proj, &layer.k_proj, &layer.v_proj]
+        .into_iter()
+        .all(|linear| runtime.cutlass_nvfp4_inference_enabled_for(linear));
+    let qkv_needs_mxfp4 = !qkv_group_cutlass
+        && !qkv_all_cutlass
+        && [&layer.q_proj, &layer.k_proj, &layer.v_proj]
+            .into_iter()
+            .any(|linear| native_mxfp4_enabled(runtime, linear));
+
+    let o_needs_mxfp4 = !runtime.cutlass_nvfp4_inference_enabled_for(&layer.o_proj)
+        && native_mxfp4_enabled(runtime, &layer.o_proj);
+
+    let gate_up_all_cutlass = [&layer.gate_proj, &layer.up_proj]
+        .into_iter()
+        .all(|linear| runtime.cutlass_nvfp4_inference_enabled_for(linear));
+    let gate_up_needs_mxfp4 = !gate_up_all_cutlass
+        && [&layer.gate_proj, &layer.up_proj]
+            .into_iter()
+            .any(|linear| native_mxfp4_enabled(runtime, linear));
+
+    qkv_needs_mxfp4 || o_needs_mxfp4 || gate_up_needs_mxfp4
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PrefillAttentionSplitScratchBytes {
     acc_f32: usize,
@@ -328,7 +403,9 @@ fn prefill_attention_split_scratch(
     executor: &CudaLlamaExecutor,
     chunk_size: usize,
 ) -> Result<PrefillAttentionSplitScratchBytes> {
-    if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_none() {
+    let split_enabled = std::env::var_os("AEGISLLM_CUDA_DISABLE_SPLIT_K_ATTENTION").is_none()
+        && std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some();
+    if !split_enabled {
         return Ok(PrefillAttentionSplitScratchBytes {
             acc_f32: 1,
             stats_f32: 1,

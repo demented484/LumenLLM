@@ -2,6 +2,23 @@
 #include <cooperative_groups.h>
 #include <mma.h>
 
+#if __CUDA_ARCH__ >= 800
+template <typename Fragment>
+__device__ __forceinline__ void aegis_scale_wmma_accumulator_m16n16_rows(
+    Fragment& frag,
+    const float* __restrict__ scalars,
+    const unsigned int row_base
+) {
+    const unsigned int lane_row_base = (threadIdx.x & 31u) >> 2u;
+#pragma unroll
+    for (unsigned int element = 0u; element < Fragment::num_elements; ++element) {
+        const unsigned int row_in_fragment = lane_row_base + ((element & 2u) ? 8u : 0u);
+        frag.x[element] *= scalars[(row_base + row_in_fragment) * 3u + 2u];
+    }
+}
+
+#endif
+
 __device__ __forceinline__ float aegis_warp_reduce_max(float value) {
 #pragma unroll
     for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
@@ -1921,12 +1938,6 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
             ? *reinterpret_cast<const uint4*>(query + query_offset)
             : zero_q_vec;
     }
-    constexpr unsigned int acc_zero_vecs = q_rows * acc_stride / (sizeof(float4) / sizeof(float));
-    float4* acc_zero_vec = reinterpret_cast<float4*>(acc);
-    const float4 zero_acc_vec = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    for (unsigned int vec = tid; vec < acc_zero_vecs; vec += blockDim.x) {
-        acc_zero_vec[vec] = zero_acc_vec;
-    }
     for (unsigned int row = tid; row < q_rows; row += blockDim.x) {
         scalars[row * 3u + 0u] = -3.402823466e38f;
         scalars[row * 3u + 1u] = 0.0f;
@@ -1937,6 +1948,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
 #if __CUDA_ARCH__ >= 800
     using namespace nvcuda;
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> q_frag[8];
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv_frag[2];
     if (warp < 4u) {
         const unsigned int row_block = warp >> 1u;
 #pragma unroll
@@ -1944,6 +1956,10 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
             const half* q_ptr = reinterpret_cast<const half*>(q_shared + row_block * 16u * hdim + kk);
             wmma::load_matrix_sync(q_frag[kk / 16u], q_ptr, hdim);
         }
+    }
+    if (warp < 8u) {
+        wmma::fill_fragment(pv_frag[0], 0.0f);
+        wmma::fill_fragment(pv_frag[1], 0.0f);
     }
 #endif
 
@@ -2022,29 +2038,6 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
         }
         __syncthreads();
 
-        constexpr unsigned int floats_per_vec = sizeof(float4) / sizeof(float);
-        constexpr unsigned int acc_vecs = q_rows * hdim / floats_per_vec;
-        for (unsigned int vec = tid; vec < acc_vecs; vec += blockDim.x) {
-            const unsigned int idx = vec * floats_per_vec;
-            const unsigned int row = idx / hdim;
-            const unsigned int dim = idx - row * hdim;
-            const unsigned int local_head = row / q_tokens;
-            const unsigned int token = row - local_head * q_tokens;
-            const unsigned int head = kv_head * group + local_head_base + local_head;
-            const unsigned int global_q = global_q_base + token;
-            if (local_head_base + local_head < group && head < num_attention_heads && global_q < total_q) {
-                float4* acc_vec = reinterpret_cast<float4*>(acc + row * acc_stride + dim);
-                float4 value = *acc_vec;
-                const float alpha = scalars[row * 3u + 2u];
-                value.x *= alpha;
-                value.y *= alpha;
-                value.z *= alpha;
-                value.w *= alpha;
-                *acc_vec = value;
-            }
-        }
-        __syncthreads();
-
 #if __CUDA_ARCH__ >= 800
         if (warp < 8u) {
             using namespace nvcuda;
@@ -2052,22 +2045,31 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
             for (unsigned int row_base = 0u; row_base < q_rows; row_base += 16u) {
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
-                wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv_frag;
-                wmma::load_matrix_sync(pv_frag, acc + row_base * acc_stride + n_off, acc_stride, wmma::mem_row_major);
+                const unsigned int row_fragment = row_base >> 4u;
+                aegis_scale_wmma_accumulator_m16n16_rows(pv_frag[row_fragment], scalars, row_base);
 #pragma unroll
                 for (unsigned int kk = 0u; kk < k_tile; kk += 16u) {
                     const half* p_ptr = weights_half + row_base * score_stride + kk;
                     const half* v_ptr = reinterpret_cast<const half*>(v_shared + kk * hdim + n_off);
                     wmma::load_matrix_sync(p_frag, p_ptr, score_stride);
                     wmma::load_matrix_sync(v_frag, v_ptr, hdim);
-                    wmma::mma_sync(pv_frag, p_frag, v_frag, pv_frag);
+                    wmma::mma_sync(pv_frag[row_fragment], p_frag, v_frag, pv_frag[row_fragment]);
                 }
-                wmma::store_matrix_sync(acc + row_base * acc_stride + n_off, pv_frag, acc_stride, wmma::mem_row_major);
             }
         }
 #endif
         __syncthreads();
     }
+
+#if __CUDA_ARCH__ >= 800
+    if (warp < 8u) {
+        using namespace nvcuda;
+        const unsigned int n_off = warp * 16u;
+        wmma::store_matrix_sync(acc + n_off, pv_frag[0], acc_stride, wmma::mem_row_major);
+        wmma::store_matrix_sync(acc + 16u * acc_stride + n_off, pv_frag[1], acc_stride, wmma::mem_row_major);
+    }
+    __syncthreads();
+#endif
 
     for (unsigned int idx = tid; idx < q_rows * hdim; idx += blockDim.x) {
         const unsigned int row = idx / hdim;

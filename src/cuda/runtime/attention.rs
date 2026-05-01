@@ -4,7 +4,9 @@ use super::{CudaRuntime, map_cuda_err};
 use crate::cuda::{
     CudaAttentionBackend, CudaAttentionRequest, CudaAttentionSplitScratch,
     CudaPrefillAttentionKernel, DensePrefillMetadataProof, DeviceBuffer,
-    config::CUDA_PREFILL_VARLEN_MIN_CONTEXT,
+    config::{
+        CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, CUDA_PREFILL_VARLEN_MIN_CONTEXT,
+    },
 };
 use crate::error::{AegisError, Result};
 
@@ -51,11 +53,12 @@ const DENSE_WMMA_Q_BLOCK: usize = 16;
 const DENSE_WMMA_FA_Q_BLOCK: usize = 16;
 const DENSE_WMMA_GQA4_Q_TOKENS: usize = 8;
 const DENSE_WMMA_GQA4_HEADS: usize = 4;
+const DENSE_WMMA_GQA4_SPLIT_Q_TOKENS: usize = 8;
 const PAGED_WMMA_GQA4_Q_TOKENS: usize = 8;
 const PAGED_WMMA_GQA4_HEADS: usize = 4;
 const DENSE_WMMA_Q32_BLOCK: usize = 32;
 const DENSE_WMMA_K_TILE: usize = 32;
-const DENSE_WMMA_SPLIT_K_TOKENS: usize = 2048;
+const DENSE_WMMA_SPLIT_K_TOKENS: usize = CUDA_PREFILL_DENSE_SPLIT_K_TOKENS;
 const FA4_HDIM128_Q_BLOCK: usize = 8;
 const FA4_HDIM128_K_TILE: usize = 32;
 const CUDA_ATTENTION_BLOCK_DIM: u32 = 128;
@@ -426,6 +429,11 @@ impl CudaRuntime {
                 dense_metadata.batch(),
                 dense_metadata.context_len()
             )));
+        }
+        if num_kv_heads == 0 || num_attention_heads % num_kv_heads != 0 {
+            return Err(AegisError::InvalidPlan(
+                "dense prefill attention heads must be divisible by kv heads".into(),
+            ));
         }
         let legacy_shared_bytes = (dense_metadata.context_len()
             + CUDA_ATTENTION_BLOCK_DIM as usize)
@@ -1049,6 +1057,11 @@ impl CudaRuntime {
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let head_dim = 128usize;
+        if num_kv_heads == 0 || num_attention_heads % num_kv_heads != 0 {
+            return Err(AegisError::InvalidPlan(
+                "dense gqa4 wmma attention heads must be divisible by kv heads".into(),
+            ));
+        }
         let group = num_attention_heads / num_kv_heads;
         if group < DENSE_WMMA_GQA4_HEADS {
             return Err(AegisError::InvalidPlan(format!(
@@ -1078,14 +1091,9 @@ impl CudaRuntime {
                 cache_len
             )));
         }
-        if num_attention_heads % num_kv_heads != 0 {
-            return Err(AegisError::InvalidPlan(
-                "dense gqa4 wmma attention heads must be divisible by kv heads".into(),
-            ));
-        }
-        let half_values =
-            q_rows * head_dim + 2 * DENSE_WMMA_K_TILE * head_dim + q_rows * (DENSE_WMMA_K_TILE + 8);
-        let float_values = q_rows * (DENSE_WMMA_K_TILE + 8) + q_rows * (head_dim + 8) + q_rows * 3;
+        let score_stride = DENSE_WMMA_K_TILE + 8;
+        let half_values = q_rows * head_dim + 2 * DENSE_WMMA_K_TILE * head_dim + q_rows * score_stride;
+        let float_values = q_rows * score_stride + q_rows * (head_dim + 8) + q_rows * 3;
         let shared_mem_bytes =
             half_values * std::mem::size_of::<u16>() + float_values * std::mem::size_of::<f32>();
         self.kernels
@@ -1163,7 +1171,7 @@ impl CudaRuntime {
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let head_dim = 128usize;
-        if num_attention_heads % num_kv_heads != 0 {
+        if num_kv_heads == 0 || num_attention_heads % num_kv_heads != 0 {
             return Err(AegisError::InvalidPlan(
                 "paged gqa4 wmma attention heads must be divisible by kv heads".into(),
             ));
@@ -1302,6 +1310,11 @@ impl CudaRuntime {
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let head_dim = 128usize;
+        if num_kv_heads == 0 || num_attention_heads % num_kv_heads != 0 {
+            return Err(AegisError::InvalidPlan(
+                "dense gqa4 split wmma attention heads must be divisible by kv heads".into(),
+            ));
+        }
         let group = num_attention_heads / num_kv_heads;
         if group < DENSE_WMMA_GQA4_HEADS {
             return Err(AegisError::InvalidPlan(format!(
@@ -1324,7 +1337,7 @@ impl CudaRuntime {
                 "dense gqa4 split wmma attention scratch buffers are too small".into(),
             ));
         }
-        let q_rows = DENSE_WMMA_GQA4_Q_TOKENS * DENSE_WMMA_GQA4_HEADS;
+        let q_rows = DENSE_WMMA_GQA4_SPLIT_Q_TOKENS * DENSE_WMMA_GQA4_HEADS;
         let q_width = checked_len(
             "dense gqa4 split wmma q width",
             num_attention_heads,
@@ -1348,11 +1361,6 @@ impl CudaRuntime {
                 value_cache.len(),
                 cache_len
             )));
-        }
-        if num_attention_heads % num_kv_heads != 0 {
-            return Err(AegisError::InvalidPlan(
-                "dense gqa4 split wmma attention heads must be divisible by kv heads".into(),
-            ));
         }
         let half_values =
             q_rows * head_dim + 2 * DENSE_WMMA_K_TILE * head_dim + q_rows * DENSE_WMMA_K_TILE;
@@ -1405,7 +1413,7 @@ impl CudaRuntime {
                         )?,
                         u32_arg(
                             "dense gqa4 split wmma q blocks",
-                            batch.div_ceil(DENSE_WMMA_GQA4_Q_TOKENS),
+                            batch.div_ceil(DENSE_WMMA_GQA4_SPLIT_Q_TOKENS),
                         )?,
                         split_count_u32,
                     ),
@@ -2251,7 +2259,8 @@ impl CudaRuntime {
 }
 
 fn dense_wmma_split_k_enabled() -> bool {
-    std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
+    std::env::var_os("AEGISLLM_CUDA_DISABLE_SPLIT_K_ATTENTION").is_none()
+        && std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
 }
 
 fn dense_wmma_q32_enabled() -> bool {

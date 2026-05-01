@@ -2,6 +2,7 @@ use crate::error::{AegisError, Result};
 
 pub(crate) const CUDA_PREFILL_VARLEN_MIN_CONTEXT: usize = 128;
 pub(crate) const CUDA_PREFILL_CHUNK_MAX: usize = 8192;
+pub(crate) const CUDA_PREFILL_DENSE_SPLIT_K_TOKENS: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CudaRuntimeConfig {
@@ -204,10 +205,7 @@ impl CudaPrefillAttentionSelection {
                 let dense_warp_tile_eligible =
                     head_dim == 128 && context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT;
                 let dense_gqa4_eligible = dense_warp_tile_eligible && gqa_group >= 4;
-                let dense_split_k_experimental =
-                    std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
-                        && head_dim == 128
-                        && context_len >= 4096;
+                let dense_split_k_eligible = dense_split_k_enabled() && head_dim == 128;
                 let dense_q32_experimental =
                     std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_PERSISTENT_ATTENTION").is_some()
                         && head_dim == 128
@@ -218,18 +216,18 @@ impl CudaPrefillAttentionSelection {
                         && context_len >= 1024;
                 let warp_eligible =
                     head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores;
-                let (logical_backend, effective_path, reason) = if dense_split_k_experimental {
+                let (logical_backend, effective_path, reason) = if dense_split_k_eligible {
                     if dense_gqa4_eligible {
                         (
                             CudaAttentionBackend::AegisVarlen,
                             CudaAttentionEffectivePath::AegisDenseWmmaGqa4SplitK,
-                            "auto selected experimental GQA4 stream-K dense WMMA-tiled prefill attention",
+                            "auto selected explicitly enabled GQA4 split-K dense WMMA-tiled prefill attention",
                         )
                     } else {
                         (
                             CudaAttentionBackend::AegisVarlen,
                             CudaAttentionEffectivePath::AegisDenseWmmaSplitK,
-                            "auto selected experimental split-K dense WMMA-tiled prefill attention",
+                            "auto selected explicitly enabled split-K dense WMMA-tiled prefill attention",
                         )
                     }
                 } else if dense_cluster2_experimental {
@@ -327,9 +325,7 @@ impl CudaPrefillAttentionSelection {
                 logical_backend: CudaAttentionBackend::AegisVarlen,
                 effective_path: if head_dim == 128 && context_len >= CUDA_PREFILL_VARLEN_MIN_CONTEXT
                 {
-                    if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
-                        && context_len >= 4096
-                    {
+                    if dense_split_k_enabled() {
                         if gqa_group >= 4 {
                             CudaAttentionEffectivePath::AegisDenseWmmaGqa4SplitK
                         } else {
@@ -393,6 +389,11 @@ impl CudaPrefillAttentionSelection {
             },
         }
     }
+}
+
+fn dense_split_k_enabled() -> bool {
+    std::env::var_os("AEGISLLM_CUDA_DISABLE_SPLIT_K_ATTENTION").is_none()
+        && std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some()
 }
 
 #[cfg(test)]

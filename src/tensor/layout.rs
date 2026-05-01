@@ -307,6 +307,7 @@ fn normalize(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::backend::BackendKind;
+    use crate::cuda::CudaAttentionDType;
     use crate::tensor::quant::TensorCorePrecision;
 
     fn cuda_backend(fp4: bool, fp8: bool) -> BackendDescriptor {
@@ -324,6 +325,7 @@ mod tests {
             supports_fp8: fp8,
             supports_flash_attention: true,
             supports_paged_attention: true,
+            attention_dtypes: vec![CudaAttentionDType::F16],
             tensor_core_precisions,
         }
     }
@@ -383,6 +385,7 @@ mod tests {
             supports_fp8: false,
             supports_flash_attention: false,
             supports_paged_attention: false,
+            attention_dtypes: vec![CudaAttentionDType::F32],
             tensor_core_precisions: Vec::new(),
         };
         let plan = policy.plan(&backend, QuantFormat::Nvfp4, KernelFamily::CpuScalar, 1024);

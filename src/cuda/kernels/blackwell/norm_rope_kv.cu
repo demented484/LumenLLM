@@ -288,6 +288,18 @@ extern "C" __global__ void aegis_swiglu(
     }
 }
 
+extern "C" __global__ void aegis_swiglu_inplace_gate(
+    float* gate,
+    const float* up,
+    const unsigned int len
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        const float x = gate[idx];
+        gate[idx] = (x / (1.0f + expf(-x))) * up[idx];
+    }
+}
+
 extern "C" __device__ __forceinline__ float rope_inv_freq_device(
     const unsigned int index,
     const unsigned int head_dim,

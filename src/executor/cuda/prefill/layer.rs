@@ -38,6 +38,9 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
 ) -> Result<()> {
     let hidden_size = layer.o_proj.rows;
     let intermediate = layer.gate_proj.rows;
+    // Prefill scratch is lifetime-pooled manually here: Q lives in `gate`
+    // until attention finishes, K lives in `up`, and attention context lives
+    // in `qkv` after QKV split has consumed it. MLP overwrites gate/up later.
     let qkv_start = Instant::now();
     if let Some(qkv_proj) = layer
         .qkv_proj
@@ -75,8 +78,8 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             layer.q_proj.output_scale,
             layer.k_proj.output_scale,
             layer.v_proj.output_scale,
-            &mut prefill.q,
-            &mut prefill.k,
+            &mut prefill.gate,
+            &mut prefill.up,
             &mut prefill.v,
         )?;
     } else if prefill_linear_native_mxfp4_enabled(runtime, &layer.q_proj)
@@ -103,8 +106,8 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &layer.v_proj,
             &prefill.mxfp4_hidden,
             params.batch,
-            &mut prefill.q,
-            &mut prefill.k,
+            &mut prefill.gate,
+            &mut prefill.up,
             &mut prefill.v,
         )?;
     } else if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.q_proj)
@@ -132,7 +135,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &prefill.cutlass_scales,
             params.batch,
             &mut prefill.cutlass_workspace,
-            &mut prefill.q,
+            &mut prefill.gate,
         )?;
         prefill_linear_cutlass_nvfp4_prepacked_device(
             runtime,
@@ -141,7 +144,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &prefill.cutlass_scales,
             params.batch,
             &mut prefill.cutlass_workspace,
-            &mut prefill.k,
+            &mut prefill.up,
         )?;
         prefill_linear_cutlass_nvfp4_prepacked_device(
             runtime,
@@ -169,7 +172,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &prefill.quant_hidden,
             params.batch,
             &mut prefill.mxfp4_hidden,
-            &mut prefill.q,
+            &mut prefill.gate,
         )?;
         let mut quant_scale = Some(layer.q_proj.input_scale);
         prefill_linear_prepare_nvfp4_input(
@@ -187,7 +190,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &prefill.quant_hidden,
             params.batch,
             &mut prefill.mxfp4_hidden,
-            &mut prefill.k,
+            &mut prefill.up,
         )?;
         prefill_linear_prepare_nvfp4_input(
             runtime,
@@ -219,7 +222,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
 
     let rope_start = Instant::now();
     runtime.apply_rope_positions_batched_f16_out_device(
-        &mut prefill.q,
+        &mut prefill.gate,
         &prefill.positions,
         params.batch,
         params.num_attention_heads,
@@ -235,7 +238,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     runtime.store_kv_slots_batched_rope_key_device(
         &mut layer_state.kv.keys,
         &mut layer_state.kv.values,
-        &mut prefill.k,
+        &mut prefill.up,
         &prefill.v,
         &prefill.positions,
         &prefill.slot_mapping,
@@ -254,9 +257,9 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     runtime.attention_prefill_dense_compat_device(
         &layer_state.kv.keys,
         &layer_state.kv.values,
-        &prefill.k,
+        &prefill.up,
         &prefill.v,
-        &prefill.q,
+        &prefill.gate,
         &mut prefill.q_half,
         true,
         &mut prefill.attn_split_acc,
@@ -273,7 +276,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         params.num_attention_heads,
         params.num_kv_heads,
         params.head_dim,
-        &mut prefill.attn_context,
+        &mut prefill.qkv,
         params.dense_metadata,
     )?;
     record_prefill_stage(runtime, timings, attention_start, |timings, elapsed| {
@@ -285,22 +288,22 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         prefill_linear_cutlass_nvfp4_device(
             runtime,
             &layer.o_proj,
-            &prefill.attn_context,
+            &prefill.qkv,
             params.batch,
             &mut prefill.cutlass_payload,
             &mut prefill.cutlass_scales,
             &mut prefill.cutlass_workspace,
-            &mut prefill.attn_out,
+            &mut prefill.input_normed,
         )?;
     } else {
         prefill_linear_batched_device_with_scratch(
             runtime,
             &layer.o_proj,
-            &prefill.attn_context,
+            &prefill.qkv,
             params.batch,
             &mut prefill.quant_hidden,
             &mut prefill.mxfp4_hidden,
-            &mut prefill.attn_out,
+            &mut prefill.input_normed,
         )?;
     }
     record_prefill_stage(runtime, timings, o_proj_start, |timings, elapsed| {
@@ -308,12 +311,12 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     })?;
 
     let batch_hidden = params.batch * hidden_size;
-    if prefill.hidden.len() < batch_hidden || prefill.attn_out.len() < batch_hidden {
+    if prefill.hidden.len() < batch_hidden || prefill.input_normed.len() < batch_hidden {
         return Err(AegisError::InvalidPlan(
             "CUDA prefill hidden scratch is too small".into(),
         ));
     }
-    runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.attn_out, batch_hidden)?;
+    runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.input_normed, batch_hidden)?;
 
     let mlp_start = Instant::now();
     if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.gate_proj)
@@ -422,7 +425,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &prefill.cutlass_scales,
             params.batch,
             &mut prefill.cutlass_workspace,
-            &mut prefill.mlp_out,
+            &mut prefill.input_normed,
         )?;
     } else if prefill_linear_native_mxfp4_enabled(runtime, &layer.down_proj) {
         runtime.swiglu_mxfp4_quantize_batched_device(
@@ -436,26 +439,25 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &layer.down_proj,
             &prefill.mxfp4_intermediate,
             params.batch,
-            &mut prefill.mlp_out,
+            &mut prefill.input_normed,
         )?;
     } else {
-        runtime.swiglu_device_len(
-            &prefill.gate,
+        runtime.swiglu_inplace_gate_device_len(
+            &mut prefill.gate,
             &prefill.up,
-            &mut prefill.swiglu,
             params.batch * intermediate,
         )?;
         prefill_linear_batched_device_with_scratch(
             runtime,
             &layer.down_proj,
-            &prefill.swiglu,
+            &prefill.gate,
             params.batch,
             &mut prefill.quant_intermediate,
             &mut prefill.mxfp4_intermediate,
-            &mut prefill.mlp_out,
+            &mut prefill.input_normed,
         )?;
     }
-    runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.mlp_out, batch_hidden)?;
+    runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.input_normed, batch_hidden)?;
     let mlp_flops =
         prefill_gemm_flops(
             params.batch,

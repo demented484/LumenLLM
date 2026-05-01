@@ -139,6 +139,9 @@ pub(super) fn parse_engine_flags(args: &[String]) -> Result<ParsedEngineFlags> {
     let inventory = HardwareInventory::detect();
     let loaded_from_config = loaded_policy.is_some();
     let mut policy = loaded_policy.unwrap_or_else(|| PlacementPolicy::auto_for(&inventory));
+    if cuda_device_explicit && !loaded_from_config {
+        force_cuda_policy(&mut policy, cuda_device);
+    }
     if cuda_device_explicit {
         crate::params::retarget_cuda_policy(&mut policy, cuda_device);
     }
@@ -200,6 +203,17 @@ pub(super) fn parse_engine_flags(args: &[String]) -> Result<ParsedEngineFlags> {
         cuda: cuda_runtime,
         generation: loaded_generation.unwrap_or_default(),
     })
+}
+
+fn force_cuda_policy(policy: &mut PlacementPolicy, device: usize) {
+    policy.weights_store = StoragePlacement::Vram { device };
+    policy.weights_compute = ComputePlacement::Cuda { device };
+    policy.spill_compute = ComputePlacement::Cuda { device };
+    policy.kv_store = StoragePlacement::Vram { device };
+    policy.kv_compute = ComputePlacement::Cuda { device };
+    if policy.reserve_vram_bytes == 0 {
+        policy.reserve_vram_bytes = 1024 * 1024 * 1024;
+    }
 }
 
 pub(super) fn is_engine_flag(flag: &str) -> bool {

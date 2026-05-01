@@ -55,6 +55,20 @@ pub enum CudaAttentionMode {
     Mixed = 3,
 }
 
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum CudaAttentionDType {
+    F32 = 0,
+    F16 = 1,
+    Bf16 = 2,
+    Fp8E4M3 = 3,
+    Fp8E5M2 = 4,
+    Fp4E2M1 = 5,
+    Int8 = 6,
+    Int4 = 7,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
@@ -74,7 +88,14 @@ pub struct CudaAttentionParamsV1 {
     pub block_table_stride: u32,
     pub physical_slots: u32,
     pub softmax_scale: f32,
+    pub q_dtype: CudaAttentionDType,
+    pub k_dtype: CudaAttentionDType,
+    pub v_dtype: CudaAttentionDType,
+    pub output_dtype: CudaAttentionDType,
+    pub accum_dtype: CudaAttentionDType,
     pub reserved0: u32,
+    pub reserved1: u32,
+    pub reserved2: u32,
     pub q: *const c_void,
     pub k_cache: *const c_void,
     pub v_cache: *const c_void,
@@ -250,7 +271,9 @@ impl DensePrefillMetadataProof {
 
 #[cfg(test)]
 mod tests {
-    use super::{CudaAttentionMode, CudaAttentionParamsV1, DensePrefillMetadataProof};
+    use super::{
+        CudaAttentionDType, CudaAttentionMode, CudaAttentionParamsV1, DensePrefillMetadataProof,
+    };
 
     #[test]
     fn attention_params_are_c_stable_enough_for_cuda_ffi() {
@@ -259,6 +282,14 @@ mod tests {
         assert_eq!(CudaAttentionMode::Prefill as u32, 1);
         assert_eq!(CudaAttentionMode::Varlen as u32, 2);
         assert_eq!(CudaAttentionMode::Mixed as u32, 3);
+        assert_eq!(CudaAttentionDType::F32 as u32, 0);
+        assert_eq!(CudaAttentionDType::F16 as u32, 1);
+        assert_eq!(CudaAttentionDType::Bf16 as u32, 2);
+        assert_eq!(CudaAttentionDType::Fp8E4M3 as u32, 3);
+        assert_eq!(CudaAttentionDType::Fp8E5M2 as u32, 4);
+        assert_eq!(CudaAttentionDType::Fp4E2M1 as u32, 5);
+        assert_eq!(CudaAttentionDType::Int8 as u32, 6);
+        assert_eq!(CudaAttentionDType::Int4 as u32, 7);
         assert_eq!(CudaAttentionParamsV1::FLAG_CAUSAL, 1);
         assert_eq!(CudaAttentionParamsV1::FLAG_PAGED_KV, 2);
         assert_eq!(CudaAttentionParamsV1::FLAG_GQA, 4);

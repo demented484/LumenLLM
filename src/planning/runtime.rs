@@ -429,6 +429,7 @@ mod tests {
             supports_fp8: true,
             supports_flash_attention: true,
             supports_paged_attention: true,
+            attention_dtypes: vec![crate::cuda::CudaAttentionDType::F16],
             tensor_core_precisions: vec![TensorCorePrecision::Fp4],
         };
         let registry = KernelRegistry::default();
@@ -445,6 +446,7 @@ mod tests {
             supports_fp8: false,
             supports_flash_attention: true,
             supports_paged_attention: true,
+            attention_dtypes: vec![crate::cuda::CudaAttentionDType::F16],
             tensor_core_precisions: Vec::new(),
         };
         let registry = KernelRegistry::default();

@@ -55,13 +55,20 @@ impl AegisEngine {
             ));
         }
         for backend in self.backends.iter() {
+            let attention_dtypes = backend
+                .attention_dtypes
+                .iter()
+                .map(|dtype| format!("{:?}", dtype))
+                .collect::<Vec<_>>()
+                .join(",");
             lines.push(format!(
-                "backend: {:?} flash={} paged={} fp4={} fp8={}",
+                "backend: {:?} flash={} paged={} fp4={} fp8={} attention_dtypes={}",
                 backend.kind,
                 backend.supports_flash_attention,
                 backend.supports_paged_attention,
                 backend.supports_fp4,
-                backend.supports_fp8
+                backend.supports_fp8,
+                attention_dtypes
             ));
         }
         push_memory_report(self, &mut lines);

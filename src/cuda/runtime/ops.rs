@@ -347,6 +347,38 @@ impl CudaRuntime {
         Ok(())
     }
 
+    pub fn swiglu_inplace_gate_device_len(
+        &self,
+        gate_and_output: &mut DeviceBuffer<f32>,
+        up: &DeviceBuffer<f32>,
+        len: usize,
+    ) -> Result<()> {
+        if gate_and_output.len() < len || up.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "in-place swiglu shape mismatch: gate={} up={} len={}",
+                gate_and_output.len(),
+                up.len(),
+                len
+            )));
+        }
+        let len = len as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.swiglu_inplace_gate)
+                .arg(&mut gate_and_output.slice)
+                .arg(&up.slice)
+                .arg(&len)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch in-place gate swiglu"))?;
+        Ok(())
+    }
+
     pub fn apply_rope_device(
         &self,
         values: &mut DeviceBuffer<f32>,

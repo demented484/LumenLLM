@@ -1,5 +1,7 @@
 use crate::backend::BackendKind;
-use crate::cuda::{CUDA_PREFILL_CHUNK_MAX, CudaRuntimeConfig};
+use crate::cuda::{
+    CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, CudaRuntimeConfig,
+};
 use crate::graph::ModelGraph;
 use crate::hardware::HardwareInventory;
 use crate::planning::placement::{
@@ -261,13 +263,33 @@ fn cuda_prefill_scratch_bytes(
     let intermediate_f32 = if cutlass_prefill {
         // CUTLASS prefill keeps gate and up activations, then quantizes SwiGLU
         // directly for the down projection. The fallback path additionally
-        // needs full-size quant_intermediate and swiglu scratch buffers.
+        // needs full-size quant_intermediate. SwiGLU fallback is in-place in
+        // gate, so there is no separate full-size swiglu scratch.
         2 * intermediate
     } else {
-        4 * intermediate
+        3 * intermediate
     };
-    let f32_elements = chunk * (8 * hidden + 2 * q_width + 2 * kv_width + intermediate_f32);
-    let mxfp4_hidden = chunk * mxfp4_vector_bytes_estimate(graph.hidden_size) as u64;
+    let hidden_f32 = if cutlass_prefill {
+        // hidden plus input_normed, which is reused for o_proj and down_proj
+        // outputs. q/qkv/k/v scratch is accounted below; separate
+        // attn_context/attn_out/mlp_out buffers are not resident on the
+        // CUTLASS hot path.
+        2 * hidden
+    } else {
+        // fallback keeps quant_hidden, but still reuses input_normed for
+        // projection outputs.
+        3 * hidden
+    };
+    // qkv is reused as attention context after split. Q reuses the gate
+    // buffer and K reuses the up buffer until MLP starts, so only V needs a
+    // separate KV-width scratch buffer.
+    let qkv_f32 = q_width + 2 * kv_width + kv_width;
+    let f32_elements = chunk * (hidden_f32 + qkv_f32 + intermediate_f32);
+    let mxfp4_hidden = if cutlass_prefill {
+        0
+    } else {
+        chunk * mxfp4_vector_bytes_estimate(graph.hidden_size) as u64
+    };
     let mxfp4_intermediate = if cutlass_prefill {
         0
     } else {
@@ -277,17 +299,21 @@ fn cuda_prefill_scratch_bytes(
     };
     let metadata_u32 = chunk * 3 + 3;
     let token_bytes = metadata_u32 * std::mem::size_of::<u32>() as u64;
-    let split_attention_f32 =
-        if std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some() {
-            let q_block = 4_u64;
-            let split_tokens = 256_u64;
-            let q_blocks = chunk.div_ceil(q_block);
-            let splits = chunk.div_ceil(split_tokens).max(1);
-            let rows = q_blocks * graph.num_attention_heads as u64 * splits * q_block;
-            rows * (graph.head_dim as u64 + 2)
-        } else {
-            0
-        };
+    let split_attention_enabled =
+        std::env::var_os("AEGISLLM_CUDA_DISABLE_SPLIT_K_ATTENTION").is_none()
+            && std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION").is_some();
+    let split_attention_f32 = if split_attention_enabled {
+        let q_block = 16_u64;
+        let split_tokens = CUDA_PREFILL_DENSE_SPLIT_K_TOKENS as u64;
+        let q_blocks = chunk.div_ceil(q_block);
+        let splits = (placement.kv_cache.context_size as u64)
+            .div_ceil(split_tokens)
+            .max(1);
+        let rows = q_blocks * graph.num_attention_heads as u64 * splits * q_block;
+        rows * (graph.head_dim as u64 + 2)
+    } else {
+        0
+    };
     Some((
         device,
         (f32_elements + split_attention_f32) * std::mem::size_of::<f32>() as u64
