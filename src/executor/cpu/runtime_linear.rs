@@ -106,7 +106,7 @@ impl CpuNvfp4Linear {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpu::loader::unpack_nvfp4_for_test;
+    use crate::executor::cpu::runtime_loader::unpack_nvfp4_for_test;
     use crate::planning::placement::StoragePlacement;
     use crate::tensor::layout::LinearResidentLayout;
     use crate::tensor::quant::{Nvfp4LinearSpec, QK_NVFP4_SUB};

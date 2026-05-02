@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::artifact::ModelArtifact;
-use crate::cpu::{CpuNvfp4Linear, CpuRuntime, nvfp4_linear_prefixes};
+use crate::executor::cpu::runtime::nvfp4_linear_prefixes;
+use crate::executor::cpu::{CpuNvfp4Linear, CpuRuntime};
 use crate::error::{AegisError, Result};
 use crate::graph::GraphRegion;
 use crate::planning::placement::{ComputePlacement, RegionPlacement, StoragePlacement};

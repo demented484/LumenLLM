@@ -1,5 +1,5 @@
 mod attention;
-mod cpu;
+pub mod cpu;
 mod cuda;
 mod generation;
 mod hybrid;

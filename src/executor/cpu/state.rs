@@ -1,5 +1,5 @@
 use super::rope::RopeConfig;
-use crate::cpu::CpuNvfp4Linear;
+use super::CpuNvfp4Linear;
 use crate::error::{AegisError, Result};
 use crate::executor::tensors::Bf16Matrix;
 

@@ -1,7 +1,6 @@
 pub mod artifact;
 pub mod backend;
 pub mod cli;
-pub mod cpu;
 pub mod cuda;
 pub mod engine;
 pub mod error;
@@ -45,7 +44,7 @@ pub mod storage {
 
 pub use artifact::{HfConfig, ModelArtifact, ModelArtifactSummary};
 pub use backend::{BackendKind, BackendRegistry};
-pub use cpu::{CpuNvfp4Linear, CpuRuntime};
+pub use executor::cpu::{CpuNvfp4Linear, CpuRuntime};
 pub use cuda::{CudaRuntime, CudaRuntimeConfig, DeviceBf16Matrix, DeviceBuffer, DeviceNvfp4Linear};
 pub use engine::{AegisEngine, EngineConfig, EngineReport};
 pub use error::{AegisError, Result};

@@ -1,7 +1,4 @@
-mod linear;
-mod loader;
-
-pub(crate) use loader::nvfp4_linear_prefixes;
+pub(crate) use super::runtime_loader::nvfp4_linear_prefixes;
 
 use crate::planning::placement::StoragePlacement;
 use crate::tensor::layout::LinearResidentLayout;

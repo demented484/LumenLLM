@@ -714,7 +714,7 @@ pub(super) fn cuda_compare(config: EngineConfig) -> Result<()> {
         )));
     }
     let mut cpu_loader = TensorStorageLoader::new();
-    let cpu = crate::cpu::CpuRuntime::new();
+    let cpu = crate::executor::cpu::CpuRuntime::new();
     for linear in &linears {
         cuda_compare_linear(&cuda, &cpu, &engine, linear, &mut cpu_loader)?;
     }
@@ -723,7 +723,7 @@ pub(super) fn cuda_compare(config: EngineConfig) -> Result<()> {
 
 fn cuda_compare_linear(
     cuda: &crate::cuda::CudaRuntime,
-    cpu: &crate::cpu::CpuRuntime,
+    cpu: &crate::executor::cpu::CpuRuntime,
     engine: &AegisEngine,
     linear: &crate::cuda::DeviceNvfp4Linear,
     cpu_loader: &mut TensorStorageLoader,
