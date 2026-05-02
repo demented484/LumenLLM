@@ -4,10 +4,10 @@ use std::net::{TcpListener, TcpStream};
 use std::time::Instant;
 
 use crate::engine::AegisEngine;
-use crate::error::{AegisError, Result};
+use aegisllm_base::error::{AegisError, Result};
 use crate::executor::ExecutorReadiness;
-use crate::generation::{ChatMessage, GenerateRequest, SamplingConfig};
-use crate::text::TextProcessor;
+use aegisllm_base::generation::{ChatMessage, GenerateRequest, SamplingConfig};
+use aegisllm_base::text::TextProcessor;
 
 #[derive(Debug)]
 struct HttpRequest {

@@ -1,16 +1,16 @@
 use std::path::PathBuf;
 
-use crate::cuda::{CudaPrefillAttentionKernel, CudaRuntimeConfig};
+use aegisllm_cuda::cuda::{CudaPrefillAttentionKernel, CudaRuntimeConfig};
 use crate::engine::EngineConfig;
-use crate::error::{AegisError, Result};
-use crate::generation::SamplingConfig;
-use crate::hardware::HardwareInventory;
+use aegisllm_base::error::{AegisError, Result};
+use aegisllm_base::generation::SamplingConfig;
+use aegisllm_base::hardware::HardwareInventory;
 use crate::params::ParametersFile;
-use crate::planning::placement::{
+use aegisllm_base::planning::placement::{
     ComputePlacement, LayerSelector, PlacementPolicy, PlacementRule, StoragePlacement,
 };
-use crate::tensor::layout::{LinearLayoutChoice, MaterializationPolicy};
-use crate::tensor::quant::KvCacheQuantization;
+use aegisllm_base::tensor::layout::{LinearLayoutChoice, MaterializationPolicy};
+use aegisllm_base::tensor::quant::KvCacheQuantization;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ParsedEngineFlags {

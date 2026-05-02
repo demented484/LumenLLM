@@ -4,7 +4,7 @@ use serde_json::json;
 
 use super::command::BenchOutputFormat;
 use crate::engine::bench::GenerateBenchMetrics;
-use crate::generation::PrefillStageTimings;
+use aegisllm_base::generation::PrefillStageTimings;
 
 pub(super) fn print_generate_bench(
     metrics: &GenerateBenchMetrics,

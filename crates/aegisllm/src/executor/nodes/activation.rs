@@ -1,5 +1,5 @@
-use crate::graph::RegionId;
-use crate::planning::placement::ComputePlacement;
+use aegisllm_base::graph::RegionId;
+use aegisllm_base::planning::placement::ComputePlacement;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActivationResidency {

@@ -1,14 +1,14 @@
 use std::fs;
 use std::path::Path;
 
-use crate::cuda::{CudaPrefillAttentionKernel, CudaRuntimeConfig};
-use crate::error::{AegisError, Result};
-use crate::generation::SamplingConfig;
-use crate::planning::placement::{
+use aegisllm_cuda::cuda::{CudaPrefillAttentionKernel, CudaRuntimeConfig};
+use aegisllm_base::error::{AegisError, Result};
+use aegisllm_base::generation::SamplingConfig;
+use aegisllm_base::planning::placement::{
     ComputePlacement, LayerSelector, PlacementPolicy, PlacementRule, StoragePlacement,
 };
-use crate::tensor::layout::{LinearLayoutChoice, LinearLayoutPolicy, MaterializationPolicy};
-use crate::tensor::quant::KvCacheQuantization;
+use aegisllm_base::tensor::layout::{LinearLayoutChoice, LinearLayoutPolicy, MaterializationPolicy};
+use aegisllm_base::tensor::quant::KvCacheQuantization;
 
 use super::file::*;
 use super::runtime::{EngineConfigFragment, ServeConfig};

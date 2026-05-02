@@ -1,5 +1,5 @@
-use crate::planning::placement::{ComputePlacement, KvCachePlacement, StoragePlacement};
-use crate::tensor::quant::KvCacheQuantization;
+use aegisllm_base::planning::placement::{ComputePlacement, KvCachePlacement, StoragePlacement};
+use aegisllm_base::tensor::quant::KvCacheQuantization;
 
 use super::ActivationResidency;
 

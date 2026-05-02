@@ -1,4 +1,4 @@
-use crate::planning::placement::{ComputePlacement, ResolvedPlacement, TransferPolicy};
+use aegisllm_base::planning::placement::{ComputePlacement, ResolvedPlacement, TransferPolicy};
 
 use super::{
     ActivationResidency, ActivationTransferNode, BackendPrimitiveNode, BackendPrimitivePlan,

@@ -1,13 +1,13 @@
 use super::{AegisEngine, EngineReport};
-use crate::cuda::CudaRuntimeConfig;
+use aegisllm_cuda::cuda::CudaRuntimeConfig;
 use crate::executor::{ExecutorGraphPlan, readiness_for_plan};
-use crate::planning::memory::AllocationPool;
-use crate::planning::placement::{
+use aegisllm_base::planning::memory::AllocationPool;
+use aegisllm_base::planning::placement::{
     ComputePlacement, ResolvedPlacement, StoragePlacement, TransferPolicy,
 };
-use crate::planning::runtime::{KernelFamily, RuntimePlan};
-use crate::tensor::layout::LinearResidentLayout;
-use crate::tensor::quant::QuantFormat;
+use aegisllm_base::planning::runtime::{KernelFamily, RuntimePlan};
+use aegisllm_base::tensor::layout::LinearResidentLayout;
+use aegisllm_base::tensor::quant::QuantFormat;
 
 impl AegisEngine {
     pub fn report(&self) -> EngineReport {

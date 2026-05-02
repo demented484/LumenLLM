@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use crate::cuda::CudaRuntimeConfig;
-use crate::generation::SamplingConfig;
-use crate::planning::placement::PlacementPolicy;
+use aegisllm_cuda::cuda::CudaRuntimeConfig;
+use aegisllm_base::generation::SamplingConfig;
+use aegisllm_base::planning::placement::PlacementPolicy;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServeConfig {

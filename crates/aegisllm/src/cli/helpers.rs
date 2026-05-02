@@ -1,8 +1,8 @@
 use crate::engine::AegisEngine;
-use crate::error::{AegisError, Result};
-use crate::graph::TensorRole;
-use crate::planning::placement::ComputePlacement;
-use crate::tensor::layout::LinearResidentLayout;
+use aegisllm_base::error::{AegisError, Result};
+use aegisllm_base::graph::TensorRole;
+use aegisllm_base::planning::placement::ComputePlacement;
+use aegisllm_base::tensor::layout::LinearResidentLayout;
 
 pub(super) fn deterministic_input(len: usize) -> Vec<f32> {
     (0..len)
@@ -88,9 +88,9 @@ pub(super) fn first_cuda_nvfp4_region<'a>(
 }
 
 pub(super) fn find_cuda_linear<'a>(
-    linears: &'a [crate::cuda::DeviceNvfp4Linear],
+    linears: &'a [aegisllm_cuda::cuda::DeviceNvfp4Linear],
     suffix: &str,
-) -> Result<&'a crate::cuda::DeviceNvfp4Linear> {
+) -> Result<&'a aegisllm_cuda::cuda::DeviceNvfp4Linear> {
     linears
         .iter()
         .find(|linear| linear.name.ends_with(suffix))

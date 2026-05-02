@@ -1,0 +1,15 @@
+[package]
+name = "aegisllm-wgpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aegisllm-base = { path = "../aegisllm-base" }
+bytemuck.workspace = true
+pollster.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

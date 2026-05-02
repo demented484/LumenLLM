@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
-use crate::error::{AegisError, Result};
-use crate::generation::{GenerateRequest, PrefillStageTimings};
+use aegisllm_base::error::{AegisError, Result};
+use aegisllm_base::generation::{GenerateRequest, PrefillStageTimings};
 
 use super::{AegisEngine, EngineConfig};
 

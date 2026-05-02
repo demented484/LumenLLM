@@ -9,7 +9,7 @@ use super::smoke::{
 use super::{Command, parse_args};
 use crate::engine::bench::run_generation_bench;
 use crate::engine::{AegisEngine, EngineConfig};
-use crate::error::Result;
+use aegisllm_base::error::Result;
 use crate::executor::readiness_for_plan;
 
 pub fn run_env() -> Result<()> {

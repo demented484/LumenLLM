@@ -1,7 +1,7 @@
     use super::*;
-    use crate::cuda::CudaPrefillAttentionKernel;
-    use crate::hardware::HardwareInventory;
-    use crate::planning::placement::{ComputePlacement, PlacementPolicy, StoragePlacement};
+    use aegisllm_cuda::cuda::CudaPrefillAttentionKernel;
+    use aegisllm_base::hardware::HardwareInventory;
+    use aegisllm_base::planning::placement::{ComputePlacement, PlacementPolicy, StoragePlacement};
 
     #[test]
     fn cuda_runtime_flags_come_from_parameters() {

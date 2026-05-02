@@ -1,5 +1,5 @@
-use crate::error::{AegisError, Result};
-use crate::generation::{GenerateOutput, GenerateRequest, SamplingConfig};
+use aegisllm_base::error::{AegisError, Result};
+use aegisllm_base::generation::{GenerateOutput, GenerateRequest, SamplingConfig};
 
 use super::{AegisEngine, EngineConfig};
 

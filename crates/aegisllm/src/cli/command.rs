@@ -1,6 +1,6 @@
 use crate::engine::EngineConfig;
 use crate::engine::bench::BenchGenerateRequest;
-use crate::generation::GenerateRequest;
+use aegisllm_base::generation::GenerateRequest;
 use crate::params::ServeConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

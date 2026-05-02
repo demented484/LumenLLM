@@ -1,25 +1,25 @@
 use std::collections::BTreeSet;
 
-use super::cpu::block::CpuLayerBlockExecutor;
-use super::cpu::state::CpuLlamaState;
-use super::cuda::block::{CudaLayerBlockExecutor, CudaLayerBlockState};
-use super::cuda::cuda_kernel_limitations;
-use super::nodes::ExecutorGraphPlan;
-use super::traits::{
+use aegisllm_cpu::cpu::block::CpuLayerBlockExecutor;
+use aegisllm_cpu::cpu::state::CpuLlamaState;
+use aegisllm_cuda::executor::block::{CudaLayerBlockExecutor, CudaLayerBlockState};
+use aegisllm_cuda::executor::cuda_kernel_limitations;
+use crate::executor::nodes::ExecutorGraphPlan;
+use aegisllm_base::executor::traits::{
     ExecutorBackendInfo, ExecutorCapability, ExecutorProviderPlan, GenerationBackendPrimitives,
     GenerationState, ModelExecutorBackend,
 };
-use crate::artifact::ModelArtifact;
-use crate::backend::BackendKind;
-use crate::cuda::CudaRuntimeConfig;
-use crate::error::{AegisError, Result};
-use crate::generation::SamplingConfig;
-use crate::graph::ModelGraph;
-use crate::planning::placement::{
+use aegisllm_base::artifact::ModelArtifact;
+use aegisllm_base::backend::BackendKind;
+use aegisllm_cuda::cuda::CudaRuntimeConfig;
+use aegisllm_base::error::{AegisError, Result};
+use aegisllm_base::generation::SamplingConfig;
+use aegisllm_base::graph::ModelGraph;
+use aegisllm_base::planning::placement::{
     ComputePlacement, ResolvedPlacement, StoragePlacement, TransferPolicy,
 };
-use crate::planning::runtime::RuntimePlan;
-use crate::text::TextProcessor;
+use aegisllm_base::planning::runtime::RuntimePlan;
+use aegisllm_base::text::TextProcessor;
 
 #[derive(Debug)]
 pub struct HybridExecutorProvider {
@@ -207,7 +207,7 @@ impl GenerationBackendPrimitives for HybridExecutorProvider {
             .as_ref()
             .ok_or_else(|| self.not_initialized())?
             .final_logits_host_with_state(&mut state.cpu, &hidden)?;
-        super::generation::sample_next_token(&logits, sampling)
+        aegisllm_base::executor::generation::sample_next_token(&logits, sampling)
     }
 
     fn forward_next_token(
@@ -217,7 +217,7 @@ impl GenerationBackendPrimitives for HybridExecutorProvider {
         sampling: &SamplingConfig,
     ) -> Result<usize> {
         let logits = self.forward_logits(state, token_id)?;
-        super::generation::sample_next_token(&logits, sampling)
+        aegisllm_base::executor::generation::sample_next_token(&logits, sampling)
     }
 }
 
@@ -454,12 +454,12 @@ fn hybrid_limitations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{GraphRegionKind, RegionId};
-    use crate::planning::memory::{MemoryBudget, MemoryPool};
-    use crate::planning::placement::{KvCachePlacement, RegionPlacement};
-    use crate::planning::runtime::{KernelPlan, SyncPolicy, TensorResidency};
-    use crate::tensor::layout::{LinearLayoutPlan, LinearResidentLayout, MaterializationPolicy};
-    use crate::tensor::quant::{KvCacheQuantization, QuantFormat, WeightQuantization};
+    use aegisllm_base::graph::{GraphRegionKind, RegionId};
+    use aegisllm_base::planning::memory::{MemoryBudget, MemoryPool};
+    use aegisllm_base::planning::placement::{KvCachePlacement, RegionPlacement};
+    use aegisllm_base::planning::runtime::{KernelPlan, SyncPolicy, TensorResidency};
+    use aegisllm_base::tensor::layout::{LinearLayoutPlan, LinearResidentLayout, MaterializationPolicy};
+    use aegisllm_base::tensor::quant::{KvCacheQuantization, QuantFormat, WeightQuantization};
 
     #[test]
     fn hybrid_provider_keeps_mixed_cpu_cuda_distinct() {

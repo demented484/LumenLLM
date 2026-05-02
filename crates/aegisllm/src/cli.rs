@@ -13,7 +13,7 @@ pub use run::run_env;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planning::placement::{ComputePlacement, StoragePlacement};
+    use aegisllm_base::planning::placement::{ComputePlacement, StoragePlacement};
     use std::path::PathBuf;
 
     #[test]

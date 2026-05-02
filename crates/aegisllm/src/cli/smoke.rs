@@ -1,17 +1,17 @@
 use super::helpers::{
     deterministic_input, find_cuda_linear, first_cuda_nvfp4_region, resident_layout_for_region,
 };
-use crate::cuda::CUDA_PREFILL_CHUNK_MAX;
+use aegisllm_cuda::cuda::CUDA_PREFILL_CHUNK_MAX;
 use crate::engine::quality::run_quality_smoke;
 use crate::engine::{AegisEngine, EngineConfig};
-use crate::error::{AegisError, Result};
+use aegisllm_base::error::{AegisError, Result};
 use crate::executor::readiness_for_plan;
-use crate::generation::{GenerateOutput, GenerateRequest, SamplingConfig};
-use crate::graph::TensorRole;
-use crate::hardware::HardwareInventory;
-use crate::planning::materialization::LinearMaterializationCache;
-use crate::planning::placement::{ComputePlacement, StoragePlacement};
-use crate::tensor::storage::{HostTensorStorage, TensorResidencyPlan, TensorStorageLoader};
+use aegisllm_base::generation::{GenerateOutput, GenerateRequest, SamplingConfig};
+use aegisllm_base::graph::TensorRole;
+use aegisllm_base::hardware::HardwareInventory;
+use aegisllm_cpu::materialization::LinearMaterializationCache;
+use aegisllm_base::planning::placement::{ComputePlacement, StoragePlacement};
+use aegisllm_base::tensor::storage::{HostTensorStorage, TensorResidencyPlan, TensorStorageLoader};
 
 pub(super) fn inspect_hardware() {
     let inventory = HardwareInventory::detect();
@@ -454,7 +454,7 @@ pub(super) fn cuda_smoke(config: EngineConfig) -> Result<()> {
         ..config
     })?;
     let device = first_cuda_device(&engine, "cuda-smoke")?;
-    let cuda = crate::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
+    let cuda = aegisllm_cuda::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
     let cuda_weights = cuda.weight_loader();
     let region_placements = engine.placement.region_map();
     let region = engine
@@ -599,7 +599,7 @@ pub(super) fn cuda_dense_smoke(config: EngineConfig) -> Result<()> {
             )));
         }
     };
-    let cuda = crate::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
+    let cuda = aegisllm_cuda::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
     let cuda_weights = cuda.weight_loader();
     let mut loader = TensorStorageLoader::new();
     let matrix = cuda_weights.load_bf16_matrix_with_store(
@@ -634,7 +634,7 @@ pub(super) fn cuda_chain_smoke(config: EngineConfig) -> Result<()> {
         ..config
     })?;
     let (device, region, placement) = first_cuda_nvfp4_region(&engine)?;
-    let cuda = crate::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
+    let cuda = aegisllm_cuda::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
     let cuda_weights = cuda.weight_loader();
     let resident_layout = resident_layout_for_region(&engine, &region.id);
     let linears = cuda_weights.load_placed_region_nvfp4_linears_with_layout(
@@ -698,7 +698,7 @@ pub(super) fn cuda_compare(config: EngineConfig) -> Result<()> {
         ..config
     })?;
     let (device, region, placement) = first_cuda_nvfp4_region(&engine)?;
-    let cuda = crate::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
+    let cuda = aegisllm_cuda::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
     let cuda_weights = cuda.weight_loader();
     let resident_layout = resident_layout_for_region(&engine, &region.id);
     let linears = cuda_weights.load_placed_region_nvfp4_linears_with_layout(
@@ -714,7 +714,7 @@ pub(super) fn cuda_compare(config: EngineConfig) -> Result<()> {
         )));
     }
     let mut cpu_loader = TensorStorageLoader::new();
-    let cpu = crate::executor::cpu::CpuRuntime::new();
+    let cpu = aegisllm_cpu::cpu::CpuRuntime::new();
     for linear in &linears {
         cuda_compare_linear(&cuda, &cpu, &engine, linear, &mut cpu_loader)?;
     }
@@ -722,10 +722,10 @@ pub(super) fn cuda_compare(config: EngineConfig) -> Result<()> {
 }
 
 fn cuda_compare_linear(
-    cuda: &crate::cuda::CudaRuntime,
-    cpu: &crate::executor::cpu::CpuRuntime,
+    cuda: &aegisllm_cuda::cuda::CudaRuntime,
+    cpu: &aegisllm_cpu::cpu::CpuRuntime,
     engine: &AegisEngine,
-    linear: &crate::cuda::DeviceNvfp4Linear,
+    linear: &aegisllm_cuda::cuda::DeviceNvfp4Linear,
     cpu_loader: &mut TensorStorageLoader,
 ) -> Result<()> {
     let cpu_linear = cpu.load_nvfp4_linear_with_store(

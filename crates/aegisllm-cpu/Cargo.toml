@@ -1,0 +1,16 @@
+[package]
+name = "aegisllm-cpu"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aegisllm-base = { path = "../aegisllm-base" }
+memmap2.workspace = true
+pulp.workspace = true
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+tempfile.workspace = true

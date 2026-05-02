@@ -1,0 +1,17 @@
+[package]
+name = "aegisllm-base"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+memmap2.workspace = true
+rand.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

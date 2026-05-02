@@ -1,0 +1,17 @@
+[package]
+name = "aegisllm-cuda"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+aegisllm-base = { path = "../aegisllm-base" }
+cudarc.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

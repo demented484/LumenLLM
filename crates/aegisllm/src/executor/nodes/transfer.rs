@@ -1,5 +1,5 @@
-use crate::graph::RegionId;
-use crate::planning::placement::{ComputePlacement, StoragePlacement, TransferPolicy};
+use aegisllm_base::graph::RegionId;
+use aegisllm_base::planning::placement::{ComputePlacement, StoragePlacement, TransferPolicy};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightTransferNode {

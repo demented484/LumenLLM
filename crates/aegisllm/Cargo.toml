@@ -2,9 +2,12 @@
 name = "aegisllm"
 version.workspace = true
 edition.workspace = true
-build = "build.rs"
 
 [dependencies]
+aegisllm-base = { path = "../aegisllm-base" }
+aegisllm-cpu = { path = "../aegisllm-cpu" }
+aegisllm-cuda = { path = "../aegisllm-cuda" }
+aegisllm-wgpu = { path = "../aegisllm-wgpu" }
 cudarc.workspace = true
 memmap2.workspace = true
 rayon.workspace = true

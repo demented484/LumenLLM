@@ -5,18 +5,18 @@ pub mod quality;
 
 mod report;
 
-use crate::artifact::ModelArtifact;
-use crate::backend::BackendRegistry;
-use crate::cuda::CudaRuntimeConfig;
-use crate::error::{AegisError, Result};
+use aegisllm_base::artifact::ModelArtifact;
+use aegisllm_base::backend::BackendRegistry;
+use aegisllm_cuda::cuda::CudaRuntimeConfig;
+use aegisllm_base::error::{AegisError, Result};
 use crate::executor::{Executor, ExecutorBackendInfo};
-use crate::generation::{GenerateOutput, GenerateRequest, TimedGenerateOutput};
-use crate::graph::ModelGraph;
-use crate::hardware::HardwareInventory;
-use crate::planning::memory::MemoryPlan;
-use crate::planning::placement::{PlacementPolicy, ResolvedPlacement};
-use crate::planning::runtime::{KernelFamily, RuntimePlan};
-use crate::tensor::storage::StoragePlan;
+use aegisllm_base::generation::{GenerateOutput, GenerateRequest, TimedGenerateOutput};
+use aegisllm_base::graph::ModelGraph;
+use aegisllm_base::hardware::HardwareInventory;
+use aegisllm_base::planning::memory::MemoryPlan;
+use aegisllm_base::planning::placement::{PlacementPolicy, ResolvedPlacement};
+use aegisllm_base::planning::runtime::{KernelFamily, RuntimePlan};
+use aegisllm_base::tensor::storage::StoragePlan;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineConfig {

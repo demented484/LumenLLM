@@ -1,80 +1,77 @@
-pub mod artifact;
-pub mod backend;
+// Top-level aegisllm crate: engine, executor orchestration, server, CLI.
+// Most of the model code lives in focused workspace crates:
+//   aegisllm-base   — shared types (error, tensor, planning, executor traits)
+//   aegisllm-cuda   — CUDA backend (runtime + kernels + executor)
+//   aegisllm-cpu    — CPU reference backend (forward, materialization)
+//   aegisllm-wgpu   — wgpu skeleton backend
+
 pub mod cli;
-pub mod cuda;
 pub mod engine;
-pub mod error;
 pub mod executor;
-pub mod generation;
-pub mod graph;
-pub mod hardware;
 pub mod params;
-pub mod planning;
 pub mod server;
-pub mod tensor;
-pub mod text;
+
+pub use aegisllm_base::{
+    AegisError, BackendKind, BackendRegistry, ComputeDevice, CpuInfo, GenerateOutput,
+    GenerateRequest, GpuArchitecture, GpuInfo, GraphRegion, GraphRegionKind, HardwareInventory,
+    HfConfig, ModelArtifact, ModelArtifactSummary, ModelGraph, RegionId, Result, SamplingConfig,
+    TensorDType, TensorInfo, TensorRegistry, TensorRole, TextProcessor,
+};
+pub use aegisllm_base::artifact;
+pub use aegisllm_base::backend;
+pub use aegisllm_base::error;
+pub use aegisllm_base::generation;
+pub use aegisllm_base::graph;
+pub use aegisllm_base::hardware;
+pub use aegisllm_base::planning;
+pub use aegisllm_base::tensor;
+pub use aegisllm_base::text;
+pub use aegisllm_base::executor::traits::{
+    ExecutorBackendInfo, ExecutorCapability, ExecutorProviderPlan, ExecutorStage,
+    GenerationBackendPrimitives, GenerationState, ModelExecutorBackend,
+};
+pub use aegisllm_base::cuda_config::{CudaPrefillAttentionKernel, CudaRuntimeConfig};
+pub use aegisllm_base::cuda_types::CudaAttentionDType;
+
+pub use aegisllm_cpu::{
+    CpuNvfp4Linear, CpuReferenceExecutor, CpuRuntime, LinearMaterializationCache,
+    LinearMaterializationKey, LinearMaterializationStats,
+};
+pub use aegisllm_cuda::{CudaExecutorProvider, CudaRuntime, DeviceBf16Matrix, DeviceBuffer, DeviceNvfp4Linear};
+pub use aegisllm_wgpu::WgpuExecutorProvider;
+
+pub use engine::{AegisEngine, EngineConfig, EngineReport};
+pub use executor::{
+    Executor, ExecutorReadiness, HybridExecutorProvider, readiness_for_plan,
+};
+pub use params::{ParametersFile, ServeConfig};
 
 pub mod layout {
-    pub use crate::tensor::layout::*;
+    pub use aegisllm_base::tensor::layout::*;
 }
 
 pub mod materialization {
-    pub use crate::planning::materialization::*;
+    pub use aegisllm_cpu::materialization::*;
 }
 
 pub mod memory {
-    pub use crate::planning::memory::*;
+    pub use aegisllm_base::planning::memory::*;
 }
 
 pub mod placement {
-    pub use crate::planning::placement::*;
+    pub use aegisllm_base::planning::placement::*;
 }
 
 pub mod quant {
-    pub use crate::tensor::quant::*;
+    pub use aegisllm_base::tensor::quant::*;
 }
 
 pub mod runtime {
-    pub use crate::planning::runtime::*;
+    pub use aegisllm_base::planning::runtime::*;
 }
 
 pub mod storage {
-    pub use crate::tensor::storage::*;
+    pub use aegisllm_base::tensor::storage::*;
 }
 
-pub use artifact::{HfConfig, ModelArtifact, ModelArtifactSummary};
-pub use backend::{BackendKind, BackendRegistry};
-pub use executor::cpu::{CpuNvfp4Linear, CpuRuntime};
-pub use cuda::{CudaRuntime, CudaRuntimeConfig, DeviceBf16Matrix, DeviceBuffer, DeviceNvfp4Linear};
-pub use engine::{AegisEngine, EngineConfig, EngineReport};
-pub use error::{AegisError, Result};
-pub use executor::{
-    Executor, ExecutorBackendInfo, ExecutorCapability, ExecutorReadiness, ExecutorStage,
-    ModelExecutorBackend, readiness_for_plan,
-};
-pub use generation::{GenerateOutput, GenerateRequest, SamplingConfig};
-pub use graph::{GraphRegion, GraphRegionKind, ModelGraph, TensorRole};
-pub use hardware::{ComputeDevice, CpuInfo, GpuArchitecture, GpuInfo, HardwareInventory};
-pub use params::{ParametersFile, ServeConfig};
-pub use planning::materialization::{
-    LinearMaterializationCache, LinearMaterializationKey, LinearMaterializationStats,
-    cuda_nvfp4_kernel_family_for_layout,
-};
-pub use planning::memory::{MemoryBudget, MemoryPlan, MemoryPool, PlannedAllocation};
-pub use planning::placement::{
-    ComputePlacement, LayerSelector, PlacementPolicy, PlacementRule, ResolvedPlacement,
-    StoragePlacement, StorageTier,
-};
-pub use planning::runtime::{
-    KernelCandidate, KernelFamily, KernelPlan, KernelRegistry, RuntimePlan,
-};
-pub use tensor::layout::{
-    LinearLayoutChoice, LinearLayoutPlan, LinearLayoutPolicy, LinearResidentLayout,
-    MaterializationPolicy,
-};
-pub use tensor::quant::{
-    KvCacheQuantization, Nvfp4LinearSpec, QuantFormat, QuantFormatDescriptor, TensorCorePrecision,
-    WeightQuantization,
-};
-pub use tensor::storage::{StoragePlan, StorageTotals, TensorResidencyPlan, TensorStoragePlan};
-pub use text::TextProcessor;
+pub use aegisllm_base::planning::runtime::cuda_nvfp4_kernel_family_for_layout;

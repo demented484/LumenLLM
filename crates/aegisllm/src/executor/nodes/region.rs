@@ -1,5 +1,5 @@
-use crate::graph::{GraphRegionKind, RegionId};
-use crate::planning::placement::ComputePlacement;
+use aegisllm_base::graph::{GraphRegionKind, RegionId};
+use aegisllm_base::planning::placement::ComputePlacement;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionExecutionNode {

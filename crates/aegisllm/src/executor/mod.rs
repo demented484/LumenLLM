@@ -1,35 +1,29 @@
-mod attention;
-pub mod cpu;
-mod cuda;
-mod generation;
+// Executor orchestration: top-level facade + hybrid provider + node graph.
+
 mod hybrid;
-mod nodes;
-mod tensors;
-mod traits;
-pub mod wgpu;
+pub mod nodes;
 
+use aegisllm_base::artifact::ModelArtifact;
+use aegisllm_base::backend::BackendKind;
+use aegisllm_base::error::{AegisError, Result};
+use aegisllm_base::generation::{GenerateOutput, GenerateRequest, TimedGenerateOutput};
+use aegisllm_base::graph::ModelGraph;
+use aegisllm_base::planning::placement::{ComputePlacement, ResolvedPlacement};
+use aegisllm_base::planning::runtime::RuntimePlan;
+use aegisllm_base::cuda_config::CudaRuntimeConfig;
 
-use crate::artifact::ModelArtifact;
-use crate::backend::BackendKind;
-use crate::cuda::CudaRuntimeConfig;
-use crate::error::{AegisError, Result};
-use crate::generation::{GenerateOutput, GenerateRequest, TimedGenerateOutput};
-use crate::graph::ModelGraph;
-use crate::planning::placement::{ComputePlacement, ResolvedPlacement};
-use crate::planning::runtime::RuntimePlan;
-
-pub use cpu::CpuReferenceExecutor;
-pub use cuda::CudaExecutorProvider;
+pub use aegisllm_base::executor::traits::{
+    ExecutorBackendInfo, ExecutorCapability, ExecutorProviderPlan, ExecutorStage,
+    GenerationBackendPrimitives, GenerationState, ModelExecutorBackend,
+};
+pub use aegisllm_cpu::CpuReferenceExecutor;
+pub use aegisllm_cuda::executor::CudaExecutorProvider;
+pub use aegisllm_wgpu::WgpuExecutorProvider;
 pub use hybrid::HybridExecutorProvider;
-pub use wgpu::WgpuExecutorProvider;
 pub use nodes::{
     ActivationResidency, ActivationTransferNode, BackendPrimitiveKind, BackendPrimitiveNode,
     BackendPrimitivePlan, ExecutionNode, ExecutorGraphPlan, KvCacheNode, RegionExecutionNode,
     WeightTransferNode,
-};
-pub use traits::{
-    ExecutorBackendInfo, ExecutorCapability, ExecutorProviderPlan, ExecutorStage,
-    GenerationBackendPrimitives, GenerationState, ModelExecutorBackend,
 };
 
 #[derive(Debug)]

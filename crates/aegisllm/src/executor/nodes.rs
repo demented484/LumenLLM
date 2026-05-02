@@ -15,14 +15,14 @@ pub use transfer::WeightTransferNode;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{GraphRegionKind, RegionId};
-    use crate::planning::memory::{MemoryBudget, MemoryPool};
-    use crate::planning::placement::{
+    use aegisllm_base::graph::{GraphRegionKind, RegionId};
+    use aegisllm_base::planning::memory::{MemoryBudget, MemoryPool};
+    use aegisllm_base::planning::placement::{
         ComputePlacement, KvCachePlacement, RegionPlacement, ResolvedPlacement, StoragePlacement,
         TransferPolicy,
     };
-    use crate::tensor::layout::LinearLayoutPolicy;
-    use crate::tensor::quant::{KvCacheQuantization, WeightQuantization};
+    use aegisllm_base::tensor::layout::LinearLayoutPolicy;
+    use aegisllm_base::tensor::quant::{KvCacheQuantization, WeightQuantization};
 
     #[test]
     fn executor_graph_plan_emits_activation_weight_and_kv_nodes() {

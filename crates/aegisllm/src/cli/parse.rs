@@ -1,13 +1,13 @@
 use std::path::PathBuf;
 
-use crate::cuda::CudaRuntimeConfig;
+use aegisllm_cuda::cuda::CudaRuntimeConfig;
 use crate::engine::EngineConfig;
 use crate::engine::bench::BenchGenerateRequest;
-use crate::error::{AegisError, Result};
-use crate::generation::{GenerateRequest, SamplingConfig};
-use crate::hardware::HardwareInventory;
+use aegisllm_base::error::{AegisError, Result};
+use aegisllm_base::generation::{GenerateRequest, SamplingConfig};
+use aegisllm_base::hardware::HardwareInventory;
 use crate::params::{ParametersFile, ServeConfig};
-use crate::planning::placement::PlacementPolicy;
+use aegisllm_base::planning::placement::PlacementPolicy;
 
 use super::Command;
 use super::command::BenchOutputFormat;
