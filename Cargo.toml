@@ -1,10 +1,12 @@
-[package]
-name = "aegisllm"
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
 version = "0.2.0"
 edition = "2024"
-build = "build.rs"
 
-[dependencies]
+[workspace.dependencies]
 cudarc = { version = "0.19.4", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cuda-version-from-build-system", "fallback-dynamic-loading"] }
 memmap2 = "0.9"
 rayon = "1.11"
@@ -17,8 +19,6 @@ pulp = "0.21"
 wgpu = "23"
 bytemuck = { version = "1.18", features = ["derive"] }
 pollster = "0.4"
-
-[dev-dependencies]
 tempfile = "3.12"
 
 [profile.release]

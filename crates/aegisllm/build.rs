@@ -11,7 +11,7 @@ fn main() {
 
     let cutlass_dir = env::var_os("CUTLASS_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("../cutlass"));
+        .unwrap_or_else(|| PathBuf::from("../../../cutlass"));
     let cuda_dir = env::var_os("CUDA_HOME")
         .or_else(|| env::var_os("CUDA_PATH"))
         .map(PathBuf::from)

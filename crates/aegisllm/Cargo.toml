@@ -1,0 +1,22 @@
+[package]
+name = "aegisllm"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[dependencies]
+cudarc.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+pulp.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
