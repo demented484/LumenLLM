@@ -8,6 +8,7 @@ use aegisllm_base::cuda_config::CUDA_PREFILL_VARLEN_MIN_CONTEXT;
 use aegisllm_base::error::{AegisError, Result};
 
 impl CudaRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_prefill_batched_device(
         &self,
         key_cache: &DeviceBuffer<u16>,
@@ -56,7 +57,7 @@ impl CudaRuntime {
                 value_cache.len()
             )));
         }
-        if num_attention_heads % num_kv_heads != 0 {
+        if !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "attention heads must be divisible by kv heads".into(),
             ));
@@ -169,7 +170,7 @@ impl CudaRuntime {
         let _ = u32_arg("batch", batch)?;
         if num_sequences != 1
             || cu_q.len() < 2
-            || context_lens.len() < 1
+            || context_lens.is_empty()
             || slot_mapping.len() < batch
             || dense_metadata.start_position() != start_position
             || dense_metadata.batch() != batch
@@ -193,7 +194,7 @@ impl CudaRuntime {
                 dense_metadata.context_len()
             )));
         }
-        if num_kv_heads == 0 || num_attention_heads % num_kv_heads != 0 {
+        if num_kv_heads == 0 || !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "dense prefill attention heads must be divisible by kv heads".into(),
             ));
@@ -363,7 +364,7 @@ impl CudaRuntime {
                 | CudaPrefillAttentionKernel::AegisVarlen
                 | CudaPrefillAttentionKernel::WarpFlash
         ) && start_position == 0
-            && head_dim % 32 == 0
+            && head_dim.is_multiple_of(32)
             && head_dim <= 256
             && legacy_shared_bytes <= 48 * 1024
         {
@@ -509,7 +510,7 @@ impl CudaRuntime {
                 cache_len
             )));
         }
-        if num_attention_heads % num_kv_heads != 0 {
+        if !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "dense halfq attention heads must be divisible by kv heads".into(),
             ));
@@ -589,7 +590,7 @@ impl CudaRuntime {
                 cache_len
             )));
         }
-        if num_attention_heads % num_kv_heads != 0 {
+        if !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "dense warp-tile attention heads must be divisible by kv heads".into(),
             ));
@@ -670,7 +671,7 @@ impl CudaRuntime {
                 cache_len
             )));
         }
-        if num_attention_heads % num_kv_heads != 0 {
+        if !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "dense wmma attention heads must be divisible by kv heads".into(),
             ));
@@ -754,7 +755,7 @@ impl CudaRuntime {
                 cache_len
             )));
         }
-        if num_attention_heads % num_kv_heads != 0 {
+        if !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "dense fa wmma attention heads must be divisible by kv heads".into(),
             ));
@@ -820,7 +821,7 @@ impl CudaRuntime {
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let head_dim = 128usize;
-        if num_kv_heads == 0 || num_attention_heads % num_kv_heads != 0 {
+        if num_kv_heads == 0 || !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "dense gqa4 wmma attention heads must be divisible by kv heads".into(),
             ));
@@ -915,7 +916,6 @@ impl CudaRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub(super) fn attention_prefill_dense_halfq_wmma_hdim128_gqa4_split_device(
         &self,
         key_cache: &DeviceBuffer<u16>,
@@ -932,7 +932,7 @@ impl CudaRuntime {
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let head_dim = 128usize;
-        if num_kv_heads == 0 || num_attention_heads % num_kv_heads != 0 {
+        if num_kv_heads == 0 || !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "dense gqa4 split wmma attention heads must be divisible by kv heads".into(),
             ));
@@ -1117,7 +1117,7 @@ impl CudaRuntime {
                 cache_len
             )));
         }
-        if num_attention_heads % num_kv_heads != 0 {
+        if !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "dense cluster2 wmma attention heads must be divisible by kv heads".into(),
             ));
@@ -1314,7 +1314,7 @@ impl CudaRuntime {
                 cache_len
             )));
         }
-        if num_attention_heads % num_kv_heads != 0 {
+        if !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "dense split wmma attention heads must be divisible by kv heads".into(),
             ));

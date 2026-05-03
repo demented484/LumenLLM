@@ -41,6 +41,8 @@ pub struct PlacementPolicy {
     pub reserve_vram_bytes: u64,
     pub linear_layout: LinearLayoutPolicy,
     pub rules: Vec<PlacementRule>,
+    /// First `kv_vram_layers` layers keep KV in VRAM; remaining use `kv_store`.
+    pub kv_vram_layers: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -89,6 +91,22 @@ pub struct KvCachePlacement {
     pub quantization: KvCacheQuantization,
     pub context_size: usize,
     pub estimated_bytes: u64,
+    /// First `vram_layers` layers keep KV in VRAM; layers >= this index use `store`.
+    pub vram_layers: Option<usize>,
+}
+
+impl KvCachePlacement {
+    /// Returns the resolved KV storage for the given layer index.
+    /// If `vram_layers` is set, layers 0..vram_layers use VRAM; the rest use `store`.
+    pub fn store_for_layer(&self, layer_idx: usize) -> StoragePlacement {
+        match self.vram_layers {
+            Some(n) if layer_idx < n => match self.compute {
+                ComputePlacement::Cuda { device } => StoragePlacement::Vram { device },
+                _ => self.store,
+            },
+            _ => self.store,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +134,7 @@ impl PlacementPolicy {
                 reserve_vram_bytes: 1024 * 1024 * 1024,
                 linear_layout: LinearLayoutPolicy::default(),
                 rules: Vec::new(),
+                kv_vram_layers: None,
             },
             None => Self {
                 weights_store: StoragePlacement::Mmap,
@@ -130,6 +149,7 @@ impl PlacementPolicy {
                 reserve_vram_bytes: 0,
                 linear_layout: LinearLayoutPolicy::default(),
                 rules: Vec::new(),
+                kv_vram_layers: None,
             },
         }
     }
@@ -155,6 +175,7 @@ impl ResolvedPlacement {
             quantization: policy.kv_quantization,
             context_size: policy.context_size,
             estimated_bytes: estimate_kv_cache_bytes(graph, policy),
+            vram_layers: policy.kv_vram_layers,
         };
         let mut region_placements = graph
             .regions
@@ -437,6 +458,7 @@ mod tests {
         };
         let graph = ModelGraph {
             model_type: "llama".into(),
+            architecture: "llama".into(),
             hidden_size: 1,
             intermediate_size: None,
             num_layers: 1,
@@ -463,6 +485,16 @@ mod tests {
                     },
                 }],
             }],
+            layer_metadata: vec![crate::graph::LayerMetadata {
+                layer_idx: 0,
+                kind: crate::model::LayerKind::DenseDecoder,
+                attention_pattern: crate::model::AttentionPattern::FullCausal,
+            }],
+            norm_pattern: crate::model::NormPattern::PreOnly,
+            lm_head_softcap: None,
+            attn_logit_softcap: None,
+            is_sliced: false,
+            text_prefix: "model.".into(),
         };
         let mut policy = PlacementPolicy::auto_for(&inventory);
         policy.reserve_vram_bytes = 0;

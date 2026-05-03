@@ -63,6 +63,12 @@ pub struct KvCacheSection {
     pub type_v: Option<String>,
     #[serde(rename = "cache-prompt")]
     pub cache_prompt: Option<bool>,
+    /// Number of layers (from layer 0) that use `store-first` instead of `store`.
+    #[serde(rename = "store-first-n")]
+    pub store_first_n: Option<usize>,
+    /// Storage backend for the first `store-first-n` layers.
+    #[serde(rename = "store-first")]
+    pub store_first: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

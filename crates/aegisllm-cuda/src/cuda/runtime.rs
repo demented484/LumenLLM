@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::{CudaContext, CudaEvent, CudaStream, sys};
 
 use aegisllm_base::cuda_config::CudaRuntimeConfig;
 use super::functions::CudaKernelFunctions;
@@ -18,6 +18,7 @@ mod memory;
 mod ops;
 mod quant;
 mod sampling;
+pub(super) mod state_cache;
 
 #[derive(Debug)]
 pub struct CudaRuntime {
@@ -25,6 +26,10 @@ pub struct CudaRuntime {
     compute_capability: Option<String>,
     config: CudaRuntimeConfig,
     pub(super) stream: Arc<CudaStream>,
+    /// Dedicated stream for asynchronous PCIe H2D/D2H transfers (KV cache staging).
+    /// Allows overlapping next-layer KV upload with current-layer compute.
+    /// Synchronization with the compute stream is managed manually via CudaEvent.
+    pub(super) transfer_stream: Arc<CudaStream>,
     kernels: CudaKernelFunctions,
 }
 
@@ -36,7 +41,18 @@ impl CudaRuntime {
     pub fn new_with_config(device_index: usize, config: CudaRuntimeConfig) -> Result<Self> {
         let context =
             CudaContext::new(device_index).map_err(map_cuda_err("create cuda context"))?;
-        let stream = context.default_stream();
+        // Disable event-based cross-stream sync tracking. We use a single non-default
+        // stream for all operations, so cudarc's automatic event tracking would only
+        // insert spurious cross-stream waits that break CUDA Graph capture.
+        // Safety: we manage ordering ourselves (single stream, single thread).
+        unsafe { context.disable_event_tracking() };
+        // Use a non-default stream so that CUDA Graph capture is supported.
+        // Stream 0 (default/legacy stream) does not allow begin_capture().
+        let stream = context.new_stream().map_err(map_cuda_err("create cuda stream"))?;
+        // Separate stream for async PCIe transfers. Manual event-based sync.
+        let transfer_stream = context
+            .new_stream()
+            .map_err(map_cuda_err("create cuda transfer stream"))?;
         let kernels = CudaKernelFunctions::load(&context, device_index)?;
         let compute_capability = HardwareInventory::detect()
             .gpus
@@ -49,6 +65,7 @@ impl CudaRuntime {
             compute_capability,
             config,
             stream,
+            transfer_stream,
             kernels,
         })
     }
@@ -70,13 +87,58 @@ impl CudaRuntime {
             .synchronize()
             .map_err(map_cuda_err("synchronize cuda stream"))
     }
+
+    pub(crate) fn stream(&self) -> &std::sync::Arc<CudaStream> {
+        &self.stream
+    }
+
+    /// Synchronize the transfer stream (block CPU until pending transfers complete).
+    /// Used at the end of a decode/prefill step to ensure D2H writebacks are visible
+    /// to the host before the next step's H2D reads from the same host buffers.
+    pub(crate) fn synchronize_transfer(&self) -> Result<()> {
+        self.transfer_stream
+            .synchronize()
+            .map_err(map_cuda_err("synchronize cuda transfer stream"))
+    }
+
+    /// Record an event on the compute stream. Used to signal "kernel finished writing
+    /// to staging" so the transfer stream can issue D2H writeback or reuse the slot.
+    pub(crate) fn record_compute_event(&self) -> Result<CudaEvent> {
+        self.stream
+            .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
+            .map_err(map_cuda_err("record compute event"))
+    }
+
+    /// Record an event on the transfer stream. Used to signal "H2D upload finished"
+    /// so the compute stream can read the staging slot.
+    pub(crate) fn record_transfer_event(&self) -> Result<CudaEvent> {
+        self.transfer_stream
+            .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
+            .map_err(map_cuda_err("record transfer event"))
+    }
+
+    /// Make the compute stream wait until `event` has been signaled.
+    /// All future kernels on the compute stream will not start until then.
+    pub(crate) fn compute_wait_event(&self, event: &CudaEvent) -> Result<()> {
+        self.stream
+            .wait(event)
+            .map_err(map_cuda_err("compute stream wait event"))
+    }
+
+    /// Make the transfer stream wait until `event` has been signaled.
+    /// All future transfers on the transfer stream will not start until then.
+    pub(crate) fn transfer_wait_event(&self, event: &CudaEvent) -> Result<()> {
+        self.transfer_stream
+            .wait(event)
+            .map_err(map_cuda_err("transfer stream wait event"))
+    }
 }
 
 fn ceil_div(value: u32, divisor: u32) -> u32 {
     value.div_ceil(divisor)
 }
 
-pub(super) fn map_cuda_err(
+pub(crate) fn map_cuda_err(
     stage: &'static str,
 ) -> impl FnOnce(cudarc::driver::DriverError) -> AegisError {
     move |error| AegisError::Unsupported(format!("cuda stage `{stage}` failed: {error:?}"))

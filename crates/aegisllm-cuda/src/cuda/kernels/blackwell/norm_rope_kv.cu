@@ -327,6 +327,36 @@ extern "C" __device__ __forceinline__ float rope_inv_freq_device(
     return (1.0f - smooth) * (freq / factor) + smooth * freq;
 }
 
+// Pointer-based variant for CUDA Graph replay: position is read from device memory.
+extern "C" __global__ void aegis_apply_rope_ptr(
+    float* values,
+    const unsigned int* p_position,
+    const unsigned int num_heads,
+    const unsigned int head_dim,
+    const float theta,
+    const float factor,
+    const float low_freq_factor,
+    const float high_freq_factor,
+    const unsigned int original_max_position_embeddings,
+    const unsigned int partial_dim  /* 0 = full head_dim; >0 = first N dims rotated (p-RoPE) */
+) {
+    const unsigned int position = *p_position;
+    const unsigned int head = blockIdx.x;
+    const unsigned int i = threadIdx.x;
+    const unsigned int half_dim = head_dim / 2u;
+    const unsigned int partial_half = (partial_dim > 0u) ? partial_dim / 2u : half_dim;
+    if (head >= num_heads || i >= half_dim) { return; }
+    if (i >= partial_half) { return; }
+    float* row = values + size_t(head) * head_dim;
+    const float angle = float(position) * rope_inv_freq_device(i, head_dim, theta, factor,
+        low_freq_factor, high_freq_factor, float(original_max_position_embeddings));
+    float sinv, cosv;
+    sincosf(angle, &sinv, &cosv);
+    const float x0 = row[i], x1 = row[i + half_dim];
+    row[i] = x0 * cosv - x1 * sinv;
+    row[i + half_dim] = x0 * sinv + x1 * cosv;
+}
+
 extern "C" __global__ void aegis_apply_rope(
     float* values,
     const unsigned int position,
@@ -509,37 +539,55 @@ extern "C" __global__ void aegis_apply_rope_positions_batched_f16_out(
     const float low_freq_factor,
     const float high_freq_factor,
     const unsigned int original_max_position_embeddings,
-    unsigned short* output
+    unsigned short* output,
+    const unsigned int partial_dim  /* 0 = full head_dim; >0 = first N dims rotated (p-RoPE) */
 ) {
     const unsigned int head = blockIdx.x;
     const unsigned int batch_idx = blockIdx.y;
     const unsigned int i = threadIdx.x;
     const unsigned int half_dim = head_dim / 2u;
+    const unsigned int partial_half = (partial_dim > 0u) ? partial_dim / 2u : half_dim;
     if (batch_idx >= batch || head >= num_heads || i >= half_dim) {
         return;
     }
     float* row = values + (size_t(batch_idx) * num_heads + head) * head_dim;
     unsigned short* out = output + (size_t(batch_idx) * num_heads + head) * head_dim;
-    const float angle = float(positions[batch_idx]) * rope_inv_freq_device(
-        i,
-        head_dim,
-        theta,
-        factor,
-        low_freq_factor,
-        high_freq_factor,
-        float(original_max_position_embeddings)
-    );
-    float sinv;
-    float cosv;
-    sincosf(angle, &sinv, &cosv);
-    const float x0 = row[i];
-    const float x1 = row[i + half_dim];
-    const float y0 = x0 * cosv - x1 * sinv;
-    const float y1 = x0 * sinv + x1 * cosv;
+    float y0, y1;
+    if (i < partial_half) {
+        const float angle = float(positions[batch_idx]) * rope_inv_freq_device(
+            i, head_dim, theta, factor, low_freq_factor, high_freq_factor,
+            float(original_max_position_embeddings));
+        float sinv, cosv;
+        sincosf(angle, &sinv, &cosv);
+        const float x0 = row[i], x1 = row[i + half_dim];
+        y0 = x0 * cosv - x1 * sinv;
+        y1 = x0 * sinv + x1 * cosv;
+    } else {
+        y0 = row[i];
+        y1 = row[i + half_dim];
+    }
     row[i] = y0;
     row[i + half_dim] = y1;
     out[i] = float_to_f16_bits(y0);
     out[i + half_dim] = float_to_f16_bits(y1);
+}
+
+// Pointer-based variant for CUDA Graph replay: position is read from device memory.
+extern "C" __global__ void aegis_kv_store_ptr(
+    unsigned short* key_cache,
+    unsigned short* value_cache,
+    const float* key,
+    const float* value,
+    const unsigned int* p_position,
+    const unsigned int width
+) {
+    const unsigned int position = *p_position;
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < width) {
+        const size_t offset = size_t(position) * width + idx;
+        key_cache[offset] = float_to_f16_bits(key[idx]);
+        value_cache[offset] = float_to_f16_bits(value[idx]);
+    }
 }
 
 extern "C" __global__ void aegis_kv_store(
@@ -615,7 +663,8 @@ extern "C" __global__ void aegis_rope_kv_store_slots_batched(
     const float factor,
     const float low_freq_factor,
     const float high_freq_factor,
-    const unsigned int original_max_position_embeddings
+    const unsigned int original_max_position_embeddings,
+    const unsigned int partial_dim  /* 0 = full head_dim; >0 = first N dims rotated (p-RoPE) */
 ) {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int batch_idx = blockIdx.y;
@@ -632,29 +681,52 @@ extern "C" __global__ void aegis_rope_kv_store_slots_batched(
     const size_t dst_base = size_t(slot) * width;
     const unsigned int dim = idx % head_dim;
     const unsigned int half_dim = head_dim / 2u;
+    const unsigned int partial_half = (partial_dim > 0u) ? partial_dim / 2u : half_dim;
 
     value_cache[dst_base + idx] = float_to_f16_bits(value[src_base + idx]);
     if (dim < half_dim) {
         const unsigned int pair_idx = idx + half_dim;
-        const float angle = float(positions[batch_idx]) * rope_inv_freq_device(
-            dim,
-            head_dim,
-            theta,
-            factor,
-            low_freq_factor,
-            high_freq_factor,
-            float(original_max_position_embeddings)
-        );
-        float sinv;
-        float cosv;
-        sincosf(angle, &sinv, &cosv);
-        const float x0 = key[src_base + idx];
-        const float x1 = key[src_base + pair_idx];
-        const float y0 = x0 * cosv - x1 * sinv;
-        const float y1 = x0 * sinv + x1 * cosv;
-        key[src_base + idx] = y0;
-        key[src_base + pair_idx] = y1;
-        key_cache[dst_base + idx] = float_to_f16_bits(y0);
-        key_cache[dst_base + pair_idx] = float_to_f16_bits(y1);
+        if (dim < partial_half) {
+            const float angle = float(positions[batch_idx]) * rope_inv_freq_device(
+                dim, head_dim, theta, factor, low_freq_factor, high_freq_factor,
+                float(original_max_position_embeddings));
+            float sinv, cosv;
+            sincosf(angle, &sinv, &cosv);
+            const float x0 = key[src_base + idx];
+            const float x1 = key[src_base + pair_idx];
+            const float y0 = x0 * cosv - x1 * sinv;
+            const float y1 = x0 * sinv + x1 * cosv;
+            key[src_base + idx] = y0;
+            key[src_base + pair_idx] = y1;
+            key_cache[dst_base + idx] = float_to_f16_bits(y0);
+            key_cache[dst_base + pair_idx] = float_to_f16_bits(y1);
+        } else {
+            key_cache[dst_base + idx] = float_to_f16_bits(key[src_base + idx]);
+            key_cache[dst_base + pair_idx] = float_to_f16_bits(key[src_base + pair_idx]);
+        }
+    }
+}
+
+// AXPY: out[i] += alpha * src[i]   (used for MoE weighted expert accumulation)
+extern "C" __global__ void aegis_axpy_f32(
+    float* out,
+    const float* src,
+    const float alpha,
+    const unsigned int len
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        out[idx] += alpha * src[idx];
+    }
+}
+
+// Zero a float buffer (used to zero the MoE accumulator before expert dispatch)
+extern "C" __global__ void aegis_zero_f32(
+    float* out,
+    const unsigned int len
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        out[idx] = 0.0f;
     }
 }

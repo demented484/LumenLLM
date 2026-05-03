@@ -1,3 +1,4 @@
+use crate::cli::gates::GatesConfig;
 use crate::engine::EngineConfig;
 use crate::engine::bench::BenchGenerateRequest;
 use aegisllm_base::generation::GenerateRequest;
@@ -36,5 +37,6 @@ pub enum Command {
         usize,
         BenchOutputFormat,
     ),
+    Gates(EngineConfig, GatesConfig),
     Serve(ServeConfig),
 }

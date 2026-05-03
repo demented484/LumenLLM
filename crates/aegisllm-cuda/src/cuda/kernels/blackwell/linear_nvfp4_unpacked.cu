@@ -237,6 +237,221 @@ extern "C" __global__ void aegis_mxfp4_matvec_native(
 #endif
 }
 
+// 16-warp GEMV: splits k_tiles across 16 warps for ~100% SM occupancy on all LLaMA projection sizes.
+// Grid: (ceil(rows/16), 1, 1), block: (512, 1, 1).
+// q/k/v/o/down (256 blocks): 3.7 blocks/SM × 16 warps = 59 warps/SM = 92% occupancy.
+// gate/up (896 blocks): saturates SM at 4 blocks × 16 warps = 64 warps/SM = 100%.
+extern "C" __global__ void aegis_mxfp4_matvec_native_16warp(
+    const unsigned char* mxfp4,
+    const unsigned char* input_mxfp4,
+    const unsigned int rows,
+    const unsigned int cols,
+    const unsigned int blocks_per_row,
+    const float output_scale,
+    float* output
+) {
+    const unsigned int warp_id = threadIdx.x >> 5u;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int row_block = blockIdx.x * 16u;
+    const unsigned int k_tiles = cols / 64u;
+    const unsigned int input_blocks = k_tiles;
+    output += size_t(blockIdx.y) * rows;
+    input_mxfp4 += size_t(blockIdx.y) * input_blocks * 36u;
+
+    __shared__ __align__(16) int a_shared[16 * 16 * 8];
+    int* my_a_shared = a_shared + warp_id * 16 * 8;
+    __shared__ float partial[16 * 16];
+
+    const unsigned int k_per_warp = k_tiles / 16u;
+    const unsigned int k_start = warp_id * k_per_warp;
+    const unsigned int k_end = (warp_id == 15u) ? k_tiles : k_start + k_per_warp;
+
+#if __CUDA_ARCH__ >= 1200
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+
+    for (unsigned int ktile = k_start; ktile < k_end; ++ktile) {
+        const unsigned int block_base = ktile * 2u;
+
+        for (unsigned int idx = lane; idx < 16u * 8u; idx += 32u) {
+            const unsigned int row_in_tile = idx / 8u;
+            const unsigned int physical_word = idx & 7u;
+            const unsigned int row = row_block + row_in_tile;
+            unsigned int word = 0u;
+            if (row < rows) {
+                const unsigned int k_block = block_base + physical_word / 4u;
+                const unsigned int word_in_block = physical_word & 3u;
+                const unsigned char* block = mxfp4 + (size_t(row) * blocks_per_row + k_block) * 17u;
+                word = load_u32_unaligned(block + 1u + word_in_block * 4u);
+            }
+            my_a_shared[idx] = int(word);
+        }
+        __syncwarp();
+
+        unsigned int a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u;
+        const int* a_ptr = my_a_shared + (lane % 16u) * 8u + (lane / 16u) * 4u;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "l"(a_ptr));
+        __syncwarp();
+
+        const unsigned char* input_block = input_mxfp4 + ktile * 36u;
+        const unsigned int b0 = load_u32_unaligned(input_block + 4u + (lane & 3u) * 4u);
+        const unsigned int b1 = load_u32_unaligned(input_block + 4u + ((lane & 3u) + 4u) * 4u);
+        const unsigned int scale_b = load_u32_unaligned(input_block);
+
+        const unsigned int scale_row_in_tile = (lane / 4u) + ((lane & 1u) * 8u);
+        const unsigned int scale_row = row_block + scale_row_in_tile;
+        unsigned int scale_a = 0u;
+        if (scale_row < rows) {
+            const unsigned char* block0 = mxfp4 + (size_t(scale_row) * blocks_per_row + block_base) * 17u;
+            const unsigned char* block1 = block0 + 17u;
+            scale_a = unsigned(block0[0]) | (unsigned(block1[0]) << 8);
+        }
+
+        asm volatile(
+            "mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+            "%10, {0, 0}, %11, {0, 0};"
+            : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(scale_a), "r"(scale_b));
+    }
+
+    if ((lane & 3u) == 0u) {
+        const unsigned int row_in_tile = lane / 4u;
+        partial[warp_id * 16u + row_in_tile]      = d0;
+        partial[warp_id * 16u + row_in_tile + 8u] = d2;
+    }
+    __syncthreads();
+
+    if (warp_id == 0u && (lane & 3u) == 0u) {
+        const unsigned int row_in_tile = lane / 4u;
+        float sum0 = 0.f, sum1 = 0.f;
+        for (unsigned int w = 0u; w < 16u; ++w) {
+            sum0 += partial[w * 16u + row_in_tile];
+            sum1 += partial[w * 16u + row_in_tile + 8u];
+        }
+        const unsigned int row0 = row_block + row_in_tile;
+        const unsigned int row1 = row0 + 8u;
+        if (row0 < rows) output[row0] = sum0 * output_scale;
+        if (row1 < rows) output[row1] = sum1 * output_scale;
+    }
+#else
+    if (lane == 0u && warp_id == 0u) {
+        for (unsigned int row = row_block; row < rows && row < row_block + 16u; ++row)
+            output[row] = 0.0f;
+    }
+#endif
+}
+
+// 4-warp GEMV: splits k_tiles across 4 warps for higher SM occupancy (80% vs 20%).
+// Grid: (ceil(rows/16), batch, 1), block: (128, 1, 1).
+// Each warp handles k_tiles/4 of the dot product independently, then reduces.
+extern "C" __global__ void aegis_mxfp4_matvec_native_4warp(
+    const unsigned char* mxfp4,
+    const unsigned char* input_mxfp4,
+    const unsigned int rows,
+    const unsigned int cols,
+    const unsigned int blocks_per_row,
+    const float output_scale,
+    float* output
+) {
+    const unsigned int warp_id = threadIdx.x >> 5u;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int batch = blockIdx.y;
+    const unsigned int row_block = blockIdx.x * 16u;
+    const unsigned int k_tiles = cols / 64u;
+    const unsigned int input_blocks = k_tiles;
+    input_mxfp4 += size_t(batch) * input_blocks * 36u;
+    output += size_t(batch) * rows;
+
+    // Per-warp shared memory for A tiles; each warp's slice is 16*8 ints = 512 bytes.
+    __shared__ __align__(16) int a_shared[4 * 16 * 8];
+    int* my_a_shared = a_shared + warp_id * 16 * 8;
+    // Shared reduction buffer: 4 warps × 16 rows × 1 f32 each.
+    __shared__ float partial[4 * 16];
+
+    const unsigned int k_per_warp = k_tiles / 4u;
+    const unsigned int k_start = warp_id * k_per_warp;
+    const unsigned int k_end = (warp_id == 3u) ? k_tiles : k_start + k_per_warp;
+
+#if __CUDA_ARCH__ >= 1200
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+
+    for (unsigned int ktile = k_start; ktile < k_end; ++ktile) {
+        const unsigned int block_base = ktile * 2u;
+
+        for (unsigned int idx = lane; idx < 16u * 8u; idx += 32u) {
+            const unsigned int row_in_tile = idx / 8u;
+            const unsigned int physical_word = idx & 7u;
+            const unsigned int row = row_block + row_in_tile;
+            unsigned int word = 0u;
+            if (row < rows) {
+                const unsigned int k_block = block_base + physical_word / 4u;
+                const unsigned int word_in_block = physical_word & 3u;
+                const unsigned char* block = mxfp4 + (size_t(row) * blocks_per_row + k_block) * 17u;
+                word = load_u32_unaligned(block + 1u + word_in_block * 4u);
+            }
+            my_a_shared[idx] = int(word);
+        }
+        __syncwarp();
+
+        unsigned int a0 = 0u, a1 = 0u, a2 = 0u, a3 = 0u;
+        const int* a_ptr = my_a_shared + (lane % 16u) * 8u + (lane / 16u) * 4u;
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+            : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3)
+            : "l"(a_ptr));
+        __syncwarp();
+
+        const unsigned char* input_block = input_mxfp4 + ktile * 36u;
+        const unsigned int b_word0 = lane & 3u;
+        const unsigned int b_word1 = (lane & 3u) + 4u;
+        const unsigned int b0 = load_u32_unaligned(input_block + 4u + b_word0 * 4u);
+        const unsigned int b1 = load_u32_unaligned(input_block + 4u + b_word1 * 4u);
+        const unsigned int scale_b = load_u32_unaligned(input_block);
+
+        const unsigned int scale_row_in_tile = (lane / 4u) + ((lane & 1u) * 8u);
+        const unsigned int scale_row = row_block + scale_row_in_tile;
+        unsigned int scale_a = 0u;
+        if (scale_row < rows) {
+            const unsigned char* block0 = mxfp4 + (size_t(scale_row) * blocks_per_row + block_base) * 17u;
+            const unsigned char* block1 = block0 + 17u;
+            scale_a = unsigned(block0[0]) | (unsigned(block1[0]) << 8);
+        }
+
+        asm volatile(
+            "mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0 "
+            "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3}, "
+            "%10, {0, 0}, %11, {0, 0};"
+            : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(scale_a), "r"(scale_b));
+    }
+
+    // Write partial sums to shared memory for cross-warp reduction.
+    // Only lanes where (lane & 3) == 0 hold valid output for rows 0-7 (d0) and 8-15 (d2).
+    if ((lane & 3u) == 0u) {
+        const unsigned int row_in_tile = lane / 4u;  // 0..7
+        partial[warp_id * 16u + row_in_tile]       = d0;
+        partial[warp_id * 16u + row_in_tile + 8u]  = d2;
+    }
+    __syncthreads();
+
+    if (warp_id == 0u && (lane & 3u) == 0u) {
+        const unsigned int row_in_tile = lane / 4u;
+        float sum0 = partial[row_in_tile]      + partial[16u + row_in_tile]      + partial[32u + row_in_tile]      + partial[48u + row_in_tile];
+        float sum1 = partial[row_in_tile + 8u] + partial[16u + row_in_tile + 8u] + partial[32u + row_in_tile + 8u] + partial[48u + row_in_tile + 8u];
+        const unsigned int row0 = row_block + row_in_tile;
+        const unsigned int row1 = row0 + 8u;
+        if (row0 < rows) output[row0] = sum0 * output_scale;
+        if (row1 < rows) output[row1] = sum1 * output_scale;
+    }
+#else
+    if (lane == 0u && warp_id == 0u) {
+        for (unsigned int row = row_block; row < rows && row < row_block + 16u; ++row) {
+            output[row] = 0.0f;
+        }
+    }
+#endif
+}
+
 extern "C" __global__ void aegis_mxfp4_matmul_native_n8(
     const unsigned char* mxfp4,
     const unsigned char* input_mxfp4,

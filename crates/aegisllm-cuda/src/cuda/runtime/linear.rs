@@ -1,7 +1,8 @@
-use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, CudaView, LaunchConfig, PushKernelArg};
 
 use super::{CudaRuntime, ceil_div, map_cuda_err};
 use crate::cuda::{DeviceBf16Matrix, DeviceBuffer, DeviceNvfp4Linear};
+use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::planning::runtime::KernelFamily;
 
@@ -162,7 +163,60 @@ impl CudaRuntime {
         input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
+        if matrix.is_host_resident() {
+            return self.matvec_bf16_host_resident_device(matrix, input, output);
+        }
         self.launch_bf16_matvec_reference(matrix, &input.slice, &mut output.slice)
+    }
+
+    /// CPU-side matvec for host-resident BF16 matrices: avoid having lm_head (~1 GB)
+    /// permanently in VRAM at the cost of one D2H download (input) + ~30ms CPU compute
+    /// + one H2D upload (logits) per decode step. Saves ~1 GB VRAM.
+    fn matvec_bf16_host_resident_device(
+        &self,
+        matrix: &DeviceBf16Matrix,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let host = matrix.host_values.as_ref().ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "host-resident matvec called on non-host-resident `{}`",
+                matrix.name
+            ))
+        })?;
+        if input.len() != matrix.cols || output.len() < matrix.rows {
+            return Err(AegisError::InvalidPlan(format!(
+                "bf16 host matvec shape mismatch for {}: input={} cols={} output={} rows={}",
+                matrix.name, input.len(), matrix.cols, output.len(), matrix.rows
+            )));
+        }
+        use rayon::prelude::*;
+        let input_host = self.download_f32(input)?;
+        let weights = host
+            .values
+            .as_slice()
+            .map_err(map_cuda_err("read pinned bf16 weights"))?;
+        let cols = matrix.cols;
+        let rows = matrix.rows;
+        let mut result = vec![0.0_f32; rows];
+        result
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(row, slot)| {
+                let row_base = row * cols;
+                let mut acc = 0.0_f32;
+                for c in 0..cols {
+                    let bf16_bits = weights[row_base + c];
+                    let f = f32::from_bits((bf16_bits as u32) << 16);
+                    acc += f * input_host[c];
+                }
+                *slot = acc;
+            });
+        let mut out_dev = output.slice.slice_mut(0..rows);
+        self.stream
+            .memcpy_htod(&result, &mut out_dev)
+            .map_err(map_cuda_err("upload host bf16 matvec result"))?;
+        Ok(())
     }
 
     pub fn bf16_row_to_f32_device(
@@ -180,6 +234,24 @@ impl CudaRuntime {
                 output.len(),
                 matrix.cols
             )));
+        }
+        if let Some(host) = matrix.host_values.as_ref() {
+            // Host-resident: extract just the requested row from pinned RAM, convert
+            // BF16→f32 on host (cols × 4 bytes ≈ 16 KB), upload to GPU. Tiny copy.
+            let weights = host
+                .values
+                .as_slice()
+                .map_err(map_cuda_err("read pinned bf16 row"))?;
+            let row_base = row * matrix.cols;
+            let row_f32: Vec<f32> = weights[row_base..row_base + matrix.cols]
+                .iter()
+                .map(|&bits| f32::from_bits((bits as u32) << 16))
+                .collect();
+            let mut dst = output.slice.slice_mut(0..matrix.cols);
+            self.stream
+                .memcpy_htod(&row_f32, &mut dst)
+                .map_err(map_cuda_err("upload host bf16 row"))?;
+            return Ok(());
         }
         let row = row as u32;
         let cols = matrix.cols as u32;
@@ -223,6 +295,39 @@ impl CudaRuntime {
                 output.len(),
                 output_len
             )));
+        }
+        if let Some(host) = matrix.host_values.as_ref() {
+            // Host-resident: download row indices, gather requested rows on host
+            // (batch × cols × 4 bytes — small for prefill chunk), upload as f32.
+            let row_indices: Vec<u32> = self
+                .stream
+                .memcpy_dtov(&rows.slice.slice(0..batch))
+                .map_err(map_cuda_err("download bf16 row indices"))?;
+            let weights = host
+                .values
+                .as_slice()
+                .map_err(map_cuda_err("read pinned bf16 rows"))?;
+            let mut gathered = Vec::with_capacity(output_len);
+            for &idx in &row_indices {
+                let idx = idx as usize;
+                if idx >= matrix.rows {
+                    return Err(AegisError::InvalidPlan(format!(
+                        "bf16 row index out of bounds: idx={} rows={}",
+                        idx, matrix.rows
+                    )));
+                }
+                let base = idx * matrix.cols;
+                gathered.extend(
+                    weights[base..base + matrix.cols]
+                        .iter()
+                        .map(|&bits| f32::from_bits((bits as u32) << 16)),
+                );
+            }
+            let mut dst = output.slice.slice_mut(0..output_len);
+            self.stream
+                .memcpy_htod(&gathered, &mut dst)
+                .map_err(map_cuda_err("upload host bf16 rows"))?;
+            return Ok(());
         }
         let batch = u32_arg("batch", batch)?;
         let rows_total = u32_arg("rows", matrix.rows)?;
@@ -306,27 +411,52 @@ impl CudaRuntime {
                 batch * linear.rows
             )));
         }
-        let rows = linear.rows as u32;
-        let cols = linear.cols as u32;
-        let batch = batch as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (rows, batch, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
-        };
-        unsafe {
-            self.stream
-                .launch_builder(&self.kernels.nvfp4_prequant_batched)
-                .arg(&linear.packed)
-                .arg(&linear.scales)
-                .arg(&input.slice)
-                .arg(&rows)
-                .arg(&cols)
-                .arg(&linear.output_scale)
-                .arg(&mut output.slice)
-                .launch(cfg)
+        let rows_u32 = linear.rows as u32;
+        let cols_u32 = linear.cols as u32;
+        let batch_u32 = batch as u32;
+        if batch > 1 {
+            // Tiled GEMM: 8 warps share one loaded weight row — weight reads ÷ 8.
+            let grid_y = ((batch + 7) / 8) as u32;
+            let shared = (linear.cols / 2 + linear.cols / 16) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (rows_u32, grid_y, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_prequant_batched_gemm)
+                    .arg(&linear.packed)
+                    .arg(&linear.scales)
+                    .arg(&input.slice)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&batch_u32)
+                    .arg(&linear.output_scale)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch batched nvfp4 gemm prequantized"))?;
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (rows_u32, batch_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_prequant_batched)
+                    .arg(&linear.packed)
+                    .arg(&linear.scales)
+                    .arg(&input.slice)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&linear.output_scale)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch batched nvfp4 matvec prequantized"))?;
         }
-        .map_err(map_cuda_err("launch batched nvfp4 matvec prequantized"))?;
         Ok(())
     }
 
@@ -364,7 +494,7 @@ impl CudaRuntime {
                 linear.name
             )));
         };
-        if linear.cols % 64 != 0 {
+        if !linear.cols.is_multiple_of(64) {
             return Err(AegisError::InvalidPlan(format!(
                 "native mxfp4 matvec for `{}` requires cols divisible by 64, got {}",
                 linear.name, linear.cols
@@ -374,14 +504,25 @@ impl CudaRuntime {
         let cols = linear.cols as u32;
         let blocks_per_row = native.blocks_per_row as u32;
         let output_scale = linear.output_scale;
+        // Choose kernel by divisibility: 16-warp → 4-warp → 1-warp, highest occupancy first.
+        // 16-warp (512 threads): ~92-100% SM occupancy for all LLaMA projection sizes.
+        // 4-warp (128 threads): ~80% for gate/up, ~23% for small matrices.
+        // 1-warp (32 threads): fallback for odd col counts.
+        let (block_dim, kernel, tag) = if linear.cols.is_multiple_of(64 * 16) {
+            (512u32, &self.kernels.mxfp4_matvec_16warp, "16warp")
+        } else if linear.cols.is_multiple_of(64 * 4) {
+            (128u32, &self.kernels.mxfp4_matvec_4warp, "4warp")
+        } else {
+            (32u32, &self.kernels.mxfp4_matvec, "1warp")
+        };
         let cfg = LaunchConfig {
             grid_dim: (ceil_div(rows, 16), 1, 1),
-            block_dim: (32, 1, 1),
+            block_dim: (block_dim, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.mxfp4_matvec)
+                .launch_builder(kernel)
                 .arg(&native.data)
                 .arg(&input_mxfp4.slice)
                 .arg(&rows)
@@ -391,7 +532,11 @@ impl CudaRuntime {
                 .arg(&mut output.slice)
                 .launch(cfg)
         }
-        .map_err(map_cuda_err("launch native mxfp4 matvec"))?;
+        .map_err(map_cuda_err(match tag {
+            "16warp" => "launch native mxfp4 matvec 16warp",
+            "4warp"  => "launch native mxfp4 matvec 4warp",
+            _        => "launch native mxfp4 matvec 1warp",
+        }))?;
         Ok(())
     }
 
@@ -421,7 +566,7 @@ impl CudaRuntime {
                 linear.name
             )));
         };
-        if linear.cols % 64 != 0 {
+        if !linear.cols.is_multiple_of(64) {
             return Err(AegisError::InvalidPlan(format!(
                 "batched native mxfp4 matvec for `{}` requires cols divisible by 64, got {}",
                 linear.name, linear.cols
@@ -582,7 +727,7 @@ impl CudaRuntime {
                 "grouped qkv mxfp4 prefill requires native MXFP4 resident layouts".into(),
             ));
         };
-        if q_proj.cols % 64 != 0 {
+        if !q_proj.cols.is_multiple_of(64) {
             return Err(AegisError::InvalidPlan(format!(
                 "grouped qkv mxfp4 prefill requires cols divisible by 64, got {}",
                 q_proj.cols
@@ -692,7 +837,7 @@ impl CudaRuntime {
                 "grouped gate/up mxfp4 prefill requires native MXFP4 resident layouts".into(),
             ));
         };
-        if gate_proj.cols % 64 != 0 {
+        if !gate_proj.cols.is_multiple_of(64) {
             return Err(AegisError::InvalidPlan(format!(
                 "grouped gate/up mxfp4 prefill requires cols divisible by 64, got {}",
                 gate_proj.cols
@@ -880,9 +1025,395 @@ impl CudaRuntime {
             && linear.native_mxfp4.is_some()
             && self.config.native_mxfp4_inference
     }
+
+    // -----------------------------------------------------------------------
+    // Staging-path launchers: accept CudaView<u8> for packed/scales so callers
+    // can pass views into a shared staging VRAM buffer instead of owned slices.
+    // -----------------------------------------------------------------------
+
+    /// Reference NVFP4 matvec where packed/scales come from a staging view.
+    pub(crate) fn launch_nvfp4_reference_views(
+        &self,
+        packed: &CudaView<u8>,
+        scales: &CudaView<u8>,
+        rows: usize,
+        cols: usize,
+        input_scale: f32,
+        output_scale: f32,
+        input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 128 * std::mem::size_of::<f32>() as u32,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.nvfp4_reference)
+                .arg(packed)
+                .arg(scales)
+                .arg(input)
+                .arg(&rows_u32)
+                .arg(&cols_u32)
+                .arg(&input_scale)
+                .arg(&output_scale)
+                .arg(output)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch staged nvfp4 reference"))?;
+        Ok(())
+    }
+
+    /// Pre-quantized NVFP4 matvec where packed/scales come from a staging view.
+    pub(crate) fn launch_nvfp4_prequantized_views(
+        &self,
+        packed: &CudaView<u8>,
+        scales: &CudaView<u8>,
+        rows: usize,
+        cols: usize,
+        output_scale: f32,
+        quantized_input: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows as u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 128 * std::mem::size_of::<f32>() as u32,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.nvfp4_prequant)
+                .arg(packed)
+                .arg(scales)
+                .arg(quantized_input)
+                .arg(&rows_u32)
+                .arg(&cols_u32)
+                .arg(&output_scale)
+                .arg(output)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch staged nvfp4 prequantized"))?;
+        Ok(())
+    }
+
+    /// Pre-quantized batched NVFP4 matvec where packed/scales come from a staging view.
+    pub(crate) fn launch_nvfp4_prequantized_batched_views(
+        &self,
+        packed: &CudaView<u8>,
+        scales: &CudaView<u8>,
+        rows: usize,
+        cols: usize,
+        output_scale: f32,
+        quantized_input: &CudaSlice<f32>,
+        batch: usize,
+        output: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+        let batch_u32 = batch as u32;
+        if batch > 1 {
+            // Tiled GEMM: 8 warps share one weight row in shared memory.
+            let grid_y = ((batch + 7) / 8) as u32;
+            let shared = (cols / 2 + cols / 16) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (rows_u32, grid_y, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_prequant_batched_gemm)
+                    .arg(packed)
+                    .arg(scales)
+                    .arg(quantized_input)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&batch_u32)
+                    .arg(&output_scale)
+                    .arg(output)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch staged nvfp4 prequantized batched gemm"))?;
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (rows_u32, batch_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_prequant_batched)
+                    .arg(packed)
+                    .arg(scales)
+                    .arg(quantized_input)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&output_scale)
+                    .arg(output)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch staged nvfp4 prequantized batched"))?;
+        }
+        Ok(())
+    }
+
+    /// Native MXFP4 batched matvec where the weight data comes from a staging view
+    /// (CudaView<u8>) rather than the owned DeviceNvfp4Linear.native_mxfp4.data slice.
+    /// Used for host-resident layers whose repacked data was staged just before this call.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_native_mxfp4_batched_views(
+        &self,
+        weight_data: &CudaView<u8>,
+        input_mxfp4: &DeviceBuffer<u8>,
+        rows: usize,
+        cols: usize,
+        blocks_per_row: usize,
+        batch: usize,
+        output_scale: f32,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let rows = u32_arg("rows", rows)?;
+        let cols = u32_arg("cols", cols)?;
+        let blocks_per_row = u32_arg("blocks_per_row", blocks_per_row)?;
+        let batch_u32 = u32_arg("batch", batch)?;
+        let use_prefill_tile_kernel = batch >= 16;
+        let use_n8_kernel = batch > 1 && !use_prefill_tile_kernel;
+        if use_prefill_tile_kernel {
+            let use_n64_tile = rows >= 64;
+            let row_tile = if use_n64_tile { 64 } else { 32 };
+            let block_dim = if use_n64_tile { 256 } else { 128 };
+            let kernel = if use_n64_tile {
+                &self.kernels.mxfp4_matmul_tile_m16n64
+            } else {
+                &self.kernels.mxfp4_matmul_tile_m16n32
+            };
+            let cfg = LaunchConfig {
+                grid_dim: (ceil_div(rows, row_tile), ceil_div(batch_u32, 16), 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(kernel)
+                    .arg(weight_data)
+                    .arg(&input_mxfp4.slice)
+                    .arg(&rows)
+                    .arg(&cols)
+                    .arg(&blocks_per_row)
+                    .arg(&batch_u32)
+                    .arg(&output_scale)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch staged native mxfp4 prefill tile"))?;
+        } else if use_n8_kernel {
+            let cfg = LaunchConfig {
+                grid_dim: (ceil_div(rows, 16), ceil_div(batch_u32, 8), 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.mxfp4_matmul_n8)
+                    .arg(weight_data)
+                    .arg(&input_mxfp4.slice)
+                    .arg(&rows)
+                    .arg(&cols)
+                    .arg(&blocks_per_row)
+                    .arg(&batch_u32)
+                    .arg(&output_scale)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch staged native mxfp4 n8"))?;
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (ceil_div(rows, 16), batch_u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.mxfp4_matvec)
+                    .arg(weight_data)
+                    .arg(&input_mxfp4.slice)
+                    .arg(&rows)
+                    .arg(&cols)
+                    .arg(&blocks_per_row)
+                    .arg(&output_scale)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch staged native mxfp4 matvec"))?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // High-level staging helpers: take DeviceBuffer + LinearStagingPool, do
+    // the H2D copy and kernel dispatch in one call.  Callers in executor/ use
+    // these because they cannot access DeviceNvfp4Linear::host_weights directly
+    // (it is pub(super) within cuda/).
+    // -----------------------------------------------------------------------
+
+    /// Staged decode matvec (M=1): H2D copy host weights to staging VRAM, then run
+    /// the pre-quantized kernel.  `quantized_input` must already hold the fp4-
+    /// quantized activations (caller ran `quantize_nvfp4_input_device` first).
+    pub(crate) fn matvec_nvfp4_staged_prequantized_device(
+        &self,
+        linear: &DeviceNvfp4Linear,
+        staging: &mut LinearStagingPool,
+        quantized_input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let hw = linear.host_weights.as_deref().ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staged matvec called on non-host-resident linear `{}`",
+                linear.name
+            ))
+        })?;
+        staging.prepare(hw, linear.packed_bytes, linear.scale_bytes, &self.stream)?;
+        let packed_view = staging.packed_view(linear.packed_bytes);
+        let scales_view = staging.scales_view(linear.scale_bytes);
+        self.launch_nvfp4_prequantized_views(
+            &packed_view,
+            &scales_view,
+            linear.rows,
+            linear.cols,
+            linear.output_scale,
+            &quantized_input.slice,
+            &mut output.slice,
+        )
+    }
+
+    /// Staged prefill matvec (M=batch): same H2D staging, batched kernel.
+    pub(crate) fn matvec_nvfp4_staged_prequantized_batched_device(
+        &self,
+        linear: &DeviceNvfp4Linear,
+        staging: &mut LinearStagingPool,
+        quantized_input: &DeviceBuffer<f32>,
+        batch: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let hw = linear.host_weights.as_deref().ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staged batched matvec called on non-host-resident linear `{}`",
+                linear.name
+            ))
+        })?;
+        staging.prepare(hw, linear.packed_bytes, linear.scale_bytes, &self.stream)?;
+        let packed_view = staging.packed_view(linear.packed_bytes);
+        let scales_view = staging.scales_view(linear.scale_bytes);
+        self.launch_nvfp4_prequantized_batched_views(
+            &packed_view,
+            &scales_view,
+            linear.rows,
+            linear.cols,
+            linear.output_scale,
+            &quantized_input.slice,
+            batch,
+            &mut output.slice,
+        )
+    }
+
+    /// Staged decode matvec (M=1) using native MXFP4 tensor cores.
+    /// Stages the repacked weight data, then runs the Blackwell tensor-core kernel.
+    pub(crate) fn matvec_native_mxfp4_staged_device(
+        &self,
+        linear: &DeviceNvfp4Linear,
+        staging: &mut LinearStagingPool,
+        input_mxfp4: &DeviceBuffer<u8>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let hw = linear.host_weights.as_deref().ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staged native mxfp4 matvec on non-host-resident linear `{}`",
+                linear.name
+            ))
+        })?;
+        let mxfp4 = hw.native_mxfp4.as_ref().ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staged native mxfp4 matvec: no repacked data for `{}`; set native_mxfp4_repack=true",
+                linear.name
+            ))
+        })?;
+        staging.prepare_native_mxfp4(mxfp4, &self.stream)?;
+        let weight_view = staging.native_mxfp4_view(mxfp4.data.len()).ok_or_else(|| {
+            AegisError::InvalidPlan("native MXFP4 staging buffer not allocated".into())
+        })?;
+        self.launch_native_mxfp4_batched_views(
+            &weight_view,
+            input_mxfp4,
+            linear.rows,
+            linear.cols,
+            mxfp4.blocks_per_row,
+            1,
+            linear.output_scale,
+            output,
+        )
+    }
+
+    /// Staged prefill matmul (M=batch) using native MXFP4 tensor cores.
+    pub(crate) fn matvec_native_mxfp4_staged_batched_device(
+        &self,
+        linear: &DeviceNvfp4Linear,
+        staging: &mut LinearStagingPool,
+        input_mxfp4: &DeviceBuffer<u8>,
+        batch: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let hw = linear.host_weights.as_deref().ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staged native mxfp4 batched matvec on non-host-resident linear `{}`",
+                linear.name
+            ))
+        })?;
+        let mxfp4 = hw.native_mxfp4.as_ref().ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staged native mxfp4 batched matvec: no repacked data for `{}`; set native_mxfp4_repack=true",
+                linear.name
+            ))
+        })?;
+        staging.prepare_native_mxfp4(mxfp4, &self.stream)?;
+        let weight_view = staging.native_mxfp4_view(mxfp4.data.len()).ok_or_else(|| {
+            AegisError::InvalidPlan("native MXFP4 staging buffer not allocated".into())
+        })?;
+        self.launch_native_mxfp4_batched_views(
+            &weight_view,
+            input_mxfp4,
+            linear.rows,
+            linear.cols,
+            mxfp4.blocks_per_row,
+            batch,
+            linear.output_scale,
+            output,
+        )
+    }
 }
 
 impl DeviceNvfp4Linear {
+    /// Returns `true` if this layer is host-resident AND has native MXFP4 repacked data,
+    /// meaning inference can use staged tensor-core path instead of software NVfp4.
+    pub fn is_host_resident_with_native_mxfp4(&self) -> bool {
+        self.host_weights
+            .as_ref()
+            .is_some_and(|hw| hw.native_mxfp4.is_some())
+    }
+
+    /// Byte count of the native MXFP4 repacked data in host RAM (0 if absent).
+    pub fn host_resident_native_mxfp4_bytes(&self) -> usize {
+        self.host_weights
+            .as_ref()
+            .and_then(|hw| hw.native_mxfp4.as_ref())
+            .map(|m| m.data.len())
+            .unwrap_or(0)
+    }
+
     pub fn native_mxfp4_bytes(&self) -> usize {
         self.native_mxfp4
             .as_ref()

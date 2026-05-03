@@ -1,5 +1,6 @@
 use crate::cuda::{CudaRuntime, DeviceBuffer, DeviceNvfp4Linear};
-use aegisllm_base::error::Result;
+use crate::cuda::staging::LinearStagingPool;
+use aegisllm_base::error::{AegisError, Result};
 
 pub(super) fn prepare_nvfp4_input(
     runtime: &CudaRuntime,
@@ -42,19 +43,48 @@ pub(super) fn prepare_nvfp4_input_batched(
     Ok(())
 }
 
-pub(super) fn matvec_nvfp4_prepared_device(
+/// Like `matvec_nvfp4_prepared_device_reuse` but skips the MXFP4 input quantization step when
+/// `mxfp4_already_valid` is true (i.e. `mxfp4_input` was already filled from the same
+/// `native_input` by a previous projection in the same layer). Returns whether `mxfp4_input`
+/// is now valid so callers can chain projections without tracking the flag themselves.
+pub(super) fn matvec_nvfp4_prepared_device_reuse(
     runtime: &CudaRuntime,
     linear: &DeviceNvfp4Linear,
     native_input: &DeviceBuffer<f32>,
     quantized_input: &DeviceBuffer<f32>,
     mxfp4_input: &mut DeviceBuffer<u8>,
+    mxfp4_already_valid: bool,
     output: &mut DeviceBuffer<f32>,
-) -> Result<()> {
+    staging: Option<&mut LinearStagingPool>,
+) -> Result<bool> {
+    // Host-resident (StagedHostToDevice): stream weights from RAM to staging VRAM first.
+    if linear.is_host_resident() {
+        let staging = staging.ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staging pool required for host-resident linear `{}`",
+                linear.name
+            ))
+        })?;
+        if linear.is_host_resident_with_native_mxfp4() {
+            // Tensor-core path: quantize input to MXFP4 (reuse if already valid), stage weight.
+            if !mxfp4_already_valid {
+                runtime.quantize_mxfp4_input_device(native_input, mxfp4_input)?;
+            }
+            runtime.matvec_native_mxfp4_staged_device(linear, staging, mxfp4_input, output)?;
+            return Ok(true);
+        }
+        runtime.matvec_nvfp4_staged_prequantized_device(linear, staging, quantized_input, output)?;
+        return Ok(false);
+    }
     if native_mxfp4_enabled(runtime, linear) {
-        runtime.quantize_mxfp4_input_device(native_input, mxfp4_input)?;
-        runtime.matvec_mxfp4_native_prepacked_device(linear, mxfp4_input, output)
+        if !mxfp4_already_valid {
+            runtime.quantize_mxfp4_input_device(native_input, mxfp4_input)?;
+        }
+        runtime.matvec_mxfp4_native_prepacked_device(linear, mxfp4_input, output)?;
+        Ok(true)
     } else {
-        runtime.matvec_nvfp4_prequantized_device(linear, quantized_input, output)
+        runtime.matvec_nvfp4_prequantized_device(linear, quantized_input, output)?;
+        Ok(false)
     }
 }
 
@@ -65,7 +95,25 @@ pub(super) fn matvec_nvfp4_device_with_scratch(
     quantized_input: &mut DeviceBuffer<f32>,
     mxfp4_input: &mut DeviceBuffer<u8>,
     output: &mut DeviceBuffer<f32>,
+    staging: Option<&mut LinearStagingPool>,
 ) -> Result<()> {
+    // Host-resident: quantize activations then stream weights from RAM.
+    if linear.is_host_resident() {
+        let staging = staging.ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staging pool required for host-resident linear `{}`",
+                linear.name
+            ))
+        })?;
+        if linear.is_host_resident_with_native_mxfp4() {
+            runtime.quantize_mxfp4_input_device(input, mxfp4_input)?;
+            return runtime.matvec_native_mxfp4_staged_device(linear, staging, mxfp4_input, output);
+        }
+        runtime.quantize_nvfp4_input_device(input, linear.input_scale, quantized_input)?;
+        return runtime.matvec_nvfp4_staged_prequantized_device(
+            linear, staging, quantized_input, output,
+        );
+    }
     if native_mxfp4_enabled(runtime, linear) {
         runtime.quantize_mxfp4_input_device(input, mxfp4_input)?;
         runtime.matvec_mxfp4_native_prepacked_device(linear, mxfp4_input, output)
@@ -83,7 +131,25 @@ pub(super) fn matvec_nvfp4_prepared_batched_device(
     batch: usize,
     mxfp4_input: &mut DeviceBuffer<u8>,
     output: &mut DeviceBuffer<f32>,
+    staging: Option<&mut LinearStagingPool>,
 ) -> Result<()> {
+    if linear.is_host_resident() {
+        let staging = staging.ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staging pool required for host-resident linear `{}`",
+                linear.name
+            ))
+        })?;
+        if linear.is_host_resident_with_native_mxfp4() {
+            runtime.quantize_mxfp4_input_batched_device(native_input, batch, linear.cols, mxfp4_input)?;
+            return runtime.matvec_native_mxfp4_staged_batched_device(
+                linear, staging, mxfp4_input, batch, output,
+            );
+        }
+        return runtime.matvec_nvfp4_staged_prequantized_batched_device(
+            linear, staging, quantized_input, batch, output,
+        );
+    }
     if native_mxfp4_enabled(runtime, linear) {
         runtime.quantize_mxfp4_input_batched_device(
             native_input,
@@ -105,7 +171,28 @@ pub(super) fn matvec_nvfp4_batched_device_with_scratch(
     quantized_input: &mut DeviceBuffer<f32>,
     mxfp4_input: &mut DeviceBuffer<u8>,
     output: &mut DeviceBuffer<f32>,
+    staging: Option<&mut LinearStagingPool>,
 ) -> Result<()> {
+    if linear.is_host_resident() {
+        let staging = staging.ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staging pool required for host-resident linear `{}`",
+                linear.name
+            ))
+        })?;
+        if linear.is_host_resident_with_native_mxfp4() {
+            runtime.quantize_mxfp4_input_batched_device(input, batch, linear.cols, mxfp4_input)?;
+            return runtime.matvec_native_mxfp4_staged_batched_device(
+                linear, staging, mxfp4_input, batch, output,
+            );
+        }
+        runtime.quantize_nvfp4_input_batched_device(
+            input, linear.input_scale, batch, linear.cols, quantized_input,
+        )?;
+        return runtime.matvec_nvfp4_staged_prequantized_batched_device(
+            linear, staging, quantized_input, batch, output,
+        );
+    }
     if native_mxfp4_enabled(runtime, linear) {
         runtime.quantize_mxfp4_input_batched_device(input, batch, linear.cols, mxfp4_input)?;
         runtime.matvec_mxfp4_native_prepacked_batched_device(linear, mxfp4_input, batch, output)

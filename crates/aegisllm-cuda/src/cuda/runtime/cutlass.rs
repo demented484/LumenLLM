@@ -25,7 +25,7 @@ fn checked_len(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
 
 impl CudaRuntime {
     pub fn cutlass_nvfp4_activation_payload_bytes(rows: usize, cols: usize) -> Result<usize> {
-        if cols % 32 != 0 {
+        if !cols.is_multiple_of(32) {
             return Err(AegisError::InvalidPlan(format!(
                 "CUTLASS NVFP4 activation payload requires cols divisible by 32, got {cols}"
             )));
@@ -34,7 +34,7 @@ impl CudaRuntime {
     }
 
     pub fn cutlass_nvfp4_activation_scale_bytes(rows: usize, cols: usize) -> Result<usize> {
-        if cols % 32 != 0 {
+        if !cols.is_multiple_of(32) {
             return Err(AegisError::InvalidPlan(format!(
                 "CUTLASS NVFP4 activation scales require cols divisible by 32, got {cols}"
             )));

@@ -90,7 +90,7 @@ impl CudaRuntime {
     }
 
     pub fn mxfp4_vector_bytes(len: usize) -> Result<usize> {
-        if len % 64 != 0 {
+        if !len.is_multiple_of(64) {
             return Err(AegisError::InvalidPlan(format!(
                 "native MXFP4 vector quantization requires len divisible by 64, got {len}"
             )));

@@ -74,7 +74,7 @@ pub(super) fn select_prefill_batched_kernel(
     head_dim: usize,
     legacy_shared_bytes: usize,
 ) -> Result<PrefillBatchedKernel> {
-    let warp_eligible = start_position == 0 && head_dim % 32 == 0 && head_dim <= 256;
+    let warp_eligible = start_position == 0 && head_dim.is_multiple_of(32) && head_dim <= 256;
     if matches!(
         config,
         CudaPrefillAttentionKernel::Auto

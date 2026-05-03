@@ -121,6 +121,33 @@ pub fn add_into_simd(a: &[f32], b: &[f32], out: &mut [f32]) {
     arch().dispatch(AddIntoSimd { a: &a[..len], b: &b[..len], out: &mut out[..len] });
 }
 
+// ── add in-place: a += b ─────────────────────────────────────────────────────
+
+struct AddInPlace<'a> {
+    a: &'a mut [f32],
+    b: &'a [f32],
+}
+
+impl pulp::WithSimd for AddInPlace<'_> {
+    type Output = ();
+    #[inline(always)]
+    fn with_simd<S: Simd>(self, simd: S) {
+        let (a_head, a_tail) = S::as_mut_simd_f32s(self.a);
+        let (b_head, b_tail) = S::as_simd_f32s(self.b);
+        for (a, &bv) in a_head.iter_mut().zip(b_head.iter()) {
+            *a = simd.add_f32s(*a, bv);
+        }
+        for (a, &bv) in a_tail.iter_mut().zip(b_tail.iter()) {
+            *a += bv;
+        }
+    }
+}
+
+pub fn add_in_place(a: &mut [f32], b: &[f32]) {
+    let len = a.len().min(b.len());
+    arch().dispatch(AddInPlace { a: &mut a[..len], b: &b[..len] });
+}
+
 // ── swiglu ───────────────────────────────────────────────────────────────────
 
 pub fn swiglu_into_simd(gate: &[f32], up: &[f32], out: &mut [f32]) {

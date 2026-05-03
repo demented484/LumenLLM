@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::time::Instant;
 
 use crate::error::{AegisError, Result};
@@ -62,6 +63,44 @@ pub fn generate_with_backend_timed<B: GenerationBackendPrimitives + ?Sized>(
     })
 }
 
+pub fn generate_streaming_with_backend<B: GenerationBackendPrimitives + ?Sized>(
+    backend: &B,
+    request: &GenerateRequest,
+    callback: &mut dyn FnMut(usize, &str) -> ControlFlow<()>,
+) -> Result<GenerateOutput> {
+    let prompt_tokens = backend.encode_prompt(&request.prompt)?;
+    if prompt_tokens.is_empty() {
+        return Err(AegisError::InvalidConfig(
+            "prompt produced no tokens".into(),
+        ));
+    }
+    let mut state = backend.new_sequence_state()?;
+    let mut next = backend.prefill_prompt(state.as_mut(), &prompt_tokens, &request.sampling)?;
+
+    let mut generated = Vec::new();
+    let mut finish_reason = "length".to_string();
+    for _ in 0..request.max_tokens {
+        if backend.is_eos(next) {
+            finish_reason = "eos_token".into();
+            break;
+        }
+        generated.push(next);
+        let token_text = backend.decode_tokens(&[next]).unwrap_or_default();
+        if callback(next, &token_text).is_break() {
+            break;
+        }
+        if generated.len() < request.max_tokens {
+            next = backend.forward_next_token(state.as_mut(), next, &request.sampling)?;
+        }
+    }
+    Ok(GenerateOutput {
+        text: backend.decode_tokens(&generated)?,
+        prompt_tokens: prompt_tokens.len(),
+        completion_tokens: generated.len(),
+        finish_reason,
+    })
+}
+
 #[allow(dead_code)]
 fn prefill_prompt_logits<B: GenerationBackendPrimitives + ?Sized>(
     backend: &B,
@@ -94,6 +133,15 @@ pub fn prefill_prompt_token_by_token<B: GenerationBackendPrimitives + ?Sized>(
         backend.forward_hidden(state, token)?;
     }
     backend.forward_next_token(state, last, sampling)
+}
+
+/// In-place logit soft-cap: `logits[i] = cap * tanh(logits[i] / cap)`.
+/// Used by Gemma 4 (lm_head output) and inside attention (attn_logit_softcap).
+pub fn apply_logit_softcap(logits: &mut [f32], cap: f32) {
+    let inv_cap = 1.0 / cap;
+    for x in logits.iter_mut() {
+        *x = cap * (*x * inv_cap).tanh();
+    }
 }
 
 pub fn sample_next_token(logits: &[f32], sampling: &SamplingConfig) -> Result<usize> {

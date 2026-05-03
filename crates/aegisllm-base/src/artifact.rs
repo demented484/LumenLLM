@@ -51,6 +51,7 @@ pub struct ShardFile {
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct HfConfig {
+    // ── Universal fields ───────────────────────────────────────────────────
     pub architectures: Option<Vec<String>>,
     pub model_type: String,
     pub hidden_size: usize,
@@ -68,11 +69,131 @@ pub struct HfConfig {
     pub bos_token_id: Option<u32>,
     pub eos_token_id: Option<serde_json::Value>,
     pub vocab_size: Option<usize>,
+
+    // ── Sliding-window attention (Gemma 4, Qwen 3.6) ──────────────────────
+    /// Attention window size; None or 0 = full causal attention.
+    pub sliding_window: Option<usize>,
+    /// Gemma 4 pattern: every Nth layer uses full (global) attention.
+    pub global_attn_every_n_layers: Option<usize>,
+
+    // ── Logit soft-capping (Gemma 4) ──────────────────────────────────────
+    /// `logits = cap * tanh(logits / cap)` applied before softmax.
+    pub attn_logit_softcapping: Option<f32>,
+    /// Applied to the final lm_head logits.
+    pub final_logit_softcapping: Option<f32>,
+
+    // ── Proportional RoPE (Gemma 4 global layers) ─────────────────────────
+    /// Fraction of head_dim that gets RoPE; the rest passes through.
+    pub partial_rotary_factor: Option<f32>,
+
+    // ── Pre+Post RMSNorm (Gemma 4) ────────────────────────────────────────
+    /// When true, a second RMSNorm is applied after attention/MLP output.
+    pub post_attention_layernorm: Option<bool>,
+
+    // ── Mixture-of-Experts (Gemma 4 MoE, Qwen 3.x, Nemotron 3) ──────────
+    pub num_experts: Option<usize>,
+    pub num_experts_per_tok: Option<usize>,
+    /// Per-expert intermediate size (Qwen 3 MoE: "moe_intermediate_size").
+    pub moe_intermediate_size: Option<usize>,
+    /// Intermediate size for shared (always-active) expert if present.
+    pub shared_expert_intermediate_size: Option<usize>,
+    pub num_shared_experts: Option<usize>,
+    /// Interleave pattern: how often a non-MoE (dense) layer appears.
+    pub moe_layer_freq: Option<usize>,
+
+    // ── Gated DeltaNet (Qwen 3.5/3.6 hybrid) ─────────────────────────────
+    /// When true, linear-attention (GDN) layers exist in the model.
+    pub use_linear_attention: Option<bool>,
+    /// Number of GDN linear-attention layers (if not derivable from freq).
+    pub num_linear_attention_layers: Option<usize>,
+    /// Alternation pattern: every N-th layer is GDN (e.g. N=4 → 3 GDN + 1 full).
+    pub linear_attn_every_n_layers: Option<usize>,
+
+    // ── Mamba / SSM (Nemotron 3) ──────────────────────────────────────────
+    /// SSM state dimension (d_state in Mamba).
+    pub state_size: Option<usize>,
+    /// Number of SSM heads.
+    pub mamba_num_heads: Option<usize>,
+    /// Head dimension for SSM.
+    pub mamba_head_dim: Option<usize>,
+    /// Mamba expansion factor (d_inner = expand * hidden_size).
+    pub expand: Option<usize>,
+
+    // ── Multimodal / Omni (Nemotron 3 Omni) ─────────────────────────────
+    /// Modalities the model can consume.
+    pub supported_modalities: Option<Vec<String>>,
+
+    // ── MatFormer / nested params (Gemma 4 E2B/E4B) ──────────────────────
+    /// Active model size within a nested-param checkpoint (e.g. "e2b").
+    pub effective_size: Option<String>,
+    /// Granularity of nested param blocks (e.g. ["1.0b", "2.0b", "4.0b"]).
+    pub nested_param_sizes: Option<Vec<String>>,
+
+    // ── Qwen-specific ────────────────────────────────────────────────────
+    /// Number of attention layers when using hybrid GDN model.
+    pub num_attention_heads_per_layer: Option<Vec<usize>>,
+}
+
+/// Effective dimensions for a MatFormer-style nested-param checkpoint.
+///
+/// Returned by `HfConfig::effective_dims()`. When the config has no
+/// `effective_size` field, callers should use `hidden_size`/`intermediate_size`
+/// directly without a slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveDims {
+    /// Effective hidden dimension after applying the nested-param slice.
+    pub hidden_size: usize,
+    /// Effective FFN intermediate dimension; `None` if not present in config.
+    pub intermediate_size: Option<usize>,
+    /// True when the slice is strictly smaller than the full checkpoint.
+    pub is_sliced: bool,
+}
+
+impl HfConfig {
+    /// Resolve the active hidden / intermediate dimensions for this config,
+    /// applying the MatFormer `effective_size` slice if present.
+    ///
+    /// Returns the full checkpoint dims when `effective_size` is `None` or
+    /// unrecognized; returns sliced dims when set to `"e2b"` or `"e4b"`.
+    pub fn effective_dims(&self) -> EffectiveDims {
+        let label = match self.effective_size.as_deref() {
+            Some(s) => s,
+            None => {
+                return EffectiveDims {
+                    hidden_size: self.hidden_size,
+                    intermediate_size: self.intermediate_size,
+                    is_sliced: false,
+                };
+            }
+        };
+        let scale = match label.to_ascii_lowercase().as_str() {
+            "e2b" | "2b" => 0.5f32,
+            "e4b" | "4b" => 1.0f32,
+            _ => {
+                return EffectiveDims {
+                    hidden_size: self.hidden_size,
+                    intermediate_size: self.intermediate_size,
+                    is_sliced: false,
+                };
+            }
+        };
+        let hidden_eff = ((self.hidden_size as f32) * scale).round().max(1.0) as usize;
+        let interm_eff = self
+            .intermediate_size
+            .map(|d| ((d as f32) * scale).round().max(1.0) as usize);
+        EffectiveDims {
+            hidden_size: hidden_eff,
+            intermediate_size: interm_eff,
+            is_sliced: scale < 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct HfQuantizationConfig {
     pub quant_algo: Option<String>,
+    /// HuggingFace standard alternative key for quantization name (FP8 / GPTQ / AWQ).
+    pub quant_method: Option<String>,
     pub kv_cache_scheme: Option<HfKvCacheScheme>,
 }
 
@@ -102,7 +223,10 @@ pub struct HfGenerationConfig {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct HfTokenizerConfig {
     pub tokenizer_class: Option<String>,
-    pub model_max_length: Option<usize>,
+    /// HuggingFace tokenizer configs sometimes set this to a sentinel like
+    /// `1e30` to signal "no limit", which overflows usize. Deserialize as
+    /// `f64` and clamp at use sites.
+    pub model_max_length: Option<f64>,
     pub chat_template: Option<String>,
 }
 
@@ -132,7 +256,7 @@ impl ModelArtifact {
             root
         };
         let root = root.canonicalize()?;
-        let config = read_json_required(&root.join("config.json"))?;
+        let config = read_hf_config(&root.join("config.json"))?;
         let generation_config = read_json_optional(&root.join("generation_config.json"))?;
         let tokenizer_config = read_json_optional(&root.join("tokenizer_config.json"))?;
         let weights = WeightManifest::from_root(&root)?;
@@ -167,13 +291,13 @@ impl ModelArtifact {
     }
 
     pub fn infer_weight_quantization(&self) -> WeightQuantization {
-        if let Some(quant) = self
-            .config
-            .quantization_config
-            .as_ref()
-            .and_then(|config| config.quant_algo.as_deref())
-        {
-            return WeightQuantization::parse_guess(quant);
+        if let Some(qcfg) = self.config.quantization_config.as_ref() {
+            if let Some(quant) = qcfg.quant_algo.as_deref() {
+                return WeightQuantization::parse_guess(quant);
+            }
+            if let Some(method) = qcfg.quant_method.as_deref() {
+                return WeightQuantization::parse_guess(method);
+            }
         }
         WeightQuantization::parse_guess(self.config.torch_dtype.as_deref().unwrap_or("none"))
     }
@@ -233,6 +357,43 @@ fn read_json_required<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
+/// Reads `config.json` and accommodates the HuggingFace multimodal layout where
+/// the text-model fields are nested under `text_config` (Qwen3.5, Gemma 4,
+/// Nemotron Omni). When `hidden_size` is absent at root but present in
+/// `text_config`, the `text_config` object is flattened into the root before
+/// deserialization. Other nested configs (`vision_config`, `audio_config`) are
+/// preserved as opaque siblings; the planner currently ignores them.
+fn read_hf_config(path: &Path) -> Result<HfConfig> {
+    if !path.exists() {
+        return Err(AegisError::MissingFile(path.to_path_buf()));
+    }
+    let bytes = fs::read(path)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let needs_flatten = value
+        .as_object()
+        .map(|obj| !obj.contains_key("hidden_size") && obj.contains_key("text_config"))
+        .unwrap_or(false);
+    if needs_flatten {
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(serde_json::Value::Object(text_cfg)) = obj.remove("text_config") {
+                for (k, v) in text_cfg {
+                    obj.entry(k).or_insert(v);
+                }
+            }
+        }
+    }
+    // HF moved `torch_dtype` → `dtype` in transformers v5; mirror it back so
+    // existing downstream consumers (`infer_weight_quantization`, etc.) still work.
+    if let Some(obj) = value.as_object_mut() {
+        if !obj.contains_key("torch_dtype") {
+            if let Some(dtype) = obj.get("dtype").cloned() {
+                obj.insert("torch_dtype".into(), dtype);
+            }
+        }
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
 fn read_json_optional<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
     if path.exists() {
         Ok(Some(read_json_required(path)?))
@@ -255,3 +416,90 @@ fn parse_lfs_pointer(path: &Path) -> Result<Option<u64>> {
             .and_then(|value| value.trim().parse::<u64>().ok())
     }))
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::HfConfig;
+
+    fn make_config(effective: Option<&str>) -> HfConfig {
+        HfConfig {
+            architectures: None,
+            model_type: "gemma4".into(),
+            hidden_size: 4096,
+            intermediate_size: Some(16384),
+            num_hidden_layers: 32,
+            num_attention_heads: 8,
+            num_key_value_heads: None,
+            head_dim: None,
+            max_position_embeddings: None,
+            rms_norm_eps: None,
+            rope_scaling: None,
+            rope_theta: None,
+            torch_dtype: None,
+            quantization_config: None,
+            bos_token_id: None,
+            eos_token_id: None,
+            vocab_size: None,
+            sliding_window: None,
+            global_attn_every_n_layers: None,
+            attn_logit_softcapping: None,
+            final_logit_softcapping: None,
+            partial_rotary_factor: None,
+            post_attention_layernorm: None,
+            num_experts: None,
+            num_experts_per_tok: None,
+            moe_intermediate_size: None,
+            shared_expert_intermediate_size: None,
+            num_shared_experts: None,
+            moe_layer_freq: None,
+            use_linear_attention: None,
+            num_linear_attention_layers: None,
+            linear_attn_every_n_layers: None,
+            state_size: None,
+            mamba_num_heads: None,
+            mamba_head_dim: None,
+            expand: None,
+            supported_modalities: None,
+            effective_size: effective.map(String::from),
+            nested_param_sizes: None,
+            num_attention_heads_per_layer: None,
+        }
+    }
+
+    #[test]
+    fn effective_dims_returns_full_when_unset() {
+        let cfg = make_config(None);
+        let d = cfg.effective_dims();
+        assert_eq!(d.hidden_size, 4096);
+        assert_eq!(d.intermediate_size, Some(16384));
+        assert!(!d.is_sliced);
+    }
+
+    #[test]
+    fn effective_dims_halves_for_e2b() {
+        let cfg = make_config(Some("e2b"));
+        let d = cfg.effective_dims();
+        assert_eq!(d.hidden_size, 2048);
+        assert_eq!(d.intermediate_size, Some(8192));
+        assert!(d.is_sliced);
+    }
+
+    #[test]
+    fn effective_dims_full_for_e4b() {
+        let cfg = make_config(Some("e4b"));
+        let d = cfg.effective_dims();
+        assert_eq!(d.hidden_size, 4096);
+        assert_eq!(d.intermediate_size, Some(16384));
+        assert!(!d.is_sliced);
+    }
+
+    #[test]
+    fn effective_dims_falls_back_when_unknown() {
+        let cfg = make_config(Some("eXX"));
+        let d = cfg.effective_dims();
+        assert_eq!(d.hidden_size, 4096);
+        assert!(!d.is_sliced);
+    }
+}
+

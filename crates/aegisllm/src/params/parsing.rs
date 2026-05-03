@@ -103,6 +103,17 @@ impl ParametersFile {
                     ))
                 })?;
             }
+            if let Some(n) = kv.store_first_n {
+                if let Some(first_store) = kv.store_first {
+                    let first = parse_storage(&first_store, cuda_device)?;
+                    // Only meaningful if the per-layer override differs from the default.
+                    if first != policy.kv_store {
+                        policy.kv_vram_layers = Some(n);
+                        // If first N are VRAM, ensure kv_store reflects the non-VRAM default.
+                        // (kv_store was already set above from the `store` field.)
+                    }
+                }
+            }
         }
 
         if let Some(layout) = self.linear_layout {
@@ -148,8 +159,8 @@ impl ParametersFile {
             let base_store = layers
                 .rest_store
                 .as_ref()
-                .or_else(|| if n == 0 { layers.store.as_ref() } else { None });
-            let base_compute = layers.rest_compute.as_ref().or_else(|| {
+                .or(if n == 0 { layers.store.as_ref() } else { None });
+            let base_compute = layers.rest_compute.as_ref().or({
                 if n == 0 {
                     layers.compute.as_ref()
                 } else {

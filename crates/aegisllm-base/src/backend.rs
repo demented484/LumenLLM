@@ -16,6 +16,9 @@ pub enum BackendKind {
 pub struct BackendDescriptor {
     pub kind: BackendKind,
     pub label: String,
+    /// Auto planner only selects this backend when `true`.
+    /// Set to `true` once the backend passes Gates v1 for this backend×dtype pair.
+    pub ready_for_auto: bool,
     pub supports_fp4: bool,
     pub supports_fp8: bool,
     pub supports_flash_attention: bool,
@@ -40,6 +43,7 @@ impl BackendRegistry {
                     "cpu avx2={} avx512={} bf16={}",
                     inventory.cpu.avx2, inventory.cpu.avx512, inventory.cpu.bf16
                 ),
+                ready_for_auto: true,
                 supports_fp4: false,
                 supports_fp8: false,
                 supports_flash_attention: false,
@@ -55,6 +59,7 @@ impl BackendRegistry {
                 BackendDescriptor {
                     kind: BackendKind::Cuda { device: gpu.index },
                     label: format!("cuda:{} {} {:?}", gpu.index, gpu.name, gpu.architecture),
+                    ready_for_auto: true,
                     supports_fp4: tensor_core_precisions.contains(&TensorCorePrecision::Fp4),
                     supports_fp8: tensor_core_precisions.contains(&TensorCorePrecision::Fp8),
                     supports_flash_attention: true,
@@ -76,6 +81,8 @@ impl BackendRegistry {
                 BackendDescriptor {
                     kind: BackendKind::Wgpu { device: idx },
                     label: format!("wgpu:{} {} {:?}", idx, info.name, info.backend),
+                    // wgpu skeleton: not runnable for inference yet
+                    ready_for_auto: false,
                     supports_fp4: false,
                     supports_fp8: false,
                     supports_flash_attention: false,
@@ -213,6 +220,7 @@ mod tests {
         let backend = BackendDescriptor {
             kind: BackendKind::Cpu,
             label: "cpu".into(),
+            ready_for_auto: true,
             supports_fp4: false,
             supports_fp8: false,
             supports_flash_attention: false,

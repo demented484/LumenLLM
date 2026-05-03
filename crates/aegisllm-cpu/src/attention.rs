@@ -35,7 +35,7 @@ impl ReferenceAttentionDecodeRequest<'_> {
                 self.num_attention_heads, self.num_kv_heads, self.head_dim
             )));
         }
-        if self.num_attention_heads % self.num_kv_heads != 0 {
+        if !self.num_attention_heads.is_multiple_of(self.num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "reference attention attention heads must be divisible by kv heads".into(),
             ));
@@ -78,7 +78,7 @@ impl ReferenceAttentionPrefillRequest<'_> {
                 self.num_attention_heads, self.num_kv_heads, self.head_dim
             )));
         }
-        if self.num_attention_heads % self.num_kv_heads != 0 {
+        if !self.num_attention_heads.is_multiple_of(self.num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "reference attention prefill attention heads must be divisible by kv heads".into(),
             ));

@@ -78,13 +78,13 @@ impl LinearLayoutPolicy {
         let (resident_layout, mut notes) =
             plan_resident_layout(choice, backend, source_format, family);
         let extra_weight_bytes = estimate_extra_bytes(source_format, resident_layout, source_bytes);
-        if let Some(limit) = self.max_extra_memory_bytes {
-            if extra_weight_bytes > limit {
-                notes.push(format!(
-                    "layout `{}` estimates extra_weight_bytes={} above max_extra_memory_bytes={}",
-                    resident_layout, extra_weight_bytes, limit
-                ));
-            }
+        if let Some(limit) = self.max_extra_memory_bytes
+            && extra_weight_bytes > limit
+        {
+            notes.push(format!(
+                "layout `{}` estimates extra_weight_bytes={} above max_extra_memory_bytes={}",
+                resident_layout, extra_weight_bytes, limit
+            ));
         }
         LinearLayoutPlan {
             source_format,
@@ -321,6 +321,7 @@ mod tests {
         BackendDescriptor {
             kind: BackendKind::Cuda { device: 0 },
             label: "cuda".into(),
+            ready_for_auto: true,
             supports_fp4: fp4,
             supports_fp8: fp8,
             supports_flash_attention: true,
@@ -381,6 +382,7 @@ mod tests {
         let backend = BackendDescriptor {
             kind: BackendKind::Cpu,
             label: "cpu".into(),
+            ready_for_auto: true,
             supports_fp4: false,
             supports_fp8: false,
             supports_flash_attention: false,

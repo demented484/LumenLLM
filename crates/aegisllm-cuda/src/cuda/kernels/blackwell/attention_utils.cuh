@@ -24,10 +24,15 @@ __device__ __forceinline__ void aegis_scale_wmma_accumulator_m16n16_rows(
 
 #endif
 
+// Butterfly reduction via __shfl_xor_sync delivers the full reduction to ALL
+// 32 lanes (unlike __shfl_down_sync which leaves the result only in lane 0).
+// Required by the WMMA prefill kernels which consume the reduced max/sum
+// per-lane to compute online-softmax weights — using a down-only reduction
+// here yields garbage in lanes 1..31 and silently corrupts the attention output.
 __device__ __forceinline__ float aegis_warp_reduce_max(float value) {
 #pragma unroll
     for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
-        value = fmaxf(value, __shfl_down_sync(0xffffffffu, value, offset));
+        value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, offset));
     }
     return value;
 }
@@ -35,7 +40,7 @@ __device__ __forceinline__ float aegis_warp_reduce_max(float value) {
 __device__ __forceinline__ float aegis_warp_reduce_sum(float value) {
 #pragma unroll
     for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
-        value += __shfl_down_sync(0xffffffffu, value, offset);
+        value += __shfl_xor_sync(0xffffffffu, value, offset);
     }
     return value;
 }

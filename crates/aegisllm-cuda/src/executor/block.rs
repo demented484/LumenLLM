@@ -1,10 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::loader::{CudaLayerShape, load_cuda_layer, runtime_layouts_by_region};
-use super::rope::RopeConfig;
 use super::state::{CudaLayer, CudaLayerState, CudaScratch};
 use aegisllm_base::artifact::ModelArtifact;
-use crate::cuda::{CudaRuntime, CudaRuntimeConfig, DeviceBuffer};
+use crate::cuda::{DECODE_SPLIT_K, CudaRuntime, CudaRuntimeConfig, DeviceBuffer};
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::graph::{ModelGraph, RegionId};
 use aegisllm_base::planning::placement::{ComputePlacement, ResolvedPlacement};
@@ -21,7 +20,6 @@ pub struct CudaLayerBlockExecutor {
     pub(super) num_kv_heads: usize,
     pub(super) head_dim: usize,
     pub(super) rms_norm_eps: f32,
-    pub(super) rope: RopeConfig,
     pub(super) layers: BTreeMap<usize, CudaLayer>,
     pub(super) kv_context_size: usize,
 }
@@ -79,6 +77,29 @@ impl CudaLayerBlockExecutor {
                 .get(&region_id.0)
                 .copied()
                 .unwrap_or(LinearResidentLayout::PackedSource);
+            let layer_meta = graph.layer(layer);
+            let window_size = layer_meta
+                .and_then(|meta| match meta.attention_pattern {
+                    aegisllm_base::model::AttentionPattern::SlidingWindow { size } => Some(size),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let partial_dim = artifact.config.partial_rotary_factor
+                .map(|factor| {
+                    let is_global = matches!(
+                        layer_meta.map(|m| &m.attention_pattern),
+                        Some(aegisllm_base::model::AttentionPattern::FullCausal)
+                    );
+                    if is_global && factor < 1.0 {
+                        (factor as f64 * graph.head_dim as f64).round() as usize
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0);
+            let layer_kind = layer_meta
+                .map(|m| m.kind)
+                .unwrap_or(aegisllm_base::model::LayerKind::DenseDecoder);
             layers.insert(
                 layer,
                 load_cuda_layer(
@@ -86,6 +107,7 @@ impl CudaLayerBlockExecutor {
                     artifact,
                     layer,
                     region.kind,
+                    layer_kind,
                     placement,
                     resident_layout,
                     CudaLayerShape {
@@ -94,7 +116,11 @@ impl CudaLayerBlockExecutor {
                         num_attention_heads: graph.num_attention_heads,
                         num_kv_heads: graph.num_kv_heads,
                         head_dim: graph.head_dim,
+                        is_sliced: graph.is_sliced,
+                        text_prefix: graph.text_prefix.clone(),
                     },
+                    window_size,
+                    partial_dim,
                     &mut loader,
                 )?,
             );
@@ -107,7 +133,6 @@ impl CudaLayerBlockExecutor {
             num_kv_heads: graph.num_kv_heads,
             head_dim: graph.head_dim,
             rms_norm_eps: artifact.config.rms_norm_eps.unwrap_or(1e-5) as f32,
-            rope: RopeConfig::from_artifact(artifact),
             layers,
             kv_context_size: placement.kv_cache.context_size,
         })
@@ -119,8 +144,9 @@ impl CudaLayerBlockExecutor {
         let intermediate = self
             .layers
             .values()
-            .next()
-            .map(|layer| layer.gate_proj.rows)
+            .filter(|l| l.moe.is_none())
+            .map(|l| l.gate_proj.rows)
+            .max()
             .unwrap_or(self.hidden_size);
         let max_cutlass_input = self.hidden_size.max(intermediate);
         let cutlass_payload =
@@ -190,6 +216,15 @@ impl CudaLayerBlockExecutor {
                     .alloc_f32(self.num_attention_heads * self.head_dim)?,
                 k: self.runtime.alloc_f32(kv_width)?,
                 v: self.runtime.alloc_f32(kv_width)?,
+                attn_split_acc: self
+                    .runtime
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K * self.head_dim)?,
+                attn_split_m: self
+                    .runtime
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K)?,
+                attn_split_l: self
+                    .runtime
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K)?,
                 attn_context: self
                     .runtime
                     .alloc_f32(self.num_attention_heads * self.head_dim)?,
@@ -204,6 +239,9 @@ impl CudaLayerBlockExecutor {
                 final_hidden: self.runtime.alloc_f32(self.hidden_size)?,
                 argmax_block_values: self.runtime.alloc_f32(1)?,
                 argmax_block_indices: self.runtime.alloc_u32(1)?,
+                moe: None,
+                staging_pool: None,
+                kv_staging: None,
             },
         })
     }

@@ -7,6 +7,7 @@ mod loader;
 mod mlp;
 mod planning;
 mod prefill;
+pub mod prefix_cache;
 mod provider;
 mod rope;
 mod state;
@@ -48,6 +49,7 @@ mod tests {
                 quantization: KvCacheQuantization::F16,
                 context_size: 1,
                 estimated_bytes: 1,
+                vram_layers: None,
             },
             budget: aegisllm_base::planning::memory::MemoryBudget {
                 ram_total_bytes: 1,
@@ -105,6 +107,7 @@ mod tests {
                 quantization: KvCacheQuantization::F16,
                 context_size: 1,
                 estimated_bytes: 1,
+                vram_layers: None,
             },
             budget: aegisllm_base::planning::memory::MemoryBudget {
                 ram_total_bytes: 1,

@@ -203,6 +203,79 @@ extern "C" __global__ void aegis_nvfp4_linear_reference(
     }
 }
 
+// Tiled batched GEMM for NVfp4 packed weights.
+//
+// Grid : (rows, ceil(total_batch / BATCH_PER_BLOCK))
+// Block: 256 threads = BATCH_PER_BLOCK warps × WARP_SIZE lanes
+//
+// Each block handles ONE weight row × BATCH_PER_BLOCK batch elements.
+// The weight row (packed + scales) is loaded into shared memory ONCE by
+// all 256 threads collaboratively, then every warp reads it from L1
+// while processing its own batch element.  This eliminates the 669×
+// redundant global-memory reloads of the same row that the original
+// per-(row,batch) kernel suffered from.
+extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_gemm(
+    const unsigned char* __restrict__ packed,
+    const unsigned char* __restrict__ scales,
+    const float*         __restrict__ input,
+    const unsigned int rows,
+    const unsigned int cols,
+    const unsigned int total_batch,
+    const float output_scale,
+    float*               __restrict__ output
+) {
+    const unsigned int WARP_SIZE      = 32u;
+    const unsigned int BATCH_PER_BLOCK = 8u;
+
+    const unsigned int row        = blockIdx.x;
+    const unsigned int batch_base = blockIdx.y * BATCH_PER_BLOCK;
+    if (row >= rows) return;
+
+    const unsigned int tid      = threadIdx.x;
+    const unsigned int warp_id  = tid / WARP_SIZE;
+    const unsigned int lane     = tid & (WARP_SIZE - 1u);
+    const unsigned int batch_idx = batch_base + warp_id;
+
+    const unsigned int packed_cols = cols / 2u;
+    const unsigned int scale_cols  = cols / 16u;
+
+    // Shared memory: [packed_cols bytes | scale_cols bytes]
+    extern __shared__ unsigned char sh[];
+    unsigned char* sh_packed = sh;
+    unsigned char* sh_scales = sh + packed_cols;
+
+    // Collaborative load of weight row by all 256 threads.
+    const unsigned char* w_packed = packed + (size_t)row * packed_cols;
+    const unsigned char* w_scales = scales + (size_t)row * scale_cols;
+    for (unsigned int i = tid; i < packed_cols; i += 256u) sh_packed[i] = w_packed[i];
+    for (unsigned int i = tid; i < scale_cols;  i += 256u) sh_scales[i] = w_scales[i];
+    __syncthreads();
+
+    if (batch_idx >= total_batch) return;
+
+    const float* input_row = input + (size_t)batch_idx * cols;
+
+    float sum = 0.0f;
+    for (unsigned int block_idx = lane; block_idx < scale_cols; block_idx += WARP_SIZE) {
+        const float         blk_scale   = decode_ue4m3_half(sh_scales[block_idx]);
+        const unsigned int  input_base  = block_idx * 16u;
+        const unsigned int  packed_base = block_idx * 8u;
+        for (unsigned int j = 0u; j < 8u; ++j) {
+            const unsigned int byte = sh_packed[packed_base + j];
+            sum += (float)decode_nvfp4_nibble(byte & 0x0Fu) * blk_scale * input_row[input_base + 2u*j];
+            sum += (float)decode_nvfp4_nibble(byte >> 4u)   * blk_scale * input_row[input_base + 2u*j + 1u];
+        }
+    }
+
+    // Warp-level reduction via shuffle.
+    for (unsigned int stride = WARP_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        sum += __shfl_down_sync(0xffffffffu, sum, stride);
+    }
+    if (lane == 0u) {
+        output[(size_t)batch_idx * rows + row] = sum * output_scale;
+    }
+}
+
 extern "C" __global__ void aegis_nvfp4_linear_reference_batched(
     const unsigned char* packed,
     const unsigned char* scales,

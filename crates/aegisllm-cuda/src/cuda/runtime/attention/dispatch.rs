@@ -165,7 +165,7 @@ impl CudaRuntime {
         }
         let kv_width = checked_len("paged varlen kv width", num_kv_heads, head_dim)?;
         let physical_slots = key_cache.len() / kv_width;
-        if key_cache.len() % kv_width != 0
+        if !key_cache.len().is_multiple_of(kv_width)
             || value_cache.len() != key_cache.len()
             || physical_slots < max_k
         {
@@ -177,7 +177,7 @@ impl CudaRuntime {
                 value_cache.len()
             )));
         }
-        if num_attention_heads % num_kv_heads != 0 {
+        if !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "paged varlen attention heads must be divisible by kv heads".into(),
             ));
@@ -270,18 +270,12 @@ impl CudaRuntime {
         let split_count = u32_arg("split_count", split_count_usize)?;
         let block_table_stride = u32_arg("block_table_stride", block_table_stride)?;
         let physical_slots = u32_arg("physical_slots", physical_slots)?;
-        let warp_eligible = head_dim_usize <= 256 && head_dim_usize % 32 == 0;
+        let warp_eligible = head_dim_usize <= 256 && head_dim_usize.is_multiple_of(32);
         let use_warp = matches!(
             self.config.prefill_attention,
             CudaPrefillAttentionKernel::WarpFlash
         ) && warp_eligible;
-        let block_dim = if use_fa4_hdim128 {
-            128_u32
-        } else if use_halfq_block4 {
-            128_u32
-        } else {
-            128_u32
-        };
+        let block_dim = 128_u32;
         let mut shared_floats = if use_warp {
             (block_dim / 32) as usize * 3 + head_dim_usize + 4
         } else if use_fa4_hdim128 {

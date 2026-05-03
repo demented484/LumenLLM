@@ -179,7 +179,14 @@ pub enum WeightQuantization {
     Fp16,
     Bf16,
     Q8_0,
+    /// GPTQ / AWQ INT8 weight-only with per-group scales (groupsize 128).
+    Int8,
+    /// GPTQ / AWQ INT4 weight-only with per-group scales (groupsize 128).
+    Int4,
     Nvfp4,
+    /// FP8 E4M3 block-quantized weights (DeepSeek-style 128x128 blocks).
+    /// Used by Qwen3.5-9B-FP8 and similar checkpoints.
+    Fp8E4M3Block,
     Unknown,
 }
 
@@ -188,8 +195,15 @@ impl WeightQuantization {
         let lower = value.to_ascii_lowercase();
         if lower.contains("nvfp4") || lower.contains("fp4") {
             Self::Nvfp4
+        } else if lower.contains("fp8") || lower.contains("float8") {
+            // DeepSeek-style block FP8 quant_method ("fp8") or torch dtype "float8_e4m3fn".
+            Self::Fp8E4M3Block
         } else if lower.contains("q8_0") || lower.contains("q8-0") {
             Self::Q8_0
+        } else if lower.contains("int4") || lower.contains("gptq-4") || lower.contains("awq-4") {
+            Self::Int4
+        } else if lower.contains("int8") || lower.contains("gptq-8") || lower.contains("awq-8") {
+            Self::Int8
         } else if lower.contains("bf16") || lower.contains("bfloat16") {
             Self::Bf16
         } else if lower.contains("fp16") || lower.contains("float16") {
@@ -205,7 +219,10 @@ impl WeightQuantization {
         match self {
             Self::None => Some(4.0),
             Self::Fp16 | Self::Bf16 => Some(2.0),
-            Self::Q8_0 => Some(1.125),
+            Self::Q8_0 | Self::Int8 => Some(1.125),
+            // FP8: 1 byte per weight + per-block scales (~0.06 b extra for 128x128 blocks).
+            Self::Fp8E4M3Block => Some(1.06),
+            Self::Int4 => Some(0.5625),
             Self::Nvfp4 => Some(0.625),
             Self::Unknown => None,
         }
@@ -217,7 +234,10 @@ impl WeightQuantization {
             Self::Fp16 => "fp16",
             Self::Bf16 => "bf16",
             Self::Q8_0 => "q8_0",
+            Self::Int8 => "int8",
+            Self::Int4 => "int4",
             Self::Nvfp4 => "nvfp4",
+            Self::Fp8E4M3Block => "fp8",
             Self::Unknown => "unknown",
         }
     }
@@ -228,7 +248,8 @@ impl WeightQuantization {
             Self::Fp16 => QuantFormat::F16,
             Self::Bf16 => QuantFormat::Bf16,
             Self::Nvfp4 => QuantFormat::Nvfp4,
-            Self::Q8_0 | Self::Unknown => QuantFormat::Unknown,
+            Self::Fp8E4M3Block => QuantFormat::Fp8E4M3Block,
+            Self::Q8_0 | Self::Int8 | Self::Int4 | Self::Unknown => QuantFormat::Unknown,
         }
     }
 }
@@ -245,6 +266,8 @@ pub enum KvCacheQuantization {
     Bf16,
     Q8_0,
     Fp8,
+    /// Blackwell-native FP4 (NVFP4 / E2M1) — 4-bit per element with per-block scales.
+    Nvfp4,
 }
 
 impl KvCacheQuantization {
@@ -254,6 +277,7 @@ impl KvCacheQuantization {
             "bf16" | "bfloat16" => Some(Self::Bf16),
             "q8_0" | "q8-0" => Some(Self::Q8_0),
             "fp8" | "f8" => Some(Self::Fp8),
+            "nvfp4" | "fp4" | "f4" => Some(Self::Nvfp4),
             _ => None,
         }
     }
@@ -262,6 +286,7 @@ impl KvCacheQuantization {
         match self {
             Self::F16 | Self::Bf16 => 2.0,
             Self::Q8_0 | Self::Fp8 => 1.0,
+            Self::Nvfp4 => 0.5,
         }
     }
 
@@ -271,6 +296,7 @@ impl KvCacheQuantization {
             Self::Bf16 => "bf16",
             Self::Q8_0 => "q8_0",
             Self::Fp8 => "fp8",
+            Self::Nvfp4 => "nvfp4",
         }
     }
 }
@@ -380,7 +406,7 @@ const fn pow2i_const(exp: i32) -> f32 {
 }
 
 pub fn quantize_input_nvfp4(input: &[f32], input_scale: f32) -> Option<Vec<f32>> {
-    if input_scale <= 0.0 || input.is_empty() || input.len() % QK_NVFP4_SUB != 0 {
+    if input_scale <= 0.0 || input.is_empty() || !input.len().is_multiple_of(QK_NVFP4_SUB) {
         return None;
     }
     let mut out = vec![0.0_f32; input.len()];
@@ -508,5 +534,24 @@ mod tests {
     fn nvfp4_nibble_matches_ggml_table() {
         assert_eq!(decode_nvfp4_nibble_i8(0x7), 12);
         assert_eq!(decode_nvfp4_nibble_i8(0xf), -12);
+    }
+
+    #[test]
+    fn kv_cache_quant_nvfp4_parse_and_label() {
+        for alias in ["nvfp4", "fp4", "f4"] {
+            let q = KvCacheQuantization::parse(alias).unwrap();
+            assert_eq!(q, KvCacheQuantization::Nvfp4);
+            assert_eq!(q.label(), "nvfp4");
+        }
+        assert!((KvCacheQuantization::Nvfp4.bytes_per_element() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn kv_cache_quant_bytes_per_element() {
+        assert!((KvCacheQuantization::F16.bytes_per_element() - 2.0).abs() < 1e-6);
+        assert!((KvCacheQuantization::Bf16.bytes_per_element() - 2.0).abs() < 1e-6);
+        assert!((KvCacheQuantization::Fp8.bytes_per_element() - 1.0).abs() < 1e-6);
+        assert!((KvCacheQuantization::Q8_0.bytes_per_element() - 1.0).abs() < 1e-6);
+        assert!((KvCacheQuantization::Nvfp4.bytes_per_element() - 0.5).abs() < 1e-6);
     }
 }

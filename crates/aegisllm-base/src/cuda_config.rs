@@ -215,7 +215,7 @@ impl CudaPrefillAttentionSelection {
                         && head_dim == 128
                         && context_len >= 1024;
                 let warp_eligible =
-                    head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores;
+                    head_dim.is_multiple_of(32) && head_dim <= 256 && !oversized_dense_scores;
                 let (logical_backend, effective_path, reason) = if dense_split_k_eligible {
                     if dense_gqa4_eligible {
                         (
@@ -346,7 +346,7 @@ impl CudaPrefillAttentionSelection {
                     } else {
                         CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline
                     }
-                } else if head_dim % 32 == 0 && head_dim <= 256 && !oversized_dense_scores {
+                } else if head_dim.is_multiple_of(32) && head_dim <= 256 && !oversized_dense_scores {
                     CudaAttentionEffectivePath::WarpFlash
                 } else {
                     CudaAttentionEffectivePath::AegisPagedVarlen
@@ -357,7 +357,7 @@ impl CudaPrefillAttentionSelection {
                 requested,
                 auto_target: None,
                 logical_backend: CudaAttentionBackend::Reference,
-                effective_path: if head_dim % 32 == 0 && head_dim <= 256 {
+                effective_path: if head_dim.is_multiple_of(32) && head_dim <= 256 {
                     CudaAttentionEffectivePath::WarpFlash
                 } else if oversized_dense_scores {
                     CudaAttentionEffectivePath::ReferenceContinuation

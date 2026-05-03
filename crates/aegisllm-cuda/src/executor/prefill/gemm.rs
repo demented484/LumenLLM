@@ -1,4 +1,5 @@
 use crate::cuda::{CudaRuntime, DeviceBuffer, DeviceNvfp4Linear};
+use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::error::Result;
 use crate::executor::linear_ops::{
     matvec_nvfp4_batched_device_with_scratch, matvec_nvfp4_prepared_batched_device,
@@ -38,6 +39,7 @@ pub(super) fn prefill_linear_prepared_batched_device(
     batch: usize,
     input_mxfp4: &mut DeviceBuffer<u8>,
     output: &mut DeviceBuffer<f32>,
+    staging: Option<&mut LinearStagingPool>,
 ) -> Result<()> {
     matvec_nvfp4_prepared_batched_device(
         runtime,
@@ -47,6 +49,7 @@ pub(super) fn prefill_linear_prepared_batched_device(
         batch,
         input_mxfp4,
         output,
+        staging,
     )
 }
 
@@ -58,6 +61,7 @@ pub(super) fn prefill_linear_batched_device_with_scratch(
     quantized_input: &mut DeviceBuffer<f32>,
     input_mxfp4: &mut DeviceBuffer<u8>,
     output: &mut DeviceBuffer<f32>,
+    staging: Option<&mut LinearStagingPool>,
 ) -> Result<()> {
     matvec_nvfp4_batched_device_with_scratch(
         runtime,
@@ -67,6 +71,7 @@ pub(super) fn prefill_linear_batched_device_with_scratch(
         quantized_input,
         input_mxfp4,
         output,
+        staging,
     )
 }
 

@@ -24,7 +24,9 @@ impl RopeConfig {
         }
     }
 
-    pub(super) fn to_device(self) -> Result<DeviceRopeConfig> {
+    /// Produce a `DeviceRopeConfig` for a specific layer.
+    /// `partial_dim` > 0 enables p-RoPE for Gemma 4 global layers; 0 = full RoPE.
+    pub(super) fn to_device_with_partial_dim(self, partial_dim: usize) -> Result<DeviceRopeConfig> {
         let low = self.low_freq_factor.unwrap_or(1.0);
         let original_max_position_embeddings =
             u32::try_from(self.original_max_position_embeddings.unwrap_or(8192)).map_err(|_| {
@@ -39,8 +41,10 @@ impl RopeConfig {
             low_freq_factor: low,
             high_freq_factor: self.high_freq_factor.unwrap_or(low),
             original_max_position_embeddings,
+            partial_dim: partial_dim as u32,
         })
     }
+
 }
 
 fn scaling_f32(

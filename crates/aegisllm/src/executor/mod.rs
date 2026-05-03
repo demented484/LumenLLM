@@ -85,12 +85,28 @@ impl Executor {
         self.backend.generate_timed(request)
     }
 
+    pub fn generate_streaming(
+        &self,
+        request: &GenerateRequest,
+        callback: &mut dyn FnMut(usize, &str) -> std::ops::ControlFlow<()>,
+    ) -> Result<GenerateOutput> {
+        aegisllm_base::executor::generation::generate_streaming_with_backend(
+            self.as_primitives(),
+            request,
+            callback,
+        )
+    }
+
     pub fn info(&self) -> ExecutorBackendInfo {
         self.backend.info()
     }
 
     pub fn probe(&self) -> Result<()> {
         self.backend.probe()
+    }
+
+    pub fn as_primitives(&self) -> &dyn GenerationBackendPrimitives {
+        self.backend.as_ref()
     }
 }
 

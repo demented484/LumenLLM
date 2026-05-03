@@ -468,6 +468,7 @@ mod tests {
                 quantization: KvCacheQuantization::F16,
                 context_size: 1,
                 estimated_bytes: 10,
+                vram_layers: None,
             },
             budget: MemoryBudget {
                 ram_total_bytes: 1024,

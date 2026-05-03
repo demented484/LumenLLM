@@ -7,6 +7,8 @@ pub mod executor;
 pub mod generation;
 pub mod graph;
 pub mod hardware;
+pub mod model;
+pub mod modalities;
 pub mod planning;
 pub mod tensor;
 pub mod text;
@@ -20,7 +22,8 @@ pub use cuda_config::{
 pub use cuda_types::CudaAttentionDType;
 pub use error::{AegisError, Result};
 pub use generation::{GenerateOutput, GenerateRequest, SamplingConfig};
-pub use graph::{GraphRegion, GraphRegionKind, ModelGraph, RegionId, TensorRole};
+pub use graph::{GraphRegion, GraphRegionKind, LayerMetadata, ModelGraph, RegionId, TensorRole};
+pub use model::{AttentionPattern, LayerKind, ModelArchitecture, NormPattern, RopeConfig};
 pub use hardware::{ComputeDevice, CpuInfo, GpuArchitecture, GpuInfo, HardwareInventory};
 pub use tensor::{TensorDType, TensorInfo, TensorRegistry};
 pub use text::TextProcessor;

@@ -1,3 +1,5 @@
+use cudarc::driver::PinnedHostSlice;
+
 use super::{CudaRuntime, map_cuda_err};
 use crate::cuda::DeviceBuffer;
 use aegisllm_base::error::Result;
@@ -58,10 +60,22 @@ impl CudaRuntime {
             .clone_dtoh(&buffer.slice)
             .map_err(map_cuda_err("dtoh u32 buffer"))
     }
+
+    /// Allocate CUDA-pinned (page-locked) host memory for `len` u16 elements.
+    /// The returned slice is zero-initialized; CPU reads are uncached (WRITECOMBINED flag
+    /// is NOT used here — KV data is read by the CPU during D2H writeback).
+    pub fn alloc_pinned_u16(&self, len: usize) -> Result<PinnedHostSlice<u16>> {
+        unsafe { self.stream.context().alloc_pinned::<u16>(len) }
+            .map_err(map_cuda_err("alloc pinned u16 for kv host"))
+    }
 }
 
 impl<T> DeviceBuffer<T> {
     pub fn len(&self) -> usize {
         self.slice.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slice.is_empty()
     }
 }

@@ -4,18 +4,20 @@ use super::loader::{
     runtime_layouts_by_region,
 };
 use super::planning::validate_cuda_placement;
-use super::rope::RopeConfig;
 use super::state::{
-    CudaLayer, CudaLayerState, CudaLlamaExecutor, CudaLlamaState, CudaPrefillScratch, CudaScratch,
+    CudaKvCache, CudaLayer, CudaLayerState, CudaLlamaExecutor, CudaLlamaState, CudaMoEScratch,
+    CudaPrefillScratch, CudaScratch, KvStagingPool, KvStagingSlot,
 };
+use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::artifact::ModelArtifact;
 use crate::cuda::{
-    CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, CudaRuntime, CudaRuntimeConfig,
+    CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, DECODE_SPLIT_K, CudaRuntime,
+    CudaRuntimeConfig,
 };
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::executor::tensors::require_tensor;
 use aegisllm_base::graph::{ModelGraph, RegionId};
-use aegisllm_base::planning::placement::ResolvedPlacement;
+use aegisllm_base::planning::placement::{ResolvedPlacement, StoragePlacement};
 use aegisllm_base::planning::runtime::RuntimePlan;
 use aegisllm_base::tensor::layout::LinearResidentLayout;
 use aegisllm_base::tensor::storage::TensorStorageLoader;
@@ -34,7 +36,7 @@ impl CudaLlamaExecutor {
         cuda_config: CudaRuntimeConfig,
     ) -> Result<Self> {
         validate_cuda_placement(placement, device)?;
-        if graph.num_kv_heads == 0 || graph.num_attention_heads % graph.num_kv_heads != 0 {
+        if graph.num_kv_heads == 0 || !graph.num_attention_heads.is_multiple_of(graph.num_kv_heads) {
             return Err(AegisError::InvalidPlan(format!(
                 "CUDA executor requires attention heads divisible by kv heads, got heads={} kv_heads={}",
                 graph.num_attention_heads, graph.num_kv_heads
@@ -56,24 +58,33 @@ impl CudaLlamaExecutor {
             .get(&RegionId("lm_head".into()))
             .ok_or_else(|| AegisError::InvalidPlan("missing lm_head placement".into()))?;
 
+        let embed_name = format!("{}embed_tokens.weight", graph.text_prefix);
         let embed_tokens = cuda_weights.load_bf16_matrix_with_store(
-            require_tensor(artifact, "model.embed_tokens.weight")?,
+            first_existing_tensor(artifact, &[&embed_name, "model.embed_tokens.weight"])?,
             embed_region.store,
             cuda_residency_for_store(embed_region.store, device)?,
             &mut loader,
         )?;
+        let final_norm_name = format!("{}norm.weight", graph.text_prefix);
         let final_norm = cuda_weights.load_dense_vector_with_store(
-            require_tensor(artifact, "model.norm.weight")?,
+            first_existing_tensor(artifact, &[&final_norm_name, "model.norm.weight"])?,
             final_norm_region.store,
             &mut loader,
         )?;
-        let lm_head_tensor =
-            first_existing_tensor(artifact, &["lm_head.weight", "model.embed_tokens.weight"])?;
-        let lm_head = cuda_weights.load_bf16_matrix_with_store(
+        let lm_head_tensor = first_existing_tensor(
+            artifact,
+            &["lm_head.weight", &embed_name, "model.embed_tokens.weight"],
+        )?;
+        // lm_head: force-VRAM regardless of `store=ram` config because the matvec path
+        // against host-pinned BF16 (WRITECOMBINED-uncached for CPU reads) is 30× slower
+        // than the VRAM kernel. Cost: ~1 GB VRAM kept resident even in hetero mode.
+        // embed_tokens (above) honors host-residency since per-token row lookup is cheap.
+        let lm_head = cuda_weights.load_bf16_matrix_with_store_opts(
             lm_head_tensor,
             lm_head_region.store,
             cuda_residency_for_store(lm_head_region.store, device)?,
             &mut loader,
+            true,
         )?;
 
         let mut layers = Vec::with_capacity(graph.num_layers);
@@ -93,11 +104,37 @@ impl CudaLlamaExecutor {
                 .get(&region_id.0)
                 .copied()
                 .unwrap_or(LinearResidentLayout::PackedSource);
+            let layer_meta = graph.layer(layer);
+            let window_size = layer_meta
+                .and_then(|meta| match meta.attention_pattern {
+                    aegisllm_base::model::AttentionPattern::SlidingWindow { size } => Some(size),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            let partial_dim = artifact.config.partial_rotary_factor
+                .map(|factor| {
+                    // Only global layers (FullCausal in Gemma 4) use partial RoPE.
+                    let is_global = matches!(
+                        layer_meta.map(|m| &m.attention_pattern),
+                        Some(aegisllm_base::model::AttentionPattern::FullCausal)
+                    );
+                    if is_global && factor < 1.0 {
+                        (factor as f64 * graph.head_dim as f64).round() as usize
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(0);
+            let layer_kind = graph
+                .layer(layer)
+                .map(|m| m.kind)
+                .unwrap_or(aegisllm_base::model::LayerKind::DenseDecoder);
             layers.push(load_cuda_layer(
                 &cuda_weights,
                 artifact,
                 layer,
                 region.kind,
+                layer_kind,
                 placement,
                 resident_layout,
                 CudaLayerShape {
@@ -106,11 +143,41 @@ impl CudaLlamaExecutor {
                     num_attention_heads: graph.num_attention_heads,
                     num_kv_heads: graph.num_kv_heads,
                     head_dim: graph.head_dim,
+                    is_sliced: graph.is_sliced,
+                    text_prefix: graph.text_prefix.clone(),
                 },
+                window_size,
+                partial_dim,
                 &mut loader,
             )?);
         }
 
+        let has_staged_layers = layers.iter().any(|layer| {
+            [
+                &layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj,
+                &layer.gate_proj, &layer.up_proj, &layer.down_proj,
+            ]
+            .iter()
+            .any(|l| l.is_host_resident())
+            || layer.qkv_proj.as_ref().is_some_and(|l| l.is_host_resident())
+            || layer.moe.as_ref().is_some_and(|moe| {
+                moe.experts.iter().any(|e| {
+                    e.gate_proj.is_host_resident()
+                        || e.up_proj.is_host_resident()
+                        || e.down_proj.is_host_resident()
+                }) || moe.shared_expert.as_ref().is_some_and(|se| {
+                    se.gate_proj.is_host_resident()
+                        || se.up_proj.is_host_resident()
+                        || se.down_proj.is_host_resident()
+                })
+            })
+        });
+
+        let kv_store = placement.kv_cache.store;
+        let kv_vram_layers = placement.kv_cache.vram_layers;
+        let num_layers = graph.num_layers;
+        let has_staged_kv = matches!(kv_store, StoragePlacement::Ram)
+            || kv_vram_layers.is_some_and(|n| n < num_layers);
         Ok(Self {
             runtime: cuda,
             hidden_size: graph.hidden_size,
@@ -118,7 +185,6 @@ impl CudaLlamaExecutor {
             num_kv_heads: graph.num_kv_heads,
             head_dim: graph.head_dim,
             rms_norm_eps: artifact.config.rms_norm_eps.unwrap_or(1e-5) as f32,
-            rope: RopeConfig::from_artifact(artifact),
             embed_tokens,
             final_norm,
             lm_head,
@@ -126,17 +192,33 @@ impl CudaLlamaExecutor {
             kv_context_size: placement.kv_cache.context_size,
             prefill_chunk_size: cuda_prefill_chunk_size(cuda_config),
             prefill_stage_timings_enabled: cuda_config.prefill_stage_timings,
+            lm_head_softcap: graph.lm_head_softcap,
+            has_staged_layers,
+            has_staged_kv,
+            kv_store,
+            kv_vram_layers,
         })
     }
 
     pub(super) fn new_state(&self) -> Result<CudaLlamaState> {
         let kv_width = self.num_kv_heads * self.head_dim;
         let qkv_width = self.num_attention_heads * self.head_dim + 2 * kv_width;
+        // Dense intermediate size: max across non-MoE layers (MoE layers have a 1-row dummy).
         let intermediate = self
             .layers
-            .first()
-            .map(|layer| layer.gate_proj.rows)
+            .iter()
+            .filter(|l| l.moe.is_none())
+            .map(|l| l.gate_proj.rows)
+            .max()
             .unwrap_or(self.hidden_size);
+        // MoE expert intermediate size: max across MoE layers (0 if no MoE layers).
+        let moe_intermediate = self
+            .layers
+            .iter()
+            .filter_map(|l| l.moe.as_ref())
+            .map(|m| m.expert_intermediate_size)
+            .max()
+            .unwrap_or(0);
         let needs_fallback_down_scratch = self.layers.iter().any(|layer| {
             !self
                 .runtime
@@ -155,7 +237,7 @@ impl CudaLlamaExecutor {
             || self
                 .layers
                 .iter()
-                .any(|layer| native_mxfp4_enabled(&self.runtime, &layer.down_proj));
+                .any(|layer| linear_on_native_mxfp4_path(&self.runtime, &layer.down_proj));
         let quant_hidden_len = if needs_quant_hidden_scratch {
             self.prefill_chunk_size * self.hidden_size
         } else {
@@ -268,14 +350,17 @@ impl CudaLlamaExecutor {
             logits: self.runtime.alloc_f32(self.lm_head.rows)?,
             sampled_token: self.runtime.alloc_u32(1)?,
             layers: (0..self.layers.len())
-                .map(|_| {
-                    Ok(CudaLayerState {
-                        kv: super::state::CudaKvCache::dense(
-                            &self.runtime,
-                            self.kv_context_size,
-                            kv_width,
-                        )?,
-                    })
+                .map(|layer_idx| {
+                    let layer_in_vram = match self.kv_vram_layers {
+                        Some(n) => layer_idx < n,
+                        None => !matches!(self.kv_store, StoragePlacement::Ram),
+                    };
+                    let kv = if layer_in_vram {
+                        CudaKvCache::dense(&self.runtime, self.kv_context_size, kv_width)?
+                    } else {
+                        CudaKvCache::staged_host(&self.runtime, self.kv_context_size, kv_width)?
+                    };
+                    Ok(CudaLayerState { kv })
                 })
                 .collect::<Result<Vec<_>>>()?,
             scratch: CudaScratch {
@@ -300,6 +385,15 @@ impl CudaLlamaExecutor {
                     .alloc_f32(self.num_attention_heads * self.head_dim)?,
                 k: self.runtime.alloc_f32(kv_width)?,
                 v: self.runtime.alloc_f32(kv_width)?,
+                attn_split_acc: self
+                    .runtime
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K * self.head_dim)?,
+                attn_split_m: self
+                    .runtime
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K)?,
+                attn_split_l: self
+                    .runtime
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K)?,
                 attn_context: self
                     .runtime
                     .alloc_f32(self.num_attention_heads * self.head_dim)?,
@@ -314,19 +408,121 @@ impl CudaLlamaExecutor {
                 final_hidden: self.runtime.alloc_f32(self.hidden_size)?,
                 argmax_block_values: self.runtime.alloc_f32(self.lm_head.rows.div_ceil(256))?,
                 argmax_block_indices: self.runtime.alloc_u32(self.lm_head.rows.div_ceil(256))?,
+                staging_pool: if self.has_staged_layers {
+                    let (max_packed, max_scale, max_native_mxfp4) = self.max_staged_layer_bytes();
+                    Some(Box::new(LinearStagingPool::new(
+                        max_packed,
+                        max_scale,
+                        max_native_mxfp4,
+                        self.runtime.stream(),
+                    )?))
+                } else {
+                    None
+                },
+                kv_staging: if self.has_staged_kv {
+                    let make_slot = || -> Result<KvStagingSlot> {
+                        Ok(KvStagingSlot {
+                            keys: self.runtime.alloc_u16(self.kv_context_size * kv_width)?,
+                            values: self.runtime.alloc_u16(self.kv_context_size * kv_width)?,
+                            context_size: self.kv_context_size,
+                            kv_width,
+                        })
+                    };
+                    Some(Box::new(KvStagingPool {
+                        slots: [make_slot()?, make_slot()?],
+                        last_compute_event: [None, None],
+                    }))
+                } else {
+                    None
+                },
+                moe: if moe_intermediate > 0 {
+                    let max_input = self.hidden_size.max(moe_intermediate);
+                    Some(Box::new(CudaMoEScratch {
+                        router_logits: self.runtime.alloc_f32(
+                            self.layers
+                                .iter()
+                                .filter_map(|l| l.moe.as_ref())
+                                .map(|m| m.num_experts)
+                                .max()
+                                .unwrap_or(1),
+                        )?,
+                        moe_acc: self.runtime.alloc_f32(self.hidden_size)?,
+                        expert_gate: self.runtime.alloc_f32(moe_intermediate)?,
+                        expert_up: self.runtime.alloc_f32(moe_intermediate)?,
+                        expert_swiglu: self.runtime.alloc_f32(moe_intermediate)?,
+                        expert_out: self.runtime.alloc_f32(self.hidden_size)?,
+                        quant_expert: self.runtime.alloc_f32(max_input)?,
+                        mxfp4_expert: self
+                            .runtime
+                            .alloc_u8(CudaRuntime::mxfp4_vector_bytes(max_input)?)?,
+                    }))
+                } else {
+                    None
+                },
             },
             prefill,
             prefill_timings: super::state::CudaPrefillStageTimings::from_enabled(
                 self.prefill_stage_timings_enabled,
             ),
+            decode_position: self.runtime.alloc_u32(1)?,
+            decode_seq_len: self.runtime.alloc_u32(1)?,
+            decode_graph: None,
         })
     }
+
+    /// Returns `(max_packed_bytes, max_scale_bytes, max_native_mxfp4_bytes)` across all
+    /// host-resident linears in the model.
+    fn max_staged_layer_bytes(&self) -> (usize, usize, usize) {
+        let mut max_p = 0usize;
+        let mut max_s = 0usize;
+        let mut max_m = 0usize;
+        for layer in &self.layers {
+            let linears: Vec<&crate::cuda::DeviceNvfp4Linear> = {
+                let mut v: Vec<&crate::cuda::DeviceNvfp4Linear> = vec![
+                    &layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj,
+                    &layer.gate_proj, &layer.up_proj, &layer.down_proj,
+                ];
+                if let Some(ref qkv) = layer.qkv_proj { v.push(qkv); }
+                if let Some(ref moe) = layer.moe {
+                    for e in &moe.experts {
+                        v.push(&e.gate_proj);
+                        v.push(&e.up_proj);
+                        v.push(&e.down_proj);
+                    }
+                    if let Some(ref se) = moe.shared_expert {
+                        v.push(&se.gate_proj);
+                        v.push(&se.up_proj);
+                        v.push(&se.down_proj);
+                    }
+                }
+                v
+            };
+            for l in linears {
+                if l.is_host_resident() {
+                    max_p = max_p.max(l.packed_bytes);
+                    max_s = max_s.max(l.scale_bytes);
+                    max_m = max_m.max(l.host_resident_native_mxfp4_bytes());
+                }
+            }
+        }
+        (max_p, max_s, max_m)
+    }
+}
+
+/// True if this linear will use the native MXFP4 tensor-core path at inference time.
+/// Covers both VRAM-resident repacked layers and host-resident layers with repacked data.
+fn linear_on_native_mxfp4_path(runtime: &CudaRuntime, linear: &crate::cuda::DeviceNvfp4Linear) -> bool {
+    native_mxfp4_enabled(runtime, linear) || linear.is_host_resident_with_native_mxfp4()
 }
 
 fn prefill_layer_needs_quant_hidden_scratch(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
 ) -> bool {
+    // Uses native_mxfp4_enabled (VRAM only) intentionally: the else branch in layer.rs
+    // still calls rms_norm_quant_nvfp4_batched_device for host-resident layers even when
+    // they have repacked native MXFP4 data in RAM.  quant_hidden must be large enough for
+    // that write even though the data is subsequently ignored by the staged native MXFP4 path.
     let qkv_group_cutlass = layer
         .qkv_proj
         .as_ref()
@@ -377,10 +573,10 @@ fn prefill_layer_needs_mxfp4_hidden_scratch(
         && !qkv_all_cutlass
         && [&layer.q_proj, &layer.k_proj, &layer.v_proj]
             .into_iter()
-            .any(|linear| native_mxfp4_enabled(runtime, linear));
+            .any(|linear| linear_on_native_mxfp4_path(runtime, linear));
 
     let o_needs_mxfp4 = !runtime.cutlass_nvfp4_inference_enabled_for(&layer.o_proj)
-        && native_mxfp4_enabled(runtime, &layer.o_proj);
+        && linear_on_native_mxfp4_path(runtime, &layer.o_proj);
 
     let gate_up_all_cutlass = [&layer.gate_proj, &layer.up_proj]
         .into_iter()
@@ -388,7 +584,7 @@ fn prefill_layer_needs_mxfp4_hidden_scratch(
     let gate_up_needs_mxfp4 = !gate_up_all_cutlass
         && [&layer.gate_proj, &layer.up_proj]
             .into_iter()
-            .any(|linear| native_mxfp4_enabled(runtime, linear));
+            .any(|linear| linear_on_native_mxfp4_path(runtime, linear));
 
     qkv_needs_mxfp4 || o_needs_mxfp4 || gate_up_needs_mxfp4
 }

@@ -1,6 +1,9 @@
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::engine::AegisEngine;
@@ -28,15 +31,36 @@ struct ServerMetrics {
     last_generation_latency_ms: Option<f64>,
 }
 
+/// RAII guard that increments the concurrent-generation counter on creation
+/// and decrements it on drop — gives accurate kv_pages_used metrics.
+struct GenerationGuard {
+    counter: Arc<AtomicI64>,
+}
+impl GenerationGuard {
+    fn new(counter: Arc<AtomicI64>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+impl Drop for GenerationGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Debug)]
 struct ServerState {
     metrics: RefCell<ServerMetrics>,
+    /// Counts how many generation requests are currently in flight.
+    /// Exposed as `kv_pages_used` (one active generation ↔ KV cache in use).
+    active_generations: Arc<AtomicI64>,
 }
 
 impl ServerState {
     fn new() -> Self {
         Self {
             metrics: RefCell::new(ServerMetrics::default()),
+            active_generations: Arc::new(AtomicI64::new(0)),
         }
     }
 
@@ -149,6 +173,20 @@ fn handle_http_connection(
 ) -> Result<()> {
     let request = read_http_request(stream)?;
     state.record_request();
+    if request.method == "GET" && request.path == "/metrics" {
+        let body = metrics_prometheus(state);
+        return write_text_response(stream, 200, "text/plain; version=0.0.4; charset=utf-8", &body);
+    }
+    // Detect SSE streaming: stream:true in body, or Google streamGenerateContent path
+    let is_streaming = request.method == "POST"
+        && (request.path.ends_with(":streamGenerateContent")
+            || serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|v| v.get("stream")?.as_bool())
+                .unwrap_or(false));
+    if is_streaming {
+        return handle_streaming_request(stream, api, engine, readiness, &request, default_sampling, state);
+    }
     let (status, payload) =
         route_http_request(api, engine, readiness, request, default_sampling, state);
     write_json_response(stream, status, payload)
@@ -170,7 +208,7 @@ fn route_http_request(
                 "model": engine.placement.model,
                 "api": {
                     "compatibility": api.name(),
-                    "streaming": false,
+                    "streaming": true,
                     "chat_completions": api == ServerApiCompatibility::OpenAi,
                     "completions": api == ServerApiCompatibility::OpenAi,
                     "messages": api == ServerApiCompatibility::Anthropic,
@@ -305,6 +343,7 @@ fn generate_http_response(
         },
     };
     let started = Instant::now();
+    let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
     match engine.generate(request) {
         Ok(output) if chat => {
             let stats = GenerateStats {
@@ -399,6 +438,7 @@ fn generate_anthropic_response(
         },
     };
     let started = Instant::now();
+    let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
     match engine.generate(request) {
         Ok(output) => {
             let stats = GenerateStats {
@@ -472,6 +512,7 @@ fn generate_google_response(
         },
     };
     let started = Instant::now();
+    let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
     match engine.generate(request) {
         Ok(output) => {
             let stats = GenerateStats {
@@ -504,6 +545,391 @@ fn generate_google_response(
         }
     }
 }
+
+// ── SSE streaming ────────────────────────────────────────────────────────────
+
+fn handle_streaming_request(
+    stream: &mut TcpStream,
+    api: ServerApiCompatibility,
+    engine: &AegisEngine,
+    readiness: &ExecutorReadiness,
+    request: &HttpRequest,
+    default_sampling: SamplingConfig,
+    state: &ServerState,
+) -> Result<()> {
+    if !readiness.runnable {
+        state.record_generation_rejected();
+        let (status, payload) = executor_not_ready(readiness);
+        return write_json_response(stream, status, payload);
+    }
+    let parsed = match serde_json::from_slice::<serde_json::Value>(&request.body) {
+        Ok(v) => v,
+        Err(e) => {
+            return write_json_response(
+                stream,
+                400,
+                serde_json::json!({
+                    "error": {"message": format!("invalid json body: {e}"), "type": "invalid_request_error"}
+                }),
+            );
+        }
+    };
+    match api {
+        ServerApiCompatibility::OpenAi if request.path == "/v1/chat/completions" => {
+            sse_openai(stream, engine, readiness, &parsed, true, default_sampling, state)
+        }
+        ServerApiCompatibility::OpenAi if request.path == "/v1/completions" => {
+            sse_openai(stream, engine, readiness, &parsed, false, default_sampling, state)
+        }
+        ServerApiCompatibility::Anthropic if request.path == "/v1/messages" => {
+            sse_anthropic(stream, engine, readiness, &parsed, default_sampling, state)
+        }
+        ServerApiCompatibility::Google
+            if request.path.starts_with("/v1beta/models/")
+                && (request.path.ends_with(":streamGenerateContent")
+                    || request.path.ends_with(":generateContent")) =>
+        {
+            sse_google(stream, engine, &parsed, default_sampling, state)
+        }
+        _ => write_json_response(
+            stream,
+            404,
+            serde_json::json!({
+                "error": {
+                    "message": format!("streaming not supported for {} {}", request.method, request.path),
+                    "type": "not_found"
+                }
+            }),
+        ),
+    }
+}
+
+fn sse_openai(
+    stream: &mut TcpStream,
+    engine: &AegisEngine,
+    readiness: &ExecutorReadiness,
+    parsed: &serde_json::Value,
+    chat: bool,
+    default_sampling: SamplingConfig,
+    state: &ServerState,
+) -> Result<()> {
+    if let Err(error) = validate_openai_request(engine, parsed) {
+        return write_json_response(
+            stream,
+            400,
+            serde_json::json!({"error": {"message": error, "type": "invalid_request_error"}}),
+        );
+    }
+    let prompt = if chat {
+        match chat_prompt_from_json(engine, parsed) {
+            Ok(p) => p,
+            Err(e) => {
+                return write_json_response(
+                    stream,
+                    400,
+                    serde_json::json!({"error": {"message": e, "type": "invalid_request_error"}}),
+                );
+            }
+        }
+    } else {
+        match completion_prompt_from_json(parsed) {
+            Ok(p) => p,
+            Err(e) => {
+                return write_json_response(
+                    stream,
+                    400,
+                    serde_json::json!({"error": {"message": e, "type": "invalid_request_error"}}),
+                );
+            }
+        }
+    };
+    let gen_request = GenerateRequest {
+        prompt,
+        max_tokens: json_usize_any(parsed, &["max_tokens", "max_completion_tokens"], 32),
+        sampling: SamplingConfig {
+            temperature: json_f32(parsed, "temperature", default_sampling.temperature),
+            top_p: json_f32(parsed, "top_p", default_sampling.top_p),
+            top_k: json_usize(parsed, "top_k", default_sampling.top_k),
+        },
+    };
+
+    write_sse_headers(stream)?;
+
+    let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
+    let id = completion_id(if chat { "chatcmpl" } else { "cmpl" });
+    let created = unix_timestamp();
+    let model = engine.placement.model.clone();
+    let fingerprint = system_fingerprint(readiness);
+    let object = if chat { "chat.completion.chunk" } else { "text_completion.chunk" };
+
+    // Initial role chunk (OpenAI chat convention)
+    if chat {
+        let first = serde_json::json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "system_fingerprint": fingerprint,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]
+        });
+        write_sse_chunk(stream, &format!("data: {}\n\n", first)).ok();
+    }
+
+    let started = Instant::now();
+    let mut finish_str = "stop".to_string();
+
+    let result = engine.generate_streaming(&gen_request, &mut |_tok, tok_text| {
+        let chunk = if chat {
+            serde_json::json!({
+                "id": id, "object": object, "created": created, "model": model,
+                "choices": [{"index": 0, "delta": {"content": tok_text}, "finish_reason": null}]
+            })
+        } else {
+            serde_json::json!({
+                "id": id, "object": object, "created": created, "model": model,
+                "choices": [{"index": 0, "text": tok_text, "finish_reason": null}]
+            })
+        };
+        if write_sse_chunk(stream, &format!("data: {}\n\n", chunk)).is_err() {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+
+    match result {
+        Ok(ref output) => {
+            finish_str = openai_finish_reason(&output.finish_reason).to_string();
+            state.record_generation(
+                started,
+                Some(GenerateStats {
+                    prompt_tokens: output.prompt_tokens,
+                    completion_tokens: output.completion_tokens,
+                }),
+            );
+        }
+        Err(_) => state.record_generation(started, None),
+    }
+
+    // Final stop chunk
+    let final_chunk = if chat {
+        serde_json::json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_str}]
+        })
+    } else {
+        serde_json::json!({
+            "id": id, "object": object, "created": created, "model": model,
+            "choices": [{"index": 0, "text": "", "finish_reason": finish_str}]
+        })
+    };
+    write_sse_chunk(stream, &format!("data: {}\n\n", final_chunk)).ok();
+    write_sse_chunk(stream, "data: [DONE]\n\n").ok();
+    write_sse_end(stream).ok();
+    Ok(())
+}
+
+fn sse_anthropic(
+    stream: &mut TcpStream,
+    engine: &AegisEngine,
+    readiness: &ExecutorReadiness,
+    parsed: &serde_json::Value,
+    default_sampling: SamplingConfig,
+    state: &ServerState,
+) -> Result<()> {
+    let prompt = match chat_prompt_from_json(engine, parsed) {
+        Ok(p) => p,
+        Err(e) => {
+            return write_json_response(
+                stream,
+                400,
+                serde_json::json!({"error": {"message": e, "type": "invalid_request_error"}}),
+            );
+        }
+    };
+    let gen_request = GenerateRequest {
+        prompt,
+        max_tokens: json_usize_any(parsed, &["max_tokens", "max_completion_tokens"], 32),
+        sampling: SamplingConfig {
+            temperature: json_f32(parsed, "temperature", default_sampling.temperature),
+            top_p: json_f32(parsed, "top_p", default_sampling.top_p),
+            top_k: json_usize(parsed, "top_k", default_sampling.top_k),
+        },
+    };
+
+    write_sse_headers(stream)?;
+
+    let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
+    let msg_id = completion_id("msg");
+    let model = engine.placement.model.clone();
+    let fingerprint = system_fingerprint(readiness);
+
+    // message_start
+    let msg_start = serde_json::json!({
+        "type": "message_start",
+        "message": {
+            "id": msg_id, "type": "message", "role": "assistant",
+            "model": model, "system_fingerprint": fingerprint,
+            "content": [], "stop_reason": null,
+            "usage": {"input_tokens": 0, "output_tokens": 0}
+        }
+    });
+    write_sse_chunk(stream, &format!("event: message_start\ndata: {}\n\n", msg_start)).ok();
+
+    // content_block_start
+    let block_start = serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}});
+    write_sse_chunk(stream, &format!("event: content_block_start\ndata: {}\n\n", block_start)).ok();
+    write_sse_chunk(stream, "event: ping\ndata: {\"type\":\"ping\"}\n\n").ok();
+
+    let started = Instant::now();
+    let mut output_tokens = 0usize;
+    let mut stop_reason = "end_turn".to_string();
+
+    let result = engine.generate_streaming(&gen_request, &mut |_tok, tok_text| {
+        let delta = serde_json::json!({
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": tok_text}
+        });
+        if write_sse_chunk(stream, &format!("event: content_block_delta\ndata: {}\n\n", delta)).is_err() {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+
+    match result {
+        Ok(ref output) => {
+            output_tokens = output.completion_tokens;
+            stop_reason = anthropic_stop_reason(&output.finish_reason).to_string();
+            state.record_generation(
+                started,
+                Some(GenerateStats {
+                    prompt_tokens: output.prompt_tokens,
+                    completion_tokens: output.completion_tokens,
+                }),
+            );
+        }
+        Err(_) => state.record_generation(started, None),
+    }
+
+    // content_block_stop
+    write_sse_chunk(stream, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n").ok();
+
+    // message_delta
+    let msg_delta = serde_json::json!({
+        "type": "message_delta",
+        "delta": {"stop_reason": stop_reason, "stop_sequence": null},
+        "usage": {"output_tokens": output_tokens}
+    });
+    write_sse_chunk(stream, &format!("event: message_delta\ndata: {}\n\n", msg_delta)).ok();
+
+    // message_stop
+    write_sse_chunk(stream, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n").ok();
+    write_sse_end(stream).ok();
+    Ok(())
+}
+
+fn sse_google(
+    stream: &mut TcpStream,
+    engine: &AegisEngine,
+    parsed: &serde_json::Value,
+    default_sampling: SamplingConfig,
+    state: &ServerState,
+) -> Result<()> {
+    let prompt = match google_prompt_from_json(parsed) {
+        Ok(p) => p,
+        Err(e) => {
+            return write_json_response(
+                stream,
+                400,
+                serde_json::json!({"error": {"message": e, "type": "invalid_request_error"}}),
+            );
+        }
+    };
+    let generation_config = parsed
+        .get("generationConfig")
+        .unwrap_or(&serde_json::Value::Null);
+    let gen_request = GenerateRequest {
+        prompt,
+        max_tokens: json_usize_any(
+            generation_config,
+            &["maxOutputTokens", "max_tokens", "max_completion_tokens"],
+            32,
+        ),
+        sampling: SamplingConfig {
+            temperature: json_f32(generation_config, "temperature", default_sampling.temperature),
+            top_p: json_f32(generation_config, "topP", default_sampling.top_p),
+            top_k: json_usize(generation_config, "topK", default_sampling.top_k),
+        },
+    };
+
+    write_sse_headers(stream)?;
+
+    let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
+    let model = engine.placement.model.clone();
+    let started = Instant::now();
+    let mut finish_reason_str = "STOP".to_string();
+
+    let result = engine.generate_streaming(&gen_request, &mut |_tok, tok_text| {
+        let chunk = serde_json::json!({
+            "candidates": [{"content": {"role": "model", "parts": [{"text": tok_text}]}, "index": 0}],
+            "modelVersion": model
+        });
+        if write_sse_chunk(stream, &format!("data: {}\n\n", chunk)).is_err() {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+
+    match result {
+        Ok(ref output) => {
+            finish_reason_str = google_finish_reason(&output.finish_reason).to_string();
+            state.record_generation(
+                started,
+                Some(GenerateStats {
+                    prompt_tokens: output.prompt_tokens,
+                    completion_tokens: output.completion_tokens,
+                }),
+            );
+        }
+        Err(_) => state.record_generation(started, None),
+    }
+
+    // Final usage chunk
+    if let Ok(ref output) = result {
+        let final_chunk = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": ""}]},
+                "finishReason": finish_reason_str, "index": 0
+            }],
+            "usageMetadata": {
+                "promptTokenCount": output.prompt_tokens,
+                "candidatesTokenCount": output.completion_tokens,
+                "totalTokenCount": output.prompt_tokens + output.completion_tokens
+            },
+            "modelVersion": engine.placement.model
+        });
+        write_sse_chunk(stream, &format!("data: {}\n\n", final_chunk)).ok();
+    }
+    write_sse_end(stream).ok();
+    Ok(())
+}
+
+fn write_sse_headers(stream: &mut TcpStream) -> Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\naccess-control-allow-origin: *\r\naccess-control-allow-headers: content-type, authorization\r\naccess-control-allow-methods: GET, POST, OPTIONS\r\ntransfer-encoding: chunked\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n"
+    )?;
+    Ok(())
+}
+
+fn write_sse_chunk(stream: &mut TcpStream, frame: &str) -> std::io::Result<()> {
+    write!(stream, "{:x}\r\n", frame.len())?;
+    stream.write_all(frame.as_bytes())?;
+    write!(stream, "\r\n")
+}
+
+fn write_sse_end(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(b"0\r\n\r\n")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     let mut buffer = Vec::new();
@@ -645,14 +1071,15 @@ mod tests {
 
     #[test]
     fn openai_request_validation_rejects_unsupported_fields() {
-        let stream = serde_json::json!({ "model": "loaded", "stream": true });
-        assert!(validate_openai_request_for_model("loaded", &stream).is_err());
-
         let wrong_model = serde_json::json!({ "model": "other" });
         assert!(validate_openai_request_for_model("loaded", &wrong_model).is_err());
 
         let multi_choice = serde_json::json!({ "model": "loaded", "n": 2 });
         assert!(validate_openai_request_for_model("loaded", &multi_choice).is_err());
+
+        // stream:true is now supported — must not be rejected
+        let streaming = serde_json::json!({ "model": "loaded", "stream": true });
+        assert!(validate_openai_request_for_model("loaded", &streaming).is_ok());
     }
 
     #[test]
@@ -683,6 +1110,38 @@ mod tests {
         assert_eq!(metrics["prompt_tokens_total"], 7);
         assert_eq!(metrics["completion_tokens_total"], 3);
         assert!(metrics["generation_latency_ms_avg"].as_f64().unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn prometheus_metrics_emits_all_required_aegis_names() {
+        let state = ServerState::new();
+        state.record_request();
+        state.record_generation(
+            Instant::now(),
+            Some(GenerateStats { prompt_tokens: 10, completion_tokens: 5 }),
+        );
+        let prom = metrics_prometheus(&state);
+        let required = [
+            "aegis_http_requests_total",
+            "aegis_generation_requests_total",
+            "aegis_generation_errors_total",
+            "aegis_generation_rejected_total",
+            "aegis_engine_prefill_tokens_total",
+            "aegis_engine_decode_tokens_total",
+            "aegis_engine_request_latency_seconds_total",
+            "aegis_engine_request_latency_seconds_avg",
+            "aegis_engine_request_latency_seconds_last",
+            "aegis_engine_kv_pages_used",
+            "aegis_engine_kv_pages_free",
+        ];
+        for name in &required {
+            assert!(prom.contains(name), "missing metric: {name}");
+        }
+        // Prometheus format: each metric must have # HELP and # TYPE lines
+        assert!(prom.contains("# HELP aegis_engine_prefill_tokens_total"));
+        assert!(prom.contains("# TYPE aegis_engine_prefill_tokens_total counter"));
+        // Value check: 10 prompt tokens recorded
+        assert!(prom.contains("aegis_engine_prefill_tokens_total 10\n"));
     }
 }
 
@@ -719,13 +1178,6 @@ fn validate_openai_request_for_model(
         return Err(format!(
             "requested model `{model}` does not match loaded model `{loaded_model}`"
         ));
-    }
-    if value
-        .get("stream")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-    {
-        return Err("stream=true is not supported by the MVP OpenAI-compatible server yet".into());
     }
     if let Some(n) = value.get("n").and_then(serde_json::Value::as_u64)
         && n != 1
@@ -841,6 +1293,61 @@ fn metrics_json(state: &ServerState) -> serde_json::Value {
         "generation_latency_ms_avg": average_generation_latency_ms,
         "generation_latency_ms_last": metrics.last_generation_latency_ms,
     })
+}
+
+fn metrics_prometheus(state: &ServerState) -> String {
+    let metrics = state.metrics.borrow();
+    let measured = metrics
+        .generation_requests_total
+        .saturating_sub(metrics.generation_rejected_total);
+    let latency_seconds_total = metrics.generation_latency_ms_total / 1000.0;
+    let latency_seconds_avg = if measured == 0 {
+        0.0
+    } else {
+        latency_seconds_total / measured as f64
+    };
+    let latency_seconds_last = metrics.last_generation_latency_ms.unwrap_or(0.0) / 1000.0;
+    let active = state.active_generations.load(Ordering::Relaxed).max(0) as u64;
+
+    let mut out = String::with_capacity(1024);
+    macro_rules! prom {
+        ($name:literal, $help:literal, $kind:literal, $val:expr) => {
+            out.push_str(concat!("# HELP ", $name, " ", $help, "\n"));
+            out.push_str(concat!("# TYPE ", $name, " ", $kind, "\n"));
+            out.push_str(&format!(concat!($name, " {}\n"), $val));
+        };
+    }
+    prom!("aegis_http_requests_total", "Total HTTP requests received", "counter", metrics.requests_total);
+    prom!("aegis_generation_requests_total", "Total generation requests", "counter", metrics.generation_requests_total);
+    prom!("aegis_generation_errors_total", "Total generation errors", "counter", metrics.generation_errors_total);
+    prom!("aegis_generation_rejected_total", "Total rejected generation requests", "counter", metrics.generation_rejected_total);
+    prom!("aegis_engine_prefill_tokens_total", "Total prompt tokens processed", "counter", metrics.prompt_tokens_total);
+    prom!("aegis_engine_decode_tokens_total", "Total completion tokens generated", "counter", metrics.completion_tokens_total);
+    prom!("aegis_engine_request_latency_seconds_total", "Total generation latency in seconds", "counter", latency_seconds_total);
+    prom!("aegis_engine_request_latency_seconds_avg", "Average generation latency in seconds", "gauge", latency_seconds_avg);
+    prom!("aegis_engine_request_latency_seconds_last", "Last generation latency in seconds", "gauge", latency_seconds_last);
+    prom!("aegis_engine_kv_pages_used", "KV cache pages currently in use", "gauge", active);
+    prom!("aegis_engine_kv_pages_free", "KV cache pages currently free", "gauge", 0u64);
+    out
+}
+
+fn write_text_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> Result<()> {
+    let reason = match status {
+        200 => "OK",
+        _ => "OK",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\naccess-control-allow-origin: *\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body.as_bytes())?;
+    Ok(())
 }
 
 fn json_error(status: u16, message: impl Into<String>) -> (u16, serde_json::Value) {

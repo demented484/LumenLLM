@@ -31,6 +31,14 @@ pub enum KernelFamily {
     CudaNativeFp4TensorCores,
     CudaCutlassFp4TensorCores,
     CudaNativeFp8TensorCores,
+    /// Gated DeltaNet linear-attention (chunked delta-rule prefill + decode).
+    /// Phase 6 stub — kernel not implemented; any plan containing this family
+    /// will be rejected by `cuda_kernel_limitations`.
+    CudaGatedDeltaNet,
+    /// Mamba selective state-space scan (parallel-scan prefill + decode).
+    /// Phase 7 stub — kernel not implemented; any plan containing this family
+    /// will be rejected by `cuda_kernel_limitations`.
+    CudaMambaScan,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,7 +142,9 @@ impl RuntimePlan {
                 KernelFamily::CudaNativeFp4TensorCores
                 | KernelFamily::CudaCutlassFp4TensorCores
                 | KernelFamily::CudaNativeFp8TensorCores
-                | KernelFamily::CudaDenseTensorCores => SyncPolicy::StreamOrdered,
+                | KernelFamily::CudaDenseTensorCores
+                | KernelFamily::CudaGatedDeltaNet
+                | KernelFamily::CudaMambaScan => SyncPolicy::StreamOrdered,
                 KernelFamily::CudaQuantizedReference => SyncPolicy::ExplicitBoundary,
                 KernelFamily::CpuScalar | KernelFamily::CpuSimd => SyncPolicy::StreamOrdered,
             };
@@ -425,6 +435,7 @@ mod tests {
         let backend = BackendDescriptor {
             kind: BackendKind::Cuda { device: 0 },
             label: "cuda".into(),
+            ready_for_auto: true,
             supports_fp4: true,
             supports_fp8: true,
             supports_flash_attention: true,
@@ -442,6 +453,7 @@ mod tests {
         let backend = BackendDescriptor {
             kind: BackendKind::Cuda { device: 0 },
             label: "cuda".into(),
+            ready_for_auto: true,
             supports_fp4: false,
             supports_fp8: false,
             supports_flash_attention: true,

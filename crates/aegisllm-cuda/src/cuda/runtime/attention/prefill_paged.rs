@@ -7,6 +7,7 @@ use crate::cuda::{
 use aegisllm_base::error::{AegisError, Result};
 
 impl CudaRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn attention_prefill_paged_varlen_halfq_wmma_hdim128_gqa4_device(
         &self,
         key_cache: &DeviceBuffer<u16>,
@@ -26,7 +27,7 @@ impl CudaRuntime {
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let head_dim = 128usize;
-        if num_kv_heads == 0 || num_attention_heads % num_kv_heads != 0 {
+        if num_kv_heads == 0 || !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
                 "paged gqa4 wmma attention heads must be divisible by kv heads".into(),
             ));
@@ -149,7 +150,6 @@ impl CudaRuntime {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn attention_prefill_paged_varlen_device(
         &self,
         key_cache: &DeviceBuffer<u16>,

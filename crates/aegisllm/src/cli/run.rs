@@ -1,5 +1,6 @@
 use std::env;
 
+use super::gates::run_gates;
 use super::generate::{print_generate_bench, print_generate_bench_sweep};
 use super::smoke::{
     cpu_materialize_smoke, cpu_smoke, cuda_chain_smoke, cuda_compare, cuda_dense_smoke,
@@ -30,6 +31,7 @@ pub fn run_env() -> Result<()> {
         Command::CudaCompare(config) => cuda_compare(config)?,
         Command::CudaPrefillCompare(config) => cuda_prefill_compare(config)?,
         Command::CudaPrefillSweep(config) => cuda_prefill_sweep(config)?,
+        Command::Gates(config, gates) => run_gates(config, gates)?,
         Command::Generate(config, request) => {
             let engine = AegisEngine::build(config)?;
             let output = engine.generate(request)?;

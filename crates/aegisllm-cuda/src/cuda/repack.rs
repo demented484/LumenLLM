@@ -34,13 +34,13 @@ impl CutlassNvfp4LinearLayout {
     pub const OUTPUT_CHANNEL_ALIGNMENT: usize = 32;
 
     pub fn for_weight(spec: &Nvfp4LinearSpec) -> Result<Self> {
-        if spec.cols % 32 != 0 {
+        if !spec.cols.is_multiple_of(32) {
             return Err(AegisError::InvalidPlan(format!(
                 "`{}` CUTLASS NVFP4 layout requires K divisible by 32, got {}",
                 spec.name, spec.cols
             )));
         }
-        if spec.rows % Self::OUTPUT_CHANNEL_ALIGNMENT != 0 {
+        if !spec.rows.is_multiple_of(Self::OUTPUT_CHANNEL_ALIGNMENT) {
             return Err(AegisError::InvalidPlan(format!(
                 "`{}` CUTLASS NVFP4 layout requires output channels divisible by {}, got {}",
                 spec.name,
@@ -179,7 +179,7 @@ pub(crate) fn repack_nvfp4_to_mxfp4_host(
     packed: &[u8],
     scales: &[u8],
 ) -> Result<Vec<u8>> {
-    if spec.cols % 32 != 0 {
+    if !spec.cols.is_multiple_of(32) {
         return Err(AegisError::InvalidPlan(format!(
             "`{}` native MXFP4 repack requires cols divisible by 32, got {}",
             spec.name, spec.cols
@@ -237,7 +237,7 @@ pub(crate) fn repack_nvfp4_to_mxfp4_host(
 }
 
 fn expected_mxfp4_bytes(spec: &Nvfp4LinearSpec) -> Result<usize> {
-    if spec.cols % 32 != 0 {
+    if !spec.cols.is_multiple_of(32) {
         return Err(AegisError::InvalidPlan(format!(
             "`{}` native MXFP4 repack requires cols divisible by 32, got {}",
             spec.name, spec.cols

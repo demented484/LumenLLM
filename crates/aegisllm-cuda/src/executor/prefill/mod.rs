@@ -61,7 +61,6 @@ impl CudaLlamaExecutor {
         sampling: &SamplingConfig,
     ) -> Result<usize> {
         state.prefill_timings.reset();
-        let rope = self.rope.to_device()?;
         let chunk_size = state.prefill.as_ref().map(|s| s.chunk_size).unwrap_or(1);
         for chunk in prompt_tokens.chunks(chunk_size) {
             let start_position = state.position;
@@ -99,6 +98,12 @@ impl CudaLlamaExecutor {
                 |timings, elapsed| timings.embed_us += elapsed,
             )?;
 
+            let staging_ptr = state.scratch.staging_pool
+                .as_deref_mut()
+                .map_or(std::ptr::null_mut(), |p| p as *mut _);
+            let kv_staging_ptr = state.scratch.kv_staging
+                .as_deref_mut()
+                .map_or(std::ptr::null_mut(), |p| p as *mut _);
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 let layer_state = &mut state.layers[layer_idx];
                 let layer_start = Instant::now();
@@ -117,7 +122,8 @@ impl CudaLlamaExecutor {
                         num_kv_heads: self.num_kv_heads,
                         head_dim: self.head_dim,
                         kv_context_size: self.kv_context_size,
-                        rope,
+                        staging_ptr,
+                        kv_staging_ptr,
                     },
                     &mut state.prefill_timings,
                 )?;

@@ -59,12 +59,31 @@ impl PrefillSlotMapper {
     }
 }
 
+/// Outcome of a `allocate_or_evict` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum KvAllocResult {
+    /// Pages allocated from the free list — no eviction needed.
+    Allocated(PrefillKvSequencePages),
+    /// Free list was exhausted; the given sequence was evicted to make room.
+    EvictedAndAllocated {
+        evicted: PrefillSequenceId,
+        pages: PrefillKvSequencePages,
+    },
+    /// Even after eviction, not enough pages are available (caller's request too large).
+    OutOfMemory,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(super) struct PrefillKvPageAllocator {
     page_tokens: usize,
     free_pages: Vec<u32>,
     active: HashMap<PrefillSequenceId, PrefillKvSequencePages>,
+    /// LRU clock: monotonically increasing tick incremented on each allocation and touch.
+    lru_clock: u64,
+    /// Last-used tick per active sequence (higher = more recently used).
+    lru_ticks: HashMap<PrefillSequenceId, u64>,
 }
 
 #[allow(dead_code)]
@@ -76,6 +95,8 @@ impl PrefillKvPageAllocator {
             page_tokens,
             free_pages,
             active: HashMap::new(),
+            lru_clock: 0,
+            lru_ticks: HashMap::new(),
         }
     }
 
@@ -83,8 +104,20 @@ impl PrefillKvPageAllocator {
         self.free_pages.len()
     }
 
+    pub(super) fn active_sequences(&self) -> usize {
+        self.active.len()
+    }
+
     pub(super) fn pages_for_tokens(&self, tokens: usize) -> usize {
         tokens.div_ceil(self.page_tokens).max(1)
+    }
+
+    /// Touch a sequence to update its LRU position.
+    pub(super) fn touch(&mut self, sequence: PrefillSequenceId) {
+        if self.active.contains_key(&sequence) {
+            self.lru_clock += 1;
+            self.lru_ticks.insert(sequence, self.lru_clock);
+        }
     }
 
     pub(super) fn allocate(
@@ -99,16 +132,58 @@ impl PrefillKvPageAllocator {
         if self.free_pages.len() < need {
             return None;
         }
+        let pages = self.alloc_pages(sequence, need);
+        Some(pages)
+    }
+
+    /// Try to allocate; if the free list is exhausted, evict the LRU non-active
+    /// sequence to reclaim its pages. Returns the allocation outcome.
+    pub(super) fn allocate_or_evict(
+        &mut self,
+        sequence: PrefillSequenceId,
+        tokens: usize,
+        active_sequences: &HashSet<PrefillSequenceId>,
+    ) -> KvAllocResult {
+        if self.active.contains_key(&sequence) {
+            return KvAllocResult::OutOfMemory;
+        }
+        let need = self.pages_for_tokens(tokens);
+        if self.free_pages.len() >= need {
+            let pages = self.alloc_pages(sequence, need);
+            return KvAllocResult::Allocated(pages);
+        }
+        // LRU eviction: pick the oldest sequence not in `active_sequences`
+        let victim = self
+            .lru_ticks
+            .iter()
+            .filter(|(seq, _)| !active_sequences.contains(seq) && **seq != sequence)
+            .min_by_key(|(_, tick)| **tick)
+            .map(|(seq, _)| *seq);
+        let Some(victim_id) = victim else {
+            return KvAllocResult::OutOfMemory;
+        };
+        self.release_sequence(victim_id);
+        if self.free_pages.len() < need {
+            return KvAllocResult::OutOfMemory;
+        }
+        let pages = self.alloc_pages(sequence, need);
+        KvAllocResult::EvictedAndAllocated {
+            evicted: victim_id,
+            pages,
+        }
+    }
+
+    fn alloc_pages(&mut self, sequence: PrefillSequenceId, need: usize) -> PrefillKvSequencePages {
+        self.lru_clock += 1;
+        let tick = self.lru_clock;
         let mut logical_pages = Vec::with_capacity(need);
         for _ in 0..need {
-            logical_pages.push(self.free_pages.pop()?);
+            logical_pages.push(self.free_pages.pop().expect("checked above"));
         }
-        let pages = PrefillKvSequencePages {
-            sequence,
-            logical_pages,
-        };
+        let pages = PrefillKvSequencePages { sequence, logical_pages };
         self.active.insert(sequence, pages.clone());
-        Some(pages)
+        self.lru_ticks.insert(sequence, tick);
+        pages
     }
 
     pub(super) fn release(&mut self, pages: PrefillKvSequencePages) -> bool {
@@ -119,6 +194,7 @@ impl PrefillKvPageAllocator {
             self.active.insert(active.sequence, active);
             return false;
         }
+        self.lru_ticks.remove(&pages.sequence);
         self.release_pages(active.logical_pages);
         true
     }
@@ -127,6 +203,7 @@ impl PrefillKvPageAllocator {
         let Some(active) = self.active.remove(&sequence) else {
             return false;
         };
+        self.lru_ticks.remove(&sequence);
         self.release_pages(active.logical_pages);
         true
     }
@@ -140,8 +217,10 @@ impl PrefillKvPageAllocator {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use super::{
-        PREFILL_KV_PAGE_TOKENS, PrefillKvPageAllocator, PrefillSequenceId, PrefillSlotMapper,
+        KvAllocResult, PREFILL_KV_PAGE_TOKENS, PrefillKvPageAllocator, PrefillSequenceId,
+        PrefillSlotMapper,
     };
 
     #[test]
@@ -182,5 +261,64 @@ mod tests {
         assert_eq!(mapper.physical_slot(3), Some(23));
         assert_eq!(mapper.physical_slot(4), Some(8));
         assert_eq!(mapper.slot_mapping(2, 4).unwrap(), [22, 23, 8, 9]);
+    }
+
+    #[test]
+    fn lru_eviction_evicts_oldest_non_active_sequence() {
+        // 3 pages total. Allocate seq 1 (1 page) then seq 2 (1 page) then seq 3 (1 page).
+        // seq 1 is oldest. Now try to allocate seq 4 (1 page) with seq 2 and 3 marked active.
+        // Expected: seq 1 gets evicted.
+        let mut allocator = PrefillKvPageAllocator::new(3, PREFILL_KV_PAGE_TOKENS);
+        allocator.allocate(PrefillSequenceId(1), 1).unwrap();
+        allocator.allocate(PrefillSequenceId(2), 1).unwrap();
+        allocator.allocate(PrefillSequenceId(3), 1).unwrap();
+        assert_eq!(allocator.free_pages(), 0);
+
+        let mut active: HashSet<PrefillSequenceId> = HashSet::new();
+        active.insert(PrefillSequenceId(2));
+        active.insert(PrefillSequenceId(3));
+        match allocator.allocate_or_evict(PrefillSequenceId(4), 1, &active) {
+            KvAllocResult::EvictedAndAllocated { evicted, pages } => {
+                assert_eq!(evicted, PrefillSequenceId(1));
+                assert_eq!(pages.sequence, PrefillSequenceId(4));
+            }
+            other => panic!("expected EvictedAndAllocated, got {other:?}"),
+        }
+        // seq 1 pages freed, seq 4 now active
+        assert_eq!(allocator.active_sequences(), 3); // seq 2, 3, 4
+    }
+
+    #[test]
+    fn lru_eviction_respects_touch_order() {
+        // 2 pages total. Allocate seq 1 then seq 2. Touch seq 1 (makes it newer).
+        // seq 2 should now be the LRU victim.
+        let mut allocator = PrefillKvPageAllocator::new(2, PREFILL_KV_PAGE_TOKENS);
+        allocator.allocate(PrefillSequenceId(1), 1).unwrap();
+        allocator.allocate(PrefillSequenceId(2), 1).unwrap();
+        allocator.touch(PrefillSequenceId(1)); // seq 1 is now newer
+        assert_eq!(allocator.free_pages(), 0);
+
+        match allocator.allocate_or_evict(PrefillSequenceId(3), 1, &HashSet::new()) {
+            KvAllocResult::EvictedAndAllocated { evicted, .. } => {
+                assert_eq!(evicted, PrefillSequenceId(2), "seq 2 is LRU after touching seq 1");
+            }
+            other => panic!("expected EvictedAndAllocated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lru_returns_out_of_memory_when_all_sequences_active() {
+        let mut allocator = PrefillKvPageAllocator::new(2, PREFILL_KV_PAGE_TOKENS);
+        allocator.allocate(PrefillSequenceId(1), 1).unwrap();
+        allocator.allocate(PrefillSequenceId(2), 1).unwrap();
+
+        // Both sequences are "active" — cannot evict either
+        let mut active = HashSet::new();
+        active.insert(PrefillSequenceId(1));
+        active.insert(PrefillSequenceId(2));
+        assert_eq!(
+            allocator.allocate_or_evict(PrefillSequenceId(3), 1, &active),
+            KvAllocResult::OutOfMemory,
+        );
     }
 }

@@ -6,12 +6,74 @@ use std::sync::Arc;
 
 use memmap2::{Mmap, MmapOptions};
 
-use crate::error::Result;
+use crate::error::{AegisError, Result};
 use crate::graph::{ModelGraph, RegionId, TensorRole};
 use crate::planning::placement::{
     ComputePlacement, ResolvedPlacement, StoragePlacement, TransferPolicy,
 };
-use crate::tensor::TensorInfo;
+use crate::tensor::{TensorDType, TensorInfo};
+
+/// Specifies a submatrix slice to load from a nested-param (MatFormer) weight.
+///
+/// MatFormer-style models (Gemma 4 E2B / E4B) store nested matrices where
+/// the smaller variant uses only the leading rows × leading cols of each
+/// weight.  `NestedParamSlice` describes the slice to extract.
+///
+/// Supported layouts:
+/// - **Row slice**: `cols_end == None` — take leading `rows_end` rows,
+///   all columns (e.g. output projection select-columns).
+/// - **Column slice**: `rows_end == None` — take all rows, leading `cols_end`
+///   columns (e.g. input projection select-features).
+/// - **Submatrix**: both set — take the leading `rows_end × cols_end` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NestedParamSlice {
+    pub rows_end: Option<usize>,
+    pub cols_end: Option<usize>,
+}
+
+impl NestedParamSlice {
+    /// Take only the leading `rows` rows (all columns).
+    pub fn rows(rows: usize) -> Self {
+        Self { rows_end: Some(rows), cols_end: None }
+    }
+
+    /// Take only the leading `cols` columns (all rows).
+    pub fn cols(cols: usize) -> Self {
+        Self { rows_end: None, cols_end: Some(cols) }
+    }
+
+    /// Take the leading `rows × cols` submatrix.
+    pub fn submatrix(rows: usize, cols: usize) -> Self {
+        Self { rows_end: Some(rows), cols_end: Some(cols) }
+    }
+
+    /// Compute the effective shape and byte count for this slice applied to `full_shape`.
+    /// Returns `(effective_rows, effective_cols, byte_count)`.
+    pub fn effective_shape(
+        &self,
+        full_shape: &[usize],
+        dtype: TensorDType,
+    ) -> Result<(usize, usize, usize)> {
+        if full_shape.len() != 2 {
+            return Err(AegisError::InvalidPlan(format!(
+                "NestedParamSlice requires a 2-D tensor, got shape {:?}",
+                full_shape
+            )));
+        }
+        let full_rows = full_shape[0];
+        let full_cols = full_shape[1];
+        let eff_rows = self.rows_end.map_or(full_rows, |r| r.min(full_rows));
+        let eff_cols = self.cols_end.map_or(full_cols, |c| c.min(full_cols));
+        if eff_rows == 0 || eff_cols == 0 {
+            return Err(AegisError::InvalidPlan(
+                "NestedParamSlice would produce an empty tensor".into(),
+            ));
+        }
+        let bytes_per_element = dtype.bytes_per_element();
+        let byte_count = eff_rows * eff_cols * bytes_per_element;
+        Ok((eff_rows, eff_cols, byte_count))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoragePlan {
@@ -156,6 +218,46 @@ impl TensorStorageLoader {
         })
     }
 
+    /// Load a submatrix slice of a 2-D weight tensor (MatFormer / nested-param).
+    ///
+    /// Reads only the bytes that belong to the effective rows × cols block.
+    /// If `slice` covers the full tensor, this is equivalent to a normal load.
+    ///
+    /// Always allocates RAM for the result (copying is required to produce a
+    /// contiguous submatrix when `cols_end` < full_cols).
+    pub fn load_submatrix(
+        &mut self,
+        tensor: &TensorInfo,
+        slice: NestedParamSlice,
+    ) -> Result<LoadedHostTensor> {
+        let (eff_rows, eff_cols, byte_count) =
+            slice.effective_shape(&tensor.shape, tensor.dtype)?;
+        let full_cols = tensor.shape[1];
+        let bytes_per_element = tensor.dtype.bytes_per_element();
+        let full_col_bytes = full_cols * bytes_per_element;
+        let eff_col_bytes = eff_cols * bytes_per_element;
+
+        // Fast path: full rows and full cols → standard load.
+        if eff_rows == tensor.shape[0] && eff_cols == full_cols {
+            return self.load(tensor, HostLoadMode::RamResident);
+        }
+
+        // Read the full tensor bytes (mmap or file read), then extract the submatrix.
+        let map = self.mmap_shard(&tensor.shard_path)?;
+        let file_start = tensor.file_offsets.0 as usize;
+        let data_start = file_start + tensor.data_offsets.0 as usize;
+
+        let mut out = Vec::with_capacity(byte_count);
+        for row in 0..eff_rows {
+            let row_offset = data_start + row * full_col_bytes;
+            out.extend_from_slice(&map[row_offset..row_offset + eff_col_bytes]);
+        }
+        Ok(LoadedHostTensor {
+            name: tensor.name.clone(),
+            storage: HostTensorStorage::Ram(out),
+        })
+    }
+
     fn mmap_shard(&mut self, path: &PathBuf) -> Result<Arc<Mmap>> {
         if let Some(map) = self.mmaps.get(path) {
             return Ok(map.clone());
@@ -277,4 +379,53 @@ fn read_tensor_bytes(tensor: &TensorInfo) -> Result<Vec<u8>> {
     let mut bytes = vec![0_u8; len];
     file.read_exact(&mut bytes)?;
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NestedParamSlice;
+    use crate::tensor::TensorDType;
+
+    #[test]
+    fn nested_param_slice_row_only() {
+        let s = NestedParamSlice::rows(2);
+        let (r, c, b) = s.effective_shape(&[4, 8], TensorDType::F32).unwrap();
+        assert_eq!(r, 2);
+        assert_eq!(c, 8);
+        assert_eq!(b, 2 * 8 * 4);
+    }
+
+    #[test]
+    fn nested_param_slice_col_only() {
+        let s = NestedParamSlice::cols(4);
+        let (r, c, b) = s.effective_shape(&[8, 16], TensorDType::F16).unwrap();
+        assert_eq!(r, 8);
+        assert_eq!(c, 4);
+        assert_eq!(b, 8 * 4 * 2);
+    }
+
+    #[test]
+    fn nested_param_slice_submatrix() {
+        let s = NestedParamSlice::submatrix(3, 5);
+        let (r, c, b) = s.effective_shape(&[6, 10], TensorDType::F32).unwrap();
+        assert_eq!(r, 3);
+        assert_eq!(c, 5);
+        assert_eq!(b, 3 * 5 * 4);
+    }
+
+    #[test]
+    fn nested_param_slice_clamps_to_full_size() {
+        // slice larger than tensor → clamp to full
+        let s = NestedParamSlice::submatrix(100, 100);
+        let (r, c, _) = s.effective_shape(&[4, 8], TensorDType::F32).unwrap();
+        assert_eq!(r, 4);
+        assert_eq!(c, 8);
+    }
+
+    #[test]
+    fn nested_param_slice_rejects_non_2d() {
+        let s = NestedParamSlice::rows(2);
+        assert!(s.effective_shape(&[4, 8, 2], TensorDType::F32).is_err());
+        assert!(s.effective_shape(&[4], TensorDType::F32).is_err());
+    }
 }

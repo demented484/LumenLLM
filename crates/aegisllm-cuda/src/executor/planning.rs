@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::planning::placement::{ComputePlacement, ResolvedPlacement, StoragePlacement};
-use aegisllm_base::planning::runtime::RuntimePlan;
+use aegisllm_base::planning::runtime::{KernelFamily, RuntimePlan};
 use aegisllm_base::tensor::layout::LinearResidentLayout;
 use aegisllm_base::tensor::quant::KvCacheQuantization;
 
@@ -88,11 +88,15 @@ pub(super) fn cuda_limitations(
             "kv-cache compute={other} does not match CUDA provider cuda:{device}"
         )),
     }
-    if placement.kv_cache.quantization != KvCacheQuantization::F16 {
-        limitations.push(format!(
-            "CUDA executor currently supports kv-cache=f16 only, got {}",
-            placement.kv_cache.quantization
-        ));
+    match placement.kv_cache.quantization {
+        KvCacheQuantization::F16 | KvCacheQuantization::Bf16 => {}
+        KvCacheQuantization::Fp8 => {} // store/load kernels implemented (Phase 3.3)
+        KvCacheQuantization::Q8_0 => limitations.push(
+            "kv-cache q8_0 support is planned (Phase 3.4) but the store/load kernel is not yet implemented".into(),
+        ),
+        KvCacheQuantization::Nvfp4 => limitations.push(
+            "kv-cache nvfp4 (Blackwell FP4) support is planned (Phase 3.5) but the store/load kernel is not yet implemented".into(),
+        ),
     }
 
     limitations.extend(cuda_kernel_limitations(runtime));
@@ -112,7 +116,22 @@ pub fn cuda_kernel_limitations(runtime: &RuntimePlan) -> Vec<String> {
     }
     if runtime.count_resident_layout(LinearResidentLayout::RepackedInt4) > 0 {
         limitations.push(
-            "CUDA INT4 materialization is planned but the repack kernel is not implemented".into(),
+            "CUDA INT4 weight-only GEMM is planned (Phase 3.6) but the kernel is not yet implemented".into(),
+        );
+    }
+    if runtime.count_resident_layout(LinearResidentLayout::UnpackedI8Scales) > 0 {
+        limitations.push(
+            "CUDA INT8 weight-only GEMM is planned (Phase 3.5) but the kernel is not yet implemented".into(),
+        );
+    }
+    if runtime.count_family(KernelFamily::CudaGatedDeltaNet) > 0 {
+        limitations.push(
+            "Gated DeltaNet (linear attention) kernel is planned (Phase 6) but not yet implemented".into(),
+        );
+    }
+    if runtime.count_family(KernelFamily::CudaMambaScan) > 0 {
+        limitations.push(
+            "Mamba selective-scan kernel is planned (Phase 7) but not yet implemented".into(),
         );
     }
     limitations.sort();

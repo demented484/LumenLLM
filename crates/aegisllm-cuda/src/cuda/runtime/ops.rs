@@ -19,7 +19,7 @@ fn checked_len(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
 }
 
 fn validate_rope_shape(label: &str, num_heads: usize, head_dim: usize) -> Result<()> {
-    if num_heads == 0 || head_dim == 0 || head_dim % 2 != 0 || head_dim > 256 {
+    if num_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) || head_dim > 256 {
         return Err(AegisError::InvalidPlan(format!(
             "{label} requires non-zero heads and even head_dim <= 256: heads={} head_dim={}",
             num_heads, head_dim
@@ -179,6 +179,7 @@ impl CudaRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn rms_norm_quant_nvfp4_batched_device(
         &self,
         input: &DeviceBuffer<f32>,
@@ -379,6 +380,51 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Like `apply_rope_device` but reads `position` from a device buffer at index 0.
+    /// Use this inside CUDA Graph captures so `position` can vary per replay.
+    pub fn apply_rope_ptr_device(
+        &self,
+        values: &mut DeviceBuffer<f32>,
+        p_position: &DeviceBuffer<u32>,
+        num_heads: usize,
+        head_dim: usize,
+        rope: DeviceRopeConfig,
+    ) -> Result<()> {
+        validate_rope_shape("rope_ptr", num_heads, head_dim)?;
+        let expected_values = checked_len("rope_ptr values", num_heads, head_dim)?;
+        if values.len() != expected_values {
+            return Err(AegisError::InvalidPlan(format!(
+                "rope_ptr shape mismatch: values={} expected={}",
+                values.len(),
+                expected_values
+            )));
+        }
+        let num_heads = u32_arg("num_heads", num_heads)?;
+        let head_dim = u32_arg("head_dim", head_dim)?;
+        let cfg = LaunchConfig {
+            grid_dim: (num_heads, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.rope_ptr)
+                .arg(&mut values.slice)
+                .arg(&p_position.slice)
+                .arg(&num_heads)
+                .arg(&head_dim)
+                .arg(&rope.theta)
+                .arg(&rope.factor)
+                .arg(&rope.low_freq_factor)
+                .arg(&rope.high_freq_factor)
+                .arg(&rope.original_max_position_embeddings)
+                .arg(&rope.partial_dim)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch rope_ptr"))?;
+        Ok(())
+    }
+
     pub fn apply_rope_device(
         &self,
         values: &mut DeviceBuffer<f32>,
@@ -524,6 +570,7 @@ impl CudaRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_rope_positions_batched_f16_out_device(
         &self,
         values: &mut DeviceBuffer<f32>,
@@ -579,6 +626,7 @@ impl CudaRuntime {
                 .arg(&rope.high_freq_factor)
                 .arg(&rope.original_max_position_embeddings)
                 .arg(&mut output.slice)
+                .arg(&rope.partial_dim)
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch positions batched rope f16 output"))?;
@@ -618,6 +666,61 @@ impl CudaRuntime {
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch copy row f32"))?;
+        Ok(())
+    }
+
+    /// Accumulate: `out[i] += alpha * src[i]`. Used for MoE weighted expert combine.
+    pub fn axpy_f32_device(
+        &self,
+        alpha: f32,
+        src: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if src.len() != out.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "axpy_f32 shape mismatch: src={} out={}",
+                src.len(),
+                out.len()
+            )));
+        }
+        let len = u32_arg("len", src.len())?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(src.len() as u32, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.axpy_f32)
+                .arg(&mut out.slice)
+                .arg(&src.slice)
+                .arg(&alpha)
+                .arg(&len)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch axpy_f32"))?;
+        Ok(())
+    }
+
+    /// Zero a float buffer. Used to initialise the MoE accumulator before expert dispatch.
+    pub fn zero_f32_device(&self, out: &mut DeviceBuffer<f32>) -> Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
+        let len = u32_arg("len", out.len())?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(out.len() as u32, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.zero_f32)
+                .arg(&mut out.slice)
+                .arg(&len)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch zero_f32"))?;
         Ok(())
     }
 }

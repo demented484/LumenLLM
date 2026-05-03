@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use cudarc::driver::CudaSlice;
+use cudarc::driver::{CudaSlice, PinnedHostSlice};
 
 use super::repack::CutlassNvfp4LinearLayout;
 use aegisllm_base::error::{AegisError, Result};
@@ -103,6 +103,31 @@ impl CudaAttentionParamsV1 {
     pub const FLAG_GQA: u32 = 1 << 2;
 }
 
+/// Weight bytes kept in host RAM for a heterogeneous (StagedHostToDevice) linear.
+/// The `packed` and `scales` fields of the parent `DeviceNvfp4Linear` are 1-byte
+/// placeholders when this is `Some`; actual data lives here in CUDA-pinned host RAM.
+///
+/// Pinned (page-locked) memory enables:
+///   1. True async DMA H2D copies (no internal driver staging buffer).
+///   2. ~3-5× higher PCIe transfer throughput vs pageable Vec<u8>.
+/// Each `PinnedHostSlice<u8>` is sized exactly to its content; staging hands the
+/// whole slice to `memcpy_htod` so cudarc preserves the pinned semantics
+/// (slicing into a pinned buffer demotes it to pageable in the safe API).
+#[derive(Debug)]
+pub(super) struct HostResidentWeights {
+    pub packed: PinnedHostSlice<u8>,
+    pub scales: PinnedHostSlice<u8>,
+    /// Native MXFP4 repacked layout, if available (requires native_mxfp4_repack=true).
+    /// When present, inference stages this into VRAM and uses tensor-core kernels.
+    pub native_mxfp4: Option<HostResidentMxfp4>,
+}
+
+#[derive(Debug)]
+pub(super) struct HostResidentMxfp4 {
+    pub data: PinnedHostSlice<u8>,
+    pub blocks_per_row: usize,
+}
+
 #[derive(Debug)]
 pub struct DeviceNvfp4Linear {
     pub name: String,
@@ -119,6 +144,17 @@ pub struct DeviceNvfp4Linear {
     pub(super) scales: CudaSlice<u8>,
     pub(super) native_mxfp4: Option<DeviceMxfp4Linear>,
     pub(super) cutlass_nvfp4: Option<DeviceCutlassNvfp4Linear>,
+    /// Non-None for `StagedHostToDevice` layers: weights live in host RAM.
+    /// When set, `packed`/`scales` above are 1-byte stubs (no real VRAM).
+    pub(super) host_weights: Option<Box<HostResidentWeights>>,
+}
+
+impl DeviceNvfp4Linear {
+    /// Returns `true` if this linear's weights live in host RAM (StagedHostToDevice residency).
+    /// In that case a staging VRAM pool must be used for H2D transfer at inference time.
+    pub fn is_host_resident(&self) -> bool {
+        self.host_weights.is_some()
+    }
 }
 
 #[derive(Debug)]
@@ -135,13 +171,32 @@ pub(super) struct DeviceCutlassNvfp4Linear {
     pub scales_ue4m3: CudaSlice<u8>,
 }
 
+/// BF16 matrix stored in CUDA-pinned host RAM for `StagedHostToDevice` residency.
+/// Rows are streamed to a small VRAM scratch buffer for embedding lookup, or the
+/// whole matrix is staged for matvec (used by lm_head).
+#[derive(Debug)]
+pub(super) struct HostBf16Weights {
+    pub values: cudarc::driver::PinnedHostSlice<u16>,
+}
+
 #[derive(Debug)]
 pub struct DeviceBf16Matrix {
     pub name: String,
     pub rows: usize,
     pub cols: usize,
     pub residency: TensorResidencyPlan,
+    /// Tiny VRAM stub when host-resident; full matrix when VRAM-resident.
     pub(super) values: CudaSlice<u16>,
+    /// Set for `StagedHostToDevice` BF16 matrices (e.g. embed_tokens, lm_head when
+    /// `model.store=ram`). When present, callers must use the staging-aware paths.
+    pub(super) host_values: Option<Box<HostBf16Weights>>,
+}
+
+impl DeviceBf16Matrix {
+    /// Host-resident BF16 matrices live in pinned host RAM and stage to VRAM per use.
+    pub fn is_host_resident(&self) -> bool {
+        self.host_values.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +206,8 @@ pub struct DeviceRopeConfig {
     pub low_freq_factor: f32,
     pub high_freq_factor: f32,
     pub original_max_position_embeddings: u32,
+    /// 0 = full head_dim (standard RoPE); >0 = first N dims get RoPE (Gemma 4 p-RoPE).
+    pub partial_dim: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

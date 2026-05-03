@@ -8,10 +8,12 @@ use super::gemm::{
     prefill_qkv_mxfp4_native_device,
 };
 use super::timings::record_prefill_stage;
-use crate::cuda::{CudaRuntime, DensePrefillMetadataProof, DeviceRopeConfig};
+use crate::cuda::{CudaRuntime, DensePrefillMetadataProof};
+use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::error::{AegisError, Result};
 use crate::executor::state::{
-    CudaLayer, CudaLayerState, CudaPrefillScratch, CudaPrefillStageTimings,
+    CudaLayer, CudaLayerState, CudaPrefillScratch, CudaPrefillStageTimings, KvStagingPool,
+    KvStagingSlot,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -25,7 +27,12 @@ pub(super) struct CudaPrefillForwardParams {
     pub(super) num_kv_heads: usize,
     pub(super) head_dim: usize,
     pub(super) kv_context_size: usize,
-    pub(super) rope: DeviceRopeConfig,
+    /// Raw pointer to the shared linear staging pool; null when no staged layers exist.
+    /// Using a raw pointer avoids lifetime entanglement with `CudaLlamaState` fields
+    /// that are already mutably borrowed when this params struct is constructed.
+    pub(super) staging_ptr: *mut LinearStagingPool,
+    /// Raw pointer to the shared KV staging slot; null when KV is VRAM-resident.
+    pub(super) kv_staging_ptr: *mut KvStagingPool,
 }
 
 pub(super) fn forward_cuda_layer_prefill_chunk_device(
@@ -37,7 +44,9 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     timings: &mut CudaPrefillStageTimings,
 ) -> Result<()> {
     let hidden_size = layer.o_proj.rows;
-    let intermediate = layer.gate_proj.rows;
+    // For MoE layers, gate_proj is a dummy (rows=1). The real intermediate lives in
+    // CudaMoE::expert_intermediate_size, but prefill MoE is guarded below.
+    let intermediate = if layer.moe.is_some() { 1 } else { layer.gate_proj.rows };
     // Prefill scratch is lifetime-pooled manually here: Q lives in `gate`
     // until attention finishes, K lives in `up`, and attention context lives
     // in `qkv` after QKV split has consumed it. MLP overwrites gate/up later.
@@ -156,6 +165,9 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.v,
         )?;
     } else {
+        // SAFETY: staging_ptr points to scratch.staging_pool which lives at least as long as this fn.
+        // We reborrow it as `&mut` individually per call; only one reborrow is alive at a time.
+        let sp = params.staging_ptr;
         runtime.rms_norm_quant_nvfp4_batched_device(
             &prefill.hidden,
             &layer.input_norm_weight,
@@ -173,6 +185,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.batch,
             &mut prefill.mxfp4_hidden,
             &mut prefill.gate,
+            if sp.is_null() { None } else { Some(unsafe { &mut *sp }) },
         )?;
         let mut quant_scale = Some(layer.q_proj.input_scale);
         prefill_linear_prepare_nvfp4_input(
@@ -191,6 +204,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.batch,
             &mut prefill.mxfp4_hidden,
             &mut prefill.up,
+            if sp.is_null() { None } else { Some(unsafe { &mut *sp }) },
         )?;
         prefill_linear_prepare_nvfp4_input(
             runtime,
@@ -208,6 +222,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.batch,
             &mut prefill.mxfp4_hidden,
             &mut prefill.v,
+            if sp.is_null() { None } else { Some(unsafe { &mut *sp }) },
         )?;
     }
     let qkv_flops = prefill_gemm_flops(
@@ -227,7 +242,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         params.batch,
         params.num_attention_heads,
         params.head_dim,
-        params.rope,
+        layer.rope,
         &mut prefill.q_half,
     )?;
     record_prefill_stage(runtime, timings, rope_start, |timings, elapsed| {
@@ -235,53 +250,147 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     })?;
 
     let kv_store_start = Instant::now();
-    runtime.store_kv_slots_batched_rope_key_device(
-        &mut layer_state.kv.keys,
-        &mut layer_state.kv.values,
-        &mut prefill.up,
-        &prefill.v,
-        &prefill.positions,
-        &prefill.slot_mapping,
-        params.batch,
-        params.num_kv_heads,
-        params.head_dim,
-        params.kv_context_size,
-        params.dense_metadata,
-        params.rope,
-    )?;
-    record_prefill_stage(runtime, timings, kv_store_start, |timings, elapsed| {
-        timings.kv_store_us += elapsed
-    })?;
+    let kv_is_host = layer_state.kv.is_host_resident();
+    // Prefill uses a single staging slot (slot 0). Async transfer pipelining is
+    // currently a decode-only optimization; prefill remains on the synchronous
+    // upload/writeback path here.
+    let mut kv_staging: Option<&mut KvStagingSlot> = if kv_is_host && !params.kv_staging_ptr.is_null() {
+        let pool = unsafe { &mut *params.kv_staging_ptr };
+        Some(&mut pool.slots[0])
+    } else {
+        None
+    };
 
-    let attention_start = Instant::now();
-    runtime.attention_prefill_dense_compat_device(
-        &layer_state.kv.keys,
-        &layer_state.kv.values,
-        &prefill.up,
-        &prefill.v,
-        &prefill.gate,
-        &mut prefill.q_half,
-        true,
-        &mut prefill.attn_split_acc,
-        &mut prefill.attn_split_m,
-        &mut prefill.attn_split_l,
-        &prefill.slot_mapping,
-        &prefill.cu_q,
-        &prefill.cu_k,
-        &prefill.context_lens,
-        &prefill.block_tables,
-        params.num_sequences,
-        params.start_position,
-        params.batch,
-        params.num_attention_heads,
-        params.num_kv_heads,
-        params.head_dim,
-        &mut prefill.qkv,
-        params.dense_metadata,
-    )?;
-    record_prefill_stage(runtime, timings, attention_start, |timings, elapsed| {
-        timings.attention_us += elapsed
-    })?;
+    if let Some(ref mut staging) = kv_staging.as_deref_mut().filter(|_| kv_is_host) {
+        // Host-resident KV: upload existing entries, store into staging, writeback new batch.
+        let kv_width = params.num_kv_heads * params.head_dim;
+        {
+            let host = layer_state.kv.host.as_ref().unwrap();
+            runtime.upload_kv_slice_device(
+                &mut staging.keys,
+                &host.keys,
+                params.start_position * kv_width,
+            )?;
+            runtime.upload_kv_slice_device(
+                &mut staging.values,
+                &host.values,
+                params.start_position * kv_width,
+            )?;
+        }
+        runtime.store_kv_slots_batched_rope_key_device(
+            &mut staging.keys,
+            &mut staging.values,
+            &mut prefill.up,
+            &prefill.v,
+            &prefill.positions,
+            &prefill.slot_mapping,
+            params.batch,
+            params.num_kv_heads,
+            params.head_dim,
+            params.kv_context_size,
+            params.dense_metadata,
+            layer.rope,
+        )?;
+        record_prefill_stage(runtime, timings, kv_store_start, |timings, elapsed| {
+            timings.kv_store_us += elapsed
+        })?;
+
+        let attention_start = Instant::now();
+        runtime.attention_prefill_dense_compat_device(
+            &staging.keys,
+            &staging.values,
+            &prefill.up,
+            &prefill.v,
+            &prefill.gate,
+            &mut prefill.q_half,
+            true,
+            &mut prefill.attn_split_acc,
+            &mut prefill.attn_split_m,
+            &mut prefill.attn_split_l,
+            &prefill.slot_mapping,
+            &prefill.cu_q,
+            &prefill.cu_k,
+            &prefill.context_lens,
+            &prefill.block_tables,
+            params.num_sequences,
+            params.start_position,
+            params.batch,
+            params.num_attention_heads,
+            params.num_kv_heads,
+            params.head_dim,
+            &mut prefill.qkv,
+            params.dense_metadata,
+        )?;
+        record_prefill_stage(runtime, timings, attention_start, |timings, elapsed| {
+            timings.attention_us += elapsed
+        })?;
+
+        // Writeback the newly-stored batch to host pinned RAM.
+        let kv_width = params.num_kv_heads * params.head_dim;
+        let host = layer_state.kv.host.as_mut().unwrap();
+        runtime.writeback_kv_batch_device(
+            &mut host.keys,
+            &staging.keys,
+            params.start_position,
+            params.batch,
+            kv_width,
+        )?;
+        runtime.writeback_kv_batch_device(
+            &mut host.values,
+            &staging.values,
+            params.start_position,
+            params.batch,
+            kv_width,
+        )?;
+    } else {
+        runtime.store_kv_slots_batched_rope_key_device(
+            &mut layer_state.kv.keys,
+            &mut layer_state.kv.values,
+            &mut prefill.up,
+            &prefill.v,
+            &prefill.positions,
+            &prefill.slot_mapping,
+            params.batch,
+            params.num_kv_heads,
+            params.head_dim,
+            params.kv_context_size,
+            params.dense_metadata,
+            layer.rope,
+        )?;
+        record_prefill_stage(runtime, timings, kv_store_start, |timings, elapsed| {
+            timings.kv_store_us += elapsed
+        })?;
+
+        let attention_start = Instant::now();
+        runtime.attention_prefill_dense_compat_device(
+            &layer_state.kv.keys,
+            &layer_state.kv.values,
+            &prefill.up,
+            &prefill.v,
+            &prefill.gate,
+            &mut prefill.q_half,
+            true,
+            &mut prefill.attn_split_acc,
+            &mut prefill.attn_split_m,
+            &mut prefill.attn_split_l,
+            &prefill.slot_mapping,
+            &prefill.cu_q,
+            &prefill.cu_k,
+            &prefill.context_lens,
+            &prefill.block_tables,
+            params.num_sequences,
+            params.start_position,
+            params.batch,
+            params.num_attention_heads,
+            params.num_kv_heads,
+            params.head_dim,
+            &mut prefill.qkv,
+            params.dense_metadata,
+        )?;
+        record_prefill_stage(runtime, timings, attention_start, |timings, elapsed| {
+            timings.attention_us += elapsed
+        })?;
+    }
 
     let o_proj_start = Instant::now();
     if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.o_proj) {
@@ -296,6 +405,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.input_normed,
         )?;
     } else {
+        let sp = params.staging_ptr;
         prefill_linear_batched_device_with_scratch(
             runtime,
             &layer.o_proj,
@@ -304,6 +414,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.quant_hidden,
             &mut prefill.mxfp4_hidden,
             &mut prefill.input_normed,
+            if sp.is_null() { None } else { Some(unsafe { &mut *sp }) },
         )?;
     }
     record_prefill_stage(runtime, timings, o_proj_start, |timings, elapsed| {
@@ -319,6 +430,13 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.input_normed, batch_hidden)?;
 
     let mlp_start = Instant::now();
+    if layer.moe.is_some() {
+        // MoE prefill requires per-token expert routing with grouped GEMM.
+        // Deferred to Phase 5.1; MoE models must use decode-only mode for now.
+        return Err(AegisError::Unsupported(
+            "MoE prefill chunking not yet implemented; use single-token (decode) mode".into(),
+        ));
+    }
     if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.gate_proj)
         && prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.up_proj)
     {
@@ -372,6 +490,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.up,
         )?;
     } else {
+        let sp = params.staging_ptr;
         runtime.rms_norm_quant_nvfp4_batched_device(
             &prefill.hidden,
             &layer.post_attention_norm_weight,
@@ -389,6 +508,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.batch,
             &mut prefill.mxfp4_hidden,
             &mut prefill.gate,
+            if sp.is_null() { None } else { Some(unsafe { &mut *sp }) },
         )?;
         let mut quant_scale = Some(layer.gate_proj.input_scale);
         prefill_linear_prepare_nvfp4_input(
@@ -407,6 +527,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.batch,
             &mut prefill.mxfp4_hidden,
             &mut prefill.up,
+            if sp.is_null() { None } else { Some(unsafe { &mut *sp }) },
         )?;
     }
     if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.down_proj) {
@@ -442,6 +563,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.input_normed,
         )?;
     } else {
+        let sp = params.staging_ptr;
         runtime.swiglu_inplace_gate_device_len(
             &mut prefill.gate,
             &prefill.up,
@@ -455,6 +577,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.quant_intermediate,
             &mut prefill.mxfp4_intermediate,
             &mut prefill.input_normed,
+            if sp.is_null() { None } else { Some(unsafe { &mut *sp }) },
         )?;
     }
     runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.input_normed, batch_hidden)?;

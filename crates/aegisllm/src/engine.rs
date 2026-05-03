@@ -126,8 +126,24 @@ impl AegisEngine {
         executor.generate_timed(&request)
     }
 
+    pub fn generate_streaming(
+        &self,
+        request: &GenerateRequest,
+        callback: &mut dyn FnMut(usize, &str) -> std::ops::ControlFlow<()>,
+    ) -> Result<GenerateOutput> {
+        let executor = self
+            .executor
+            .as_ref()
+            .ok_or_else(|| AegisError::Unsupported("engine was built without executor".into()))?;
+        executor.generate_streaming(request, callback)
+    }
+
     pub fn executor_info(&self) -> Option<ExecutorBackendInfo> {
         self.executor.as_ref().map(Executor::info)
+    }
+
+    pub fn executor(&self) -> Option<&Executor> {
+        self.executor.as_ref()
     }
 
     pub fn probe_executor(&self) -> Result<()> {

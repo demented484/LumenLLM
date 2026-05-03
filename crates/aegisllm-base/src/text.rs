@@ -41,10 +41,10 @@ impl TextProcessor {
             .iter()
             .map(|id| *id as usize)
             .collect::<Vec<_>>();
-        if ids.is_empty() {
-            if let Some(bos) = self.bos_token_id {
-                ids.push(bos);
-            }
+        if ids.is_empty()
+            && let Some(bos) = self.bos_token_id
+        {
+            ids.push(bos);
         }
         Ok(ids)
     }

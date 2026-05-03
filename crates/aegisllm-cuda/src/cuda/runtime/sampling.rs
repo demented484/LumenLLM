@@ -12,7 +12,7 @@ impl CudaRuntime {
         block_indices: &mut DeviceBuffer<u32>,
         output_token: &mut DeviceBuffer<u32>,
     ) -> Result<()> {
-        if logits.len() == 0 || output_token.len() != 1 {
+        if logits.is_empty() || output_token.len() != 1 {
             return Err(AegisError::InvalidPlan(format!(
                 "argmax shape mismatch: logits={} output={}",
                 logits.len(),

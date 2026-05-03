@@ -26,12 +26,12 @@ pub(super) fn resident_layout_for_region(
         .unwrap_or(LinearResidentLayout::PackedSource)
 }
 
-pub(super) fn first_cuda_nvfp4_region<'a>(
-    engine: &'a AegisEngine,
+pub(super) fn first_cuda_nvfp4_region(
+    engine: &AegisEngine,
 ) -> Result<(
     usize,
-    &'a crate::graph::GraphRegion,
-    &'a crate::planning::placement::RegionPlacement,
+    &crate::graph::GraphRegion,
+    &crate::planning::placement::RegionPlacement,
 )> {
     let device = match engine
         .placement

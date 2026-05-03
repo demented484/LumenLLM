@@ -2,4 +2,7 @@
 
 pub mod wgpu;
 
-pub use wgpu::{rms_norm_gpu, WgpuContext, WgpuExecutorProvider, WgpuLlamaState};
+pub use wgpu::{
+    decode_attention_gpu, embedding_gpu, matmul_f32_gpu, residual_add_gpu, rms_norm_gpu, rope_gpu,
+    swiglu_gpu, WgpuContext, WgpuExecutorProvider, WgpuLlamaState,
+};

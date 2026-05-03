@@ -1,6 +1,7 @@
 mod command;
 mod flags;
 mod generate;
+pub mod gates;
 mod helpers;
 mod parse;
 mod run;
@@ -181,6 +182,46 @@ mod tests {
         assert!(config.cuda.native_mxfp4_repack);
         assert!(config.cuda.cutlass_nvfp4_repack);
         assert!(config.cuda.native_mxfp4_inference);
+    }
+
+    #[test]
+    fn gates_parses_backend_and_mode_flags() {
+        use crate::cli::gates::{GatesBackend, GatesMode};
+
+        let command = parse_args([
+            "gates".to_string(),
+            "--model".to_string(),
+            "/tmp/model".to_string(),
+            "--backend".to_string(),
+            "cpu".to_string(),
+            "--full".to_string(),
+        ])
+        .expect("gates should parse");
+
+        let Command::Gates(config, gates) = command else {
+            panic!("expected gates command");
+        };
+        assert_eq!(config.model_path, PathBuf::from("/tmp/model"));
+        assert_eq!(gates.backend, GatesBackend::Cpu);
+        assert_eq!(gates.mode, GatesMode::Full);
+    }
+
+    #[test]
+    fn gates_defaults_to_cuda_quick() {
+        use crate::cli::gates::{GatesBackend, GatesMode};
+
+        let command = parse_args([
+            "gates".to_string(),
+            "--model".to_string(),
+            "/tmp/model".to_string(),
+        ])
+        .expect("gates should parse");
+
+        let Command::Gates(_, gates) = command else {
+            panic!("expected gates command");
+        };
+        assert_eq!(gates.backend, GatesBackend::Cuda);
+        assert_eq!(gates.mode, GatesMode::Quick);
     }
 
     #[test]

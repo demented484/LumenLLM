@@ -1,23 +1,143 @@
 use super::attention::forward_attention_device;
 use super::block::{CudaLayerBlockExecutor, CudaLayerBlockState};
 use super::mlp::forward_mlp_device;
-use super::state::{CudaLayer, CudaLayerState, CudaLlamaExecutor, CudaLlamaState, CudaScratch};
-use crate::cuda::{CudaRuntime, DeviceBuffer, DeviceRopeConfig};
+use super::state::{CudaLayer, CudaLayerState, CudaLlamaExecutor, CudaLlamaState, CudaScratch, SendCudaGraph};
+use crate::cuda::{CUDA_GRAPH_ATTN_MAX_SEQ_LEN, CudaRuntime, DeviceBuffer};
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::generation::SamplingConfig;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct CudaLayerForwardParams {
     pub(super) rms_norm_eps: f32,
-    pub(super) position: usize,
     pub(super) num_attention_heads: usize,
     pub(super) num_kv_heads: usize,
     pub(super) head_dim: usize,
     pub(super) kv_context_size: usize,
-    pub(super) rope: DeviceRopeConfig,
+    /// Host-side token position (0-indexed). Needed by host-resident KV staging:
+    /// upload `position` existing entries before store, writeback at `position` after.
+    pub(super) position: usize,
+    /// Host-side sequence length = position + 1.
+    pub(super) seq_len: usize,
+    /// When `Some(idx)`, layer is host-resident and uses `kv_staging.slots[idx]`.
+    pub(super) staging_slot_idx: Option<usize>,
 }
 
 impl CudaLlamaExecutor {
+    /// Run all transformer layers for the current decode step.
+    /// decode_position and decode_seq_len must already be updated before calling this.
+    ///
+    /// For host-resident KV layers, this orchestrates an async PCIe transfer pipeline:
+    /// layer L+1's H2D upload runs on the dedicated transfer stream while layer L's
+    /// compute runs on the compute stream. The two ping-pong staging slots ensure
+    /// no buffer conflicts. After each host-resident layer's attention, the new KV
+    /// slot is asynchronously written back via the transfer stream.
+    fn forward_layers_device(&self, state: &mut CudaLlamaState, position: usize) -> Result<()> {
+        let base_params = CudaLayerForwardParams {
+            rms_norm_eps: self.rms_norm_eps,
+            num_attention_heads: self.num_attention_heads,
+            num_kv_heads: self.num_kv_heads,
+            head_dim: self.head_dim,
+            kv_context_size: self.kv_context_size,
+            position,
+            seq_len: position + 1,
+            staging_slot_idx: None,
+        };
+        let kv_width = self.num_kv_heads * self.head_dim;
+        let CudaLlamaState {
+            ref mut layers,
+            ref mut hidden,
+            ref mut scratch,
+            ref decode_position,
+            ref decode_seq_len,
+            ..
+        } = *state;
+
+        // Pre-issue H2D for layer 0 if it's host-resident (no overlap possible).
+        // Holds the H2D event for the layer whose iteration is *about to start*.
+        let mut current_h2d_event: Option<cudarc::driver::CudaEvent> =
+            issue_h2d_for_layer(&self.runtime, scratch, layers, 0, position, kv_width)?;
+
+        for layer_idx in 0..self.layers.len() {
+            let host_resident = layers[layer_idx].kv.is_host_resident();
+            let staging_slot_idx = if host_resident { Some(layer_idx % 2) } else { None };
+
+            // Prefetch H2D for the next layer onto the transfer stream BEFORE we
+            // start compute on this layer, so it overlaps with this layer's kernels.
+            // This is queued on the transfer stream after the current H2D but before
+            // any subsequent D2H — so it can run in parallel with compute on the
+            // compute stream.
+            let next_h2d_event = if layer_idx + 1 < self.layers.len() {
+                issue_h2d_for_layer(
+                    &self.runtime,
+                    scratch,
+                    layers,
+                    layer_idx + 1,
+                    position,
+                    kv_width,
+                )?
+            } else {
+                None
+            };
+
+            // Make compute stream wait for THIS layer's H2D (if host-resident).
+            if host_resident {
+                let evt = current_h2d_event.as_ref().ok_or_else(|| {
+                    AegisError::InvalidPlan(
+                        "missing H2D event for host-resident layer".into(),
+                    )
+                })?;
+                self.runtime.compute_wait_event(evt)?;
+            }
+
+            let mut params = base_params;
+            params.staging_slot_idx = staging_slot_idx;
+
+            let layer = &self.layers[layer_idx];
+            let layer_state = &mut layers[layer_idx];
+            forward_cuda_layer_device(
+                &self.runtime,
+                layer,
+                layer_state,
+                hidden,
+                scratch,
+                decode_position,
+                decode_seq_len,
+                params,
+            )?;
+
+            // Schedule async D2H of the new KV slot on the transfer stream after
+            // the compute stream finishes the attention store + read. This overlaps
+            // with the next layer's compute.
+            if host_resident {
+                let compute_evt = self.runtime.record_compute_event()?;
+                self.runtime.transfer_wait_event(&compute_evt)?;
+                let slot_idx = staging_slot_idx.unwrap();
+                // Re-borrow the pool to schedule the D2H. Disjoint from the
+                // current and next H2D since this writes the host KV (a separate
+                // memory region) and reads the staging slot we just finished.
+                let pool = scratch.kv_staging.as_mut().ok_or_else(|| {
+                    AegisError::InvalidPlan("missing kv_staging pool".into())
+                })?;
+                let slot = &pool.slots[slot_idx];
+                let host = layers[layer_idx]
+                    .kv
+                    .host
+                    .as_mut()
+                    .ok_or_else(|| AegisError::InvalidPlan("layer host kv missing".into()))?;
+                // Take an immutable view into staging since slot is a different
+                // borrow than host.
+                self.runtime
+                    .writeback_kv_slot_async(&mut host.keys, &slot.keys, position, kv_width)?;
+                self.runtime
+                    .writeback_kv_slot_async(&mut host.values, &slot.values, position, kv_width)?;
+            }
+
+            current_h2d_event = next_h2d_event;
+        }
+
+        Ok(())
+    }
+
     pub(super) fn forward_hidden(&self, state: &mut CudaLlamaState, token_id: usize) -> Result<()> {
         if state.position >= self.kv_context_size {
             return Err(AegisError::InvalidPlan(format!(
@@ -27,26 +147,18 @@ impl CudaLlamaExecutor {
         }
         self.runtime
             .bf16_row_to_f32_device(&self.embed_tokens, token_id, &mut state.hidden)?;
-        let rope = self.rope.to_device()?;
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let layer_state = &mut state.layers[layer_idx];
-            forward_cuda_layer_device(
-                &self.runtime,
-                layer,
-                layer_state,
-                &mut state.hidden,
-                &mut state.scratch,
-                CudaLayerForwardParams {
-                    rms_norm_eps: self.rms_norm_eps,
-                    position: state.position,
-                    num_attention_heads: self.num_attention_heads,
-                    num_kv_heads: self.num_kv_heads,
-                    head_dim: self.head_dim,
-                    kv_context_size: self.kv_context_size,
-                    rope,
-                },
-            )?;
-        }
+
+        let seq_len = state.position + 1;
+        self.runtime.copy_u32_to_device(
+            &[state.position as u32],
+            &mut state.decode_position,
+        )?;
+        self.runtime.copy_u32_to_device(
+            &[seq_len as u32],
+            &mut state.decode_seq_len,
+        )?;
+
+        self.forward_layers_device(state, state.position)?;
         state.position += 1;
         Ok(())
     }
@@ -63,7 +175,11 @@ impl CudaLlamaExecutor {
             &state.scratch.final_hidden,
             &mut state.logits,
         )?;
-        self.runtime.download_f32(&state.logits)
+        let mut logits = self.runtime.download_f32(&state.logits)?;
+        if let Some(cap) = self.lm_head_softcap {
+            aegisllm_base::executor::generation::apply_logit_softcap(&mut logits, cap);
+        }
+        Ok(logits)
     }
 
     pub(super) fn sample_next_from_current_hidden(
@@ -82,8 +198,12 @@ impl CudaLlamaExecutor {
             &state.scratch.final_hidden,
             &mut state.logits,
         )?;
-        if sampling.temperature > 0.0 && sampling.top_k != 1 {
-            let logits = self.runtime.download_f32(&state.logits)?;
+        let non_greedy = sampling.temperature > 0.0 && sampling.top_k != 1;
+        if non_greedy || self.lm_head_softcap.is_some() {
+            let mut logits = self.runtime.download_f32(&state.logits)?;
+            if let Some(cap) = self.lm_head_softcap {
+                aegisllm_base::executor::generation::apply_logit_softcap(&mut logits, cap);
+            }
             return aegisllm_base::executor::generation::sample_next_token(&logits, sampling);
         }
         self.runtime.argmax_f32_device(
@@ -115,12 +235,102 @@ impl CudaLlamaExecutor {
         token_id: usize,
         sampling: &SamplingConfig,
     ) -> Result<usize> {
-        if sampling.temperature > 0.0 && sampling.top_k != 1 {
-            let logits = self.forward_logits(state, token_id)?;
+        let non_greedy = sampling.temperature > 0.0 && sampling.top_k != 1;
+
+        if state.position >= self.kv_context_size {
+            return Err(AegisError::InvalidPlan(format!(
+                "kv cache context exhausted: position={} context={}",
+                state.position, self.kv_context_size
+            )));
+        }
+
+        self.runtime
+            .bf16_row_to_f32_device(&self.embed_tokens, token_id, &mut state.hidden)?;
+
+        let seq_len = state.position + 1;
+        // Update dynamic decode params BEFORE capture/replay (outside the captured graph).
+        self.runtime.copy_u32_to_device(
+            &[state.position as u32],
+            &mut state.decode_position,
+        )?;
+        self.runtime.copy_u32_to_device(
+            &[seq_len as u32],
+            &mut state.decode_seq_len,
+        )?;
+
+        if let Some(ref graph) = state.decode_graph {
+            // Hot path: replay the previously captured graph (32 layers + norm + lm_head + argmax).
+            // For non-greedy we'll download logits from state.logits; the argmax is a no-op for us.
+            self.runtime.replay_decode_graph(&graph.0)?;
+        } else {
+            let can_capture = seq_len <= CUDA_GRAPH_ATTN_MAX_SEQ_LEN
+                && !self.has_staged_layers
+                && !self.has_staged_kv;
+            if can_capture {
+                self.runtime.begin_decode_graph_capture()?;
+            }
+
+            let position = state.position;
+            self.forward_layers_device(state, position)?;
+
+            // Final norm + lm_head + argmax (graph-compatible: no dynamic scalar params).
+            // Argmax is always captured in the graph even for non-greedy — we'll just ignore
+            // the sampled_token result and download state.logits directly if non_greedy.
+            {
+                let CudaLlamaState {
+                    ref hidden,
+                    ref mut scratch,
+                    ref mut logits,
+                    ref mut sampled_token,
+                    ..
+                } = *state;
+                self.runtime.rms_norm_device(
+                    hidden,
+                    &self.final_norm,
+                    self.rms_norm_eps,
+                    &mut scratch.final_hidden,
+                )?;
+                self.runtime.matvec_bf16_reference_device(
+                    &self.lm_head,
+                    &scratch.final_hidden,
+                    logits,
+                )?;
+                self.runtime.argmax_f32_device(
+                    logits,
+                    &mut scratch.argmax_block_values,
+                    &mut scratch.argmax_block_indices,
+                    sampled_token,
+                )?;
+            }
+
+            if can_capture
+                && let Some(graph) = self.runtime.end_decode_graph_capture()?
+            {
+                // The capture recorded kernels but did NOT execute them.
+                // Launch the graph now so that results are correct for this step.
+                self.runtime.replay_decode_graph(&graph)?;
+                state.decode_graph = Some(SendCudaGraph(graph));
+            }
+        }
+
+        state.position += 1;
+
+        if non_greedy || self.lm_head_softcap.is_some() {
+            // Download all logits and sample on CPU (also needed for soft-cap).
+            let mut logits = self.runtime.download_f32(&state.logits)?;
+            if let Some(cap) = self.lm_head_softcap {
+                aegisllm_base::executor::generation::apply_logit_softcap(&mut logits, cap);
+            }
             return aegisllm_base::executor::generation::sample_next_token(&logits, sampling);
         }
-        self.forward_hidden(state, token_id)?;
-        self.sample_next_from_current_hidden(state, sampling)
+
+        // Greedy (no soft-cap): download the argmax result (also synchronizes the stream).
+        let token = self.runtime.download_u32(&state.sampled_token)?;
+        token
+            .first()
+            .copied()
+            .map(|token| token as usize)
+            .ok_or_else(|| AegisError::InvalidPlan("CUDA decode argmax returned no token".into()))
     }
 }
 
@@ -158,33 +368,42 @@ impl CudaLayerBlockExecutor {
         let layer_state = state.layers.get_mut(&layer_idx).ok_or_else(|| {
             AegisError::InvalidPlan(format!("missing CUDA hybrid layer state `{layer_idx}`"))
         })?;
-        let rope = self.rope.to_device()?;
+        let mut p_position = self.runtime.alloc_u32(1)?;
+        let mut p_seq_len = self.runtime.alloc_u32(1)?;
+        self.runtime.copy_u32_to_device(&[position as u32], &mut p_position)?;
+        self.runtime.copy_u32_to_device(&[(position + 1) as u32], &mut p_seq_len)?;
         forward_cuda_layer_device(
             &self.runtime,
             layer,
             layer_state,
             &mut state.hidden,
             &mut state.scratch,
+            &p_position,
+            &p_seq_len,
             CudaLayerForwardParams {
                 rms_norm_eps: self.rms_norm_eps,
-                position,
                 num_attention_heads: self.num_attention_heads,
                 num_kv_heads: self.num_kv_heads,
                 head_dim: self.head_dim,
                 kv_context_size: self.kv_context_size,
-                rope,
+                position,
+                seq_len: position + 1,
+                staging_slot_idx: None,
             },
         )?;
         Ok(())
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn forward_cuda_layer_device(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
     layer_state: &mut CudaLayerState,
     hidden: &mut DeviceBuffer<f32>,
     scratch: &mut CudaScratch,
+    p_position: &DeviceBuffer<u32>,
+    p_seq_len: &DeviceBuffer<u32>,
     params: CudaLayerForwardParams,
 ) -> Result<()> {
     forward_attention_device(
@@ -193,15 +412,47 @@ pub(super) fn forward_cuda_layer_device(
         layer_state,
         hidden,
         scratch,
+        p_position,
+        p_seq_len,
         params.rms_norm_eps,
-        params.position,
         params.num_attention_heads,
         params.num_kv_heads,
         params.head_dim,
         params.kv_context_size,
-        params.rope,
+        layer.rope,
+        params.staging_slot_idx,
+        params.position,
+        params.seq_len,
     )?;
     forward_mlp_device(runtime, layer, scratch, params.rms_norm_eps)?;
     std::mem::swap(hidden, &mut scratch.hidden_out);
     Ok(())
+}
+
+/// Issues asynchronous H2D upload of `position` existing KV entries for a single
+/// layer onto the dedicated transfer stream. Returns the recorded transfer event
+/// (the compute stream must wait on this before reading the staging slot).
+/// Returns `None` if the layer is not host-resident (no upload needed).
+fn issue_h2d_for_layer(
+    runtime: &CudaRuntime,
+    scratch: &mut CudaScratch,
+    layers: &mut [CudaLayerState],
+    layer_idx: usize,
+    position: usize,
+    kv_width: usize,
+) -> Result<Option<cudarc::driver::CudaEvent>> {
+    if !layers[layer_idx].kv.is_host_resident() {
+        return Ok(None);
+    }
+    let pool = scratch.kv_staging.as_mut().ok_or_else(|| {
+        AegisError::InvalidPlan("missing kv_staging pool for host-resident layer".into())
+    })?;
+    let slot_idx = layer_idx % 2;
+    let host = layers[layer_idx].kv.host.as_ref().ok_or_else(|| {
+        AegisError::InvalidPlan(format!("layer {layer_idx} marked host-resident but missing host kv"))
+    })?;
+    let slot = &mut pool.slots[slot_idx];
+    runtime.upload_kv_slice_async(&mut slot.keys, &host.keys, position * kv_width)?;
+    runtime.upload_kv_slice_async(&mut slot.values, &host.values, position * kv_width)?;
+    Ok(Some(runtime.record_transfer_event()?))
 }

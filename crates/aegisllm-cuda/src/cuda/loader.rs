@@ -5,16 +5,37 @@ use super::repack::{
 use super::runtime::{CudaRuntime, map_cuda_err};
 use super::types::{
     DeviceBf16Matrix, DeviceBuffer, DeviceCutlassNvfp4Linear, DeviceMxfp4Linear, DeviceNvfp4Linear,
+    HostBf16Weights, HostResidentMxfp4, HostResidentWeights,
 };
 use aegisllm_base::artifact::ModelArtifact;
 use aegisllm_base::error::{AegisError, Result};
+use cudarc::driver::PinnedHostSlice;
+
+/// Allocate a CUDA-pinned (page-locked) host buffer sized exactly to `bytes.len()`
+/// and copy `bytes` into it. Pinned memory enables real async DMA H2D copies that
+/// run at full PCIe bandwidth instead of going through the driver's internal staging.
+fn alloc_pinned_from_bytes(
+    runtime: &CudaRuntime,
+    bytes: &[u8],
+    label: &'static str,
+) -> Result<PinnedHostSlice<u8>> {
+    let mut pinned = unsafe { runtime.stream.context().alloc_pinned::<u8>(bytes.len()) }
+        .map_err(map_cuda_err(label))?;
+    pinned
+        .as_mut_slice()
+        .map_err(map_cuda_err(label))?
+        .copy_from_slice(bytes);
+    Ok(pinned)
+}
 use aegisllm_base::graph::{GraphRegion, TensorRole};
 use aegisllm_base::planning::cuda_nvfp4_kernel_family_for_layout;
 use aegisllm_base::planning::placement::{ComputePlacement, RegionPlacement, StoragePlacement};
 use aegisllm_base::planning::runtime::KernelFamily;
 use aegisllm_base::tensor::layout::LinearResidentLayout;
-use aegisllm_base::tensor::quant::Nvfp4LinearSpec;
-use aegisllm_base::tensor::storage::{LoadedHostTensor, TensorResidencyPlan, TensorStorageLoader};
+use aegisllm_base::tensor::quant::{Nvfp4LinearSpec, QK_NVFP4, QK_NVFP4_SUB};
+use aegisllm_base::tensor::storage::{
+    LoadedHostTensor, NestedParamSlice, TensorResidencyPlan, TensorStorageLoader,
+};
 use aegisllm_base::tensor::{TensorDType, TensorInfo};
 
 pub struct CudaWeightLoader<'a> {
@@ -74,6 +95,20 @@ impl CudaWeightLoader<'_> {
         residency: TensorResidencyPlan,
         loader: &mut TensorStorageLoader,
     ) -> Result<DeviceBf16Matrix> {
+        self.load_bf16_matrix_with_store_opts(tensor, store, residency, loader, false)
+    }
+
+    /// `force_vram=true` overrides any `StagedHostToDevice` residency and uploads to VRAM.
+    /// Used for matrices where the host-resident path would be too slow (e.g. lm_head matvec
+    /// against pinned WRITECOMBINED RAM is ~30× slower than VRAM matvec).
+    pub fn load_bf16_matrix_with_store_opts(
+        &self,
+        tensor: &TensorInfo,
+        store: StoragePlacement,
+        residency: TensorResidencyPlan,
+        loader: &mut TensorStorageLoader,
+        force_vram: bool,
+    ) -> Result<DeviceBf16Matrix> {
         if tensor.dtype != TensorDType::BF16 || tensor.shape.len() != 2 {
             return Err(AegisError::InvalidPlan(format!(
                 "`{}` must be a BF16 matrix",
@@ -86,6 +121,30 @@ impl CudaWeightLoader<'_> {
             .chunks_exact(2)
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect::<Vec<_>>();
+        let is_host_resident = !force_vram
+            && matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
+        if is_host_resident {
+            // Allocate pinned host buffer for fast staging and a tiny VRAM stub.
+            let mut pinned = unsafe { self.runtime.stream.context().alloc_pinned::<u16>(values.len()) }
+                .map_err(map_cuda_err("alloc pinned bf16 host"))?;
+            pinned
+                .as_mut_slice()
+                .map_err(map_cuda_err("alloc pinned bf16 host"))?
+                .copy_from_slice(&values);
+            let stub = self
+                .runtime
+                .stream
+                .clone_htod(&[0u16])
+                .map_err(map_cuda_err("htod bf16 host-resident stub"))?;
+            return Ok(DeviceBf16Matrix {
+                name: tensor.name.clone(),
+                rows: tensor.shape[0],
+                cols: tensor.shape[1],
+                residency,
+                values: stub,
+                host_values: Some(Box::new(HostBf16Weights { values: pinned })),
+            });
+        }
         Ok(DeviceBf16Matrix {
             name: tensor.name.clone(),
             rows: tensor.shape[0],
@@ -96,6 +155,7 @@ impl CudaWeightLoader<'_> {
                 .stream
                 .clone_htod(&values)
                 .map_err(map_cuda_err("htod bf16 matrix"))?,
+            host_values: None,
         })
     }
 
@@ -170,7 +230,12 @@ impl CudaWeightLoader<'_> {
             Nvfp4LinearSpec::from_tensors(prefix, weight, scales, input_scale, output_scale)?;
         let packed_host = loader.load_for_store(weight, store)?;
         let scales_host = loader.load_for_store(scales, store)?;
-        let native_mxfp4 = if self.should_repack_native_mxfp4(prefix, kernel_family) {
+        // For host-resident (StagedHostToDevice) layers: keep bytes in RAM, allocate 1-byte
+        // VRAM stubs so the type system stays intact. Native/CUTLASS repacking is skipped
+        // (no repacked VRAM available); the fallback packed-source kernel is always used.
+        let is_host_resident = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
+
+        let native_mxfp4 = if !is_host_resident && self.should_repack_native_mxfp4(prefix, kernel_family) {
             if spec.cols % 64 != 0 {
                 return Err(AegisError::InvalidPlan(format!(
                     "native MXFP4 tensor-core layout for `{}` requires cols divisible by 64, got {}",
@@ -198,7 +263,7 @@ impl CudaWeightLoader<'_> {
             None
         };
         let cutlass_nvfp4 =
-            if self.should_repack_cutlass_nvfp4(prefix, kernel_family, resident_layout) {
+            if !is_host_resident && self.should_repack_cutlass_nvfp4(prefix, kernel_family, resident_layout) {
                 let repacked = cached_repack_nvfp4_to_cutlass_e2m1_ue4m3_host(
                     &artifact.root,
                     &spec,
@@ -224,6 +289,82 @@ impl CudaWeightLoader<'_> {
                 None
             };
 
+        if is_host_resident {
+            // Weights stay in host RAM (CUDA-pinned). Allocate tiny VRAM stubs so the
+            // struct fields are always valid; real bytes live in host_weights.
+            // Also perform native MXFP4 repacking (CPU-side) when requested: this lets
+            // inference stage the repacked format to VRAM and use Blackwell tensor cores.
+            let host_native_mxfp4 =
+                if self.should_repack_native_mxfp4(prefix, kernel_family) {
+                    if spec.cols % 64 != 0 {
+                        return Err(AegisError::InvalidPlan(format!(
+                            "native MXFP4 tensor-core layout for `{}` requires cols divisible by 64, got {}",
+                            spec.name, spec.cols
+                        )));
+                    }
+                    let repacked = cached_repack_nvfp4_to_mxfp4_host(
+                        &artifact.root,
+                        &spec,
+                        weight,
+                        scales,
+                        packed_host.as_bytes(),
+                        scales_host.as_bytes(),
+                    )?;
+                    let pinned = alloc_pinned_from_bytes(
+                        self.runtime,
+                        &repacked,
+                        "alloc pinned host native mxfp4",
+                    )?;
+                    Some(HostResidentMxfp4 {
+                        blocks_per_row: spec.cols / 32,
+                        data: pinned,
+                    })
+                } else {
+                    None
+                };
+            let pinned_packed = alloc_pinned_from_bytes(
+                self.runtime,
+                packed_host.as_bytes(),
+                "alloc pinned host packed weights",
+            )?;
+            let pinned_scales = alloc_pinned_from_bytes(
+                self.runtime,
+                scales_host.as_bytes(),
+                "alloc pinned host scales",
+            )?;
+            let stub_packed = self
+                .runtime
+                .stream
+                .clone_htod(&[0u8])
+                .map_err(map_cuda_err("htod nvfp4 host-resident stub packed"))?;
+            let stub_scales = self
+                .runtime
+                .stream
+                .clone_htod(&[0u8])
+                .map_err(map_cuda_err("htod nvfp4 host-resident stub scales"))?;
+            return Ok(DeviceNvfp4Linear {
+                name: spec.name,
+                rows: spec.rows,
+                cols: spec.cols,
+                packed_bytes: spec.packed_bytes,
+                scale_bytes: spec.scale_bytes,
+                input_scale: spec.input_scale,
+                output_scale: spec.output_scale,
+                kernel_family,
+                resident_layout: aegisllm_base::tensor::layout::LinearResidentLayout::PackedSource,
+                residency,
+                packed: stub_packed,
+                scales: stub_scales,
+                native_mxfp4: None,
+                cutlass_nvfp4: None,
+                host_weights: Some(Box::new(HostResidentWeights {
+                    packed: pinned_packed,
+                    scales: pinned_scales,
+                    native_mxfp4: host_native_mxfp4,
+                })),
+            });
+        }
+
         Ok(DeviceNvfp4Linear {
             name: spec.name,
             rows: spec.rows,
@@ -247,9 +388,140 @@ impl CudaWeightLoader<'_> {
                 .map_err(map_cuda_err("htod nvfp4 scales"))?,
             native_mxfp4,
             cutlass_nvfp4,
+            host_weights: None,
         })
     }
 
+    /// Load an NVFP4 linear by slicing the leading `eff_rows × eff_logical_cols` block
+    /// from a MatFormer nested-param checkpoint.
+    ///
+    /// Unlike the full-tensor loader, this always uses `LinearResidentLayout::PackedSource`
+    /// (no repacking), so the kernel falls back to the unpacked NVFP4 path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_nvfp4_linear_sliced_with_layout(
+        &self,
+        artifact: &ModelArtifact,
+        prefix: &str,
+        store: StoragePlacement,
+        residency: TensorResidencyPlan,
+        _resident_layout: LinearResidentLayout,
+        eff_rows: usize,
+        eff_logical_cols: usize,
+        loader: &mut TensorStorageLoader,
+    ) -> Result<DeviceNvfp4Linear> {
+        let kernel_family =
+            cuda_nvfp4_kernel_family_for_layout(prefix, LinearResidentLayout::PackedSource)?;
+        let weight = artifact
+            .tensors
+            .get(&format!("{prefix}.weight"))
+            .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight`")))?;
+        let scales_info = artifact
+            .tensors
+            .get(&format!("{prefix}.weight_scale"))
+            .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`")))?;
+        let output_scale = artifact
+            .tensors
+            .get(&format!("{prefix}.weight_scale_2"))
+            .map(|t| read_scalar_f32_with_loader(loader, t, store))
+            .transpose()?
+            .unwrap_or(1.0);
+        let input_scale = artifact
+            .tensors
+            .get(&format!("{prefix}.input_scale"))
+            .map(|t| read_scalar_f32_with_loader(loader, t, store))
+            .transpose()?
+            .unwrap_or(1.0);
+
+        if eff_logical_cols == 0 || eff_logical_cols % QK_NVFP4 != 0 {
+            return Err(AegisError::InvalidPlan(format!(
+                "NVFP4 sliced `{prefix}` eff_logical_cols={eff_logical_cols} must be non-zero and divisible by {QK_NVFP4}"
+            )));
+        }
+        let eff_packed_cols = eff_logical_cols / 2;
+        let eff_scale_cols = eff_logical_cols / QK_NVFP4 * (QK_NVFP4 / QK_NVFP4_SUB);
+
+        let packed_host = loader.load_submatrix(
+            weight,
+            NestedParamSlice::submatrix(eff_rows, eff_packed_cols),
+        )?;
+        let scales_host = loader.load_submatrix(
+            scales_info,
+            NestedParamSlice::submatrix(eff_rows, eff_scale_cols),
+        )?;
+
+        let is_host_resident = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
+        if is_host_resident {
+            let pinned_packed = alloc_pinned_from_bytes(
+                self.runtime,
+                packed_host.as_bytes(),
+                "alloc pinned sliced host packed",
+            )?;
+            let pinned_scales = alloc_pinned_from_bytes(
+                self.runtime,
+                scales_host.as_bytes(),
+                "alloc pinned sliced host scales",
+            )?;
+            let stub = self
+                .runtime
+                .stream
+                .clone_htod(&[0u8])
+                .map_err(map_cuda_err("htod sliced host-resident stub"))?;
+            let stub2 = self
+                .runtime
+                .stream
+                .clone_htod(&[0u8])
+                .map_err(map_cuda_err("htod sliced host-resident stub2"))?;
+            return Ok(DeviceNvfp4Linear {
+                name: prefix.to_string(),
+                rows: eff_rows,
+                cols: eff_logical_cols,
+                packed_bytes: packed_host.len(),
+                scale_bytes: scales_host.len(),
+                input_scale,
+                output_scale,
+                kernel_family,
+                resident_layout: LinearResidentLayout::PackedSource,
+                residency,
+                packed: stub,
+                scales: stub2,
+                native_mxfp4: None,
+                cutlass_nvfp4: None,
+                host_weights: Some(Box::new(HostResidentWeights {
+                    packed: pinned_packed,
+                    scales: pinned_scales,
+                    native_mxfp4: None,
+                })),
+            });
+        }
+
+        Ok(DeviceNvfp4Linear {
+            name: prefix.to_string(),
+            rows: eff_rows,
+            cols: eff_logical_cols,
+            packed_bytes: packed_host.len(),
+            scale_bytes: scales_host.len(),
+            input_scale,
+            output_scale,
+            kernel_family,
+            resident_layout: LinearResidentLayout::PackedSource,
+            residency,
+            packed: self
+                .runtime
+                .stream
+                .clone_htod(packed_host.as_bytes())
+                .map_err(map_cuda_err("htod nvfp4 sliced packed weights"))?,
+            scales: self
+                .runtime
+                .stream
+                .clone_htod(scales_host.as_bytes())
+                .map_err(map_cuda_err("htod nvfp4 sliced scales"))?,
+            native_mxfp4: None,
+            cutlass_nvfp4: None,
+            host_weights: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn load_cutlass_qkv_group_with_layout(
         &self,
         artifact: &ModelArtifact,
@@ -369,6 +641,7 @@ impl CudaWeightLoader<'_> {
                     .clone_htod(&repacked.scales_ue4m3)
                     .map_err(map_cuda_err("htod qkv group cutlass nvfp4 scales"))?,
             }),
+            host_weights: None,
         }))
     }
 
@@ -634,6 +907,43 @@ impl CudaWeightLoader<'_> {
             || (kernel_family == KernelFamily::CudaNativeFp4TensorCores
                 && self.runtime.config().cutlass_nvfp4_repack
                 && native_layout_cutlass_prefill_sidecar(prefix))
+    }
+}
+
+impl CudaWeightLoader<'_> {
+    /// Returns a 1×1 NvFP4 placeholder that satisfies the type system but is never used for
+    /// computation. MoE layers hold real per-expert linears in `CudaMoE`; the `CudaLayer`
+    /// gate/up/down fields are dummies so the struct is always fully initialised.
+    pub fn alloc_dummy_nvfp4_linear(&self, name: &str) -> Result<DeviceNvfp4Linear> {
+        let stub = self
+            .runtime
+            .stream
+            .clone_htod(&[0u8])
+            .map_err(map_cuda_err("htod dummy nvfp4 stub"))?;
+        let stub2 = self
+            .runtime
+            .stream
+            .clone_htod(&[0u8])
+            .map_err(map_cuda_err("htod dummy nvfp4 stub2"))?;
+        Ok(DeviceNvfp4Linear {
+            name: name.to_string(),
+            rows: 1,
+            cols: 1,
+            packed_bytes: 1,
+            scale_bytes: 1,
+            input_scale: 1.0,
+            output_scale: 1.0,
+            kernel_family: KernelFamily::CpuScalar,
+            resident_layout: LinearResidentLayout::PackedSource,
+            residency: TensorResidencyPlan::VramResident {
+                device: self.runtime.device_index(),
+            },
+            packed: stub,
+            scales: stub2,
+            native_mxfp4: None,
+            cutlass_nvfp4: None,
+            host_weights: None,
+        })
     }
 }
 

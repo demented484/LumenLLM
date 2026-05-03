@@ -106,6 +106,42 @@ extern "C" __device__ __forceinline__ float maybe_quantize_nvfp4_input(
     const unsigned int nibble = best_nvfp4_index(value * inv, block_scale);
     return float(decode_nvfp4_nibble(nibble)) * block_scale * input_scale;
 }
+// ---------------------------------------------------------------------------
+// FP8 E4M3 signed conversion (NVIDIA convention: NaN=0x7f/0xff, max=448=0x7e)
+// ---------------------------------------------------------------------------
+//
+// float_to_fp8_e4m3_bits: signed float → 8-bit E4M3 (1 sign, 4 exp, 3 mant)
+//   Uses fp32_to_ue4m3_halfbits for the magnitude (already handles subnormals
+//   and clamping to [0, 448]); prepends the sign bit.
+extern "C" __device__ __forceinline__ unsigned char float_to_fp8_e4m3_bits(float x) {
+    const unsigned int bits = __float_as_uint(x);
+    const unsigned int sign = (bits >> 31u) & 1u;
+    const float abs_val = __uint_as_float(bits & 0x7FFFFFFFu);
+    const unsigned int mag = fp32_to_ue4m3_halfbits(abs_val);
+    return (unsigned char)((sign << 7u) | mag);
+}
+
+// fp8_e4m3_bits_to_float: 8-bit E4M3 → float
+//   0x7f / 0xff are NaN.
+//   exp=0 → subnormal: mantissa * 2^(-9).
+//   exp in [1,15] → normal: (1 + mantissa/8) * 2^(exp-7), max = 1.75*256 = 448.
+extern "C" __device__ __forceinline__ float fp8_e4m3_bits_to_float(unsigned char x) {
+    const unsigned int sign = (unsigned int)((x >> 7u) & 1u);
+    const unsigned int mag  = (unsigned int)(x & 0x7Fu);
+    if (mag == 0x7Fu) { return __uint_as_float(0x7FC00000u); } /* NaN */
+    if (mag == 0u)    { return 0.0f; }
+    const unsigned int exp_fp8 = (mag >> 3u) & 0xFu;
+    const unsigned int mantissa = mag & 0x7u;
+    float abs_val;
+    if (exp_fp8 == 0u) {
+        abs_val = (float)mantissa * 0.001953125f; /* mantissa * 2^(-9) */
+    } else {
+        abs_val = (1.0f + (float)mantissa * 0.125f) * exp2f((float)exp_fp8 - 7.0f);
+    }
+    return sign ? -abs_val : abs_val;
+}
+// ---------------------------------------------------------------------------
+
 extern "C" __device__ __forceinline__ float e8m0_to_fp32(unsigned int value) {
     const unsigned int bits = value == 0u ? 0x00400000u : (value << 23);
     return __uint_as_float(bits);

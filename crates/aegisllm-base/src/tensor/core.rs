@@ -151,6 +151,10 @@ impl TensorRegistry {
         self.tensors.get(name)
     }
 
+    pub fn has(&self, name: &str) -> bool {
+        self.tensors.contains_key(name)
+    }
+
     pub fn dtype_counts(&self) -> BTreeMap<TensorDType, usize> {
         let mut counts = BTreeMap::new();
         for tensor in self.tensors.values() {

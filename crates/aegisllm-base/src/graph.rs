@@ -1,9 +1,14 @@
 use std::collections::BTreeMap;
 
 use crate::artifact::ModelArtifact;
-use crate::error::{AegisError, Result};
+use crate::error::Result;
+use crate::model::{
+    detect_architecture, AttentionPattern, LayerKind, ModelArchitecture, NormPattern,
+};
 use crate::tensor::TensorInfo;
 use crate::tensor::quant::WeightQuantization;
+
+// ── Core types ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelGraph {
@@ -17,6 +22,44 @@ pub struct ModelGraph {
     pub vocab_size: Option<usize>,
     pub weight_quantization: WeightQuantization,
     pub regions: Vec<GraphRegion>,
+
+    // ── Per-layer heterogeneous metadata ──────────────────────────────────
+    /// One entry per transformer layer; drives per-layer dispatch decisions.
+    pub layer_metadata: Vec<LayerMetadata>,
+    /// Pre-only or pre+post RMSNorm style (Llama vs Gemma 4).
+    pub norm_pattern: NormPattern,
+    /// Logit soft-cap on lm_head output (`cap * tanh(logits / cap)`).
+    pub lm_head_softcap: Option<f32>,
+    /// Logit soft-cap applied inside attention before softmax (Gemma 4).
+    pub attn_logit_softcap: Option<f32>,
+    /// Detected architecture name (for display / debugging).
+    pub architecture: String,
+    /// True when the graph was built from a MatFormer nested-param checkpoint
+    /// with an `effective_size` that slices to a smaller sub-model (e.g. E2B).
+    pub is_sliced: bool,
+    /// Tensor-name prefix for the text decoder. `"model."` for Llama / Qwen3,
+    /// `"model.language_model."` for HuggingFace multimodal wrappers
+    /// (Qwen3.5-9B, Gemma 4, Nemotron Omni). Includes trailing dot.
+    pub text_prefix: String,
+}
+
+/// Detect the text-decoder tensor-name prefix for an artifact. Returns
+/// `"model.language_model."` when the embedding is wrapped under
+/// `language_model` (multimodal HF layout), otherwise `"model."`.
+pub fn detect_text_prefix(artifact: &ModelArtifact) -> String {
+    if artifact.tensors.has("model.language_model.embed_tokens.weight") {
+        "model.language_model.".to_string()
+    } else {
+        "model.".to_string()
+    }
+}
+
+/// Per-layer dispatch information built during graph construction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayerMetadata {
+    pub layer_idx: usize,
+    pub kind: LayerKind,
+    pub attention_pattern: AttentionPattern,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,6 +94,10 @@ pub struct GraphTensor {
 pub enum TensorRole {
     TokenEmbedding,
     AttentionNorm,
+    /// Post-sublayer norm (Gemma 4 PrePost pattern).
+    PostAttentionNorm,
+    /// Post-MLP norm (Gemma 4 PrePost pattern).
+    PostMlpNorm,
     Query,
     Key,
     Value,
@@ -64,24 +111,44 @@ pub enum TensorRole {
     WeightScale,
     InputScale,
     OutputScale,
+    /// MoE router weight matrix [hidden, num_experts].
+    MoeRouter,
+    /// Shared / always-active expert weights.
+    MoeSharedGate,
+    MoeSharedUp,
+    MoeSharedDown,
+    /// Mamba / SSM parameters.
+    SsmInProj,
+    SsmOutProj,
+    SsmA,
+    SsmD,
+    SsmDt,
+    SsmConv1d,
+    /// Generic catch-all.
     Other,
 }
 
-impl ModelGraph {
-    pub fn from_artifact(artifact: &ModelArtifact) -> Result<Self> {
-        if !artifact
-            .config
-            .model_type
-            .to_ascii_lowercase()
-            .contains("llama")
-        {
-            return Err(AegisError::Unsupported(format!(
-                "graph builder currently understands llama-style tensor names, got `{}`",
-                artifact.config.model_type
-            )));
-        }
+// ── ModelGraph construction ───────────────────────────────────────────────────
 
+impl ModelGraph {
+    /// Dispatch to the correct architecture and build the graph.
+    pub fn from_artifact(artifact: &ModelArtifact) -> Result<Self> {
+        let arch = detect_architecture(&artifact.config)?;
+        arch.build_graph(artifact)
+    }
+
+    /// Shared "Llama-style" builder used by Llama, Qwen 3, Gemma 4, and Nemotron 3.
+    /// All four families share the same HuggingFace tensor naming convention.
+    pub fn build_llama_style(
+        artifact: &ModelArtifact,
+        arch: &dyn ModelArchitecture,
+    ) -> Result<Self> {
+        let config = &artifact.config;
+        let text_prefix = detect_text_prefix(artifact);
         let mut regions = Vec::new();
+
+        // Embedding — try the detected text prefix first, then bare fallbacks.
+        let embed_candidate = format!("{text_prefix}embed_tokens.weight");
         push_single_tensor_region(
             &mut regions,
             artifact,
@@ -89,102 +156,112 @@ impl ModelGraph {
             GraphRegionKind::TokenEmbedding,
             None,
             TensorRole::TokenEmbedding,
-            &["model.embed_tokens.weight"],
+            &[embed_candidate.as_str(), "model.embed_tokens.weight"],
         );
 
-        for layer in 0..artifact.config.num_hidden_layers {
-            let prefix = format!("model.layers.{layer}");
+        let mut layer_metadata = Vec::with_capacity(config.num_hidden_layers);
+
+        for layer in 0..config.num_hidden_layers {
+            let prefix = format!("{text_prefix}layers.{layer}");
             let mut tensors = Vec::new();
-            add_known_tensor(
-                &mut tensors,
-                artifact,
-                TensorRole::AttentionNorm,
-                &format!("{prefix}.input_layernorm.weight"),
-            );
-            add_known_tensor(
-                &mut tensors,
-                artifact,
-                TensorRole::Query,
-                &format!("{prefix}.self_attn.q_proj.weight"),
-            );
-            add_quant_aux_tensors(
-                &mut tensors,
-                artifact,
-                &format!("{prefix}.self_attn.q_proj"),
-            );
-            add_known_tensor(
-                &mut tensors,
-                artifact,
-                TensorRole::Key,
-                &format!("{prefix}.self_attn.k_proj.weight"),
-            );
-            add_quant_aux_tensors(
-                &mut tensors,
-                artifact,
-                &format!("{prefix}.self_attn.k_proj"),
-            );
-            add_known_tensor(
-                &mut tensors,
-                artifact,
-                TensorRole::Value,
-                &format!("{prefix}.self_attn.v_proj.weight"),
-            );
-            add_quant_aux_tensors(
-                &mut tensors,
-                artifact,
-                &format!("{prefix}.self_attn.v_proj"),
-            );
-            add_known_tensor(
-                &mut tensors,
-                artifact,
-                TensorRole::Output,
-                &format!("{prefix}.self_attn.o_proj.weight"),
-            );
-            add_quant_aux_tensors(
-                &mut tensors,
-                artifact,
-                &format!("{prefix}.self_attn.o_proj"),
-            );
-            add_known_tensor(
-                &mut tensors,
-                artifact,
-                TensorRole::MlpNorm,
-                &format!("{prefix}.post_attention_layernorm.weight"),
-            );
-            add_known_tensor(
-                &mut tensors,
-                artifact,
-                TensorRole::Gate,
-                &format!("{prefix}.mlp.gate_proj.weight"),
-            );
+
+            // ── Standard attention tensors ────────────────────────────────
+            add_known_tensor(&mut tensors, artifact, TensorRole::AttentionNorm,
+                &format!("{prefix}.input_layernorm.weight"));
+
+            add_known_tensor(&mut tensors, artifact, TensorRole::Query,
+                &format!("{prefix}.self_attn.q_proj.weight"));
+            add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.self_attn.q_proj"));
+
+            add_known_tensor(&mut tensors, artifact, TensorRole::Key,
+                &format!("{prefix}.self_attn.k_proj.weight"));
+            add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.self_attn.k_proj"));
+
+            add_known_tensor(&mut tensors, artifact, TensorRole::Value,
+                &format!("{prefix}.self_attn.v_proj.weight"));
+            add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.self_attn.v_proj"));
+
+            add_known_tensor(&mut tensors, artifact, TensorRole::Output,
+                &format!("{prefix}.self_attn.o_proj.weight"));
+            add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.self_attn.o_proj"));
+
+            // ── Post-attention norm (Gemma 4 PrePost) ────────────────────
+            add_known_tensor(&mut tensors, artifact, TensorRole::PostAttentionNorm,
+                &format!("{prefix}.post_attention_norm.weight"));
+            // Alternate naming used by some Gemma variants
+            add_known_tensor(&mut tensors, artifact, TensorRole::PostAttentionNorm,
+                &format!("{prefix}.post_attn_layernorm.weight"));
+
+            // ── MLP norm and projections ──────────────────────────────────
+            add_known_tensor(&mut tensors, artifact, TensorRole::MlpNorm,
+                &format!("{prefix}.post_attention_layernorm.weight"));
+
+            // Dense MLP
+            add_known_tensor(&mut tensors, artifact, TensorRole::Gate,
+                &format!("{prefix}.mlp.gate_proj.weight"));
             add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.mlp.gate_proj"));
-            add_known_tensor(
-                &mut tensors,
-                artifact,
-                TensorRole::Up,
-                &format!("{prefix}.mlp.up_proj.weight"),
-            );
+
+            add_known_tensor(&mut tensors, artifact, TensorRole::Up,
+                &format!("{prefix}.mlp.up_proj.weight"));
             add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.mlp.up_proj"));
-            add_known_tensor(
-                &mut tensors,
-                artifact,
-                TensorRole::Down,
-                &format!("{prefix}.mlp.down_proj.weight"),
-            );
+
+            add_known_tensor(&mut tensors, artifact, TensorRole::Down,
+                &format!("{prefix}.mlp.down_proj.weight"));
             add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.mlp.down_proj"));
-            if tensors.is_empty() {
-                return Err(AegisError::Unsupported(format!(
-                    "no tensors found for llama layer {layer}"
-                )));
-            }
+
+            // ── Post-MLP norm (Gemma 4 PrePost) ──────────────────────────
+            add_known_tensor(&mut tensors, artifact, TensorRole::PostMlpNorm,
+                &format!("{prefix}.post_mlp_norm.weight"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::PostMlpNorm,
+                &format!("{prefix}.post_feedforward_layernorm.weight"));
+
+            // ── MoE tensors (Gemma 4 MoE, Qwen 3.x MoE) ─────────────────
+            add_known_tensor(&mut tensors, artifact, TensorRole::MoeRouter,
+                &format!("{prefix}.mlp.router_logits.weight"));
+            // Some checkpoints use this naming:
+            add_known_tensor(&mut tensors, artifact, TensorRole::MoeRouter,
+                &format!("{prefix}.block_sparse_moe.gate.weight"));
+
+            // Shared expert (Nemotron 3 / some Qwen 3.x)
+            add_known_tensor(&mut tensors, artifact, TensorRole::MoeSharedGate,
+                &format!("{prefix}.mlp.shared_expert.gate_proj.weight"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::MoeSharedUp,
+                &format!("{prefix}.mlp.shared_expert.up_proj.weight"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::MoeSharedDown,
+                &format!("{prefix}.mlp.shared_expert.down_proj.weight"));
+
+            // ── SSM / Mamba tensors (Nemotron 3) ─────────────────────────
+            add_known_tensor(&mut tensors, artifact, TensorRole::SsmInProj,
+                &format!("{prefix}.mamba.in_proj.weight"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::SsmOutProj,
+                &format!("{prefix}.mamba.out_proj.weight"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::SsmA,
+                &format!("{prefix}.mamba.A_log"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::SsmD,
+                &format!("{prefix}.mamba.D"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::SsmDt,
+                &format!("{prefix}.mamba.dt_bias"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::SsmConv1d,
+                &format!("{prefix}.mamba.conv1d.weight"));
+
+            // Warn but do not error on empty layers — some checkpoint shards
+            // may not include all layers. The executor validates completeness.
             regions.push(GraphRegion {
                 id: RegionId(format!("layer.{layer}")),
                 kind: GraphRegionKind::TransformerBlock,
                 layer_index: Some(layer),
                 tensors,
             });
+
+            layer_metadata.push(LayerMetadata {
+                layer_idx: layer,
+                kind: arch.layer_kind(layer, config),
+                attention_pattern: arch.attention_pattern(layer, config),
+            });
         }
 
+        // Final norm
+        let final_norm_candidate = format!("{text_prefix}norm.weight");
         push_single_tensor_region(
             &mut regions,
             artifact,
@@ -192,8 +269,11 @@ impl ModelGraph {
             GraphRegionKind::FinalNorm,
             None,
             TensorRole::FinalNorm,
-            &["model.norm.weight"],
+            &[final_norm_candidate.as_str(), "model.norm.weight"],
         );
+
+        // LM head (may be tied to embeddings).
+        let embed_candidate_lmhead = format!("{text_prefix}embed_tokens.weight");
         push_single_tensor_region(
             &mut regions,
             artifact,
@@ -201,23 +281,43 @@ impl ModelGraph {
             GraphRegionKind::LmHead,
             None,
             TensorRole::LmHead,
-            &["lm_head.weight", "model.embed_tokens.weight"],
+            &[
+                "lm_head.weight",
+                embed_candidate_lmhead.as_str(),
+                "model.embed_tokens.weight",
+            ],
         );
 
+        let eff = config.effective_dims();
+        let head_dim = artifact.head_dim();
+        let orig_q = config.num_attention_heads;
+        let orig_kv = config.num_key_value_heads.unwrap_or(orig_q);
+        let (num_attention_heads, num_kv_heads) = if eff.is_sliced && head_dim > 0 {
+            let eff_q = eff.hidden_size / head_dim;
+            let eff_kv = (eff_q * orig_kv / orig_q).max(1);
+            (eff_q, eff_kv)
+        } else {
+            (orig_q, orig_kv)
+        };
+
         Ok(Self {
-            model_type: artifact.config.model_type.clone(),
-            hidden_size: artifact.config.hidden_size,
-            intermediate_size: artifact.config.intermediate_size,
-            num_layers: artifact.config.num_hidden_layers,
-            num_attention_heads: artifact.config.num_attention_heads,
-            num_kv_heads: artifact
-                .config
-                .num_key_value_heads
-                .unwrap_or(artifact.config.num_attention_heads),
-            head_dim: artifact.head_dim(),
-            vocab_size: artifact.config.vocab_size,
+            model_type: config.model_type.clone(),
+            architecture: arch.name().to_string(),
+            hidden_size: eff.hidden_size,
+            intermediate_size: eff.intermediate_size,
+            num_layers: config.num_hidden_layers,
+            num_attention_heads,
+            num_kv_heads,
+            head_dim,
+            vocab_size: config.vocab_size,
             weight_quantization: artifact.infer_weight_quantization(),
             regions,
+            layer_metadata,
+            norm_pattern: arch.norm_pattern(),
+            lm_head_softcap: arch.lm_head_softcap(config),
+            attn_logit_softcap: config.attn_logit_softcapping.filter(|&v| v > 0.0),
+            is_sliced: eff.is_sliced,
+            text_prefix,
         })
     }
 
@@ -231,6 +331,11 @@ impl ModelGraph {
             .map(|region| (&region.id, region))
             .collect()
     }
+
+    /// Returns the `LayerMetadata` for a given layer index (None if out of range).
+    pub fn layer(&self, idx: usize) -> Option<&LayerMetadata> {
+        self.layer_metadata.get(idx)
+    }
 }
 
 impl GraphRegion {
@@ -242,7 +347,9 @@ impl GraphRegion {
     }
 }
 
-fn push_single_tensor_region(
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+pub fn push_single_tensor_region(
     regions: &mut Vec<GraphRegion>,
     artifact: &ModelArtifact,
     id: &str,
@@ -265,7 +372,7 @@ fn push_single_tensor_region(
     }
 }
 
-fn add_known_tensor(
+pub fn add_known_tensor(
     tensors: &mut Vec<GraphTensor>,
     artifact: &ModelArtifact,
     role: TensorRole,
@@ -279,26 +386,20 @@ fn add_known_tensor(
     }
 }
 
-fn add_quant_aux_tensors(tensors: &mut Vec<GraphTensor>, artifact: &ModelArtifact, prefix: &str) {
-    add_known_tensor(
-        tensors,
-        artifact,
-        TensorRole::WeightScale,
-        &format!("{prefix}.weight_scale"),
-    );
-    add_known_tensor(
-        tensors,
-        artifact,
-        TensorRole::OutputScale,
-        &format!("{prefix}.weight_scale_2"),
-    );
-    add_known_tensor(
-        tensors,
-        artifact,
-        TensorRole::InputScale,
-        &format!("{prefix}.input_scale"),
-    );
+pub fn add_quant_aux_tensors(
+    tensors: &mut Vec<GraphTensor>,
+    artifact: &ModelArtifact,
+    prefix: &str,
+) {
+    add_known_tensor(tensors, artifact, TensorRole::WeightScale,
+        &format!("{prefix}.weight_scale"));
+    add_known_tensor(tensors, artifact, TensorRole::OutputScale,
+        &format!("{prefix}.weight_scale_2"));
+    add_known_tensor(tensors, artifact, TensorRole::InputScale,
+        &format!("{prefix}.input_scale"));
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -325,5 +426,31 @@ mod tests {
             }],
         };
         assert_eq!(region.weight_bytes(), 8);
+    }
+
+    #[test]
+    fn layer_kind_debug_is_deterministic() {
+        let k = LayerKind::DenseDecoder;
+        assert_eq!(format!("{k:?}"), "DenseDecoder");
+
+        let m = LayerKind::MoEDecoder { num_experts: 128, top_k: 2, has_shared_expert: false };
+        assert!(format!("{m:?}").contains("MoEDecoder"));
+    }
+
+    #[test]
+    fn effective_head_count_math_e2b() {
+        // Simulate the head-count computation for a Gemma 4 E2B slice:
+        // full: hidden=4096, 16 q-heads, 8 kv-heads, head_dim=256
+        // e2b:  eff_hidden=2048 → eff_q=2048/256=8, eff_kv=8*8/16=4
+        let orig_q: usize = 16;
+        let orig_kv: usize = 8;
+        let head_dim: usize = 256;
+        let eff_hidden: usize = 2048;
+        let eff_q = eff_hidden / head_dim;
+        let eff_kv = (eff_q * orig_kv / orig_q).max(1);
+        assert_eq!(eff_q, 8);
+        assert_eq!(eff_kv, 4);
+        // ratio preserved: q/kv = 2:1 in both full and sliced
+        assert_eq!(eff_q / eff_kv, orig_q / orig_kv);
     }
 }
