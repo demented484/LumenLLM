@@ -261,12 +261,15 @@ pub(super) fn forward_moe_prefill_chunk_device(
     // Done unconditionally (cheap: ~128 HashMap lookups + 6 small Vec::push)
     // so we know which experts the grouped pass covers and which need the
     // fallback.
-    let mut gate_packed = vec![0u32; num_experts];
-    let mut gate_scales = vec![0u32; num_experts];
-    let mut up_packed = vec![0u32; num_experts];
-    let mut up_scales = vec![0u32; num_experts];
-    let mut down_packed = vec![0u32; num_experts];
-    let mut down_scales = vec![0u32; num_experts];
+    // u64 byte offsets into the cache buffer — the buffer can exceed 4 GB
+    // on Gemma-4-26B (~9 GB cache) so 32-bit offsets silently wrap around
+    // layer ~10 and the kernel reads weights from the wrong layer.
+    let mut gate_packed = vec![0u64; num_experts];
+    let mut gate_scales = vec![0u64; num_experts];
+    let mut up_packed = vec![0u64; num_experts];
+    let mut up_scales = vec![0u64; num_experts];
+    let mut down_packed = vec![0u64; num_experts];
+    let mut down_scales = vec![0u64; num_experts];
     // Per-expert input/output scales for the three matmuls. Each NVFP4 expert
     // weight has its own pair, so we cannot use a single scalar across the
     // grouped GEMM — per-expert arrays are uploaded next to the offset arrays.
@@ -289,12 +292,12 @@ pub(super) fn forward_moe_prefill_chunk_device(
             let u = cache.get(&expert.up_proj.name);
             let d = cache.get(&expert.down_proj.name);
             if let (Some(g), Some(u), Some(d)) = (g, u, d) {
-                gate_packed[e] = g.packed_offset as u32;
-                gate_scales[e] = g.scales_offset as u32;
-                up_packed[e] = u.packed_offset as u32;
-                up_scales[e] = u.scales_offset as u32;
-                down_packed[e] = d.packed_offset as u32;
-                down_scales[e] = d.scales_offset as u32;
+                gate_packed[e] = g.packed_offset as u64;
+                gate_scales[e] = g.scales_offset as u64;
+                up_packed[e] = u.packed_offset as u64;
+                up_scales[e] = u.scales_offset as u64;
+                down_packed[e] = d.packed_offset as u64;
+                down_scales[e] = d.scales_offset as u64;
                 gate_in_scales[e] = expert.gate_proj.input_scale;
                 gate_out_scales[e] = expert.gate_proj.output_scale;
                 up_in_scales[e] = expert.up_proj.input_scale;
@@ -342,12 +345,12 @@ pub(super) fn forward_moe_prefill_chunk_device(
         let cache = cache_handle.as_ref().unwrap();
         // Upload per-layer offset arrays + cached_counts to the device.
         runtime.upload_u32_slice_to_device(&cached_counts_host, &mut moe_scratch.cached_counts)?;
-        runtime.upload_u32_slice_to_device(&gate_packed, &mut moe_scratch.gate_packed_offsets)?;
-        runtime.upload_u32_slice_to_device(&gate_scales, &mut moe_scratch.gate_scales_offsets)?;
-        runtime.upload_u32_slice_to_device(&up_packed, &mut moe_scratch.up_packed_offsets)?;
-        runtime.upload_u32_slice_to_device(&up_scales, &mut moe_scratch.up_scales_offsets)?;
-        runtime.upload_u32_slice_to_device(&down_packed, &mut moe_scratch.down_packed_offsets)?;
-        runtime.upload_u32_slice_to_device(&down_scales, &mut moe_scratch.down_scales_offsets)?;
+        runtime.upload_u64_slice_to_device(&gate_packed, &mut moe_scratch.gate_packed_offsets)?;
+        runtime.upload_u64_slice_to_device(&gate_scales, &mut moe_scratch.gate_scales_offsets)?;
+        runtime.upload_u64_slice_to_device(&up_packed, &mut moe_scratch.up_packed_offsets)?;
+        runtime.upload_u64_slice_to_device(&up_scales, &mut moe_scratch.up_scales_offsets)?;
+        runtime.upload_u64_slice_to_device(&down_packed, &mut moe_scratch.down_packed_offsets)?;
+        runtime.upload_u64_slice_to_device(&down_scales, &mut moe_scratch.down_scales_offsets)?;
         runtime.upload_f32_slice_to_device(&gate_in_scales, &mut moe_scratch.gate_input_scales)?;
         runtime.upload_f32_slice_to_device(&gate_out_scales, &mut moe_scratch.gate_output_scales)?;
         runtime.upload_f32_slice_to_device(&up_in_scales, &mut moe_scratch.up_input_scales)?;
@@ -435,7 +438,6 @@ pub(super) fn forward_moe_prefill_chunk_device(
             num_experts,
             max_count,
         )?;
-
         // Step 3: up (re-quantize input with up.input_scale, then grouped GEMM)
         runtime.nvfp4_quantize_input_per_expert_device(
             &moe_scratch.permuted_input,
@@ -499,20 +501,47 @@ pub(super) fn forward_moe_prefill_chunk_device(
             num_experts,
             max_count,
         )?;
-        // Unpermute scatter-add: contribute only cached experts. Reads
-        // `cached_counts` for early-exit so uncached entries are skipped.
-        runtime.unpermute_scatter_add_f32_device(
-            &moe_scratch.permuted_down,
-            &moe_scratch.expert_token_lists,
-            &moe_scratch.expert_weight_lists,
-            &moe_scratch.cached_counts,
-            &moe_scratch.expert_offsets,
-            stride,
-            num_experts,
-            max_count,
-            hidden_size,
-            &mut moe_scratch.moe_acc,
-        )?;
+        // Per-expert serial scatter: matches the per-expert fallback's
+        // accumulation order bit-exactly so Gemma 4's top-k router sees the
+        // same logits as the cache-on/grouped-disabled path. (A single fused
+        // unpermute_scatter_add kernel relies on atomicAdd ordering, which
+        // produces 1-ULP per-element drift that the router amplifies into
+        // flipped expert selections within ~3 layers.)
+        //
+        // Compute the prefix sum of `counts_host` on the host so we know each
+        // expert's start row in `permuted_down` without an extra GPU→host sync.
+        let mut off_host = vec![0u64; num_experts + 1];
+        for e in 0..num_experts {
+            off_host[e + 1] = off_host[e] + counts_host[e] as u64;
+        }
+        for e in 0..num_experts {
+            let count = cached_counts_host[e] as usize;
+            if count == 0 { continue; }
+            let bucket_off = e * stride;
+            runtime.copy_u32_d2d_range(
+                &moe_scratch.expert_token_lists, bucket_off,
+                &mut moe_scratch.gather_indices, 0, count,
+            )?;
+            runtime.copy_f32_d2d_range(
+                &moe_scratch.expert_weight_lists, bucket_off,
+                &mut moe_scratch.gather_weights, 0, count,
+            )?;
+            // Copy this expert's slice of permuted_down into gather_out so it
+            // can feed scatter_add_weighted (which expects a contiguous
+            // [count, hidden] source).
+            let src_off = (off_host[e] as usize) * hidden_size;
+            runtime.copy_f32_d2d_range(
+                &moe_scratch.permuted_down, src_off,
+                &mut moe_scratch.gather_out, 0, count * hidden_size,
+            )?;
+            runtime.scatter_add_weighted_f32_device(
+                &moe_scratch.gather_out,
+                &moe_scratch.gather_indices,
+                &moe_scratch.gather_weights,
+                count, hidden_size,
+                &mut moe_scratch.moe_acc,
+            )?;
+        }
     }
 
     // Per-expert fallback: covers all experts when no cache is installed,

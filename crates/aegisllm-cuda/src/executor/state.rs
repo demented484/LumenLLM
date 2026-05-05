@@ -482,12 +482,14 @@ pub(super) struct CudaMoEPrefillScratch {
     /// Built on host per chunk by looking up each expert's weight name in the
     /// cache, uploaded before each grouped matvec call. 6 small buffers per
     /// chunk: (gate, up, down) × (packed, scales). Each is `[num_experts]` u32.
-    pub(super) gate_packed_offsets: DeviceBuffer<u32>,
-    pub(super) gate_scales_offsets: DeviceBuffer<u32>,
-    pub(super) up_packed_offsets: DeviceBuffer<u32>,
-    pub(super) up_scales_offsets: DeviceBuffer<u32>,
-    pub(super) down_packed_offsets: DeviceBuffer<u32>,
-    pub(super) down_scales_offsets: DeviceBuffer<u32>,
+    // u64 byte offsets — the VRAM expert cache exceeds 4 GB on Gemma-4-26B,
+    // so 32-bit offsets silently wrap around layer 10 and corrupt weights.
+    pub(super) gate_packed_offsets: DeviceBuffer<u64>,
+    pub(super) gate_scales_offsets: DeviceBuffer<u64>,
+    pub(super) up_packed_offsets: DeviceBuffer<u64>,
+    pub(super) up_scales_offsets: DeviceBuffer<u64>,
+    pub(super) down_packed_offsets: DeviceBuffer<u64>,
+    pub(super) down_scales_offsets: DeviceBuffer<u64>,
     /// Per-expert input/output scales per matmul position. Each is
     /// `[num_experts]` f32, uploaded before each grouped matvec call.
     pub(super) gate_input_scales: DeviceBuffer<f32>,

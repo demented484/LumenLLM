@@ -413,9 +413,9 @@ impl CudaRuntime {
     pub fn nvfp4_grouped_prequant_gemm_device(
         &self,
         base_packed: &DeviceBuffer<u8>,
-        packed_offsets: &DeviceBuffer<u32>,
+        packed_offsets: &DeviceBuffer<u64>,
         base_scales: &DeviceBuffer<u8>,
-        scales_offsets: &DeviceBuffer<u32>,
+        scales_offsets: &DeviceBuffer<u64>,
         expert_counts: &DeviceBuffer<u32>,
         expert_first_token_off: &DeviceBuffer<u32>,
         expert_output_scales: &DeviceBuffer<f32>,

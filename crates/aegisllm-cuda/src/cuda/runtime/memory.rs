@@ -34,6 +34,34 @@ impl CudaRuntime {
         })
     }
 
+    pub fn alloc_u64(&self, len: usize) -> Result<DeviceBuffer<u64>> {
+        Ok(DeviceBuffer {
+            slice: unsafe { self.stream.alloc::<u64>(len) }
+                .map_err(map_cuda_err("alloc cuda u64 buffer"))?,
+        })
+    }
+
+    pub fn upload_u64_slice_to_device(
+        &self,
+        values: &[u64],
+        buffer: &mut DeviceBuffer<u64>,
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        if buffer.len() < values.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "upload_u64_slice_to_device buffer too small: have {}, need {}",
+                buffer.len(),
+                values.len(),
+            )));
+        }
+        let mut dst = buffer.slice.slice_mut(0..values.len());
+        self.stream
+            .memcpy_htod(values, &mut dst)
+            .map_err(map_cuda_err("htod u64 slice"))
+    }
+
     pub fn upload_f32(&self, values: &[f32]) -> Result<DeviceBuffer<f32>> {
         Ok(DeviceBuffer {
             slice: self

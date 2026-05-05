@@ -203,6 +203,40 @@ extern "C" __global__ void aegis_nvfp4_linear_reference(
     }
 }
 
+// Shared inner kernel of the prequantized batched GEMM and its grouped-MoE
+// counterpart. Centralising the inner-loop arithmetic in a single
+// __forceinline__ function guarantees both kernels compile to byte-identical
+// SASS for the dot product, which keeps the moe.rs grouped-MoE path
+// bit-exact with the per-expert reference path — Gemma 4's softmax+top-k
+// router amplifies even single-ULP per-element drift into flipped expert
+// selections within a few layers.
+extern "C" __device__ __forceinline__ void aegis_nvfp4_prequant_gemm_inner(
+    const unsigned char* sh_packed,
+    const unsigned char* sh_scales,
+    const float*         input_row,
+    const unsigned int   scale_cols,
+    const unsigned int   lane,
+    float&               sum_inout
+) {
+    float sum = sum_inout;
+    for (unsigned int block_idx = lane; block_idx < scale_cols; block_idx += 32u) {
+        const float blk_scale = decode_ue4m3_half(sh_scales[block_idx]);
+        const unsigned int input_base  = block_idx * 16u;
+        const unsigned int packed_base = block_idx * 8u;
+        for (unsigned int j = 0u; j < 8u; ++j) {
+            const unsigned int byte = sh_packed[packed_base + j];
+            sum += (float)decode_nvfp4_nibble(byte & 0x0Fu) * blk_scale
+                 * input_row[input_base + 2u*j];
+            sum += (float)decode_nvfp4_nibble(byte >> 4u)   * blk_scale
+                 * input_row[input_base + 2u*j + 1u];
+        }
+    }
+    for (unsigned int stride = 16u; stride > 0u; stride >>= 1u) {
+        sum += __shfl_down_sync(0xffffffffu, sum, stride);
+    }
+    sum_inout = sum;
+}
+
 // Tiled batched GEMM for NVfp4 packed weights.
 //
 // Grid : (rows, ceil(total_batch / BATCH_PER_BLOCK))
@@ -256,21 +290,7 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_gemm(
     const float* input_row = input + (size_t)batch_idx * cols;
 
     float sum = 0.0f;
-    for (unsigned int block_idx = lane; block_idx < scale_cols; block_idx += WARP_SIZE) {
-        const float         blk_scale   = decode_ue4m3_half(sh_scales[block_idx]);
-        const unsigned int  input_base  = block_idx * 16u;
-        const unsigned int  packed_base = block_idx * 8u;
-        for (unsigned int j = 0u; j < 8u; ++j) {
-            const unsigned int byte = sh_packed[packed_base + j];
-            sum += (float)decode_nvfp4_nibble(byte & 0x0Fu) * blk_scale * input_row[input_base + 2u*j];
-            sum += (float)decode_nvfp4_nibble(byte >> 4u)   * blk_scale * input_row[input_base + 2u*j + 1u];
-        }
-    }
-
-    // Warp-level reduction via shuffle.
-    for (unsigned int stride = WARP_SIZE / 2u; stride > 0u; stride >>= 1u) {
-        sum += __shfl_down_sync(0xffffffffu, sum, stride);
-    }
+    aegis_nvfp4_prequant_gemm_inner(sh_packed, sh_scales, input_row, scale_cols, lane, sum);
     if (lane == 0u) {
         output[(size_t)batch_idx * rows + row] = sum * output_scale;
     }
@@ -346,17 +366,17 @@ extern "C" __global__ void aegis_nvfp4_quantize_input_per_expert(
 // Block: 256 threads (8 warps).
 // Shared mem: packed_cols + scale_cols bytes (one weight row).
 extern "C" __global__ void aegis_nvfp4_grouped_prequant_gemm(
-    const unsigned char* __restrict__ base_packed,
-    const unsigned int*  __restrict__ packed_offsets,        // [num_experts]
-    const unsigned char* __restrict__ base_scales,
-    const unsigned int*  __restrict__ scales_offsets,        // [num_experts]
-    const unsigned int*  __restrict__ expert_counts,         // [num_experts] (cached_counts)
-    const unsigned int*  __restrict__ expert_first_token_off, // [num_experts + 1] CSR start
-    const float*         __restrict__ expert_output_scales,   // [num_experts]
+    const unsigned char*       __restrict__ base_packed,
+    const unsigned long long*  __restrict__ packed_offsets,   // [num_experts] u64 byte offsets
+    const unsigned char*       __restrict__ base_scales,
+    const unsigned long long*  __restrict__ scales_offsets,   // [num_experts] u64 byte offsets
+    const unsigned int*        __restrict__ expert_counts,         // [num_experts] (cached_counts)
+    const unsigned int*        __restrict__ expert_first_token_off, // [num_experts + 1] CSR start
+    const float*               __restrict__ expert_output_scales,   // [num_experts]
     const unsigned int rows,
     const unsigned int cols,
-    const float*         __restrict__ permuted_quantized_input, // [total_assignments, cols]
-    float*               __restrict__ permuted_output           // [total_assignments, rows]
+    const float*               __restrict__ permuted_quantized_input, // [total_assignments, cols]
+    float*                     __restrict__ permuted_output           // [total_assignments, rows]
 ) {
     const unsigned int WARP_SIZE       = 32u;
     const unsigned int BATCH_PER_BLOCK = 8u;
@@ -399,20 +419,7 @@ extern "C" __global__ void aegis_nvfp4_grouped_prequant_gemm(
     const float* input_row = permuted_quantized_input + (size_t)abs_row * cols;
 
     float sum = 0.0f;
-    for (unsigned int block_idx = lane; block_idx < scale_cols; block_idx += WARP_SIZE) {
-        const float blk_scale  = decode_ue4m3_half(sh_scales[block_idx]);
-        const unsigned int input_base  = block_idx * 16u;
-        const unsigned int packed_base = block_idx * 8u;
-        for (unsigned int j = 0u; j < 8u; ++j) {
-            const unsigned int byte = sh_packed[packed_base + j];
-            sum += (float)decode_nvfp4_nibble(byte & 0x0Fu) * blk_scale * input_row[input_base + 2u*j];
-            sum += (float)decode_nvfp4_nibble(byte >> 4u)   * blk_scale * input_row[input_base + 2u*j + 1u];
-        }
-    }
-
-    for (unsigned int stride = WARP_SIZE / 2u; stride > 0u; stride >>= 1u) {
-        sum += __shfl_down_sync(0xffffffffu, sum, stride);
-    }
+    aegis_nvfp4_prequant_gemm_inner(sh_packed, sh_scales, input_row, scale_cols, lane, sum);
     if (lane == 0u) {
         permuted_output[(size_t)abs_row * rows + row] = sum * expert_output_scales[expert];
     }
