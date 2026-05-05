@@ -185,133 +185,14 @@ impl CudaLlamaExecutor {
             })
         });
 
-        // ── Phase 4: VRAM expert cache (env-gated) ─────────────────────────
-        // After all loading completes, query free VRAM and pre-populate as
-        // many host-resident NVFP4 expert weights as fit. Cache hits during
-        // inference skip the per-call H2D bandwidth.
-        //
-        // WHY OPT-IN: empirically, on its own the cache regresses prefill
-        // ~7% — eliminating the H2D path on the transfer stream removes the
-        // implicit compute/transfer-stream parallelism that double-buffered
-        // staging provides, and the per-matvec kernel time dominates so
-        // skipping H2D doesn't claw it back. Combining the cache with a
-        // grouped-GEMM dispatch (Phase 2) is expected to unlock the win
-        // because per-layer kernel count drops from ~150 to ~3 and per-call
-        // staging overhead becomes dominant. Until Phase 2 lands, set
-        // `AEGIS_VRAM_EXPERT_CACHE=1` to enable for experimentation.
-        if has_staged_layers && std::env::var("AEGIS_VRAM_EXPERT_CACHE").is_ok() {
-            let safety_margin: usize = 1usize << 30; // 1 GB headroom
-            match crate::cuda::expert_cache::pick_cache_capacity(&cuda, safety_margin) {
-                Ok(capacity_bytes) if capacity_bytes > 0 => {
-                    let mut cache = crate::cuda::expert_cache::VramExpertCache::new(
-                        &cuda, capacity_bytes,
-                    )?;
-                    let mut inserted: usize = 0;
-                    let mut skipped: usize = 0;
-                    // Iterate experts in load order. Static cache; first-fit fills
-                    // the buffer until capacity is exhausted. Once the cache is
-                    // full we stop — remaining experts use the per-call staging
-                    // pool path.
-                    'outer: for layer in &layers {
-                        if let Some(moe) = layer.moe.as_ref() {
-                            for expert in &moe.experts {
-                                for proj in [
-                                    &expert.gate_proj,
-                                    &expert.up_proj,
-                                    &expert.down_proj,
-                                ] {
-                                    let placed = crate::cuda::expert_cache::try_cache_nvfp4_expert(
-                                        &mut cache, &cuda, proj,
-                                    )?;
-                                    if placed { inserted += 1; }
-                                    else      { skipped  += 1;  break 'outer; }
-                                }
-                            }
-                        }
-                    }
-                    eprintln!(
-                        "vram-expert-cache: capacity={} MB used={} MB inserted={} skipped={}",
-                        cache.capacity_bytes() / (1usize << 20),
-                        cache.used_bytes() / (1usize << 20),
-                        inserted,
-                        skipped,
-                    );
-                    // Drop the host-arena copy of every weight that's now in
-                    // the VRAM cache, and re-pin the (typically very few)
-                    // uncached weights into standalone PinnedHostSlices.
-                    // After this returns, no `HostWeightBytes::Arena` clone
-                    // of the arena Arc remains, so the trailing
-                    // `drop(host_arena)` below releases the entire ~12 GB
-                    // pinned host allocation.
-                    let mut dropped_count = 0usize;
-                    let mut repinned_count = 0usize;
-                    let mut handle_nvfp4 = |proj: &mut crate::cuda::DeviceNvfp4Linear| -> Result<()> {
-                        if !proj.is_host_resident() { return Ok(()); }
-                        if cache.get(&proj.name).is_some() {
-                            crate::cuda::expert_cache::drop_host_weights(proj);
-                            dropped_count += 1;
-                        } else {
-                            crate::cuda::expert_cache::repin_host_weights(&cuda, proj)?;
-                            repinned_count += 1;
-                        }
-                        Ok(())
-                    };
-                    for layer in layers.iter_mut() {
-                        // Attention projections: BF16 typically, but match if NVFP4.
-                        for proj in [&mut layer.q_proj, &mut layer.k_proj, &mut layer.v_proj,
-                                     &mut layer.o_proj] {
-                            if let crate::executor::state::CudaLinear::Nvfp4(n) = proj {
-                                handle_nvfp4(n)?;
-                            }
-                        }
-                        if let Some(qkv) = layer.qkv_proj.as_mut() {
-                            if let crate::executor::state::CudaLinear::Nvfp4(n) = qkv {
-                                handle_nvfp4(n)?;
-                            }
-                        }
-                        // Dense MLP projections (unused on MoE layers but still loaded).
-                        for proj in [&mut layer.gate_proj, &mut layer.up_proj, &mut layer.down_proj] {
-                            handle_nvfp4(proj)?;
-                        }
-                        if let Some(moe) = layer.moe.as_mut() {
-                            // Shared expert
-                            if let Some(shared) = moe.shared_expert.as_mut() {
-                                for proj in [&mut shared.gate_proj, &mut shared.up_proj,
-                                             &mut shared.down_proj] {
-                                    if let crate::executor::state::CudaLinear::Nvfp4(n) = proj {
-                                        handle_nvfp4(n)?;
-                                    }
-                                }
-                            }
-                            // Routed experts
-                            for expert in moe.experts.iter_mut() {
-                                handle_nvfp4(&mut expert.gate_proj)?;
-                                handle_nvfp4(&mut expert.up_proj)?;
-                                handle_nvfp4(&mut expert.down_proj)?;
-                            }
-                        }
-                    }
-                    eprintln!(
-                        "vram-expert-cache: dropped_arena_refs={} repinned_uncached={}",
-                        dropped_count, repinned_count,
-                    );
-                    cuda.install_expert_cache(std::sync::Arc::new(cache))?;
-                }
-                Ok(_) => {
-                    eprintln!("vram-expert-cache: skipped (capacity 0 after safety margin)");
-                }
-                Err(e) => {
-                    eprintln!("vram-expert-cache: skipped: {e:?}");
-                }
-            }
-        }
-        // Release the host arena. By this point the cache (if enabled) has
-        // dropped its `Arc<PinnedArena>` clones for cached experts and re-pinned
-        // any uncached experts standalone, so dropping the local arena Arc and
-        // the loader (which also holds an Arc clone) lets the ~12 GB pinned
-        // host allocation actually go away.
+        // Drop the loader and our local arena clone now that load is
+        // complete. The arena `Arc<PinnedArena>` is still cloned inside every
+        // host-resident weight's `HostWeightBytes::Arena { arena, .. }`, so
+        // these drops just decrement the refcount — the pinned ~12 GB stays
+        // alive for staged inference. Bookkeeping only.
         drop(cuda_weights);
         drop(host_arena);
+        let _ = has_staged_layers;
 
         let kv_store = placement.kv_cache.store;
         let kv_first_n_layers = placement.kv_cache.first_n_layers;
@@ -570,28 +451,6 @@ impl CudaLlamaExecutor {
                         expert_weight_lists: self.runtime.alloc_f32(max_experts * max_per_expert)?,
                         expert_counts: self.runtime.alloc_u32(max_experts)?,
                         expert_list_stride: max_per_expert,
-                        // Phase 2 grouped-MoE scratch (used when VRAM cache is on).
-                        expert_offsets: self.runtime.alloc_u32(max_experts + 1)?,
-                        cached_counts: self.runtime.alloc_u32(max_experts)?,
-                        permuted_input: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,
-                        permuted_input_quant: self.runtime.alloc_f32(
-                            cs * max_top_k * self.hidden_size.max(max_expert_intermediate),
-                        )?,
-                        permuted_gate: self.runtime.alloc_f32(cs * max_top_k * max_expert_intermediate)?,
-                        permuted_up: self.runtime.alloc_f32(cs * max_top_k * max_expert_intermediate)?,
-                        permuted_down: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,
-                        gate_packed_offsets: self.runtime.alloc_u64(max_experts)?,
-                        gate_scales_offsets: self.runtime.alloc_u64(max_experts)?,
-                        up_packed_offsets: self.runtime.alloc_u64(max_experts)?,
-                        up_scales_offsets: self.runtime.alloc_u64(max_experts)?,
-                        down_packed_offsets: self.runtime.alloc_u64(max_experts)?,
-                        down_scales_offsets: self.runtime.alloc_u64(max_experts)?,
-                        gate_input_scales: self.runtime.alloc_f32(max_experts)?,
-                        gate_output_scales: self.runtime.alloc_f32(max_experts)?,
-                        up_input_scales: self.runtime.alloc_f32(max_experts)?,
-                        up_output_scales: self.runtime.alloc_f32(max_experts)?,
-                        down_input_scales: self.runtime.alloc_f32(max_experts)?,
-                        down_output_scales: self.runtime.alloc_f32(max_experts)?,
                     }))
                 } else {
                     None

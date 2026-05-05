@@ -468,51 +468,6 @@ pub(super) struct CudaMoEPrefillScratch {
     pub(super) expert_counts: DeviceBuffer<u32>,
     /// Stride between per-expert lists (= `max_per_expert` = chunk_size * top_k).
     pub(super) expert_list_stride: usize,
-    // ── Phase 2 grouped-MoE scratch (used when VRAM expert cache is on) ────
-    /// CSR prefix-sum over `expert_counts`: `expert_offsets[e]` is the start
-    /// row in the permuted activation buffer for expert `e`. Length is
-    /// `num_experts + 1`; last entry is `total_assignments`.
-    pub(super) expert_offsets: DeviceBuffer<u32>,
-    /// Per-chunk packed-cached-counts upload buffer. For experts cached in
-    /// VRAM the value is the original `expert_counts[e]`; for uncached the
-    /// value is 0 (so the grouped GEMM skips them — they go through the
-    /// per-expert fallback path that still uses staging).
-    pub(super) cached_counts: DeviceBuffer<u32>,
-    /// Per-layer per-matmul-position byte offsets into the VRAM cache buffer.
-    /// Built on host per chunk by looking up each expert's weight name in the
-    /// cache, uploaded before each grouped matvec call. 6 small buffers per
-    /// chunk: (gate, up, down) × (packed, scales). Each is `[num_experts]` u32.
-    // u64 byte offsets — the VRAM expert cache exceeds 4 GB on Gemma-4-26B,
-    // so 32-bit offsets silently wrap around layer 10 and corrupt weights.
-    pub(super) gate_packed_offsets: DeviceBuffer<u64>,
-    pub(super) gate_scales_offsets: DeviceBuffer<u64>,
-    pub(super) up_packed_offsets: DeviceBuffer<u64>,
-    pub(super) up_scales_offsets: DeviceBuffer<u64>,
-    pub(super) down_packed_offsets: DeviceBuffer<u64>,
-    pub(super) down_scales_offsets: DeviceBuffer<u64>,
-    /// Per-expert input/output scales per matmul position. Each is
-    /// `[num_experts]` f32, uploaded before each grouped matvec call.
-    pub(super) gate_input_scales: DeviceBuffer<f32>,
-    pub(super) gate_output_scales: DeviceBuffer<f32>,
-    pub(super) up_input_scales: DeviceBuffer<f32>,
-    pub(super) up_output_scales: DeviceBuffer<f32>,
-    pub(super) down_input_scales: DeviceBuffer<f32>,
-    pub(super) down_output_scales: DeviceBuffer<f32>,
-    /// Permuted activation buffer for the grouped MoE pipeline:
-    /// `[chunk_size * top_k, hidden]`.
-    pub(super) permuted_input: DeviceBuffer<f32>,
-    /// Per-expert NVFP4-prequantized copy of the permuted activation. Written
-    /// by `nvfp4_quantize_input_per_expert_device` (different `input_scale`
-    /// per expert) and consumed by the grouped prequant GEMM. Sized to fit
-    /// either the gate/up input (hidden) or the down input (intermediate),
-    /// using the larger of the two.
-    pub(super) permuted_input_quant: DeviceBuffer<f32>,
-    /// Permuted gate-projection output: `[chunk_size * top_k, expert_intermediate]`.
-    pub(super) permuted_gate: DeviceBuffer<f32>,
-    /// Permuted up-projection output (reused as SwiGLU/GeGLU input/output).
-    pub(super) permuted_up: DeviceBuffer<f32>,
-    /// Permuted down-projection output: `[chunk_size * top_k, hidden]`.
-    pub(super) permuted_down: DeviceBuffer<f32>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]

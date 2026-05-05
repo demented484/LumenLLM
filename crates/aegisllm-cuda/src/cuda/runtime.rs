@@ -1,10 +1,9 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use cudarc::cublaslt::CudaBlasLT;
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream, sys};
 
 use aegisllm_base::cuda_config::CudaRuntimeConfig;
-use super::expert_cache::CacheHandle;
 use super::functions::CudaKernelFunctions;
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::hardware::HardwareInventory;
@@ -37,10 +36,6 @@ pub struct CudaRuntime {
     /// cuBLASLt handle for BF16 tensor-core GEMM (attention Q/K/V/O, shared MLP, lm_head).
     /// Bound to the compute stream so launches order with custom kernels.
     pub(super) cublas_lt: CudaBlasLT,
-    /// VRAM expert weight cache (Phase 4 of perf overhaul). Set after the
-    /// executor finishes loading host-resident NVFP4 weights and knows how
-    /// much VRAM is free. Cache hits skip per-call H2D bandwidth.
-    expert_cache: OnceLock<CacheHandle>,
 }
 
 impl CudaRuntime {
@@ -83,23 +78,7 @@ impl CudaRuntime {
             transfer_stream,
             kernels,
             cublas_lt,
-            expert_cache: OnceLock::new(),
         })
-    }
-
-    /// Install the VRAM expert cache. Called once by the executor after all
-    /// host-resident NVFP4 weights have been loaded into the pinned arena —
-    /// at that point the runtime knows how much VRAM is free and can size
-    /// the cache. Subsequent inference dispatch checks `expert_cache()` for
-    /// a hit before falling through to the staging path.
-    pub(crate) fn install_expert_cache(&self, cache: CacheHandle) -> Result<()> {
-        self.expert_cache
-            .set(cache)
-            .map_err(|_| AegisError::InvalidPlan("expert cache already installed".into()))
-    }
-
-    pub(crate) fn expert_cache(&self) -> Option<&CacheHandle> {
-        self.expert_cache.get()
     }
 
     pub fn device_index(&self) -> usize {

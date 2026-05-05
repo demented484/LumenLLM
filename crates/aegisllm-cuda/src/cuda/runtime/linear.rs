@@ -464,35 +464,48 @@ impl CudaRuntime {
         let rows_u32 = linear.rows as u32;
         let cols_u32 = linear.cols as u32;
         let batch_u32 = batch as u32;
-        // Always use the tiled GEMM kernel (8 warps share one loaded weight row)
-        // even for batch=1. This unifies the float reduction order with the
-        // grouped-MoE kernel (`aegis_nvfp4_grouped_prequant_gemm`), so prefill
-        // is bit-exact between the per-expert and grouped paths — Gemma 4's
-        // softmax+top-k router is so sensitive to per-element noise that any
-        // mismatch flips expert selections by layer ~3 and produces coherent-
-        // but-different generation. The slight per-launch waste at batch=1
-        // (7 of 8 warps idle) is negligible vs the determinism gain.
-        let grid_y = ((batch + 7) / 8) as u32;
-        let shared = (linear.cols / 2 + linear.cols / 16) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (rows_u32, grid_y, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: shared,
-        };
-        unsafe {
-            self.stream
-                .launch_builder(&self.kernels.nvfp4_prequant_batched_gemm)
-                .arg(&linear.packed)
-                .arg(&linear.scales)
-                .arg(&input.slice)
-                .arg(&rows_u32)
-                .arg(&cols_u32)
-                .arg(&batch_u32)
-                .arg(&linear.output_scale)
-                .arg(&mut output.slice)
-                .launch(cfg)
+        if batch > 1 {
+            let grid_y = ((batch + 7) / 8) as u32;
+            let shared = (linear.cols / 2 + linear.cols / 16) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (rows_u32, grid_y, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_prequant_batched_gemm)
+                    .arg(&linear.packed)
+                    .arg(&linear.scales)
+                    .arg(&input.slice)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&batch_u32)
+                    .arg(&linear.output_scale)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch batched nvfp4 gemm prequantized"))?;
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (rows_u32, batch_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_prequant_batched)
+                    .arg(&linear.packed)
+                    .arg(&linear.scales)
+                    .arg(&input.slice)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&linear.output_scale)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch batched nvfp4 matvec prequantized"))?;
         }
-        .map_err(map_cuda_err("launch batched nvfp4 gemm prequantized"))?;
         Ok(())
     }
 
@@ -1152,29 +1165,48 @@ impl CudaRuntime {
         let rows_u32 = rows as u32;
         let cols_u32 = cols as u32;
         let batch_u32 = batch as u32;
-        // Same kernel choice as the non-staged path: always use the tiled GEMM
-        // kernel for bit-exact match with the grouped-MoE pipeline.
-        let grid_y = ((batch + 7) / 8) as u32;
-        let shared = (cols / 2 + cols / 16) as u32;
-        let cfg = LaunchConfig {
-            grid_dim: (rows_u32, grid_y, 1),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: shared,
-        };
-        unsafe {
-            self.stream
-                .launch_builder(&self.kernels.nvfp4_prequant_batched_gemm)
-                .arg(packed)
-                .arg(scales)
-                .arg(quantized_input)
-                .arg(&rows_u32)
-                .arg(&cols_u32)
-                .arg(&batch_u32)
-                .arg(&output_scale)
-                .arg(output)
-                .launch(cfg)
+        if batch > 1 {
+            let grid_y = ((batch + 7) / 8) as u32;
+            let shared = (cols / 2 + cols / 16) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (rows_u32, grid_y, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: shared,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_prequant_batched_gemm)
+                    .arg(packed)
+                    .arg(scales)
+                    .arg(quantized_input)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&batch_u32)
+                    .arg(&output_scale)
+                    .arg(output)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch staged nvfp4 prequantized batched gemm"))?;
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (rows_u32, batch_u32, 1),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_prequant_batched)
+                    .arg(packed)
+                    .arg(scales)
+                    .arg(quantized_input)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&output_scale)
+                    .arg(output)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch staged nvfp4 prequantized batched"))?;
         }
-        .map_err(map_cuda_err("launch staged nvfp4 prequantized batched gemm"))?;
         Ok(())
     }
 
@@ -1287,27 +1319,6 @@ impl CudaRuntime {
         quantized_input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
-        // Phase 4: VRAM cache fast-path (decode M=1 case).
-        if let Some(cache) = self.expert_cache() {
-            if let Some(entry) = cache.get(&linear.name) {
-                let buf = cache.buffer();
-                let packed_view = buf
-                    .slice
-                    .slice(entry.packed_offset..entry.packed_offset + entry.packed_bytes);
-                let scales_view = buf
-                    .slice
-                    .slice(entry.scales_offset..entry.scales_offset + entry.scales_bytes);
-                return self.launch_nvfp4_prequantized_views(
-                    &packed_view,
-                    &scales_view,
-                    linear.rows,
-                    linear.cols,
-                    linear.output_scale,
-                    &quantized_input.slice,
-                    &mut output.slice,
-                );
-            }
-        }
         let hw = linear.host_weights.as_deref().ok_or_else(|| {
             AegisError::InvalidPlan(format!(
                 "staged matvec called on non-host-resident linear `{}`",
@@ -1341,30 +1352,6 @@ impl CudaRuntime {
         batch: usize,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
-        // Phase 4: VRAM expert cache — if this weight has been pre-loaded
-        // into the cache, launch the kernel against the cache buffer views
-        // directly. Skips the staging-pool H2D entirely.
-        if let Some(cache) = self.expert_cache() {
-            if let Some(entry) = cache.get(&linear.name) {
-                let buf = cache.buffer();
-                let packed_view = buf
-                    .slice
-                    .slice(entry.packed_offset..entry.packed_offset + entry.packed_bytes);
-                let scales_view = buf
-                    .slice
-                    .slice(entry.scales_offset..entry.scales_offset + entry.scales_bytes);
-                return self.launch_nvfp4_prequantized_batched_views(
-                    &packed_view,
-                    &scales_view,
-                    linear.rows,
-                    linear.cols,
-                    linear.output_scale,
-                    &quantized_input.slice,
-                    batch,
-                    &mut output.slice,
-                );
-            }
-        }
         let hw = linear.host_weights.as_deref().ok_or_else(|| {
             AegisError::InvalidPlan(format!(
                 "staged batched matvec called on non-host-resident linear `{}`",

@@ -1,6 +1,5 @@
 mod compile;
 mod cutlass_bridge;
-pub(crate) mod expert_cache;
 mod functions;
 pub(crate) mod host_arena;
 mod kernels;
