@@ -3,7 +3,7 @@
 //! Each supported model family implements [`ModelArchitecture`], which drives
 //! graph construction and per-layer dispatch decisions throughout the engine.
 
-mod gemma4;
+pub mod gemma4;
 mod llama;
 mod nemotron3;
 mod qwen3;
@@ -120,6 +120,14 @@ pub trait ModelArchitecture: Send + Sync + std::fmt::Debug {
 
     /// Positional encoding config for this architecture.
     fn rope_config(&self, config: &HfConfig) -> RopeConfig;
+
+    /// Multiplicative scale applied to token embeddings after lookup. Most
+    /// architectures use 1.0 (returns None). Gemma family scales by
+    /// `sqrt(hidden_size)` so the embedding output sits on the same order of
+    /// magnitude as RMS-norm hidden states.
+    fn embed_scale(&self, _config: &HfConfig) -> Option<f32> {
+        None
+    }
 }
 
 // ── Detection ────────────────────────────────────────────────────────────────

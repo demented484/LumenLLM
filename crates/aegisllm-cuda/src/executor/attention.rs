@@ -1,8 +1,8 @@
 use super::linear_ops::{
-    matvec_nvfp4_device_with_scratch, matvec_nvfp4_prepared_device_reuse, native_mxfp4_enabled,
-    prepare_nvfp4_input,
+    matvec_cuda_linear_with_scratch, matvec_nvfp4_device_with_scratch,
+    matvec_nvfp4_prepared_device_reuse, native_mxfp4_enabled, prepare_nvfp4_input,
 };
-use super::state::{CudaLayer, CudaLayerState, CudaScratch};
+use super::state::{CudaLayer, CudaLayerState, CudaLinear, CudaScratch};
 use crate::cuda::{CudaRuntime, DeviceBuffer, DeviceRopeConfig};
 use aegisllm_base::error::Result;
 
@@ -35,61 +35,133 @@ pub(super) fn forward_attention_device(
 ) -> Result<()> {
     let kv_width = num_kv_heads * head_dim;
 
-    runtime.rms_norm_quant_nvfp4_device(
-        hidden,
-        &layer.input_norm_weight,
-        rms_norm_eps,
-        layer.q_proj.input_scale,
-        &mut scratch.input_normed,
-        &mut scratch.quant_hidden,
-    )?;
-    let mut quant_scale = Some(layer.q_proj.input_scale);
-    // Q projection: quantize input_normed to mxfp4_hidden (native path) or quant_hidden (legacy).
-    let mxfp4_valid = matvec_nvfp4_prepared_device_reuse(
-        runtime,
-        &layer.q_proj,
-        &scratch.input_normed,
-        &scratch.quant_hidden,
-        &mut scratch.mxfp4_hidden,
-        false,
-        &mut scratch.q,
-        scratch.staging_pool.as_deref_mut(),
-    )?;
-    // K/V projections share the same input_normed — skip MXFP4 re-quantize in native path.
-    prepare_nvfp4_input(
-        runtime,
-        &layer.k_proj,
-        &scratch.input_normed,
-        &mut quant_scale,
-        &mut scratch.quant_hidden,
-    )?;
-    matvec_nvfp4_prepared_device_reuse(
-        runtime,
-        &layer.k_proj,
-        &scratch.input_normed,
-        &scratch.quant_hidden,
-        &mut scratch.mxfp4_hidden,
-        mxfp4_valid,
-        &mut scratch.k,
-        scratch.staging_pool.as_deref_mut(),
-    )?;
-    prepare_nvfp4_input(
-        runtime,
-        &layer.v_proj,
-        &scratch.input_normed,
-        &mut quant_scale,
-        &mut scratch.quant_hidden,
-    )?;
-    matvec_nvfp4_prepared_device_reuse(
-        runtime,
-        &layer.v_proj,
-        &scratch.input_normed,
-        &scratch.quant_hidden,
-        &mut scratch.mxfp4_hidden,
-        mxfp4_valid,
-        &mut scratch.v,
-        scratch.staging_pool.as_deref_mut(),
-    )?;
+    if let (Some(q), Some(k), Some(v)) = (layer.q_proj.as_nvfp4(), layer.k_proj.as_nvfp4(), layer.v_proj.as_nvfp4()) {
+        // NVFP4 path (Llama, Qwen, etc.)
+        runtime.rms_norm_quant_nvfp4_device(
+            hidden,
+            &layer.input_norm_weight,
+            rms_norm_eps,
+            q.input_scale,
+            &mut scratch.input_normed,
+            &mut scratch.quant_hidden,
+        )?;
+        let mut quant_scale = Some(q.input_scale);
+        // Q projection: quantize input_normed to mxfp4_hidden (native path) or quant_hidden (legacy).
+        let mxfp4_valid = matvec_nvfp4_prepared_device_reuse(
+            runtime,
+            q,
+            &scratch.input_normed,
+            &scratch.quant_hidden,
+            &mut scratch.mxfp4_hidden,
+            false,
+            &mut scratch.q,
+            scratch.staging_pool.as_deref_mut(),
+        )?;
+        // K/V projections share the same input_normed — skip MXFP4 re-quantize in native path.
+        prepare_nvfp4_input(
+            runtime,
+            k,
+            &scratch.input_normed,
+            &mut quant_scale,
+            &mut scratch.quant_hidden,
+        )?;
+        matvec_nvfp4_prepared_device_reuse(
+            runtime,
+            k,
+            &scratch.input_normed,
+            &scratch.quant_hidden,
+            &mut scratch.mxfp4_hidden,
+            mxfp4_valid,
+            &mut scratch.k,
+            scratch.staging_pool.as_deref_mut(),
+        )?;
+        prepare_nvfp4_input(
+            runtime,
+            v,
+            &scratch.input_normed,
+            &mut quant_scale,
+            &mut scratch.quant_hidden,
+        )?;
+        matvec_nvfp4_prepared_device_reuse(
+            runtime,
+            v,
+            &scratch.input_normed,
+            &scratch.quant_hidden,
+            &mut scratch.mxfp4_hidden,
+            mxfp4_valid,
+            &mut scratch.v,
+            scratch.staging_pool.as_deref_mut(),
+        )?;
+    } else {
+        // BF16 path (Gemma4 attention)
+        runtime.rms_norm_device(hidden, &layer.input_norm_weight, rms_norm_eps, &mut scratch.input_normed)?;
+        matvec_cuda_linear_with_scratch(runtime, &layer.q_proj, &scratch.input_normed,
+            &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut scratch.q,
+            scratch.staging_pool.as_deref_mut())?;
+        matvec_cuda_linear_with_scratch(runtime, &layer.k_proj, &scratch.input_normed,
+            &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut scratch.k,
+            scratch.staging_pool.as_deref_mut())?;
+        matvec_cuda_linear_with_scratch(runtime, &layer.v_proj, &scratch.input_normed,
+            &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut scratch.v,
+            scratch.staging_pool.as_deref_mut())?;
+    }
+    // Gemma 4: per-head RMS norm on Q and K, applied between projection and RoPE.
+    // The norm weight has length `head_dim`; the kernel processes `num_heads` rows in parallel.
+    // RMS norm cannot run in-place (the kernel re-reads its input in the second pass), so
+    // write to the scratch buffer then copy back. The scratch buffer holds enough elements
+    // for the largest (q_width / kv_width) across all layers.
+    if let Some(ref qnw) = layer.q_norm_weight {
+        runtime.rms_norm_batched_device(
+            &scratch.q,
+            qnw,
+            num_attention_heads,
+            rms_norm_eps,
+            &mut scratch.qk_norm_scratch,
+        )?;
+        runtime.copy_prefix_f32_device(
+            &scratch.qk_norm_scratch,
+            &mut scratch.q,
+            num_attention_heads * head_dim,
+        )?;
+    }
+    if let Some(ref knw) = layer.k_norm_weight {
+        runtime.rms_norm_batched_device(
+            &scratch.k,
+            knw,
+            num_kv_heads,
+            rms_norm_eps,
+            &mut scratch.qk_norm_scratch,
+        )?;
+        runtime.copy_prefix_f32_device(
+            &scratch.qk_norm_scratch,
+            &mut scratch.k,
+            num_kv_heads * head_dim,
+        )?;
+    }
+    // Gemma 4: V is RMS-normed per-head with NO learned weight (with_scale=False).
+    // This applies whenever `q_norm` is present (Gemma 4 always pairs q/k/v norms).
+    if layer.q_norm_weight.is_some() {
+        runtime.rms_norm_batched_no_weight_device(
+            &scratch.v,
+            num_kv_heads,
+            head_dim,
+            rms_norm_eps,
+            &mut scratch.qk_norm_scratch,
+        )?;
+        runtime.copy_prefix_f32_device(
+            &scratch.qk_norm_scratch,
+            &mut scratch.v,
+            num_kv_heads * head_dim,
+        )?;
+    }
+    if let Ok(tag) = std::env::var("AEGIS_DUMP_QKV") {
+        let q = runtime.download_f32(&scratch.q).unwrap();
+        let k = runtime.download_f32(&scratch.k).unwrap();
+        let v = runtime.download_f32(&scratch.v).unwrap();
+        eprintln!("[DUMP {tag} Q post-norm] first8={:?}", &q[0..8]);
+        eprintln!("[DUMP {tag} K post-norm] first8={:?}", &k[0..8]);
+        eprintln!("[DUMP {tag} V post-norm] first8={:?}", &v[0..8]);
+    }
     runtime.apply_rope_ptr_device(
         &mut scratch.q,
         p_position,
@@ -98,6 +170,23 @@ pub(super) fn forward_attention_device(
         rope,
     )?;
     runtime.apply_rope_ptr_device(&mut scratch.k, p_position, num_kv_heads, head_dim, rope)?;
+    if let Ok(tag) = std::env::var("AEGIS_DUMP_QROPE") {
+        thread_local! { static C: std::cell::RefCell<usize> = std::cell::RefCell::new(0); }
+        let idx = C.with(|c| { let v = *c.borrow(); *c.borrow_mut() = v + 1; v });
+        if idx == 0 || idx == 30 {
+            // First call (BOS layer 0) and 30th call (Hi layer 0).
+            let q = runtime.download_f32(&scratch.q).unwrap();
+            let pos = runtime.download_u32(p_position).unwrap();
+            eprintln!("[DUMP {tag} call#{} pos={:?} Q post-rope] {:?}", idx, pos, &q[0..8]);
+        }
+    }
+    // Gemma 4 attention uses scaling=1.0 (NOT 1/sqrt(d)). Our attention kernels hardcode
+    // softmax scale = rsqrt(head_dim). Pre-multiply Q by sqrt(head_dim) so the kernel's
+    // built-in scaling cancels out and the effective Q·K^T is unscaled.
+    if layer.q_norm_weight.is_some() {
+        let sqrt_d = (head_dim as f32).sqrt();
+        runtime.scale_f32_device_len(sqrt_d, &mut scratch.q, num_attention_heads * head_dim)?;
+    }
 
     if let Some(idx) = staging_slot_idx {
         // Host-resident KV: caller has pre-uploaded prior KV onto the staging slot
@@ -157,36 +246,44 @@ pub(super) fn forward_attention_device(
             &mut scratch.attn_context,
         )?;
     }
-    if native_mxfp4_enabled(runtime, &layer.o_proj) {
-        matvec_nvfp4_device_with_scratch(
-            runtime,
-            &layer.o_proj,
-            &scratch.attn_context,
-            &mut scratch.quant_hidden,
-            &mut scratch.mxfp4_hidden,
-            &mut scratch.attn_out,
-            scratch.staging_pool.as_deref_mut(),
-        )?;
-    } else if runtime.cutlass_nvfp4_inference_enabled_for(&layer.o_proj) {
-        runtime.matmul_cutlass_nvfp4_prefill_device(
-            &layer.o_proj,
-            &scratch.attn_context,
-            1,
-            &mut scratch.cutlass_payload,
-            &mut scratch.cutlass_scales,
-            &mut scratch.cutlass_workspace,
-            &mut scratch.attn_out,
-        )?;
-    } else {
-        matvec_nvfp4_device_with_scratch(
-            runtime,
-            &layer.o_proj,
-            &scratch.attn_context,
-            &mut scratch.quant_hidden,
-            &mut scratch.mxfp4_hidden,
-            &mut scratch.attn_out,
-            scratch.staging_pool.as_deref_mut(),
-        )?;
+    if let Ok(tag) = std::env::var("AEGIS_DUMP_ATTNOUT") {
+        thread_local! { static C2: std::cell::RefCell<usize> = std::cell::RefCell::new(0); }
+        let target = std::env::var("AEGIS_DUMP_ATTNOUT_LAYER")
+            .ok().and_then(|s| s.parse::<usize>().ok());
+        let idx = C2.with(|c| { let v = *c.borrow(); *c.borrow_mut() = v + 1; v });
+        // Decode-style call counter: layer L for token T = call#(T*num_layers + L). Default to first 2 tokens layer 0.
+        let layer_match = target.map(|t| idx % 30 == t).unwrap_or(idx == 0 || idx == 30);
+        if layer_match {
+            let q = runtime.download_f32(&scratch.attn_context).unwrap();
+            let pos = runtime.download_u32(p_position).unwrap();
+            eprintln!("[DUMP {tag} call#{} pos={:?} attn_output] {:?}", idx, pos, &q[0..8]);
+        }
+    }
+    match &layer.o_proj {
+        CudaLinear::Nvfp4(o) => {
+            if native_mxfp4_enabled(runtime, o) {
+                matvec_nvfp4_device_with_scratch(
+                    runtime, o, &scratch.attn_context,
+                    &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden,
+                    &mut scratch.attn_out, scratch.staging_pool.as_deref_mut(),
+                )?;
+            } else if runtime.cutlass_nvfp4_inference_enabled_for(o) {
+                runtime.matmul_cutlass_nvfp4_prefill_device(
+                    o, &scratch.attn_context, 1,
+                    &mut scratch.cutlass_payload, &mut scratch.cutlass_scales,
+                    &mut scratch.cutlass_workspace, &mut scratch.attn_out,
+                )?;
+            } else {
+                matvec_nvfp4_device_with_scratch(
+                    runtime, o, &scratch.attn_context,
+                    &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden,
+                    &mut scratch.attn_out, scratch.staging_pool.as_deref_mut(),
+                )?;
+            }
+        }
+        CudaLinear::Bf16(o) => {
+            runtime.matvec_bf16_reference_device(o, &scratch.attn_context, &mut scratch.attn_out)?;
+        }
     }
     if let Some(ref post_norm) = layer.post_attn_sublayer_norm {
         // Gemma 4 PrePost: normalize attention output before adding to residual.

@@ -73,44 +73,130 @@ impl ParametersFile {
         }
         let model_path = self.model.path;
 
+        // ── `model.{store, compute}` — defaults for non-block weights (embed, lm_head,
+        //    final_norm). Also serves as the fallback tier for hidden-layers sub-sections
+        //    when they don't specify their own `fallback-store/compute`.
         let mmap_enabled = self.model.mmap.unwrap_or(true);
-        if let Some(store) = self.model.store {
-            policy.weights_store = parse_storage(&store, cuda_device)?;
+        let model_store: Option<StoragePlacement> = self.model.store
+            .as_deref()
+            .map(|s| parse_storage(s, cuda_device))
+            .transpose()?;
+        let model_compute: Option<ComputePlacement> = self.model.compute
+            .as_deref()
+            .map(|c| parse_compute(c, cuda_device))
+            .transpose()?;
+        if let Some(store) = model_store {
+            policy.weights_store = store;
+            policy.spill_store = store;
+            policy.kv_store = store;
         } else if !mmap_enabled && policy.weights_store == StoragePlacement::Mmap {
             policy.weights_store = StoragePlacement::Ram;
             policy.spill_store = StoragePlacement::Ram;
         }
-        if let Some(compute) = self.model.compute {
-            let compute = parse_compute(&compute, cuda_device)?;
+        if let Some(compute) = model_compute {
             policy.weights_compute = compute;
             policy.spill_compute = compute;
+            policy.kv_compute = compute;
         }
 
-        if let Some(kv) = self.kv_cache {
-            if let Some(context_size) = kv.context_size {
-                policy.context_size = context_size;
+        // ── `hidden-layers` — per-block weights and per-block KV cache.
+        if let Some(hidden_layers) = self.hidden_layers {
+            let parent_compute: Option<ComputePlacement> = hidden_layers.compute
+                .as_deref()
+                .map(|c| parse_compute(c, cuda_device))
+                .transpose()?;
+
+            // ── weights sub-section ────────────────────────────────────────────
+            if let Some(weights) = hidden_layers.weights {
+                let primary_store = weights.store
+                    .as_deref()
+                    .map(|s| parse_storage(s, cuda_device))
+                    .transpose()?;
+                let primary_compute = weights.compute
+                    .as_deref()
+                    .map(|c| parse_compute(c, cuda_device))
+                    .transpose()?
+                    .or(parent_compute);
+                let fallback_store = weights.fallback_store
+                    .as_deref()
+                    .map(|s| parse_storage(s, cuda_device))
+                    .transpose()?;
+                let fallback_compute = weights.fallback_compute
+                    .as_deref()
+                    .map(|c| parse_compute(c, cuda_device))
+                    .transpose()?;
+
+                // Tail (layers >= number) is described by the policy default
+                // (weights_store/compute). Override it with fallback if specified.
+                if let Some(store) = fallback_store {
+                    policy.weights_store = store;
+                }
+                if let Some(compute) = fallback_compute {
+                    policy.weights_compute = compute;
+                }
+
+                // First-N rule (or All if number is omitted).
+                let selector = match weights.number {
+                    Some(n) => LayerSelector::FirstN { n },
+                    None => LayerSelector::All,
+                };
+                if primary_store.is_some() || primary_compute.is_some() {
+                    policy.rules.push(PlacementRule {
+                        selector,
+                        store: primary_store,
+                        compute: primary_compute,
+                    });
+                }
             }
-            if let Some(store) = kv.store {
-                policy.kv_store = parse_storage(&store, cuda_device)?;
-            }
-            if let Some(compute) = kv.compute {
-                policy.kv_compute = parse_compute(&compute, cuda_device)?;
-            }
-            if let Some(value) = kv.type_k.or(kv.type_v) {
-                policy.kv_quantization = KvCacheQuantization::parse(&value).ok_or_else(|| {
-                    AegisError::InvalidConfig(format!(
-                        "unsupported kv cache quantization `{value}`"
-                    ))
-                })?;
-            }
-            if let Some(n) = kv.store_first_n {
-                if let Some(first_store) = kv.store_first {
-                    let first = parse_storage(&first_store, cuda_device)?;
-                    // Only meaningful if the per-layer override differs from the default.
-                    if first != policy.kv_store {
-                        policy.kv_vram_layers = Some(n);
-                        // If first N are VRAM, ensure kv_store reflects the non-VRAM default.
-                        // (kv_store was already set above from the `store` field.)
+
+            // ── kv-cache sub-section ───────────────────────────────────────────
+            if let Some(kv) = hidden_layers.kv_cache {
+                if let Some(context_size) = kv.context_size {
+                    policy.context_size = context_size;
+                }
+                let primary_store = kv.store
+                    .as_deref()
+                    .map(|s| parse_storage(s, cuda_device))
+                    .transpose()?;
+                let fallback_store = kv.fallback_store
+                    .as_deref()
+                    .map(|s| parse_storage(s, cuda_device))
+                    .transpose()?;
+                if let Some(value) = kv.type_k.or(kv.type_v) {
+                    policy.kv_quantization = KvCacheQuantization::parse(&value).ok_or_else(|| {
+                        AegisError::InvalidConfig(format!(
+                            "unsupported kv cache quantization `{value}`"
+                        ))
+                    })?;
+                }
+
+                // KV cache compute is implicit from the matching layer's weights compute
+                // (set above). We only manage storage here.
+                //
+                // Mapping to policy fields:
+                //   * `kv-cache.{number=N, store=A}`: first N layers use A; tail uses
+                //     `fallback-store` if set, else `model.store`.
+                //   * `kv-cache.{store=A}` (no number): ALL layers use A; first_n_layers=None.
+                match (kv.number, primary_store, fallback_store) {
+                    (Some(n), Some(first), fallback) => {
+                        policy.kv_first_n_layers = Some(n);
+                        policy.kv_first_store = Some(first);
+                        policy.kv_store = fallback.unwrap_or(policy.kv_store);
+                    }
+                    (None, Some(store), _) => {
+                        policy.kv_store = store;
+                        policy.kv_first_n_layers = None;
+                        policy.kv_first_store = None;
+                    }
+                    (Some(_), None, _) => {
+                        return Err(AegisError::InvalidConfig(
+                            "hidden-layers.kv-cache.number set but `store` missing; \
+                             specify the store for the first-N tier or remove `number`."
+                                .into(),
+                        ));
+                    }
+                    (None, None, _) => {
+                        // Nothing to do — keeps inherited values from `model.store`.
                     }
                 }
             }
@@ -150,45 +236,6 @@ impl ParametersFile {
             }
             if let Some(value) = other.top_k {
                 generation.top_k = value;
-            }
-        }
-
-        policy.rules.clear();
-        if let Some(layers) = self.layers {
-            let n = layers.number.unwrap_or(0);
-            let base_store = layers
-                .rest_store
-                .as_ref()
-                .or(if n == 0 { layers.store.as_ref() } else { None });
-            let base_compute = layers.rest_compute.as_ref().or({
-                if n == 0 {
-                    layers.compute.as_ref()
-                } else {
-                    None
-                }
-            });
-            if let Some(store) = base_store {
-                policy.weights_store = parse_storage(store, cuda_device)?;
-                policy.spill_store = policy.weights_store;
-            }
-            if let Some(compute) = base_compute {
-                policy.weights_compute = parse_compute(compute, cuda_device)?;
-                policy.spill_compute = policy.weights_compute;
-            }
-            if n > 0 {
-                policy.rules.push(PlacementRule {
-                    selector: LayerSelector::FirstN { n },
-                    store: layers
-                        .store
-                        .as_deref()
-                        .map(|value| parse_storage(value, cuda_device))
-                        .transpose()?,
-                    compute: layers
-                        .compute
-                        .as_deref()
-                        .map(|value| parse_compute(value, cuda_device))
-                        .transpose()?,
-                });
             }
         }
 
@@ -291,8 +338,9 @@ fn parse_bytes_string(value: &str) -> Result<u64> {
 
 pub fn parse_storage(value: &str, default_device: usize) -> Result<StoragePlacement> {
     match value.to_ascii_lowercase().as_str() {
+        // "ram" is the user-facing name for host memory; the engine picks the most
+        // memory-efficient internal residency (pinned vs mmap) based on the compute target.
         "ram" => Ok(StoragePlacement::Ram),
-        "mmap" => Ok(StoragePlacement::Mmap),
         "vram" | "gpu" => Ok(StoragePlacement::Vram {
             device: default_device,
         }),
@@ -302,8 +350,12 @@ pub fn parse_storage(value: &str, default_device: usize) -> Result<StoragePlacem
                 .parse::<usize>()
                 .map_err(|_| AegisError::InvalidConfig(format!("invalid storage `{value}`")))?,
         }),
+        "mmap" => Err(AegisError::InvalidConfig(
+            "`mmap` is no longer accepted as a storage placement; use `ram` (the engine \
+             will mmap weights internally when staging to a GPU)".into()
+        )),
         _ => Err(AegisError::InvalidConfig(format!(
-            "unsupported storage placement `{value}`"
+            "unsupported storage placement `{value}` (use `ram` or `vram`)"
         ))),
     }
 }

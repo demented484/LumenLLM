@@ -24,4 +24,6 @@ pub(crate) const BLACKWELL_FP4_KERNEL_SRC: &str = concat!(
     include_str!("kernels/blackwell/gated_deltanet_decode.cu"),
     "\n",
     include_str!("kernels/blackwell/mamba_scan_decode.cu"),
+    "\n",
+    include_str!("kernels/blackwell/router_topk.cu"),
 );

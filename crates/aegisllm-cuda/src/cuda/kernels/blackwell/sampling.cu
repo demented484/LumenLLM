@@ -89,3 +89,59 @@ extern "C" __global__ void aegis_argmax_f32_finalize(
     }
     output_token[0] = best_idx;
 }
+
+// Batched BF16 matmul: output[batch, row] = sum_c bf16(matrix[row, c]) * input[batch, c].
+// Used by chunked prefill for BF16 weights (router, shared MLP, lm_head).
+// Grid: (rows, batch). Block: (128, 1, 1). Shared mem: 128 * sizeof(float).
+extern "C" __global__ void aegis_bf16_matmul_reference_batched(
+    const unsigned short* matrix,
+    const float* input,
+    const unsigned int rows,
+    const unsigned int cols,
+    const unsigned int batch,
+    float* output
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int batch_idx = blockIdx.y;
+    const unsigned int tid = threadIdx.x;
+    if (row >= rows || batch_idx >= batch) {
+        return;
+    }
+    extern __shared__ float partial[];
+    float sum = 0.0f;
+    const unsigned short* matrix_row = matrix + size_t(row) * cols;
+    const float* input_row = input + size_t(batch_idx) * cols;
+    for (unsigned int col = tid; col < cols; col += blockDim.x) {
+        sum += bf16_to_float(matrix_row[col]) * input_row[col];
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        output[size_t(batch_idx) * rows + row] = partial[0];
+    }
+}
+
+// Batched element-wise GeGLU (gelu_pytorch_tanh): out[i] = gelu_tanh(gate[i]) * up[i].
+// Used by chunked prefill for the routed-expert GeGLU step on gathered token batches.
+extern "C" __global__ void aegis_geglu_tanh_batched(
+    const float* gate,
+    const float* up,
+    const unsigned int len,
+    float* output
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        const float x = gate[idx];
+        const float k = 0.7978845608028654f;
+        const float k2 = 0.044715f;
+        const float inner = k * (x + k2 * x * x * x);
+        const float gelu = 0.5f * x * (1.0f + tanhf(inner));
+        output[idx] = gelu * up[idx];
+    }
+}

@@ -143,7 +143,7 @@ impl CudaRuntime {
         matrix: &DeviceBf16Matrix,
         input: &[f32],
     ) -> Result<Vec<f32>> {
-        if input.len() != matrix.cols {
+        if input.len() < matrix.cols {
             return Err(AegisError::InvalidPlan(format!(
                 "bf16 matrix shape mismatch for {}: expected input={}, got input={}",
                 matrix.name,
@@ -169,6 +169,56 @@ impl CudaRuntime {
         self.launch_bf16_matvec_reference(matrix, &input.slice, &mut output.slice)
     }
 
+    /// Batched BF16 GEMM-like matmul over `batch` token rows. Requires the matrix
+    /// to be VRAM-resident (host-resident BF16 hot-path is the slow CPU rayon
+    /// fallback and is intentionally not supported here — chunked prefill always
+    /// runs on VRAM-resident weights).
+    pub fn matmul_bf16_reference_batched_device(
+        &self,
+        matrix: &DeviceBf16Matrix,
+        input: &DeviceBuffer<f32>,
+        batch: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if matrix.is_host_resident() {
+            return Err(AegisError::InvalidPlan(format!(
+                "batched bf16 matmul does not support host-resident matrix `{}`; load to VRAM",
+                matrix.name
+            )));
+        }
+        let total_in = checked_len("bf16 matmul input", batch, matrix.cols)?;
+        let total_out = checked_len("bf16 matmul output", batch, matrix.rows)?;
+        if input.len() < total_in || output.len() < total_out {
+            return Err(AegisError::InvalidPlan(format!(
+                "batched bf16 matmul shape mismatch for {}: input.len()={} need {}*{}={}, output.len()={} need {}*{}={}",
+                matrix.name, input.len(), batch, matrix.cols, total_in,
+                output.len(), batch, matrix.rows, total_out
+            )));
+        }
+        let rows = u32_arg("rows", matrix.rows)?;
+        let cols = u32_arg("cols", matrix.cols)?;
+        let batch_u32 = u32_arg("batch", batch)?;
+        let block_dim = 128u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows, batch_u32, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: block_dim * std::mem::size_of::<f32>() as u32,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.bf16_matmul_reference_batched)
+                .arg(&matrix.values)
+                .arg(&input.slice)
+                .arg(&rows)
+                .arg(&cols)
+                .arg(&batch_u32)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch bf16_matmul_reference_batched"))?;
+        Ok(())
+    }
+
     /// CPU-side matvec for host-resident BF16 matrices: avoid having lm_head (~1 GB)
     /// permanently in VRAM at the cost of one D2H download (input) + ~30ms CPU compute
     /// + one H2D upload (logits) per decode step. Saves ~1 GB VRAM.
@@ -184,7 +234,7 @@ impl CudaRuntime {
                 matrix.name
             ))
         })?;
-        if input.len() != matrix.cols || output.len() < matrix.rows {
+        if input.len() < matrix.cols || output.len() < matrix.rows {
             return Err(AegisError::InvalidPlan(format!(
                 "bf16 host matvec shape mismatch for {}: input={} cols={} output={} rows={}",
                 matrix.name, input.len(), matrix.cols, output.len(), matrix.rows
@@ -907,7 +957,7 @@ impl CudaRuntime {
         input: &CudaSlice<f32>,
         output: &mut CudaSlice<f32>,
     ) -> Result<()> {
-        if input.len() != matrix.cols || output.len() != matrix.rows {
+        if input.len() < matrix.cols || output.len() < matrix.rows {
             return Err(AegisError::InvalidPlan(format!(
                 "bf16 matvec shape mismatch for {}: expected input={} output={}, got input={} output={}",
                 matrix.name,
@@ -1271,24 +1321,49 @@ impl CudaRuntime {
         quantized_input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
+        // Phase 4: VRAM cache fast-path (decode M=1 case).
+        if let Some(cache) = self.expert_cache() {
+            if let Some(entry) = cache.get(&linear.name) {
+                let buf = cache.buffer();
+                let packed_view = buf
+                    .slice
+                    .slice(entry.packed_offset..entry.packed_offset + entry.packed_bytes);
+                let scales_view = buf
+                    .slice
+                    .slice(entry.scales_offset..entry.scales_offset + entry.scales_bytes);
+                return self.launch_nvfp4_prequantized_views(
+                    &packed_view,
+                    &scales_view,
+                    linear.rows,
+                    linear.cols,
+                    linear.output_scale,
+                    &quantized_input.slice,
+                    &mut output.slice,
+                );
+            }
+        }
         let hw = linear.host_weights.as_deref().ok_or_else(|| {
             AegisError::InvalidPlan(format!(
                 "staged matvec called on non-host-resident linear `{}`",
                 linear.name
             ))
         })?;
-        staging.prepare(hw, linear.packed_bytes, linear.scale_bytes, &self.stream)?;
-        let packed_view = staging.packed_view(linear.packed_bytes);
-        let scales_view = staging.scales_view(linear.scale_bytes);
-        self.launch_nvfp4_prequantized_views(
-            &packed_view,
-            &scales_view,
-            linear.rows,
-            linear.cols,
-            linear.output_scale,
-            &quantized_input.slice,
-            &mut output.slice,
-        )
+        let slot = staging.prepare_async(self, hw, linear.packed_bytes, linear.scale_bytes)?;
+        let result = {
+            let packed_view = staging.packed_view(slot, linear.packed_bytes);
+            let scales_view = staging.scales_view(slot, linear.scale_bytes);
+            self.launch_nvfp4_prequantized_views(
+                &packed_view,
+                &scales_view,
+                linear.rows,
+                linear.cols,
+                linear.output_scale,
+                &quantized_input.slice,
+                &mut output.slice,
+            )
+        };
+        staging.mark_kernel_launched(self, slot)?;
+        result
     }
 
     /// Staged prefill matvec (M=batch): same H2D staging, batched kernel.
@@ -1300,25 +1375,53 @@ impl CudaRuntime {
         batch: usize,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
+        // Phase 4: VRAM expert cache — if this weight has been pre-loaded
+        // into the cache, launch the kernel against the cache buffer views
+        // directly. Skips the staging-pool H2D entirely.
+        if let Some(cache) = self.expert_cache() {
+            if let Some(entry) = cache.get(&linear.name) {
+                let buf = cache.buffer();
+                let packed_view = buf
+                    .slice
+                    .slice(entry.packed_offset..entry.packed_offset + entry.packed_bytes);
+                let scales_view = buf
+                    .slice
+                    .slice(entry.scales_offset..entry.scales_offset + entry.scales_bytes);
+                return self.launch_nvfp4_prequantized_batched_views(
+                    &packed_view,
+                    &scales_view,
+                    linear.rows,
+                    linear.cols,
+                    linear.output_scale,
+                    &quantized_input.slice,
+                    batch,
+                    &mut output.slice,
+                );
+            }
+        }
         let hw = linear.host_weights.as_deref().ok_or_else(|| {
             AegisError::InvalidPlan(format!(
                 "staged batched matvec called on non-host-resident linear `{}`",
                 linear.name
             ))
         })?;
-        staging.prepare(hw, linear.packed_bytes, linear.scale_bytes, &self.stream)?;
-        let packed_view = staging.packed_view(linear.packed_bytes);
-        let scales_view = staging.scales_view(linear.scale_bytes);
-        self.launch_nvfp4_prequantized_batched_views(
-            &packed_view,
-            &scales_view,
-            linear.rows,
-            linear.cols,
-            linear.output_scale,
-            &quantized_input.slice,
-            batch,
-            &mut output.slice,
-        )
+        let slot = staging.prepare_async(self, hw, linear.packed_bytes, linear.scale_bytes)?;
+        let result = {
+            let packed_view = staging.packed_view(slot, linear.packed_bytes);
+            let scales_view = staging.scales_view(slot, linear.scale_bytes);
+            self.launch_nvfp4_prequantized_batched_views(
+                &packed_view,
+                &scales_view,
+                linear.rows,
+                linear.cols,
+                linear.output_scale,
+                &quantized_input.slice,
+                batch,
+                &mut output.slice,
+            )
+        };
+        staging.mark_kernel_launched(self, slot)?;
+        result
     }
 
     /// Staged decode matvec (M=1) using native MXFP4 tensor cores.
@@ -1342,20 +1445,29 @@ impl CudaRuntime {
                 linear.name
             ))
         })?;
-        staging.prepare_native_mxfp4(mxfp4, &self.stream)?;
-        let weight_view = staging.native_mxfp4_view(mxfp4.data.len()).ok_or_else(|| {
-            AegisError::InvalidPlan("native MXFP4 staging buffer not allocated".into())
-        })?;
-        self.launch_native_mxfp4_batched_views(
-            &weight_view,
-            input_mxfp4,
-            linear.rows,
-            linear.cols,
-            mxfp4.blocks_per_row,
-            1,
-            linear.output_scale,
-            output,
-        )
+        // Stage packed/scales into a fresh slot, then layer the native-mxfp4
+        // bytes into the same slot (consumed by the same kernel launch).
+        let slot = staging.prepare_async(self, hw, linear.packed_bytes, linear.scale_bytes)?;
+        staging.prepare_native_mxfp4_into_last(self, mxfp4)?;
+        let result = {
+            let weight_view = staging
+                .native_mxfp4_view(slot, mxfp4.data.len())
+                .ok_or_else(|| {
+                    AegisError::InvalidPlan("native MXFP4 staging buffer not allocated".into())
+                })?;
+            self.launch_native_mxfp4_batched_views(
+                &weight_view,
+                input_mxfp4,
+                linear.rows,
+                linear.cols,
+                mxfp4.blocks_per_row,
+                1,
+                linear.output_scale,
+                output,
+            )
+        };
+        staging.mark_kernel_launched(self, slot)?;
+        result
     }
 
     /// Staged prefill matmul (M=batch) using native MXFP4 tensor cores.
@@ -1379,20 +1491,27 @@ impl CudaRuntime {
                 linear.name
             ))
         })?;
-        staging.prepare_native_mxfp4(mxfp4, &self.stream)?;
-        let weight_view = staging.native_mxfp4_view(mxfp4.data.len()).ok_or_else(|| {
-            AegisError::InvalidPlan("native MXFP4 staging buffer not allocated".into())
-        })?;
-        self.launch_native_mxfp4_batched_views(
-            &weight_view,
-            input_mxfp4,
-            linear.rows,
-            linear.cols,
-            mxfp4.blocks_per_row,
-            batch,
-            linear.output_scale,
-            output,
-        )
+        let slot = staging.prepare_async(self, hw, linear.packed_bytes, linear.scale_bytes)?;
+        staging.prepare_native_mxfp4_into_last(self, mxfp4)?;
+        let result = {
+            let weight_view = staging
+                .native_mxfp4_view(slot, mxfp4.data.len())
+                .ok_or_else(|| {
+                    AegisError::InvalidPlan("native MXFP4 staging buffer not allocated".into())
+                })?;
+            self.launch_native_mxfp4_batched_views(
+                &weight_view,
+                input_mxfp4,
+                linear.rows,
+                linear.cols,
+                mxfp4.blocks_per_row,
+                batch,
+                linear.output_scale,
+                output,
+            )
+        };
+        staging.mark_kernel_launched(self, slot)?;
+        result
     }
 }
 

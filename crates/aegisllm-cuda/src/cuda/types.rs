@@ -2,11 +2,12 @@ use std::ffi::c_void;
 
 use cudarc::driver::{CudaSlice, PinnedHostSlice};
 
+use super::host_arena::ArenaHandle;
 use super::repack::CutlassNvfp4LinearLayout;
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::planning::runtime::KernelFamily;
 use aegisllm_base::tensor::layout::LinearResidentLayout;
-use aegisllm_base::tensor::storage::TensorResidencyPlan;
+use aegisllm_base::tensor::storage::{LoadedHostTensor, TensorResidencyPlan};
 
 #[derive(Debug)]
 pub struct DeviceBuffer<T> {
@@ -113,10 +114,63 @@ impl CudaAttentionParamsV1 {
 /// Each `PinnedHostSlice<u8>` is sized exactly to its content; staging hands the
 /// whole slice to `memcpy_htod` so cudarc preserves the pinned semantics
 /// (slicing into a pinned buffer demotes it to pageable in the safe API).
+/// Host-resident weight bytes for a single tensor. Three variants reflect the
+/// three ways host-side weight data shows up in the loader:
+///
+///   * `Arena` — sub-slice of a single big `cuMemAllocHost` arena that holds
+///     all NVFP4 host-resident weights. **The fast path** for inference: source
+///     is pinned, so `memcpy_htod` issues a direct DMA without driver bouncing
+///     and without any CPU memcpy in the hot loop.
+///   * `Pinned` — standalone pinned alloc owned by this weight. Used for
+///     generated data (native-MXFP4 repack output) and sliced (MatFormer)
+///     weights where bytes are produced at load time, not directly read from
+///     a file region.
+///   * `Mmap` — file-backed safetensors region. Kept for cases where the
+///     arena isn't available; not currently used by the main NVFP4 path.
+///
+/// All three expose bytes via `as_bytes()`; staging feeds the slice to
+/// `memcpy_htod`. Pinned source (Arena, Pinned) → fast direct DMA; Mmap →
+/// driver internal bounce (slower).
+#[derive(Debug)]
+pub(super) enum HostWeightBytes {
+    Arena {
+        arena: ArenaHandle,
+        offset: usize,
+        len: usize,
+    },
+    Pinned(PinnedHostSlice<u8>),
+    Mmap(LoadedHostTensor),
+}
+
+impl HostWeightBytes {
+    pub fn as_bytes(&self) -> Result<&[u8]> {
+        match self {
+            Self::Arena { arena, offset, len } => Ok(arena.slice(*offset, *len)),
+            Self::Pinned(p) => p
+                .as_slice()
+                .map_err(|e| AegisError::Unsupported(format!("pinned host slice: {e:?}"))),
+            Self::Mmap(t) => Ok(t.as_bytes()),
+        }
+    }
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Arena { len, .. } => *len,
+            Self::Pinned(p) => p.len(),
+            Self::Mmap(t) => t.as_bytes().len(),
+        }
+    }
+    /// `true` when bytes live in CUDA-pinned host memory and can be DMA'd
+    /// directly without an intermediate CPU memcpy. The staging pool uses this
+    /// to skip the bounce-buffer fast-path overhead for pinned sources.
+    pub fn is_pinned(&self) -> bool {
+        matches!(self, Self::Arena { .. } | Self::Pinned(_))
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct HostResidentWeights {
-    pub packed: PinnedHostSlice<u8>,
-    pub scales: PinnedHostSlice<u8>,
+    pub packed: HostWeightBytes,
+    pub scales: HostWeightBytes,
     /// Native MXFP4 repacked layout, if available (requires native_mxfp4_repack=true).
     /// When present, inference stages this into VRAM and uses tensor-core kernels.
     pub native_mxfp4: Option<HostResidentMxfp4>,
@@ -124,7 +178,7 @@ pub(super) struct HostResidentWeights {
 
 #[derive(Debug)]
 pub(super) struct HostResidentMxfp4 {
-    pub data: PinnedHostSlice<u8>,
+    pub data: HostWeightBytes,
     pub blocks_per_row: usize,
 }
 

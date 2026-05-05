@@ -41,8 +41,13 @@ pub struct PlacementPolicy {
     pub reserve_vram_bytes: u64,
     pub linear_layout: LinearLayoutPolicy,
     pub rules: Vec<PlacementRule>,
-    /// First `kv_vram_layers` layers keep KV in VRAM; remaining use `kv_store`.
-    pub kv_vram_layers: Option<usize>,
+    /// First `kv_first_n_layers` layers use `kv_first_store` (or VRAM derived from
+    /// `kv_compute` if `kv_first_store` is `None`); remaining layers use `kv_store`.
+    pub kv_first_n_layers: Option<usize>,
+    /// Storage tier for the first-N KV layers. When `None` and `kv_first_n_layers`
+    /// is `Some`, executor falls back to VRAM derived from `kv_compute` (legacy
+    /// behavior preserved for the old `vram_layers` use case).
+    pub kv_first_store: Option<StoragePlacement>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,24 +91,32 @@ pub struct RegionPlacement {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KvCachePlacement {
+    /// Tail tier: where KV for layers `[first_n_layers..)` lives. If `first_n_layers`
+    /// is `None`, this is the storage for ALL layers' KV.
     pub store: StoragePlacement,
     pub compute: ComputePlacement,
     pub quantization: KvCacheQuantization,
     pub context_size: usize,
     pub estimated_bytes: u64,
-    /// First `vram_layers` layers keep KV in VRAM; layers >= this index use `store`.
-    pub vram_layers: Option<usize>,
+    /// First `first_n_layers` layers use `first_store`; remaining layers use `store`.
+    /// When `None`, all layers use `store`.
+    pub first_n_layers: Option<usize>,
+    /// Storage tier for the first-N layers. When `None` and `first_n_layers` is set,
+    /// the executor falls back to `Vram { device }` derived from `compute` (legacy
+    /// behavior preserved for the `vram_layers` use case).
+    pub first_store: Option<StoragePlacement>,
 }
 
 impl KvCachePlacement {
     /// Returns the resolved KV storage for the given layer index.
-    /// If `vram_layers` is set, layers 0..vram_layers use VRAM; the rest use `store`.
+    /// If `first_n_layers` is set, layers `0..first_n_layers` use `first_store` (or
+    /// VRAM derived from `compute` if `first_store` is `None`); the rest use `store`.
     pub fn store_for_layer(&self, layer_idx: usize) -> StoragePlacement {
-        match self.vram_layers {
-            Some(n) if layer_idx < n => match self.compute {
+        match self.first_n_layers {
+            Some(n) if layer_idx < n => self.first_store.unwrap_or_else(|| match self.compute {
                 ComputePlacement::Cuda { device } => StoragePlacement::Vram { device },
                 _ => self.store,
-            },
+            }),
             _ => self.store,
         }
     }
@@ -134,7 +147,8 @@ impl PlacementPolicy {
                 reserve_vram_bytes: 1024 * 1024 * 1024,
                 linear_layout: LinearLayoutPolicy::default(),
                 rules: Vec::new(),
-                kv_vram_layers: None,
+                kv_first_n_layers: None,
+                kv_first_store: None,
             },
             None => Self {
                 weights_store: StoragePlacement::Mmap,
@@ -149,7 +163,8 @@ impl PlacementPolicy {
                 reserve_vram_bytes: 0,
                 linear_layout: LinearLayoutPolicy::default(),
                 rules: Vec::new(),
-                kv_vram_layers: None,
+                kv_first_n_layers: None,
+                kv_first_store: None,
             },
         }
     }
@@ -175,13 +190,26 @@ impl ResolvedPlacement {
             quantization: policy.kv_quantization,
             context_size: policy.context_size,
             estimated_bytes: estimate_kv_cache_bytes(graph, policy),
-            vram_layers: policy.kv_vram_layers,
+            first_n_layers: policy.kv_first_n_layers,
+            first_store: policy.kv_first_store,
         };
         let mut region_placements = graph
             .regions
             .iter()
             .map(|region| {
                 let (store, compute) = apply_rules(region, graph.num_layers, policy);
+                // User-facing `ram` paired with a CUDA compute target is internally
+                // represented as `Mmap`: weights are file-backed and only the active
+                // working set lives in pinned host memory while the rest is paged
+                // in/out by the kernel under memory pressure. This avoids reserving
+                // the full model footprint in pinned RAM, which would not fit on
+                // memory-tight hosts even when the model itself fits in VRAM budgets.
+                let store = match (store, compute) {
+                    (StoragePlacement::Ram, ComputePlacement::Cuda { .. }) => {
+                        StoragePlacement::Mmap
+                    }
+                    other => other.0,
+                };
                 RegionPlacement {
                     region_id: region.id.clone(),
                     kind: region.kind,
@@ -489,10 +517,12 @@ mod tests {
                 layer_idx: 0,
                 kind: crate::model::LayerKind::DenseDecoder,
                 attention_pattern: crate::model::AttentionPattern::FullCausal,
+                head_dim: 128,
             }],
             norm_pattern: crate::model::NormPattern::PreOnly,
             lm_head_softcap: None,
             attn_logit_softcap: None,
+            embed_scale: None,
             is_sliced: false,
             text_prefix: "model.".into(),
         };

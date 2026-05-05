@@ -49,10 +49,11 @@ pub struct ShardFile {
     pub expected_bytes: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct HfConfig {
     // ── Universal fields ───────────────────────────────────────────────────
     pub architectures: Option<Vec<String>>,
+    #[serde(default)]
     pub model_type: String,
     pub hidden_size: usize,
     pub intermediate_size: Option<usize>,
@@ -64,6 +65,12 @@ pub struct HfConfig {
     pub rms_norm_eps: Option<f64>,
     pub rope_scaling: Option<HfRopeScaling>,
     pub rope_theta: Option<f64>,
+    /// Gemma 4: explicit per-attention-type rope_theta (sliding=10k, global=1M).
+    /// Hoisted from `rope_parameters.{sliding_attention,full_attention}.rope_theta`.
+    #[serde(default)]
+    pub rope_theta_sliding: Option<f64>,
+    #[serde(default)]
+    pub rope_theta_global: Option<f64>,
     pub torch_dtype: Option<String>,
     pub quantization_config: Option<HfQuantizationConfig>,
     pub bos_token_id: Option<u32>,
@@ -90,13 +97,37 @@ pub struct HfConfig {
     /// When true, a second RMSNorm is applied after attention/MLP output.
     pub post_attention_layernorm: Option<bool>,
 
+    // ── Per-layer type list (Gemma 4, Qwen 3.5/3.6 hybrid) ──────────────
+    /// Explicit per-layer attention-type strings. When present, overrides
+    /// interval-based calculations. Values: "sliding_attention",
+    /// "full_attention", "linear_attention".
+    pub layer_types: Option<Vec<String>>,
+
+    // ── Gemma 4 per-attention-kind dimensions ─────────────────────────────
+    /// Head dimension for global (full) attention layers in Gemma 4.
+    /// Defaults to `head_dim` when absent.
+    pub global_head_dim: Option<usize>,
+    /// Number of KV heads for global attention layers (Gemma 4 26B).
+    pub num_global_key_value_heads: Option<usize>,
+    /// Last N layers share their KV cache with an earlier layer of the same
+    /// attention type (Gemma 4 E4B feature, optional skip in Phase 4).
+    pub num_kv_shared_layers: Option<usize>,
+    /// When true, K and V projections share the same weight matrix.
+    pub attention_k_eq_v: Option<bool>,
+
     // ── Mixture-of-Experts (Gemma 4 MoE, Qwen 3.x, Nemotron 3) ──────────
+    /// When true this model has MoE blocks (Gemma 4 26B).
+    pub enable_moe_block: Option<bool>,
+    #[serde(alias = "n_routed_experts")]
     pub num_experts: Option<usize>,
+    /// Top-k experts selected per token.
+    #[serde(alias = "top_k_experts", alias = "num_experts_per_tok")]
     pub num_experts_per_tok: Option<usize>,
     /// Per-expert intermediate size (Qwen 3 MoE: "moe_intermediate_size").
     pub moe_intermediate_size: Option<usize>,
     /// Intermediate size for shared (always-active) expert if present.
     pub shared_expert_intermediate_size: Option<usize>,
+    #[serde(alias = "n_shared_experts")]
     pub num_shared_experts: Option<usize>,
     /// Interleave pattern: how often a non-MoE (dense) layer appears.
     pub moe_layer_freq: Option<usize>,
@@ -108,9 +139,20 @@ pub struct HfConfig {
     pub num_linear_attention_layers: Option<usize>,
     /// Alternation pattern: every N-th layer is GDN (e.g. N=4 → 3 GDN + 1 full).
     pub linear_attn_every_n_layers: Option<usize>,
+    /// Fallback interval: full attention every N layers, GDN for the rest.
+    pub full_attention_interval: Option<usize>,
+    // GDN per-head dimensions
+    pub linear_num_key_heads: Option<usize>,
+    pub linear_key_head_dim: Option<usize>,
+    pub linear_value_head_dim: Option<usize>,
+    pub linear_num_value_heads: Option<usize>,
+    pub linear_conv_kernel_dim: Option<usize>,
+    /// When true, a gated output norm is applied after the GDN output projection.
+    pub attn_output_gate: Option<bool>,
 
     // ── Mamba / SSM (Nemotron 3) ──────────────────────────────────────────
-    /// SSM state dimension (d_state in Mamba).
+    /// SSM state dimension (d_state in Mamba / ssm_state_size in Nemotron).
+    #[serde(alias = "ssm_state_size")]
     pub state_size: Option<usize>,
     /// Number of SSM heads.
     pub mamba_num_heads: Option<usize>,
@@ -118,6 +160,12 @@ pub struct HfConfig {
     pub mamba_head_dim: Option<usize>,
     /// Mamba expansion factor (d_inner = expand * hidden_size).
     pub expand: Option<usize>,
+    /// Chunk size for chunked Mamba prefill.
+    pub chunk_size: Option<usize>,
+    /// Convolutional kernel size in Mamba layers.
+    pub conv_kernel: Option<usize>,
+    /// Hybrid layer pattern string (Nemotron): 'M'=Mamba, 'E'=MoE, '*'=attn.
+    pub hybrid_override_pattern: Option<String>,
 
     // ── Multimodal / Omni (Nemotron 3 Omni) ─────────────────────────────
     /// Modalities the model can consume.
@@ -312,6 +360,15 @@ impl ModelArtifact {
 impl WeightManifest {
     pub fn from_root(root: &Path) -> Result<Self> {
         let index_path = root.join("model.safetensors.index.json");
+        // Single-shard models (e.g. Gemma 4 E4B) ship only `model.safetensors`
+        // without a companion index.json. Build a synthetic manifest by reading
+        // the safetensors header directly.
+        if !index_path.exists() {
+            let single = root.join("model.safetensors");
+            if single.exists() {
+                return Self::from_single_shard(root, &single);
+            }
+        }
         let index: SafetensorsIndex = read_json_required(&index_path)?;
         let mut shard_names = BTreeSet::new();
         let mut tensor_counts = BTreeMap::<String, usize>::new();
@@ -348,6 +405,65 @@ impl WeightManifest {
             shard_files,
         })
     }
+
+    /// Builds a manifest from a single `model.safetensors` file by reading
+    /// its embedded JSON header (no companion `.index.json` needed).
+    fn from_single_shard(root: &Path, shard_path: &Path) -> Result<Self> {
+        let shard_name = "model.safetensors".to_string();
+        let header = read_safetensors_header(shard_path)?;
+        let mut weight_map = BTreeMap::new();
+        let mut tensor_count = 0usize;
+        for key in header.keys() {
+            if key != "__metadata__" {
+                weight_map.insert(key.clone(), shard_name.clone());
+                tensor_count += 1;
+            }
+        }
+        let bytes_on_disk = fs::metadata(shard_path).map(|m| m.len()).unwrap_or(0);
+        Ok(Self {
+            index_path: root.join("model.safetensors.index.json"),
+            total_tensors: tensor_count,
+            total_size_bytes: None,
+            total_parameters: None,
+            weight_map,
+            shard_files: vec![ShardFile {
+                name: shard_name,
+                path: shard_path.to_path_buf(),
+                tensor_count,
+                bytes_on_disk,
+                lfs_pointer: false,
+                expected_bytes: None,
+            }],
+        })
+    }
+}
+
+/// Reads the safetensors header JSON from the first bytes of a `.safetensors`
+/// file. The format is: [8 bytes LE u64 N][N bytes JSON header].
+/// Returns a map of tensor_name → {dtype, shape, data_offsets}.
+fn read_safetensors_header(
+    path: &Path,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    use std::io::Read;
+    let mut f = std::io::BufReader::new(fs::File::open(path)?);
+    let mut len_bytes = [0u8; 8];
+    f.read_exact(&mut len_bytes)
+        .map_err(|e| AegisError::InvalidConfig(format!("safetensors read: {e}")))?;
+    let header_len = u64::from_le_bytes(len_bytes) as usize;
+    if header_len > 256 * 1024 * 1024 {
+        return Err(AegisError::InvalidConfig(format!(
+            "safetensors header too large: {header_len} bytes"
+        )));
+    }
+    let mut header_bytes = vec![0u8; header_len];
+    f.read_exact(&mut header_bytes)
+        .map_err(|e| AegisError::InvalidConfig(format!("safetensors header read: {e}")))?;
+    let value: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| AegisError::InvalidConfig(format!("safetensors header JSON: {e}")))?;
+    value
+        .as_object()
+        .cloned()
+        .ok_or_else(|| AegisError::InvalidConfig("safetensors header not an object".into()))
 }
 
 fn read_json_required<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
@@ -369,6 +485,9 @@ fn read_hf_config(path: &Path) -> Result<HfConfig> {
     }
     let bytes = fs::read(path)?;
     let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    // Flatten text_config (Qwen3.5, Gemma4, Nemotron Omni outer wrapper)
+    // or llm_config (Nemotron Omni inner LLM config) when hidden_size is
+    // absent at the top level.
     let needs_flatten = value
         .as_object()
         .map(|obj| !obj.contains_key("hidden_size") && obj.contains_key("text_config"))
@@ -382,12 +501,66 @@ fn read_hf_config(path: &Path) -> Result<HfConfig> {
             }
         }
     }
+    // Second pass: llm_config (Nemotron Omni wraps the LLM under llm_config)
+    let needs_flatten_llm = value
+        .as_object()
+        .map(|obj| !obj.contains_key("hidden_size") && obj.contains_key("llm_config"))
+        .unwrap_or(false);
+    if needs_flatten_llm {
+        if let Some(obj) = value.as_object_mut() {
+            if let Some(serde_json::Value::Object(llm_cfg)) = obj.remove("llm_config") {
+                for (k, v) in llm_cfg {
+                    obj.entry(k).or_insert(v);
+                }
+            }
+        }
+    }
     // HF moved `torch_dtype` → `dtype` in transformers v5; mirror it back so
     // existing downstream consumers (`infer_weight_quantization`, etc.) still work.
     if let Some(obj) = value.as_object_mut() {
         if !obj.contains_key("torch_dtype") {
             if let Some(dtype) = obj.get("dtype").cloned() {
                 obj.insert("torch_dtype".into(), dtype);
+            }
+        }
+    }
+    // Gemma 4 nests per-attention-type rope params under `rope_parameters`.
+    // Hoist `partial_rotary_factor` from `rope_parameters.full_attention` so
+    // that HfConfig.partial_rotary_factor gets populated correctly.
+    if let Some(obj) = value.as_object_mut() {
+        if !obj.contains_key("partial_rotary_factor") {
+            let factor = obj
+                .get("rope_parameters")
+                .and_then(|rp| rp.get("full_attention"))
+                .and_then(|fa| fa.get("partial_rotary_factor"))
+                .and_then(|f| f.as_f64());
+            if let Some(f) = factor {
+                obj.insert("partial_rotary_factor".into(), serde_json::json!(f));
+            }
+        }
+        // Per-layer-type rope_theta (Gemma 4: sliding=10k, global=1M).
+        for (key, lt) in [
+            ("rope_theta_sliding", "sliding_attention"),
+            ("rope_theta_global", "full_attention"),
+        ] {
+            if !obj.contains_key(key)
+                && let Some(theta) = obj
+                    .get("rope_parameters")
+                    .and_then(|rp| rp.get(lt))
+                    .and_then(|p| p.get("rope_theta"))
+                    .and_then(|f| f.as_f64())
+            {
+                obj.insert(key.into(), serde_json::json!(theta));
+            }
+        }
+        // Fallback for top-level rope_theta — many Gemma 4 configs only set it under
+        // rope_parameters.{layer_type}; without this hoist, RopeConfig::from_artifact
+        // would silently default to 10_000.
+        if !obj.contains_key("rope_theta") {
+            let global = obj.get("rope_theta_global").and_then(|f| f.as_f64());
+            let sliding = obj.get("rope_theta_sliding").and_then(|f| f.as_f64());
+            if let Some(theta) = sliding.or(global) {
+                obj.insert("rope_theta".into(), serde_json::json!(theta));
             }
         }
     }
@@ -424,46 +597,13 @@ mod tests {
 
     fn make_config(effective: Option<&str>) -> HfConfig {
         HfConfig {
-            architectures: None,
             model_type: "gemma4".into(),
             hidden_size: 4096,
             intermediate_size: Some(16384),
             num_hidden_layers: 32,
             num_attention_heads: 8,
-            num_key_value_heads: None,
-            head_dim: None,
-            max_position_embeddings: None,
-            rms_norm_eps: None,
-            rope_scaling: None,
-            rope_theta: None,
-            torch_dtype: None,
-            quantization_config: None,
-            bos_token_id: None,
-            eos_token_id: None,
-            vocab_size: None,
-            sliding_window: None,
-            global_attn_every_n_layers: None,
-            attn_logit_softcapping: None,
-            final_logit_softcapping: None,
-            partial_rotary_factor: None,
-            post_attention_layernorm: None,
-            num_experts: None,
-            num_experts_per_tok: None,
-            moe_intermediate_size: None,
-            shared_expert_intermediate_size: None,
-            num_shared_experts: None,
-            moe_layer_freq: None,
-            use_linear_attention: None,
-            num_linear_attention_layers: None,
-            linear_attn_every_n_layers: None,
-            state_size: None,
-            mamba_num_heads: None,
-            mamba_head_dim: None,
-            expand: None,
-            supported_modalities: None,
             effective_size: effective.map(String::from),
-            nested_param_sizes: None,
-            num_attention_heads_per_layer: None,
+            ..Default::default()
         }
     }
 

@@ -57,7 +57,10 @@ impl CudaLlamaExecutor {
         let mut current_h2d_event: Option<cudarc::driver::CudaEvent> =
             issue_h2d_for_layer(&self.runtime, scratch, layers, 0, position, kv_width)?;
 
+        let prof = std::env::var("AEGIS_PROFILE_LAYERS").ok().is_some_and(|v| !v.is_empty());
+        let mut layer_times: Vec<(usize, f64)> = Vec::with_capacity(self.layers.len());
         for layer_idx in 0..self.layers.len() {
+            let lt0 = std::time::Instant::now();
             let host_resident = layers[layer_idx].kv.is_host_resident();
             let staging_slot_idx = if host_resident { Some(layer_idx % 2) } else { None };
 
@@ -94,7 +97,8 @@ impl CudaLlamaExecutor {
 
             let layer = &self.layers[layer_idx];
             let layer_state = &mut layers[layer_idx];
-            forward_cuda_layer_device(
+            let lt_attn = std::time::Instant::now();
+            super::attention::forward_attention_device(
                 &self.runtime,
                 layer,
                 layer_state,
@@ -102,8 +106,40 @@ impl CudaLlamaExecutor {
                 scratch,
                 decode_position,
                 decode_seq_len,
-                params,
+                params.rms_norm_eps,
+                params.num_attention_heads,
+                layer.layer_num_kv_heads,
+                layer.layer_head_dim,
+                params.kv_context_size,
+                layer.rope,
+                params.staging_slot_idx,
+                params.position,
+                params.seq_len,
             )?;
+            let lt_attn_done = lt_attn.elapsed().as_secs_f64() * 1000.0;
+            if let Ok(layer_str) = std::env::var("AEGIS_DUMP_LAYER") {
+                if let Ok(target_layer) = layer_str.parse::<usize>() {
+                    if layer_idx == target_layer {
+                        let tag = std::env::var("AEGIS_DUMP_TAG").unwrap_or_else(|_| "?".into());
+                        let h = self.runtime.download_f32(&scratch.residual)?;
+                        eprintln!(
+                            "[DUMP {tag} L{}] residual first8={:?}",
+                            layer_idx,
+                            &h[0..8.min(h.len())],
+                        );
+                    }
+                }
+            }
+            let lt_mlp = std::time::Instant::now();
+            super::mlp::forward_mlp_device(&self.runtime, layer, scratch, params.rms_norm_eps)?;
+            let lt_mlp_done = lt_mlp.elapsed().as_secs_f64() * 1000.0;
+            std::mem::swap(hidden, &mut scratch.hidden_out);
+            if prof {
+                eprintln!(
+                    "[PROF L{:>2}] attn={:>6.1}ms mlp={:>6.1}ms",
+                    layer_idx, lt_attn_done, lt_mlp_done
+                );
+            }
 
             // Schedule async D2H of the new KV slot on the transfer stream after
             // the compute stream finishes the attention store + read. This overlaps
@@ -133,7 +169,9 @@ impl CudaLlamaExecutor {
             }
 
             current_h2d_event = next_h2d_event;
+            let _ = lt0; // attn/mlp printed above when AEGIS_PROFILE_LAYERS=1
         }
+        let _ = layer_times;
 
         Ok(())
     }
@@ -145,8 +183,17 @@ impl CudaLlamaExecutor {
                 state.position, self.kv_context_size
             )));
         }
+        let prof = std::env::var("AEGIS_PROFILE").ok().is_some_and(|v| !v.is_empty());
+        let t0 = std::time::Instant::now();
         self.runtime
             .bf16_row_to_f32_device(&self.embed_tokens, token_id, &mut state.hidden)?;
+        if let Some(scale) = self.embed_scale {
+            self.runtime.scale_f32_device(scale, &mut state.hidden)?;
+        }
+        if let Ok(tag) = std::env::var("AEGIS_DUMP_EMBED") {
+            let h = self.runtime.download_f32(&state.hidden)?;
+            eprintln!("[DUMP {tag} EMBED tok={}] first8={:?}", token_id, &h[0..8.min(h.len())]);
+        }
 
         let seq_len = state.position + 1;
         self.runtime.copy_u32_to_device(
@@ -158,7 +205,21 @@ impl CudaLlamaExecutor {
             &mut state.decode_seq_len,
         )?;
 
+        let t1 = std::time::Instant::now();
         self.forward_layers_device(state, state.position)?;
+        let t2 = std::time::Instant::now();
+        if prof {
+            // Force a sync to attribute time to where it was actually spent on GPU.
+            self.runtime.synchronize()?;
+            let t3 = std::time::Instant::now();
+            eprintln!(
+                "[PROF] embed+setup={:>6.1}ms layers_dispatch={:>6.1}ms gpu_work={:>6.1}ms total={:>6.1}ms",
+                (t1 - t0).as_secs_f64() * 1000.0,
+                (t2 - t1).as_secs_f64() * 1000.0,
+                (t3 - t2).as_secs_f64() * 1000.0,
+                (t3 - t0).as_secs_f64() * 1000.0,
+            );
+        }
         state.position += 1;
         Ok(())
     }
@@ -246,6 +307,11 @@ impl CudaLlamaExecutor {
 
         self.runtime
             .bf16_row_to_f32_device(&self.embed_tokens, token_id, &mut state.hidden)?;
+        // Gemma 4 ScaledWordEmbedding: multiply embeddings by sqrt(hidden_size) so that
+        // token embedding magnitudes match downstream RMS-norm hidden states.
+        if let Some(scale) = self.embed_scale {
+            self.runtime.scale_f32_device(scale, &mut state.hidden)?;
+        }
 
         let seq_len = state.position + 1;
         // Update dynamic decode params BEFORE capture/replay (outside the captured graph).
@@ -406,6 +472,8 @@ pub(super) fn forward_cuda_layer_device(
     p_seq_len: &DeviceBuffer<u32>,
     params: CudaLayerForwardParams,
 ) -> Result<()> {
+    // Per-layer head_dim and num_kv_heads override model-wide params
+    // (e.g. Gemma 4 global layers use head_dim=512, num_kv_heads=2).
     forward_attention_device(
         runtime,
         layer,
@@ -416,14 +484,34 @@ pub(super) fn forward_cuda_layer_device(
         p_seq_len,
         params.rms_norm_eps,
         params.num_attention_heads,
-        params.num_kv_heads,
-        params.head_dim,
+        layer.layer_num_kv_heads,
+        layer.layer_head_dim,
         params.kv_context_size,
         layer.rope,
         params.staging_slot_idx,
         params.position,
         params.seq_len,
     )?;
+    if let Ok(layer_str) = std::env::var("AEGIS_DUMP_LAYER") {
+        if let Ok(target_layer) = layer_str.parse::<usize>() {
+            let tag = std::env::var("AEGIS_DUMP_TAG").unwrap_or_else(|_| "?".into());
+            thread_local! {
+                static CALL_COUNT: std::cell::RefCell<usize> = std::cell::RefCell::new(0);
+            }
+            CALL_COUNT.with(|c| {
+                let mut c = c.borrow_mut();
+                if *c == target_layer {
+                    let h = runtime.download_f32(&scratch.residual).unwrap();
+                    eprintln!(
+                        "[DUMP {tag} L{}] residual first8={:?}",
+                        *c,
+                        &h[0..8.min(h.len())],
+                    );
+                }
+                *c += 1;
+            });
+        }
+    }
     forward_mlp_device(runtime, layer, scratch, params.rms_norm_eps)?;
     std::mem::swap(hidden, &mut scratch.hidden_out);
     Ok(())

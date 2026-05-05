@@ -19,10 +19,23 @@ fn checked_len(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
 }
 
 fn validate_rope_shape(label: &str, num_heads: usize, head_dim: usize) -> Result<()> {
-    if num_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) || head_dim > 256 {
+    validate_rope_shape_with_partial(label, num_heads, head_dim, 0)
+}
+
+/// When partial_dim > 0, only the first `partial_dim` elements per head are rotated
+/// so the kernel only needs `partial_dim/2` threads — the 256-element constraint
+/// applies to the active dims, not the full head_dim.
+fn validate_rope_shape_with_partial(
+    label: &str,
+    num_heads: usize,
+    head_dim: usize,
+    partial_dim: u32,
+) -> Result<()> {
+    let active_dim = if partial_dim > 0 { partial_dim as usize } else { head_dim };
+    if num_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) || active_dim > 256 {
         return Err(AegisError::InvalidPlan(format!(
-            "{label} requires non-zero heads and even head_dim <= 256: heads={} head_dim={}",
-            num_heads, head_dim
+            "{label} requires non-zero heads and even active_dim <= 256: \
+             heads={num_heads} head_dim={head_dim} partial_dim={partial_dim}"
         )));
     }
     Ok(())
@@ -58,6 +71,207 @@ impl CudaRuntime {
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch f32 to f16"))?;
+        Ok(())
+    }
+
+    pub fn f32_to_bf16_device(
+        &self,
+        input: &DeviceBuffer<f32>,
+        len: usize,
+        output: &mut DeviceBuffer<u16>,
+    ) -> Result<()> {
+        if input.len() < len || output.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "f32->bf16 conversion shape mismatch: input={} output={} len={}",
+                input.len(),
+                output.len(),
+                len
+            )));
+        }
+        let len = len as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.f32_to_bf16)
+                .arg(&input.slice)
+                .arg(&len)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch f32 to bf16"))?;
+        Ok(())
+    }
+
+    pub fn bf16_to_f32_device(
+        &self,
+        input: &DeviceBuffer<u16>,
+        len: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if input.len() < len || output.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "bf16->f32 conversion shape mismatch: input={} output={} len={}",
+                input.len(),
+                output.len(),
+                len
+            )));
+        }
+        let len = len as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.bf16_to_f32)
+                .arg(&input.slice)
+                .arg(&len)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch bf16 to f32"))?;
+        Ok(())
+    }
+
+    /// MoE router: per-token softmax + top-k selection with per-expert scaling
+    /// and renormalisation. Output: device-resident `[batch, top_k]` expert
+    /// indices and routing weights summing to 1 per token.
+    ///
+    /// Replaces the host-roundtrip pattern (download logits, softmax/top-k on
+    /// CPU, upload indices/weights) with one device kernel — saves a sync
+    /// stall per MoE layer.
+    ///
+    /// `per_expert_scale` must be a device buffer of length `num_experts`.
+    /// Callers whose model has no per-expert scale should provide an
+    /// all-ones identity buffer.
+    pub fn router_softmax_topk_device(
+        &self,
+        logits: &DeviceBuffer<f32>,
+        per_expert_scale: &DeviceBuffer<f32>,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+        out_idx: &mut DeviceBuffer<u32>,
+        out_weights: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let total_logits = batch
+            .checked_mul(num_experts)
+            .ok_or_else(|| AegisError::InvalidPlan("router logits len overflow".into()))?;
+        let total_topk = batch
+            .checked_mul(top_k)
+            .ok_or_else(|| AegisError::InvalidPlan("router top-k len overflow".into()))?;
+        if logits.len() < total_logits
+            || out_idx.len() < total_topk
+            || out_weights.len() < total_topk
+            || per_expert_scale.len() < num_experts
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "router top-k shape mismatch: logits={} need {}, scale={} need {}, out_idx={} out_weights={} need {}",
+                logits.len(), total_logits,
+                per_expert_scale.len(), num_experts,
+                out_idx.len(), out_weights.len(), total_topk,
+            )));
+        }
+        let batch_u32 = batch as u32;
+        let num_experts_u32 = num_experts as u32;
+        let top_k_u32 = top_k as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(batch_u32, 64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.router_softmax_topk)
+                .arg(&logits.slice)
+                .arg(&per_expert_scale.slice)
+                .arg(&batch_u32)
+                .arg(&num_experts_u32)
+                .arg(&top_k_u32)
+                .arg(&mut out_idx.slice)
+                .arg(&mut out_weights.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch router softmax topk"))?;
+        Ok(())
+    }
+
+    /// Zero an `expert_counts[num_experts]` buffer in preparation for the
+    /// `router_bucket_sort_device` scatter.
+    pub fn router_zero_expert_counts_device(
+        &self,
+        expert_counts: &mut DeviceBuffer<u32>,
+        num_experts: usize,
+    ) -> Result<()> {
+        if expert_counts.len() < num_experts {
+            return Err(AegisError::InvalidPlan(format!(
+                "router_zero_expert_counts: buffer={} need {}",
+                expert_counts.len(), num_experts,
+            )));
+        }
+        let n_u32 = num_experts as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(n_u32, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.router_zero_expert_counts)
+                .arg(&mut expert_counts.slice)
+                .arg(&n_u32)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch router zero expert counts"))?;
+        Ok(())
+    }
+
+    /// Scatter (token, expert, weight) triples into per-expert lists. Atomic
+    /// `expert_counts[expert]` provides each token's slot inside the per-
+    /// expert list. After this kernel, the host downloads `expert_counts`
+    /// (`num_experts * 4` bytes — small), then dispatches a per-expert
+    /// matmul reading from `expert_token_lists`/`expert_weight_lists`.
+    pub fn router_bucket_sort_device(
+        &self,
+        topk_idx: &DeviceBuffer<u32>,
+        topk_weights: &DeviceBuffer<f32>,
+        batch: usize,
+        top_k: usize,
+        stride: usize, // max tokens per expert (typically batch * top_k)
+        expert_token_lists: &mut DeviceBuffer<u32>,
+        expert_weight_lists: &mut DeviceBuffer<f32>,
+        expert_counts: &mut DeviceBuffer<u32>,
+    ) -> Result<()> {
+        let total_slots = batch
+            .checked_mul(top_k)
+            .ok_or_else(|| AegisError::InvalidPlan("router bucket sort total slots overflow".into()))?;
+        let batch_u32 = batch as u32;
+        let top_k_u32 = top_k as u32;
+        let stride_u32 = stride as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(total_slots as u32, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.router_bucket_sort)
+                .arg(&topk_idx.slice)
+                .arg(&topk_weights.slice)
+                .arg(&batch_u32)
+                .arg(&top_k_u32)
+                .arg(&stride_u32)
+                .arg(&mut expert_token_lists.slice)
+                .arg(&mut expert_weight_lists.slice)
+                .arg(&mut expert_counts.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch router bucket sort"))?;
         Ok(())
     }
 
@@ -272,6 +486,43 @@ impl CudaRuntime {
         Ok(())
     }
 
+    pub fn add_inplace_device(&self, a: &mut DeviceBuffer<f32>, b: &DeviceBuffer<f32>) -> Result<()> {
+        self.add_inplace_device_len(a, b, a.len())
+    }
+
+    /// Element-wise copy: `dst = src`.  Implemented as `zero(dst); dst += src`.
+    /// Copy the first `len` f32 elements from `src` to `dst`. Both buffers must hold at
+    /// least `len` elements. Useful when source and destination have different total sizes
+    /// (e.g. scratch holds the max width across all layers, but we only need to write the
+    /// active layer's prefix).
+    pub fn copy_prefix_f32_device(
+        &self,
+        src: &DeviceBuffer<f32>,
+        dst: &mut DeviceBuffer<f32>,
+        len: usize,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if src.len() < len || dst.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "copy_prefix_f32 size mismatch: src={} dst={} len={}",
+                src.len(),
+                dst.len(),
+                len
+            )));
+        }
+        // dst[..len] = 0; dst[..len] += src[..len]  (avoids needing a dedicated copy kernel)
+        self.zero_f32_device_len(dst, len)?;
+        self.add_inplace_device_len(dst, src, len)?;
+        Ok(())
+    }
+
+    pub fn copy_f32_device(&self, src: &DeviceBuffer<f32>, dst: &mut DeviceBuffer<f32>) -> Result<()> {
+        self.zero_f32_device(dst)?;
+        self.add_inplace_device_len(dst, src, src.len())
+    }
+
     pub fn add_inplace_device_len(
         &self,
         a: &mut DeviceBuffer<f32>,
@@ -311,6 +562,123 @@ impl CudaRuntime {
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         self.swiglu_device_len(gate, up, output, gate.len())
+    }
+
+    /// RMS norm with no learned weight (used by Gemma 4 v_norm and the router pre-norm).
+    /// `output[batch_idx, i] = input[batch_idx, i] * rsqrt(mean(input[batch_idx]^2) + eps)`.
+    pub fn rms_norm_batched_no_weight_device(
+        &self,
+        input: &DeviceBuffer<f32>,
+        batch: usize,
+        len: usize,
+        eps: f32,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let total = batch.saturating_mul(len);
+        if input.len() < total || output.len() < total {
+            return Err(AegisError::InvalidPlan(format!(
+                "rms_norm_batched_no_weight shape mismatch: input={} output={} batch={} len={}",
+                input.len(), output.len(), batch, len
+            )));
+        }
+        let batch_u32 = u32_arg("batch", batch)?;
+        let len_u32 = u32_arg("len", len)?;
+        let cfg = LaunchConfig {
+            grid_dim: (batch_u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 256 * std::mem::size_of::<f32>() as u32,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.rms_norm_batched_no_weight)
+                .arg(&input.slice)
+                .arg(&batch_u32)
+                .arg(&len_u32)
+                .arg(&eps)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch rms_norm_batched_no_weight"))?;
+        Ok(())
+    }
+
+    /// In-place GeGLU: `up_inout[i] = gelu_tanh(gate[i]) * up_inout[i]`.
+    /// Used in chunked MoE prefill where the up buffer doubles as the output
+    /// to save a copy (read-then-write of `up[idx]` is per-thread safe).
+    pub fn geglu_tanh_in_place_device(
+        &self,
+        gate: &DeviceBuffer<f32>,
+        up_inout: &mut DeviceBuffer<f32>,
+        len: usize,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if gate.len() < len || up_inout.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "geglu_in_place size mismatch: gate={} up={} need {}",
+                gate.len(),
+                up_inout.len(),
+                len
+            )));
+        }
+        let len_u32 = u32_arg("len", len)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len_u32, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: same buffer is bound twice — once as the `up` input and once
+        // as `output`. Each thread reads `up[idx]` once before writing
+        // `output[idx]`, so the per-thread read-then-write is safe with input
+        // and output aliased. Different threads touch disjoint indices.
+        let up_ptr: *mut crate::cuda::DeviceBuffer<f32> = up_inout as *mut _;
+        unsafe {
+            let up_for_input = &(*up_ptr).slice;
+            let up_for_output = &mut (*up_ptr).slice;
+            self.stream
+                .launch_builder(&self.kernels.geglu_tanh)
+                .arg(&gate.slice)
+                .arg(up_for_input)
+                .arg(&len_u32)
+                .arg(up_for_output)
+                .launch(cfg)
+                .map_err(map_cuda_err("launch geglu_tanh in-place"))
+        }?;
+        Ok(())
+    }
+
+    /// Gemma 3/4 gated activation: `output[i] = gelu_tanh(gate[i]) * up[i]`.
+    pub fn geglu_tanh_device(
+        &self,
+        gate: &DeviceBuffer<f32>,
+        up: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let len = gate.len();
+        if up.len() < len || output.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "geglu shape mismatch: gate={} up={} output={}",
+                gate.len(), up.len(), output.len()
+            )));
+        }
+        let len_u32 = u32_arg("len", len)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len_u32, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.geglu_tanh)
+                .arg(&gate.slice)
+                .arg(&up.slice)
+                .arg(&len_u32)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch geglu_tanh"))?;
+        Ok(())
     }
 
     pub fn swiglu_device_len(
@@ -390,11 +758,11 @@ impl CudaRuntime {
         head_dim: usize,
         rope: DeviceRopeConfig,
     ) -> Result<()> {
-        validate_rope_shape("rope_ptr", num_heads, head_dim)?;
+        validate_rope_shape_with_partial("rope_ptr", num_heads, head_dim, rope.partial_dim)?;
         let expected_values = checked_len("rope_ptr values", num_heads, head_dim)?;
-        if values.len() != expected_values {
+        if values.len() < expected_values {
             return Err(AegisError::InvalidPlan(format!(
-                "rope_ptr shape mismatch: values={} expected={}",
+                "rope_ptr shape mismatch: values={} expected_min={}",
                 values.len(),
                 expected_values
             )));
@@ -435,9 +803,9 @@ impl CudaRuntime {
     ) -> Result<()> {
         validate_rope_shape("rope", num_heads, head_dim)?;
         let expected_values = checked_len("rope values", num_heads, head_dim)?;
-        if values.len() != expected_values {
+        if values.len() < expected_values {
             return Err(AegisError::InvalidPlan(format!(
-                "rope shape mismatch: values={} expected={}",
+                "rope shape mismatch: values={} expected_min={}",
                 values.len(),
                 expected_values
             )));
@@ -477,7 +845,7 @@ impl CudaRuntime {
         head_dim: usize,
         rope: DeviceRopeConfig,
     ) -> Result<()> {
-        validate_rope_shape("batched rope", num_heads, head_dim)?;
+        validate_rope_shape_with_partial("batched rope", num_heads, head_dim, rope.partial_dim)?;
         let expected_values = checked_len("batched rope batch/head", batch, num_heads)
             .and_then(|len| checked_len("batched rope values", len, head_dim))?;
         if values.len() < expected_values {
@@ -524,7 +892,7 @@ impl CudaRuntime {
         head_dim: usize,
         rope: DeviceRopeConfig,
     ) -> Result<()> {
-        validate_rope_shape("positions batched rope", num_heads, head_dim)?;
+        validate_rope_shape_with_partial("positions batched rope", num_heads, head_dim, rope.partial_dim)?;
         let expected_values = batch
             .checked_mul(num_heads)
             .and_then(|len| len.checked_mul(head_dim))
@@ -581,7 +949,12 @@ impl CudaRuntime {
         rope: DeviceRopeConfig,
         output: &mut DeviceBuffer<u16>,
     ) -> Result<()> {
-        validate_rope_shape("positions batched rope f16 output", num_heads, head_dim)?;
+        validate_rope_shape_with_partial(
+            "positions batched rope f16 output",
+            num_heads,
+            head_dim,
+            rope.partial_dim,
+        )?;
         let expected_values = batch
             .checked_mul(num_heads)
             .and_then(|len| len.checked_mul(head_dim))
@@ -704,8 +1077,191 @@ impl CudaRuntime {
 
     /// Zero a float buffer. Used to initialise the MoE accumulator before expert dispatch.
     pub fn zero_f32_device(&self, out: &mut DeviceBuffer<f32>) -> Result<()> {
+        let total = out.len();
+        self.zero_f32_device_len(out, total)
+    }
+
+    /// Zero only the first `len` elements of a float buffer.
+    pub fn zero_f32_device_len(&self, out: &mut DeviceBuffer<f32>, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if out.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "zero_f32 len exceeds buffer: out={} requested={}",
+                out.len(),
+                len
+            )));
+        }
+        let len_u32 = u32_arg("len", len)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len_u32, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.zero_f32)
+                .arg(&mut out.slice)
+                .arg(&len_u32)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch zero_f32"))?;
+        Ok(())
+    }
+
+    /// In-place element-wise scale: `out[i] *= scale`. Used for Gemma 4 per-layer `layer_scalar`.
+    pub fn scale_f32_device(&self, scale: f32, out: &mut DeviceBuffer<f32>) -> Result<()> {
+        let total = out.len();
+        self.scale_f32_device_len(scale, out, total)
+    }
+
+    /// Like `scale_f32_device` but only operates on the first `len` elements.
+    pub fn scale_f32_device_len(
+        &self,
+        scale: f32,
+        out: &mut DeviceBuffer<f32>,
+        len: usize,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if out.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "scale_f32 len exceeds buffer: out={} requested={}",
+                out.len(),
+                len
+            )));
+        }
+        let len_u32 = u32_arg("len", len)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len_u32, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.scale_f32)
+                .arg(&mut out.slice)
+                .arg(&scale)
+                .arg(&len_u32)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch scale_f32"))?;
+        Ok(())
+    }
+
+    /// MoE chunked prefill helper: gather `count` rows of `cols` floats from `src`
+    /// into `dst` per the `indices` mapping. `dst[r, c] = src[indices[r], c]`.
+    pub fn gather_rows_f32_device(
+        &self,
+        src: &DeviceBuffer<f32>,
+        indices: &DeviceBuffer<u32>,
+        count: usize,
+        cols: usize,
+        dst: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if count == 0 || cols == 0 {
+            return Ok(());
+        }
+        if dst.len() < count * cols {
+            return Err(AegisError::InvalidPlan(format!(
+                "gather_rows_f32 dst too small: have {}, need {}*{}={}",
+                dst.len(), count, cols, count * cols
+            )));
+        }
+        if indices.len() < count {
+            return Err(AegisError::InvalidPlan(format!(
+                "gather_rows_f32 indices too small: have {}, need {}",
+                indices.len(), count
+            )));
+        }
+        let count_u32 = u32_arg("count", count)?;
+        let cols_u32 = u32_arg("cols", cols)?;
+        let cfg = LaunchConfig {
+            grid_dim: (count_u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.gather_rows_f32)
+                .arg(&src.slice)
+                .arg(&indices.slice)
+                .arg(&count_u32)
+                .arg(&cols_u32)
+                .arg(&mut dst.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch gather_rows_f32"))?;
+        Ok(())
+    }
+
+    /// MoE chunked prefill helper: scatter-add with per-row weight. Multiple rows
+    /// may target the same destination row (different top-k positions for the
+    /// same source token), so atomicAdd is used.
+    /// `out[indices[r], c] += weights[r] * src[r, c]`.
+    pub fn scatter_add_weighted_f32_device(
+        &self,
+        src: &DeviceBuffer<f32>,
+        indices: &DeviceBuffer<u32>,
+        weights: &DeviceBuffer<f32>,
+        count: usize,
+        cols: usize,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if count == 0 || cols == 0 {
+            return Ok(());
+        }
+        if src.len() < count * cols {
+            return Err(AegisError::InvalidPlan(format!(
+                "scatter_add_weighted_f32 src too small: have {}, need {}*{}={}",
+                src.len(), count, cols, count * cols
+            )));
+        }
+        if indices.len() < count || weights.len() < count {
+            return Err(AegisError::InvalidPlan(format!(
+                "scatter_add_weighted_f32 indices/weights too small: indices={} weights={} need {}",
+                indices.len(), weights.len(), count
+            )));
+        }
+        let count_u32 = u32_arg("count", count)?;
+        let cols_u32 = u32_arg("cols", cols)?;
+        let cfg = LaunchConfig {
+            grid_dim: (count_u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.scatter_add_weighted_f32)
+                .arg(&src.slice)
+                .arg(&indices.slice)
+                .arg(&weights.slice)
+                .arg(&count_u32)
+                .arg(&cols_u32)
+                .arg(&mut out.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch scatter_add_weighted_f32"))?;
+        Ok(())
+    }
+
+    /// Element-wise multiply in-place: `out[i] *= scale[i]`. Lengths must match.
+    pub fn mul_vec_inplace_device(
+        &self,
+        out: &mut DeviceBuffer<f32>,
+        scale: &DeviceBuffer<f32>,
+    ) -> Result<()> {
         if out.is_empty() {
             return Ok(());
+        }
+        if out.len() != scale.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "mul_vec shape mismatch: out={} scale={}",
+                out.len(),
+                scale.len()
+            )));
         }
         let len = u32_arg("len", out.len())?;
         let cfg = LaunchConfig {
@@ -715,12 +1271,13 @@ impl CudaRuntime {
         };
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.zero_f32)
+                .launch_builder(&self.kernels.mul_vec_inplace_f32)
                 .arg(&mut out.slice)
+                .arg(&scale.slice)
                 .arg(&len)
                 .launch(cfg)
         }
-        .map_err(map_cuda_err("launch zero_f32"))?;
+        .map_err(map_cuda_err("launch mul_vec_inplace_f32"))?;
         Ok(())
     }
 }

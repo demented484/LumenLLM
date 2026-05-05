@@ -1,14 +1,17 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use cudarc::cublaslt::CudaBlasLT;
 use cudarc::driver::{CudaContext, CudaEvent, CudaStream, sys};
 
 use aegisllm_base::cuda_config::CudaRuntimeConfig;
+use super::expert_cache::CacheHandle;
 use super::functions::CudaKernelFunctions;
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::hardware::HardwareInventory;
 
 mod attention;
 mod blackwell;
+mod cublaslt;
 mod cutlass;
 mod gemm;
 mod graph;
@@ -31,6 +34,13 @@ pub struct CudaRuntime {
     /// Synchronization with the compute stream is managed manually via CudaEvent.
     pub(super) transfer_stream: Arc<CudaStream>,
     kernels: CudaKernelFunctions,
+    /// cuBLASLt handle for BF16 tensor-core GEMM (attention Q/K/V/O, shared MLP, lm_head).
+    /// Bound to the compute stream so launches order with custom kernels.
+    pub(super) cublas_lt: CudaBlasLT,
+    /// VRAM expert weight cache (Phase 4 of perf overhaul). Set after the
+    /// executor finishes loading host-resident NVFP4 weights and knows how
+    /// much VRAM is free. Cache hits skip per-call H2D bandwidth.
+    expert_cache: OnceLock<CacheHandle>,
 }
 
 impl CudaRuntime {
@@ -59,6 +69,11 @@ impl CudaRuntime {
             .iter()
             .find(|gpu| gpu.index == device_index)
             .and_then(|gpu| gpu.compute_capability.clone());
+        // cuBLASLt is bound to the compute stream so its kernels share the same launch order
+        // as the custom kernels we issue. Workspace is auto-sized for SM_120 (32 MiB) by cudarc.
+        let cublas_lt = CudaBlasLT::new(stream.clone()).map_err(|e| {
+            AegisError::Unsupported(format!("create cuBLASLt handle failed: {e:?}"))
+        })?;
 
         Ok(Self {
             device_index,
@@ -67,7 +82,24 @@ impl CudaRuntime {
             stream,
             transfer_stream,
             kernels,
+            cublas_lt,
+            expert_cache: OnceLock::new(),
         })
+    }
+
+    /// Install the VRAM expert cache. Called once by the executor after all
+    /// host-resident NVFP4 weights have been loaded into the pinned arena —
+    /// at that point the runtime knows how much VRAM is free and can size
+    /// the cache. Subsequent inference dispatch checks `expert_cache()` for
+    /// a hit before falling through to the staging path.
+    pub(crate) fn install_expert_cache(&self, cache: CacheHandle) -> Result<()> {
+        self.expert_cache
+            .set(cache)
+            .map_err(|_| AegisError::InvalidPlan("expert cache already installed".into()))
+    }
+
+    pub(crate) fn expert_cache(&self) -> Option<&CacheHandle> {
+        self.expert_cache.get()
     }
 
     pub fn device_index(&self) -> usize {
@@ -90,6 +122,13 @@ impl CudaRuntime {
 
     pub(crate) fn stream(&self) -> &std::sync::Arc<CudaStream> {
         &self.stream
+    }
+
+    /// Dedicated transfer stream — used by `LinearStagingPool::prepare_async`
+    /// and the KV-cache async upload path so PCIe traffic can overlap with
+    /// compute.
+    pub(crate) fn transfer_stream(&self) -> &std::sync::Arc<CudaStream> {
+        &self.transfer_stream
     }
 
     /// Synchronize the transfer stream (block CPU until pending transfers complete).
@@ -131,6 +170,32 @@ impl CudaRuntime {
         self.transfer_stream
             .wait(event)
             .map_err(map_cuda_err("transfer stream wait event"))
+    }
+
+    /// Allocate a pre-recorded `CudaEvent` for reuse. Events are expensive to
+    /// create/destroy (each is a kernel-mode driver call); call this once at
+    /// startup and re-record the event in the hot path via `record_into`.
+    pub(crate) fn alloc_event(&self) -> Result<CudaEvent> {
+        self.stream
+            .context()
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
+            .map_err(map_cuda_err("alloc cuda event"))
+    }
+
+    /// Re-record an existing event with the compute stream's current state.
+    /// Cheaper than `record_compute_event` because no new event object is
+    /// allocated.
+    pub(crate) fn record_into_compute(&self, event: &CudaEvent) -> Result<()> {
+        event
+            .record(&self.stream)
+            .map_err(map_cuda_err("record event on compute stream"))
+    }
+
+    /// Re-record an existing event with the transfer stream's current state.
+    pub(crate) fn record_into_transfer(&self, event: &CudaEvent) -> Result<()> {
+        event
+            .record(&self.transfer_stream)
+            .map_err(map_cuda_err("record event on transfer stream"))
     }
 }
 

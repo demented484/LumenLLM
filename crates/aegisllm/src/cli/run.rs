@@ -1,4 +1,5 @@
 use std::env;
+use std::path::Path;
 
 use super::gates::run_gates;
 use super::generate::{print_generate_bench, print_generate_bench_sweep};
@@ -10,8 +11,80 @@ use super::smoke::{
 use super::{Command, parse_args};
 use crate::engine::bench::run_generation_bench;
 use crate::engine::{AegisEngine, EngineConfig};
-use aegisllm_base::error::Result;
+use aegisllm_base::error::{AegisError, Result};
 use crate::executor::readiness_for_plan;
+
+/// Greedy-generation snapshot/diff for quality regression detection.
+///
+/// First run with a given reference path: writes the current generation to it
+/// (snapshot mode). Subsequent runs: compares the current text to the saved
+/// reference and prints a `loss` metric — `mismatched_chars / max_chars`,
+/// where 0.0 is byte-identical and larger numbers indicate divergence.
+///
+/// The metric is intentionally simple — character-level rather than tokens or
+/// log-prob — so it works without exposing logits or the tokenizer to the
+/// CLI. For more sensitive regression detection use a longer prompt + larger
+/// `--max-tokens`; the metric scales with the test surface area.
+fn run_quality_diff(current: &str, reference_path: &Path) -> Result<()> {
+    if !reference_path.exists() {
+        std::fs::write(reference_path, current.as_bytes()).map_err(|e| {
+            AegisError::InvalidConfig(format!(
+                "quality-diff: failed to write snapshot at {}: {e}",
+                reference_path.display(),
+            ))
+        })?;
+        println!(
+            "quality-diff SNAPSHOT saved={} bytes path={}",
+            current.len(),
+            reference_path.display(),
+        );
+        return Ok(());
+    }
+    let reference_bytes = std::fs::read(reference_path).map_err(|e| {
+        AegisError::InvalidConfig(format!(
+            "quality-diff: failed to read reference at {}: {e}",
+            reference_path.display(),
+        ))
+    })?;
+    let reference = String::from_utf8_lossy(&reference_bytes);
+    let max_len = reference.chars().count().max(current.chars().count());
+    if max_len == 0 {
+        println!("quality-diff PASS loss=0.0000 (both empty)");
+        return Ok(());
+    }
+    let mut mismatched = 0usize;
+    let mut first_diff: Option<usize> = None;
+    let mut ref_chars = reference.chars();
+    let mut cur_chars = current.chars();
+    let mut idx = 0usize;
+    loop {
+        match (ref_chars.next(), cur_chars.next()) {
+            (None, None) => break,
+            (Some(a), Some(b)) if a == b => {}
+            (Some(_), Some(_)) | (Some(_), None) | (None, Some(_)) => {
+                mismatched += 1;
+                if first_diff.is_none() {
+                    first_diff = Some(idx);
+                }
+            }
+        }
+        idx += 1;
+    }
+    let loss = mismatched as f32 / max_len as f32;
+    let status = if mismatched == 0 { "PASS" } else { "FAIL" };
+    let preview_len = 80usize;
+    let ref_preview: String = reference.chars().take(preview_len).collect();
+    let cur_preview: String = current.chars().take(preview_len).collect();
+    println!(
+        "quality-diff {status} loss={loss:.4} mismatched={mismatched}/{max_len} \
+         first_diff={first_diff:?}",
+    );
+    if mismatched > 0 {
+        println!("  reference: {ref_preview}");
+        println!("  current:   {cur_preview}");
+    }
+    Ok(())
+}
 
 pub fn run_env() -> Result<()> {
     match parse_args(env::args().skip(1))? {
@@ -40,6 +113,11 @@ pub fn run_env() -> Result<()> {
                 "finish={} prompt_tokens={} completion_tokens={}",
                 output.finish_reason, output.prompt_tokens, output.completion_tokens
             );
+        }
+        Command::QualityDiff(config, request, reference_path) => {
+            let engine = AegisEngine::build(config)?;
+            let output = engine.generate(request)?;
+            run_quality_diff(&output.text, &reference_path)?;
         }
         Command::BenchGenerate(config, request, prompt_repeat, format) => {
             let metrics = run_generation_bench(config, request)?;

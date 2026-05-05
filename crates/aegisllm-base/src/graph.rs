@@ -5,6 +5,7 @@ use crate::error::Result;
 use crate::model::{
     detect_architecture, AttentionPattern, LayerKind, ModelArchitecture, NormPattern,
 };
+use crate::model::gemma4::{head_dim_for_layer, is_global_layer};
 use crate::tensor::TensorInfo;
 use crate::tensor::quant::WeightQuantization;
 
@@ -32,6 +33,9 @@ pub struct ModelGraph {
     pub lm_head_softcap: Option<f32>,
     /// Logit soft-cap applied inside attention before softmax (Gemma 4).
     pub attn_logit_softcap: Option<f32>,
+    /// Multiplicative scale applied to token embeddings after lookup.
+    /// Gemma 4 uses `sqrt(hidden_size)`. Other architectures: None (treated as 1.0).
+    pub embed_scale: Option<f32>,
     /// Detected architecture name (for display / debugging).
     pub architecture: String,
     /// True when the graph was built from a MatFormer nested-param checkpoint
@@ -60,6 +64,14 @@ pub struct LayerMetadata {
     pub layer_idx: usize,
     pub kind: LayerKind,
     pub attention_pattern: AttentionPattern,
+    /// Effective head_dim for this layer. Gemma 4 global layers use
+    /// `global_head_dim` (512); sliding layers use `head_dim` (256).
+    /// For all other architectures this equals `ModelGraph::head_dim`.
+    pub head_dim: usize,
+    /// Per-layer KV head count. Gemma 4 global layers use
+    /// `num_global_key_value_heads` (2); sliding layers use `num_key_value_heads` (8).
+    /// For all other architectures this equals `ModelGraph::num_kv_heads`.
+    pub num_kv_heads: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -103,11 +115,20 @@ pub enum TensorRole {
     Value,
     Output,
     MlpNorm,
+    /// Additional pre-FFN norm present in Gemma 4 (pre_feedforward_layernorm).
+    /// In Llama/Qwen the single post_attention_layernorm serves as MlpNorm;
+    /// Gemma 4 has both post_attention_layernorm (PostAttentionNorm) AND
+    /// pre_feedforward_layernorm (MlpPreNorm).
+    MlpPreNorm,
     Gate,
     Up,
     Down,
     FinalNorm,
     LmHead,
+    /// Per-query-head RMS norm (Gemma 4).
+    QNorm,
+    /// Per-key-head RMS norm (Gemma 4).
+    KNorm,
     WeightScale,
     InputScale,
     OutputScale,
@@ -161,21 +182,29 @@ impl ModelGraph {
 
         let mut layer_metadata = Vec::with_capacity(config.num_hidden_layers);
 
+        let is_gemma4 = arch.norm_pattern() == NormPattern::PrePost;
+        let num_experts = config.num_experts.unwrap_or(0);
+
         for layer in 0..config.num_hidden_layers {
             let prefix = format!("{text_prefix}layers.{layer}");
             let mut tensors = Vec::new();
 
-            // ── Standard attention tensors ────────────────────────────────
+            // ── Pre-attention norm ────────────────────────────────────────
             add_known_tensor(&mut tensors, artifact, TensorRole::AttentionNorm,
                 &format!("{prefix}.input_layernorm.weight"));
 
+            // ── QKV projections + QK norms (Gemma 4) ─────────────────────
             add_known_tensor(&mut tensors, artifact, TensorRole::Query,
                 &format!("{prefix}.self_attn.q_proj.weight"));
             add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.self_attn.q_proj"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::QNorm,
+                &format!("{prefix}.self_attn.q_norm.weight"));
 
             add_known_tensor(&mut tensors, artifact, TensorRole::Key,
                 &format!("{prefix}.self_attn.k_proj.weight"));
             add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.self_attn.k_proj"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::KNorm,
+                &format!("{prefix}.self_attn.k_norm.weight"));
 
             add_known_tensor(&mut tensors, artifact, TensorRole::Value,
                 &format!("{prefix}.self_attn.v_proj.weight"));
@@ -185,18 +214,22 @@ impl ModelGraph {
                 &format!("{prefix}.self_attn.o_proj.weight"));
             add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.self_attn.o_proj"));
 
-            // ── Post-attention norm (Gemma 4 PrePost) ────────────────────
-            add_known_tensor(&mut tensors, artifact, TensorRole::PostAttentionNorm,
-                &format!("{prefix}.post_attention_norm.weight"));
-            // Alternate naming used by some Gemma variants
-            add_known_tensor(&mut tensors, artifact, TensorRole::PostAttentionNorm,
-                &format!("{prefix}.post_attn_layernorm.weight"));
+            // ── Post-attention norm ───────────────────────────────────────
+            // Gemma 4: post_attention_layernorm = post-attn (PostAttentionNorm)
+            // Llama/Qwen: post_attention_layernorm = pre-MLP (MlpNorm)
+            if is_gemma4 {
+                add_known_tensor(&mut tensors, artifact, TensorRole::PostAttentionNorm,
+                    &format!("{prefix}.post_attention_layernorm.weight"));
+                // Gemma 4 pre-MLP norm is a separate tensor
+                add_known_tensor(&mut tensors, artifact, TensorRole::MlpNorm,
+                    &format!("{prefix}.pre_feedforward_layernorm.weight"));
+            } else {
+                // Llama/Qwen: the single norm after attention serves as MLP norm
+                add_known_tensor(&mut tensors, artifact, TensorRole::MlpNorm,
+                    &format!("{prefix}.post_attention_layernorm.weight"));
+            }
 
-            // ── MLP norm and projections ──────────────────────────────────
-            add_known_tensor(&mut tensors, artifact, TensorRole::MlpNorm,
-                &format!("{prefix}.post_attention_layernorm.weight"));
-
-            // Dense MLP
+            // Dense MLP (present on non-MoE layers and as shared expert)
             add_known_tensor(&mut tensors, artifact, TensorRole::Gate,
                 &format!("{prefix}.mlp.gate_proj.weight"));
             add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.mlp.gate_proj"));
@@ -215,14 +248,33 @@ impl ModelGraph {
             add_known_tensor(&mut tensors, artifact, TensorRole::PostMlpNorm,
                 &format!("{prefix}.post_feedforward_layernorm.weight"));
 
-            // ── MoE tensors (Gemma 4 MoE, Qwen 3.x MoE) ─────────────────
+            // ── MoE router (Gemma 4: router.proj, Qwen: mlp.router_logits) ─
+            add_known_tensor(&mut tensors, artifact, TensorRole::MoeRouter,
+                &format!("{prefix}.router.proj.weight"));
             add_known_tensor(&mut tensors, artifact, TensorRole::MoeRouter,
                 &format!("{prefix}.mlp.router_logits.weight"));
-            // Some checkpoints use this naming:
             add_known_tensor(&mut tensors, artifact, TensorRole::MoeRouter,
                 &format!("{prefix}.block_sparse_moe.gate.weight"));
 
-            // Shared expert (Nemotron 3 / some Qwen 3.x)
+            // ── Per-expert tensors (Gemma 4 MoE: experts.N.{gate|up|down}_proj) ─
+            // We record individual expert regions as Other tensors so the loader
+            // can access them; the executor stacks them at load time.
+            if num_experts > 1 {
+                for expert_idx in 0..num_experts {
+                    let ep = format!("{prefix}.experts.{expert_idx}");
+                    for (proj, role) in [
+                        ("gate_proj", TensorRole::Gate),
+                        ("up_proj", TensorRole::Up),
+                        ("down_proj", TensorRole::Down),
+                    ] {
+                        add_known_tensor(&mut tensors, artifact, role,
+                            &format!("{ep}.{proj}.weight"));
+                        add_quant_aux_tensors(&mut tensors, artifact, &format!("{ep}.{proj}"));
+                    }
+                }
+            }
+
+            // ── Shared expert (Nemotron 3 / Qwen 3.x) ────────────────────
             add_known_tensor(&mut tensors, artifact, TensorRole::MoeSharedGate,
                 &format!("{prefix}.mlp.shared_expert.gate_proj.weight"));
             add_known_tensor(&mut tensors, artifact, TensorRole::MoeSharedUp,
@@ -244,8 +296,23 @@ impl ModelGraph {
             add_known_tensor(&mut tensors, artifact, TensorRole::SsmConv1d,
                 &format!("{prefix}.mamba.conv1d.weight"));
 
-            // Warn but do not error on empty layers — some checkpoint shards
-            // may not include all layers. The executor validates completeness.
+            // Per-layer head_dim (Gemma 4 global layers use global_head_dim).
+            let layer_head_dim = if is_gemma4 {
+                head_dim_for_layer(layer, config)
+                    .unwrap_or_else(|| artifact.head_dim())
+            } else {
+                artifact.head_dim()
+            };
+            // Per-layer KV head count (Gemma 4 global layers use num_global_key_value_heads).
+            let base_kv_heads = config.num_key_value_heads.unwrap_or_else(|| {
+                config.num_attention_heads
+            });
+            let layer_num_kv_heads = if is_gemma4 && is_global_layer(layer, config) {
+                config.num_global_key_value_heads.unwrap_or(base_kv_heads)
+            } else {
+                base_kv_heads
+            };
+
             regions.push(GraphRegion {
                 id: RegionId(format!("layer.{layer}")),
                 kind: GraphRegionKind::TransformerBlock,
@@ -257,6 +324,8 @@ impl ModelGraph {
                 layer_idx: layer,
                 kind: arch.layer_kind(layer, config),
                 attention_pattern: arch.attention_pattern(layer, config),
+                head_dim: layer_head_dim,
+                num_kv_heads: layer_num_kv_heads,
             });
         }
 
@@ -289,6 +358,8 @@ impl ModelGraph {
         );
 
         let eff = config.effective_dims();
+        // Use the base (sliding) head_dim for the graph-level field.
+        // Per-layer head_dim is stored in LayerMetadata.head_dim for Gemma 4.
         let head_dim = artifact.head_dim();
         let orig_q = config.num_attention_heads;
         let orig_kv = config.num_key_value_heads.unwrap_or(orig_q);
@@ -316,6 +387,7 @@ impl ModelGraph {
             norm_pattern: arch.norm_pattern(),
             lm_head_softcap: arch.lm_head_softcap(config),
             attn_logit_softcap: config.attn_logit_softcapping.filter(|&v| v > 0.0),
+            embed_scale: arch.embed_scale(config),
             is_sliced: eff.is_sliced,
             text_prefix,
         })

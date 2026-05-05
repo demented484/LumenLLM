@@ -157,14 +157,37 @@ impl MemoryPlan {
             file_backed: false,
         });
         if let Some(runtime) = runtime {
+            // Device-resident kernels: each repacked copy lives persistently in VRAM → SUM.
+            // Host/mapped-staged kernels: the executor reuses ONE staging buffer (max across
+            // all host kernels per device), mirroring LinearStagingPool.new(max_*) → MAX.
+            let mut host_staged_max: std::collections::BTreeMap<usize, u64> =
+                std::collections::BTreeMap::new();
             for kernel in &runtime.kernels {
                 let bytes = effective_layout_extra_bytes(kernel, cuda);
                 if bytes == 0 {
                     continue;
                 }
+                let BackendKind::Cuda { device } = kernel.device else { continue };
+                match kernel.residency {
+                    crate::planning::runtime::TensorResidency::Device => {
+                        allocations.push(PlannedAllocation {
+                            name: format!("{}:layout_extra", kernel.name),
+                            pool: AllocationPool::Vram { device },
+                            bytes,
+                            file_backed: false,
+                        });
+                    }
+                    crate::planning::runtime::TensorResidency::Host
+                    | crate::planning::runtime::TensorResidency::MappedHostToDevice => {
+                        let entry = host_staged_max.entry(device).or_insert(0);
+                        *entry = (*entry).max(bytes);
+                    }
+                }
+            }
+            for (device, bytes) in host_staged_max {
                 allocations.push(PlannedAllocation {
-                    name: format!("{}:layout_extra", kernel.name),
-                    pool: pool_for_backend_extra(kernel.device),
+                    name: "host_staged:layout_extra_max".into(),
+                    pool: AllocationPool::Vram { device },
                     bytes,
                     file_backed: false,
                 });
@@ -468,7 +491,8 @@ mod tests {
                 quantization: KvCacheQuantization::F16,
                 context_size: 1,
                 estimated_bytes: 10,
-                vram_layers: None,
+                first_n_layers: None,
+                first_store: None,
             },
             budget: MemoryBudget {
                 ram_total_bytes: 1024,

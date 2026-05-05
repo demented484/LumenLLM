@@ -31,6 +31,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("cuda-prefill-compare") => parse_cuda_prefill_compare(&args[1..]),
         Some("cuda-prefill-sweep") => parse_cuda_prefill_sweep(&args[1..]),
         Some("generate") => parse_generate(&args[1..]),
+        Some("quality-diff") => parse_quality_diff(&args[1..]),
         Some("bench-generate") => parse_bench_generate(&args[1..]),
         Some("gates") => parse_gates(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
@@ -182,6 +183,37 @@ fn parse_serve(args: &[String]) -> Result<Command> {
 fn parse_generate(args: &[String]) -> Result<Command> {
     let (config, request) = parse_generate_request(args, "generate")?;
     Ok(Command::Generate(config, request))
+}
+
+fn parse_quality_diff(args: &[String]) -> Result<Command> {
+    // Strip out --reference PATH, leave the rest for parse_generate_request.
+    let mut filtered = Vec::with_capacity(args.len());
+    let mut reference_path: Option<std::path::PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--reference" {
+            i += 1;
+            if i >= args.len() {
+                return Err(aegisllm_base::error::AegisError::InvalidConfig(
+                    "quality-diff: --reference requires a path".into(),
+                ));
+            }
+            reference_path = Some(std::path::PathBuf::from(&args[i]));
+            i += 1;
+        } else {
+            filtered.push(args[i].clone());
+            i += 1;
+        }
+    }
+    let reference_path = reference_path.ok_or_else(|| {
+        aegisllm_base::error::AegisError::InvalidConfig(
+            "quality-diff requires --reference PATH (snapshot file written on first run, \
+             diffed against on subsequent runs)"
+                .into(),
+        )
+    })?;
+    let (config, request) = parse_generate_request(&filtered, "quality-diff")?;
+    Ok(Command::QualityDiff(config, request, reference_path))
 }
 
 fn parse_bench_generate(args: &[String]) -> Result<Command> {

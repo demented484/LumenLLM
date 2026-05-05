@@ -4,7 +4,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::{Advice, Mmap, MmapOptions, UncheckedAdvice};
+use std::os::unix::io::AsRawFd;
 
 use crate::error::{AegisError, Result};
 use crate::graph::{ModelGraph, RegionId, TensorRole};
@@ -292,6 +293,52 @@ impl HostTensorStorage {
     }
 }
 
+impl LoadedHostTensor {
+    /// Hint the kernel to drop the pages backing this tensor from the page cache.
+    /// Called automatically on `Drop` for mmap-backed tensors so that streaming
+    /// many GB of weights from disk into VRAM does not balloon the page cache and
+    /// trigger the OOM killer on memory-tight hosts.
+    pub fn advise_release_pages(&self) {
+        if let HostTensorStorage::Mmap { map, offset, len } = &self.storage {
+            // SAFETY: the underlying mmap is a read-only mapping of an immutable
+            // safetensors shard; MADV_DONTNEED only drops cached pages, no data is lost.
+            unsafe {
+                let _ = map.unchecked_advise_range(UncheckedAdvice::DontNeed, *offset, *len);
+            }
+        }
+    }
+
+    /// Tell the kernel we will need these pages soon — schedules async readahead
+    /// from disk into the page cache. Used for long-term host-resident weights
+    /// (mmap-backed) so that inference doesn't pay page-fault cost on first access.
+    pub fn advise_prefault(&self) {
+        if let HostTensorStorage::Mmap { map, offset, len } = &self.storage {
+            let _ = map.advise_range(Advice::WillNeed, *offset, *len);
+        }
+    }
+}
+
+impl Drop for LoadedHostTensor {
+    fn drop(&mut self) {
+        self.advise_release_pages();
+    }
+}
+
+/// Hint the kernel to drop pages in `[offset, offset+len)` of `file` from the page cache.
+/// Used after `read_exact` so that one-shot bulk reads (weights → pinned RAM / VRAM) do
+/// not balloon the page cache and trigger the OOM killer on memory-tight hosts.
+pub fn fadvise_dont_need(file: &File, offset: u64, len: u64) {
+    let fd = file.as_raw_fd();
+    unsafe {
+        libc::posix_fadvise(
+            fd,
+            offset as libc::off_t,
+            len as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        );
+    }
+}
+
 impl StorageTotals {
     fn from_tensors(tensors: &[TensorStoragePlan]) -> Self {
         let mut totals = Self::default();
@@ -378,6 +425,7 @@ fn read_tensor_bytes(tensor: &TensorInfo) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(tensor.file_offsets.0))?;
     let mut bytes = vec![0_u8; len];
     file.read_exact(&mut bytes)?;
+    fadvise_dont_need(&file, tensor.file_offsets.0, len as u64);
     Ok(bytes)
 }
 

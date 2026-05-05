@@ -61,6 +61,42 @@ extern "C" __global__ void aegis_rms_norm(
     }
 }
 
+// RMS norm WITHOUT a learned weight (Gemma 4 v_norm uses with_scale=False).
+// output[i] = input[i] * rsqrt(mean(input^2) + eps)
+extern "C" __global__ void aegis_rms_norm_batched_no_weight(
+    const float* input,
+    const unsigned int batch,
+    const unsigned int len,
+    const float eps,
+    float* output
+) {
+    const unsigned int batch_idx = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    if (batch_idx >= batch) {
+        return;
+    }
+    const float* input_row = input + size_t(batch_idx) * len;
+    float* output_row = output + size_t(batch_idx) * len;
+    extern __shared__ float partial[];
+    float sum = 0.0f;
+    for (unsigned int i = tid; i < len; i += blockDim.x) {
+        const float value = input_row[i];
+        sum += value * value;
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / float(len) + eps);
+    for (unsigned int i = tid; i < len; i += blockDim.x) {
+        output_row[i] = input_row[i] * scale;
+    }
+}
+
 extern "C" __global__ void aegis_rms_norm_batched(
     const float* input,
     const float* weight,
@@ -288,6 +324,26 @@ extern "C" __global__ void aegis_swiglu(
     }
 }
 
+// gelu_pytorch_tanh approx, same form as PyTorch's nn.functional.gelu(x, approximate="tanh"):
+//   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// Used by Gemma 3/4 where hidden_activation == "gelu_pytorch_tanh".
+extern "C" __global__ void aegis_geglu_tanh(
+    const float* gate,
+    const float* up,
+    const unsigned int len,
+    float* output
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        const float x = gate[idx];
+        const float k = 0.7978845608028654f;        // sqrt(2/pi)
+        const float k2 = 0.044715f;
+        const float inner = k * (x + k2 * x * x * x);
+        const float gelu = 0.5f * x * (1.0f + tanhf(inner));
+        output[idx] = gelu * up[idx];
+    }
+}
+
 extern "C" __global__ void aegis_swiglu_inplace_gate(
     float* gate,
     const float* up,
@@ -445,28 +501,31 @@ extern "C" __global__ void aegis_apply_rope_positions_batched(
 ) {
     const unsigned int head = blockIdx.x;
     const unsigned int batch_idx = blockIdx.y;
-    const unsigned int i = threadIdx.x;
     const unsigned int half_dim = head_dim / 2u;
-    if (batch_idx >= batch || head >= num_heads || i >= half_dim) {
+    if (batch_idx >= batch || head >= num_heads) {
         return;
     }
     float* row = values + (size_t(batch_idx) * num_heads + head) * head_dim;
-    const float angle = float(positions[batch_idx]) * rope_inv_freq_device(
-        i,
-        head_dim,
-        theta,
-        factor,
-        low_freq_factor,
-        high_freq_factor,
-        float(original_max_position_embeddings)
-    );
-    float sinv;
-    float cosv;
-    sincosf(angle, &sinv, &cosv);
-    const float x0 = row[i];
-    const float x1 = row[i + half_dim];
-    row[i] = x0 * cosv - x1 * sinv;
-    row[i + half_dim] = x0 * sinv + x1 * cosv;
+    // Loop so the kernel handles any head_dim with blockDim.x = 128. Gemma 4 global
+    // layers have head_dim=512 (half_dim=256) which exceeds blockDim.x.
+    for (unsigned int i = threadIdx.x; i < half_dim; i += blockDim.x) {
+        const float angle = float(positions[batch_idx]) * rope_inv_freq_device(
+            i,
+            head_dim,
+            theta,
+            factor,
+            low_freq_factor,
+            high_freq_factor,
+            float(original_max_position_embeddings)
+        );
+        float sinv;
+        float cosv;
+        sincosf(angle, &sinv, &cosv);
+        const float x0 = row[i];
+        const float x1 = row[i + half_dim];
+        row[i] = x0 * cosv - x1 * sinv;
+        row[i + half_dim] = x0 * sinv + x1 * cosv;
+    }
 }
 
 extern "C" __global__ void aegis_build_dense_prefill_metadata(
@@ -528,6 +587,43 @@ extern "C" __global__ void aegis_f32_to_f16(
     }
 }
 
+// F32 → BF16 (round to nearest even). BF16 is the upper 16 bits of the f32 with
+// rounding applied to the discarded mantissa. Used to feed cuBLASLt BF16 GEMM
+// from F32 activations.
+extern "C" __global__ void aegis_f32_to_bf16(
+    const float* input,
+    const unsigned int len,
+    unsigned short* output
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        const float v = input[idx];
+        unsigned int bits = __float_as_uint(v);
+        // NaN passthrough: keep upper 16 bits, mantissa already non-zero.
+        if (((bits >> 23) & 0xff) == 0xff && (bits & 0x7fffff) != 0) {
+            output[idx] = (unsigned short)((bits >> 16) | 0x40);
+        } else {
+            // Round to nearest even.
+            const unsigned int lsb = (bits >> 16) & 1;
+            const unsigned int rounding_bias = 0x7fff + lsb;
+            output[idx] = (unsigned short)((bits + rounding_bias) >> 16);
+        }
+    }
+}
+
+// BF16 → F32: pad lower 16 bits with zero.
+extern "C" __global__ void aegis_bf16_to_f32(
+    const unsigned short* input,
+    const unsigned int len,
+    float* output
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        const unsigned int bits = ((unsigned int)input[idx]) << 16;
+        output[idx] = __uint_as_float(bits);
+    }
+}
+
 extern "C" __global__ void aegis_apply_rope_positions_batched_f16_out(
     float* values,
     const unsigned int* positions,
@@ -544,32 +640,36 @@ extern "C" __global__ void aegis_apply_rope_positions_batched_f16_out(
 ) {
     const unsigned int head = blockIdx.x;
     const unsigned int batch_idx = blockIdx.y;
-    const unsigned int i = threadIdx.x;
     const unsigned int half_dim = head_dim / 2u;
     const unsigned int partial_half = (partial_dim > 0u) ? partial_dim / 2u : half_dim;
-    if (batch_idx >= batch || head >= num_heads || i >= half_dim) {
+    if (batch_idx >= batch || head >= num_heads) {
         return;
     }
     float* row = values + (size_t(batch_idx) * num_heads + head) * head_dim;
     unsigned short* out = output + (size_t(batch_idx) * num_heads + head) * head_dim;
-    float y0, y1;
-    if (i < partial_half) {
-        const float angle = float(positions[batch_idx]) * rope_inv_freq_device(
-            i, head_dim, theta, factor, low_freq_factor, high_freq_factor,
-            float(original_max_position_embeddings));
-        float sinv, cosv;
-        sincosf(angle, &sinv, &cosv);
-        const float x0 = row[i], x1 = row[i + half_dim];
-        y0 = x0 * cosv - x1 * sinv;
-        y1 = x0 * sinv + x1 * cosv;
-    } else {
-        y0 = row[i];
-        y1 = row[i + half_dim];
+    // Loop over half_dim so the kernel works for any head_dim (Gemma 4 global layers
+    // have head_dim=512 -> half_dim=256, larger than blockDim.x). Each thread handles
+    // its lane plus blockDim.x-strided neighbours.
+    for (unsigned int i = threadIdx.x; i < half_dim; i += blockDim.x) {
+        float y0, y1;
+        if (i < partial_half) {
+            const float angle = float(positions[batch_idx]) * rope_inv_freq_device(
+                i, head_dim, theta, factor, low_freq_factor, high_freq_factor,
+                float(original_max_position_embeddings));
+            float sinv, cosv;
+            sincosf(angle, &sinv, &cosv);
+            const float x0 = row[i], x1 = row[i + half_dim];
+            y0 = x0 * cosv - x1 * sinv;
+            y1 = x0 * sinv + x1 * cosv;
+        } else {
+            y0 = row[i];
+            y1 = row[i + half_dim];
+        }
+        row[i] = y0;
+        row[i + half_dim] = y1;
+        out[i] = float_to_f16_bits(y0);
+        out[i + half_dim] = float_to_f16_bits(y1);
     }
-    row[i] = y0;
-    row[i + half_dim] = y1;
-    out[i] = float_to_f16_bits(y0);
-    out[i + half_dim] = float_to_f16_bits(y1);
 }
 
 // Pointer-based variant for CUDA Graph replay: position is read from device memory.
@@ -728,5 +828,74 @@ extern "C" __global__ void aegis_zero_f32(
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < len) {
         out[idx] = 0.0f;
+    }
+}
+
+// In-place scale: out[i] *= scale  (Gemma 4 per-layer layer_scalar)
+extern "C" __global__ void aegis_scale_f32(
+    float* out,
+    const float scale,
+    const unsigned int len
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        out[idx] *= scale;
+    }
+}
+
+extern "C" __global__ void aegis_mul_vec_inplace_f32(
+    float* out,
+    const float* scale,
+    const unsigned int len
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        out[idx] *= scale[idx];
+    }
+}
+
+// MoE chunked prefill: gather rows by index.
+// dst[r * cols + c] = src[indices[r] * cols + c] for r in [0, count).
+// Used to build a contiguous batch of token rows that route to one expert.
+extern "C" __global__ void aegis_gather_rows_f32(
+    const float* src,
+    const unsigned int* indices,
+    const unsigned int count,
+    const unsigned int cols,
+    float* dst
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    if (row >= count) return;
+    const unsigned int src_row = indices[row];
+    const float* sp = src + size_t(src_row) * cols;
+    float* dp = dst + size_t(row) * cols;
+    for (unsigned int c = tid; c < cols; c += blockDim.x) {
+        dp[c] = sp[c];
+    }
+}
+
+// MoE chunked prefill: scatter-add with per-row weight.
+// out[indices[r] * cols + c] += weights[r] * src[r * cols + c]
+// `weights` length == count. Uses atomicAdd because multiple top-k positions of
+// the same source token route to different experts but ultimately accumulate
+// into the same output row (one output row per source token).
+extern "C" __global__ void aegis_scatter_add_weighted_f32(
+    const float* src,
+    const unsigned int* indices,
+    const float* weights,
+    const unsigned int count,
+    const unsigned int cols,
+    float* out
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    if (row >= count) return;
+    const unsigned int dst_row = indices[row];
+    const float w = weights[row];
+    const float* sp = src + size_t(row) * cols;
+    float* op = out + size_t(dst_row) * cols;
+    for (unsigned int c = tid; c < cols; c += blockDim.x) {
+        atomicAdd(&op[c], sp[c] * w);
     }
 }

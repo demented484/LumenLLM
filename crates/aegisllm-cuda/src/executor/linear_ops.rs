@@ -1,6 +1,7 @@
 use crate::cuda::{CudaRuntime, DeviceBuffer, DeviceNvfp4Linear};
 use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::error::{AegisError, Result};
+use super::state::CudaLinear;
 
 pub(super) fn prepare_nvfp4_input(
     runtime: &CudaRuntime,
@@ -210,6 +211,26 @@ pub(super) fn matvec_nvfp4_batched_device_with_scratch(
 
 pub(super) fn native_mxfp4_enabled(runtime: &CudaRuntime, linear: &DeviceNvfp4Linear) -> bool {
     runtime.native_mxfp4_inference_enabled_for(linear)
+}
+
+/// Matvec dispatch for a CudaLinear (BF16 or NVFP4 path).
+pub(super) fn matvec_cuda_linear_with_scratch(
+    runtime: &CudaRuntime,
+    linear: &CudaLinear,
+    input: &DeviceBuffer<f32>,
+    quant_hidden: &mut DeviceBuffer<f32>,
+    mxfp4_hidden: &mut DeviceBuffer<u8>,
+    output: &mut DeviceBuffer<f32>,
+    staging: Option<&mut LinearStagingPool>,
+) -> Result<()> {
+    match linear {
+        CudaLinear::Nvfp4(l) => {
+            matvec_nvfp4_device_with_scratch(runtime, l, input, quant_hidden, mxfp4_hidden, output, staging)
+        }
+        CudaLinear::Bf16(m) => {
+            runtime.matvec_bf16_reference_device(m, input, output)
+        }
+    }
 }
 
 fn scale_differs(a: f32, b: f32) -> bool {

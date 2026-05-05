@@ -25,7 +25,7 @@ impl CudaRuntime {
         input_scale: f32,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
-        if input.len() != output.len() {
+        if input.len() > output.len() {
             return Err(AegisError::InvalidPlan(format!(
                 "nvfp4 input quantization shape mismatch: input={} output={}",
                 input.len(),

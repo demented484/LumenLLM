@@ -2,16 +2,43 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+/// Top-level schema for `parameters.*.json` files.
+///
+/// Layout (post-rename):
+/// ```jsonc
+/// {
+///   "model": {
+///     "path": "...",
+///     "store": "vram",      // default tier for non-block weights (embed, lm_head, final_norm);
+///                           // also fallback for hidden-layers.{weights,kv-cache} when not overridden
+///     "compute": "cuda:0"
+///   },
+///   "hidden-layers": {
+///     "compute": "cuda:0",  // optional default compute for both sub-sections
+///     "weights":  { "number": ..., "store": ..., "compute": ...,
+///                   "fallback-store": ..., "fallback-compute": ... },
+///     "kv-cache": { "number": ..., "context-size": ...,
+///                   "store": ..., "fallback-store": ...,
+///                   "type-k": ..., "type-v": ... }
+///   },
+///   "linear-layout":   { ... },
+///   "other-parameters":{ ... },
+///   "cuda":            { ... }
+/// }
+/// ```
+///
+/// Old top-level `layers` / `kv-cache` keys are rejected by `deny_unknown_fields`
+/// to produce a clear error pointing users at the new path.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ParametersFile {
     #[serde(rename = "server-bin")]
     pub server_bin: Option<ServerBinSection>,
     #[serde(rename = "server-parameters")]
     pub server: Option<ServerSection>,
     pub model: ModelSection,
-    pub layers: Option<LayersSection>,
-    #[serde(rename = "kv-cache")]
-    pub kv_cache: Option<KvCacheSection>,
+    #[serde(rename = "hidden-layers")]
+    pub hidden_layers: Option<HiddenLayersSection>,
     #[serde(rename = "linear-layout")]
     pub linear_layout: Option<LinearLayoutSection>,
     #[serde(rename = "other-parameters")]
@@ -20,11 +47,13 @@ pub struct ParametersFile {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ServerBinSection {
     pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ServerSection {
     pub host: Option<String>,
     pub port: Option<u16>,
@@ -33,6 +62,7 @@ pub struct ServerSection {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ModelSection {
     pub path: PathBuf,
     pub store: Option<String>,
@@ -40,38 +70,57 @@ pub struct ModelSection {
     pub mmap: Option<bool>,
 }
 
+/// Wrapper for the two sub-sections that together describe per-hidden-layer placement.
+/// `compute` here (if set) is the **default compute target** for both sub-sections; each
+/// sub-section may still override its own `compute`. There is no `store` at this level
+/// by design — store must be explicit per sub-section, or fall back to `model.store`.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct LayersSection {
-    pub number: Option<usize>,
-    pub store: Option<String>,
+#[serde(deny_unknown_fields)]
+pub struct HiddenLayersSection {
     pub compute: Option<String>,
-    #[serde(rename = "rest-store")]
-    pub rest_store: Option<String>,
-    #[serde(rename = "rest-compute")]
-    pub rest_compute: Option<String>,
+    pub weights: Option<HiddenLayerWeightsSection>,
+    #[serde(rename = "kv-cache")]
+    pub kv_cache: Option<HiddenLayerKvCacheSection>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-pub struct KvCacheSection {
+#[serde(deny_unknown_fields)]
+pub struct HiddenLayerWeightsSection {
+    /// First `number` hidden layers use `store`/`compute`; the remaining hidden layers
+    /// use `fallback-store`/`fallback-compute` (or fall back to `model.{store,compute}`).
+    /// If omitted, applies to all hidden layers.
+    /// If `number > num_hidden_layers`, clamped down with a warning (llama.cpp style).
+    pub number: Option<usize>,
+    pub store: Option<String>,
+    pub compute: Option<String>,
+    #[serde(rename = "fallback-store")]
+    pub fallback_store: Option<String>,
+    #[serde(rename = "fallback-compute")]
+    pub fallback_compute: Option<String>,
+}
+
+/// KV cache section. Note: no `compute` / `fallback-compute` fields by design — KV cache
+/// is read by the attention kernel that runs on the same compute target as the matching
+/// layer's `weights`. Specifying compute separately would be redundant or contradictory.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HiddenLayerKvCacheSection {
+    pub number: Option<usize>,
     #[serde(rename = "context-size")]
     pub context_size: Option<usize>,
     pub store: Option<String>,
-    pub compute: Option<String>,
+    #[serde(rename = "fallback-store")]
+    pub fallback_store: Option<String>,
     #[serde(rename = "type-k")]
     pub type_k: Option<String>,
     #[serde(rename = "type-v")]
     pub type_v: Option<String>,
     #[serde(rename = "cache-prompt")]
     pub cache_prompt: Option<bool>,
-    /// Number of layers (from layer 0) that use `store-first` instead of `store`.
-    #[serde(rename = "store-first-n")]
-    pub store_first_n: Option<usize>,
-    /// Storage backend for the first `store-first-n` layers.
-    #[serde(rename = "store-first")]
-    pub store_first: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct OtherSection {
     pub temperature: Option<f32>,
     #[serde(rename = "top-p")]
@@ -94,6 +143,7 @@ pub struct OtherSection {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LinearLayoutSection {
     pub mode: Option<String>,
     pub cpu: Option<String>,
@@ -104,6 +154,7 @@ pub struct LinearLayoutSection {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct CudaSection {
     pub device: Option<usize>,
     #[serde(rename = "native-mxfp4-repack")]

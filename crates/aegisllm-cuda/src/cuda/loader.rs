@@ -5,15 +5,17 @@ use super::repack::{
 use super::runtime::{CudaRuntime, map_cuda_err};
 use super::types::{
     DeviceBf16Matrix, DeviceBuffer, DeviceCutlassNvfp4Linear, DeviceMxfp4Linear, DeviceNvfp4Linear,
-    HostBf16Weights, HostResidentMxfp4, HostResidentWeights,
+    HostBf16Weights, HostResidentMxfp4, HostResidentWeights, HostWeightBytes,
 };
 use aegisllm_base::artifact::ModelArtifact;
 use aegisllm_base::error::{AegisError, Result};
 use cudarc::driver::PinnedHostSlice;
+use std::io::{Read, Seek, SeekFrom};
 
-/// Allocate a CUDA-pinned (page-locked) host buffer sized exactly to `bytes.len()`
-/// and copy `bytes` into it. Pinned memory enables real async DMA H2D copies that
-/// run at full PCIe bandwidth instead of going through the driver's internal staging.
+/// Allocate CUDA-pinned host memory and copy an in-memory byte slice into it.
+/// Only used for repacked data (native MXFP4) that is generated in a Vec<u8> at runtime.
+/// For tensors loaded from disk, prefer `alloc_pinned_u8_from_file` to avoid the
+/// intermediate mmap/pageable copy.
 fn alloc_pinned_from_bytes(
     runtime: &CudaRuntime,
     bytes: &[u8],
@@ -25,6 +27,98 @@ fn alloc_pinned_from_bytes(
         .as_mut_slice()
         .map_err(map_cuda_err(label))?
         .copy_from_slice(bytes);
+    Ok(pinned)
+}
+
+/// Read a tensor's bytes directly from the safetensors file into a freshly allocated
+/// CUDA-pinned host buffer.  Avoids the mmap-then-copy double-allocation that occurs
+/// when weights are staged from disk: only one copy of the data exists in RAM (the
+/// pinned buffer), instead of the kernel page-cache pages + a separate pinned copy.
+fn alloc_pinned_u8_from_file(
+    runtime: &CudaRuntime,
+    tensor: &TensorInfo,
+    label: &'static str,
+) -> Result<PinnedHostSlice<u8>> {
+    let len = tensor.data_len_bytes() as usize;
+    let mut pinned = unsafe { runtime.stream.context().alloc_pinned::<u8>(len) }
+        .map_err(map_cuda_err(label))?;
+    {
+        let dst = pinned.as_mut_slice().map_err(map_cuda_err(label))?;
+        let mut file = std::fs::File::open(&tensor.shard_path)?;
+        file.seek(SeekFrom::Start(tensor.file_offsets.0))?;
+        file.read_exact(dst)?;
+        aegisllm_base::tensor::storage::fadvise_dont_need(
+            &file,
+            tensor.file_offsets.0,
+            len as u64,
+        );
+    }
+    Ok(pinned)
+}
+
+/// Read a tensor's bytes into the shared pinned-host arena via direct file
+/// I/O. Uses `read_exact` straight into the arena slice — sequential reads
+/// inside a shard let the OS aggressively prefetch.
+///
+/// Per-call file open is cheap relative to the file read itself (NVMe at
+/// ~3-5 GB/s dominates), but for very many tensors the open + seek overhead
+/// adds up. We accept this for code simplicity; if it shows up as a hot
+/// spot, the next step is a per-shard `File` handle cache or a single
+/// shard-wide read into a temporary buffer.
+fn read_tensor_into_arena(
+    arena: &super::host_arena::ArenaHandle,
+    tensor: &TensorInfo,
+) -> Result<super::types::HostWeightBytes> {
+    let len = tensor.data_len_bytes() as usize;
+    let mut file = std::fs::File::open(&tensor.shard_path)?;
+    file.seek(SeekFrom::Start(tensor.file_offsets.0))?;
+    let offset = arena.alloc_and_fill(&mut file, len)?;
+    aegisllm_base::tensor::storage::fadvise_dont_need(
+        &file,
+        tensor.file_offsets.0,
+        len as u64,
+    );
+    Ok(super::types::HostWeightBytes::Arena {
+        arena: arena.clone(),
+        offset,
+        len,
+    })
+}
+
+/// Read a BF16 tensor directly from disk into a CUDA-pinned u16 buffer.
+/// Safetensors uses little-endian byte order, same as x86/ARM, so the raw bytes
+/// can be reinterpreted as u16 values in-place without endian conversion.
+fn alloc_pinned_u16_from_file(
+    runtime: &CudaRuntime,
+    tensor: &TensorInfo,
+    label: &'static str,
+) -> Result<PinnedHostSlice<u16>> {
+    let len_bytes = tensor.data_len_bytes() as usize;
+    if len_bytes % 2 != 0 {
+        return Err(AegisError::InvalidPlan(format!(
+            "`{}` BF16 byte length is not even: {len_bytes}",
+            tensor.name
+        )));
+    }
+    let len_u16 = len_bytes / 2;
+    let mut pinned = unsafe { runtime.stream.context().alloc_pinned::<u16>(len_u16) }
+        .map_err(map_cuda_err(label))?;
+    {
+        let dst_u16 = pinned.as_mut_slice().map_err(map_cuda_err(label))?;
+        // Safety: u16 and u8 have the same alignment requirements here; we treat the
+        // pinned u16 buffer as a raw byte buffer for the initial file read.
+        let dst_u8 = unsafe {
+            std::slice::from_raw_parts_mut(dst_u16.as_mut_ptr() as *mut u8, len_bytes)
+        };
+        let mut file = std::fs::File::open(&tensor.shard_path)?;
+        file.seek(SeekFrom::Start(tensor.file_offsets.0))?;
+        file.read_exact(dst_u8)?;
+        aegisllm_base::tensor::storage::fadvise_dont_need(
+            &file,
+            tensor.file_offsets.0,
+            len_bytes as u64,
+        );
+    }
     Ok(pinned)
 }
 use aegisllm_base::graph::{GraphRegion, TensorRole};
@@ -40,17 +134,47 @@ use aegisllm_base::tensor::{TensorDType, TensorInfo};
 
 pub struct CudaWeightLoader<'a> {
     runtime: &'a CudaRuntime,
+    /// Shared pinned-host arena for staged-NVFP4 weight residency. When set,
+    /// host-resident NVFP4 weights are read directly into this arena instead
+    /// of allocating a separate `cuMemAllocHost` per tensor — collapses ~7700
+    /// pinned allocations into one. `None` for paths that don't need host
+    /// residency (used for backwards-compatible callers).
+    arena: Option<super::host_arena::ArenaHandle>,
 }
 
 impl CudaRuntime {
     pub fn weight_loader(&self) -> CudaWeightLoader<'_> {
-        CudaWeightLoader { runtime: self }
+        CudaWeightLoader {
+            runtime: self,
+            arena: None,
+        }
+    }
+
+    /// Create a weight loader bound to a pre-allocated pinned-host arena.
+    /// The arena is consumed by host-resident NVFP4 weights as they are loaded;
+    /// non-host-resident weights ignore it.
+    pub fn weight_loader_with_arena(
+        &self,
+        arena: super::host_arena::ArenaHandle,
+    ) -> CudaWeightLoader<'_> {
+        CudaWeightLoader {
+            runtime: self,
+            arena: Some(arena),
+        }
     }
 }
 
 impl CudaWeightLoader<'_> {
     pub fn device_index(&self) -> usize {
         self.runtime.device_index()
+    }
+
+    /// Borrow the underlying runtime for callers that need direct access to
+    /// allocator / upload primitives during loading. Used by the executor's
+    /// loader to populate `router_per_expert_scale_device` and similar
+    /// accompanying device-resident metadata.
+    pub fn runtime(&self) -> &CudaRuntime {
+        self.runtime
     }
 
     pub fn load_dense_vector_with_store(
@@ -115,22 +239,16 @@ impl CudaWeightLoader<'_> {
                 tensor.name
             )));
         }
-        let loaded = loader.load_for_store(tensor, store)?;
-        let values = loaded
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
         let is_host_resident = !force_vram
             && matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
         if is_host_resident {
-            // Allocate pinned host buffer for fast staging and a tiny VRAM stub.
-            let mut pinned = unsafe { self.runtime.stream.context().alloc_pinned::<u16>(values.len()) }
-                .map_err(map_cuda_err("alloc pinned bf16 host"))?;
-            pinned
-                .as_mut_slice()
-                .map_err(map_cuda_err("alloc pinned bf16 host"))?
-                .copy_from_slice(&values);
+            // Read directly from file into pinned u16 memory — avoids the mmap page-cache
+            // copy and the intermediate Vec<u16>; only one copy of the data exists in RAM.
+            let pinned = alloc_pinned_u16_from_file(
+                self.runtime,
+                tensor,
+                "alloc pinned bf16 host",
+            )?;
             let stub = self
                 .runtime
                 .stream
@@ -145,6 +263,12 @@ impl CudaWeightLoader<'_> {
                 host_values: Some(Box::new(HostBf16Weights { values: pinned })),
             });
         }
+        let loaded = loader.load_for_store(tensor, store)?;
+        let values = loaded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
         Ok(DeviceBf16Matrix {
             name: tensor.name.clone(),
             rows: tensor.shape[0],
@@ -228,12 +352,22 @@ impl CudaWeightLoader<'_> {
             .unwrap_or(1.0);
         let spec =
             Nvfp4LinearSpec::from_tensors(prefix, weight, scales, input_scale, output_scale)?;
-        let packed_host = loader.load_for_store(weight, store)?;
-        let scales_host = loader.load_for_store(scales, store)?;
-        // For host-resident (StagedHostToDevice) layers: keep bytes in RAM, allocate 1-byte
-        // VRAM stubs so the type system stays intact. Native/CUTLASS repacking is skipped
-        // (no repacked VRAM available); the fallback packed-source kernel is always used.
         let is_host_resident = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
+
+        // Load mmap data only when it is needed: VRAM upload, or repacking for tensor cores.
+        // For plain host-resident layers (staged streaming) we read straight into pinned RAM
+        // via alloc_pinned_u8_from_file, avoiding the kernel page-cache copy entirely.
+        let needs_mmap = !is_host_resident
+            || self.should_repack_native_mxfp4(prefix, kernel_family)
+            || self.should_repack_cutlass_nvfp4(prefix, kernel_family, resident_layout);
+        let (packed_host, scales_host) = if needs_mmap {
+            (
+                Some(loader.load_for_store(weight, store)?),
+                Some(loader.load_for_store(scales, store)?),
+            )
+        } else {
+            (None, None)
+        };
 
         let native_mxfp4 = if !is_host_resident && self.should_repack_native_mxfp4(prefix, kernel_family) {
             if spec.cols % 64 != 0 {
@@ -247,8 +381,8 @@ impl CudaWeightLoader<'_> {
                 &spec,
                 weight,
                 scales,
-                packed_host.as_bytes(),
-                scales_host.as_bytes(),
+                packed_host.as_ref().unwrap().as_bytes(),
+                scales_host.as_ref().unwrap().as_bytes(),
             )?;
             Some(DeviceMxfp4Linear {
                 bytes: repacked.len(),
@@ -269,8 +403,8 @@ impl CudaWeightLoader<'_> {
                     &spec,
                     weight,
                     scales,
-                    packed_host.as_bytes(),
-                    scales_host.as_bytes(),
+                    packed_host.as_ref().unwrap().as_bytes(),
+                    scales_host.as_ref().unwrap().as_bytes(),
                 )?;
                 Some(DeviceCutlassNvfp4Linear {
                     layout: repacked.layout,
@@ -290,10 +424,9 @@ impl CudaWeightLoader<'_> {
             };
 
         if is_host_resident {
-            // Weights stay in host RAM (CUDA-pinned). Allocate tiny VRAM stubs so the
-            // struct fields are always valid; real bytes live in host_weights.
-            // Also perform native MXFP4 repacking (CPU-side) when requested: this lets
-            // inference stage the repacked format to VRAM and use Blackwell tensor cores.
+            // Weights stay in CUDA-pinned host RAM; tiny VRAM stubs keep the type system intact.
+            // Weights are read directly from the safetensors file into pinned memory so no
+            // intermediate mmap/pageable copy is created in the kernel page cache.
             let host_native_mxfp4 =
                 if self.should_repack_native_mxfp4(prefix, kernel_family) {
                     if spec.cols % 64 != 0 {
@@ -307,8 +440,8 @@ impl CudaWeightLoader<'_> {
                         &spec,
                         weight,
                         scales,
-                        packed_host.as_bytes(),
-                        scales_host.as_bytes(),
+                        packed_host.as_ref().unwrap().as_bytes(),
+                        scales_host.as_ref().unwrap().as_bytes(),
                     )?;
                     let pinned = alloc_pinned_from_bytes(
                         self.runtime,
@@ -317,21 +450,29 @@ impl CudaWeightLoader<'_> {
                     )?;
                     Some(HostResidentMxfp4 {
                         blocks_per_row: spec.cols / 32,
-                        data: pinned,
+                        data: HostWeightBytes::Pinned(pinned),
                     })
                 } else {
                     None
                 };
-            let pinned_packed = alloc_pinned_from_bytes(
-                self.runtime,
-                packed_host.as_bytes(),
-                "alloc pinned host packed weights",
-            )?;
-            let pinned_scales = alloc_pinned_from_bytes(
-                self.runtime,
-                scales_host.as_bytes(),
-                "alloc pinned host scales",
-            )?;
+            // Host-resident NVFP4 weights are read directly into the shared
+            // pinned-host arena. One `cuMemAllocHost` covers all weights;
+            // each tensor sub-allocates by atomic offset bump. This keeps the
+            // hot inference path with **zero CPU memcpy** (source is pinned →
+            // GPU DMA pulls directly) at the cost of locking ~total_model_size
+            // RAM. See `host_arena.rs` for the rationale and trade-off vs the
+            // earlier mmap+bounce approach.
+            let arena = self.arena.as_ref().ok_or_else(|| {
+                AegisError::InvalidPlan(format!(
+                    "host-resident NVFP4 layer `{}` requires the loader to be built \
+                     with `weight_loader_with_arena(...)`; got bare `weight_loader()`",
+                    spec.name,
+                ))
+            })?;
+            let packed_arena = read_tensor_into_arena(arena, weight)?;
+            let scales_arena = read_tensor_into_arena(arena, scales)?;
+            let mmap_packed = packed_arena;
+            let mmap_scales = scales_arena;
             let stub_packed = self
                 .runtime
                 .stream
@@ -358,8 +499,8 @@ impl CudaWeightLoader<'_> {
                 native_mxfp4: None,
                 cutlass_nvfp4: None,
                 host_weights: Some(Box::new(HostResidentWeights {
-                    packed: pinned_packed,
-                    scales: pinned_scales,
+                    packed: mmap_packed,
+                    scales: mmap_scales,
                     native_mxfp4: host_native_mxfp4,
                 })),
             });
@@ -379,12 +520,12 @@ impl CudaWeightLoader<'_> {
             packed: self
                 .runtime
                 .stream
-                .clone_htod(packed_host.as_bytes())
+                .clone_htod(packed_host.as_ref().unwrap().as_bytes())
                 .map_err(map_cuda_err("htod nvfp4 packed weights"))?,
             scales: self
                 .runtime
                 .stream
-                .clone_htod(scales_host.as_bytes())
+                .clone_htod(scales_host.as_ref().unwrap().as_bytes())
                 .map_err(map_cuda_err("htod nvfp4 scales"))?,
             native_mxfp4,
             cutlass_nvfp4,
@@ -487,8 +628,8 @@ impl CudaWeightLoader<'_> {
                 native_mxfp4: None,
                 cutlass_nvfp4: None,
                 host_weights: Some(Box::new(HostResidentWeights {
-                    packed: pinned_packed,
-                    scales: pinned_scales,
+                    packed: HostWeightBytes::Pinned(pinned_packed),
+                    scales: HostWeightBytes::Pinned(pinned_scales),
                     native_mxfp4: None,
                 })),
             });
@@ -996,21 +1137,29 @@ fn load_nvfp4_linear_host_parts(
     })
 }
 
-fn read_scalar_f32_with_loader(
+pub(crate) fn read_scalar_f32_with_loader(
     loader: &mut TensorStorageLoader,
     tensor: &TensorInfo,
     store: StoragePlacement,
 ) -> Result<f32> {
-    if tensor.dtype != TensorDType::F32 || tensor.data_len_bytes() != 4 {
-        return Err(AegisError::InvalidPlan(format!(
-            "`{}` must be a scalar F32 tensor",
-            tensor.name
-        )));
-    }
     let loaded: LoadedHostTensor = loader.load_for_store(tensor, store)?;
-    Ok(f32::from_le_bytes(loaded.as_bytes().try_into().map_err(
-        |_| AegisError::InvalidPlan(format!("bad scalar F32 tensor `{}`", tensor.name)),
-    )?))
+    let bytes = loaded.as_bytes();
+    match tensor.dtype {
+        TensorDType::F32 if bytes.len() == 4 => Ok(f32::from_le_bytes(bytes.try_into().map_err(
+            |_| AegisError::InvalidPlan(format!("bad scalar F32 tensor `{}`", tensor.name)),
+        )?)),
+        TensorDType::BF16 if bytes.len() == 2 => {
+            let bits = u16::from_le_bytes(bytes.try_into().map_err(
+                |_| AegisError::InvalidPlan(format!("bad scalar BF16 tensor `{}`", tensor.name)),
+            )?);
+            // BF16 is the top 16 bits of an F32; shift left by 16 to recover f32 bits.
+            Ok(f32::from_bits((bits as u32) << 16))
+        }
+        _ => Err(AegisError::InvalidPlan(format!(
+            "`{}` must be a scalar F32 or BF16 tensor, got {:?} ({} bytes)",
+            tensor.name, tensor.dtype, bytes.len()
+        ))),
+    }
 }
 
 fn first_nvfp4_linear_prefix(region: &GraphRegion) -> Option<&str> {

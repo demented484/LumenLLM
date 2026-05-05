@@ -161,15 +161,14 @@ impl CudaLayerBlockExecutor {
             .layers
             .values()
             .flat_map(|layer| {
-                [
-                    &layer.q_proj,
-                    &layer.k_proj,
-                    &layer.v_proj,
-                    &layer.o_proj,
-                    &layer.gate_proj,
-                    &layer.up_proj,
-                    &layer.down_proj,
-                ]
+                // gate/up/down are always DeviceNvfp4Linear; q/k/v/o are CudaLinear
+                let mut nvfp4s: Vec<&crate::cuda::DeviceNvfp4Linear> = vec![
+                    &layer.gate_proj, &layer.up_proj, &layer.down_proj,
+                ];
+                for cl in [&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj] {
+                    if let Some(l) = cl.as_nvfp4() { nvfp4s.push(l); }
+                }
+                nvfp4s
             })
             .filter(|linear| self.runtime.cutlass_nvfp4_inference_enabled_for(linear))
             .map(|linear| {
@@ -216,6 +215,9 @@ impl CudaLayerBlockExecutor {
                     .alloc_f32(self.num_attention_heads * self.head_dim)?,
                 k: self.runtime.alloc_f32(kv_width)?,
                 v: self.runtime.alloc_f32(kv_width)?,
+                qk_norm_scratch: self
+                    .runtime
+                    .alloc_f32((self.num_attention_heads * self.head_dim).max(kv_width))?,
                 attn_split_acc: self
                     .runtime
                     .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K * self.head_dim)?,

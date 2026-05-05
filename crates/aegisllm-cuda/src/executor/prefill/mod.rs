@@ -3,6 +3,7 @@ mod batch;
 mod gemm;
 mod kv;
 mod layer;
+mod moe;
 mod scheduler;
 mod timings;
 
@@ -91,6 +92,24 @@ impl CudaLlamaExecutor {
                 batch_meta.num_prefill_tokens,
                 &mut prefill.hidden,
             )?;
+            // Gemma 4 ScaledWordEmbedding: embeddings get multiplied by sqrt(hidden_size).
+            // The decode path applies this in `forward_hidden`; chunked prefill must mirror.
+            // Without it the first layer's RMS-norm sees magnitudes ~53× too small,
+            // attention collapses, and the rest of the model diverges into garbage.
+            if let Some(scale) = self.embed_scale {
+                let total = batch_meta
+                    .num_prefill_tokens
+                    .checked_mul(self.hidden_size)
+                    .ok_or_else(|| AegisError::InvalidPlan(
+                        "prefill embed_scale length overflow".into(),
+                    ))?;
+                self.runtime
+                    .scale_f32_device_len(scale, &mut prefill.hidden, total)?;
+            }
+            if let Ok(tag) = std::env::var("AEGIS_DUMP_EMBED") {
+                let h = self.runtime.download_f32(&prefill.hidden)?;
+                eprintln!("[DUMP {tag} EMBED] first8={:?}", &h[0..8.min(h.len())]);
+            }
             record_prefill_stage(
                 &self.runtime,
                 &mut state.prefill_timings,

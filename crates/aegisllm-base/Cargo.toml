@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 memmap2.workspace = true
+libc.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true

@@ -130,23 +130,39 @@ extern "C" __global__ void aegis_attention_decode_ptr_split(
     }
 
     /* --- Phase 3: weighted V sum, 1 warp per position, coalesced V loads ---
-     * Each lane accumulates 4 consecutive V dims.
-     * After position loop, reduce 4 warps' partial sums via shared memory. */
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+     * Each lane accumulates 4 consecutive V dims per d-block. d-blocks step by 128
+     * (32 lanes * 4 dims/lane). For head_dim=128 there is one d-block (Llama). For
+     * head_dim=256/512 (Gemma 4 sliding/global) there are 2 / 4 d-blocks. The previous
+     * implementation only had 4 accumulators total and silently summed contributions
+     * from every d-block into the same slot — correct for head_dim=128, garbage
+     * otherwise. We size the accumulator by the max supported head_dim (512 → 4
+     * d-blocks). */
+    constexpr unsigned int MAX_D_BLOCKS = 4u;  // supports head_dim up to 4*128 = 512
+    float acc[MAX_D_BLOCKS][4] = { {0.0f, 0.0f, 0.0f, 0.0f} };
+    const unsigned int d_blocks = (head_dim + 127u) / 128u;
     for (unsigned int pos = warp_id; pos < chunk_len; pos += 4u) {
         const unsigned short* v = value_cache + ((size_t)(chunk_start + pos) * num_kv_heads + kv_head) * head_dim;
         float w = scores[pos];
-        for (unsigned int d = lane * 4u; d < head_dim; d += 128u) {
-            acc[0] += w * f16_bits_to_float(v[d+0u]);
-            acc[1] += w * f16_bits_to_float(v[d+1u]);
-            acc[2] += w * f16_bits_to_float(v[d+2u]);
-            acc[3] += w * f16_bits_to_float(v[d+3u]);
+        for (unsigned int b = 0u; b < d_blocks; ++b) {
+            const unsigned int d = b * 128u + lane * 4u;
+            if (d >= head_dim) break;
+            acc[b][0] += w * f16_bits_to_float(v[d+0u]);
+            acc[b][1] += w * f16_bits_to_float(v[d+1u]);
+            acc[b][2] += w * f16_bits_to_float(v[d+2u]);
+            acc[b][3] += w * f16_bits_to_float(v[d+3u]);
         }
     }
-    /* Write per-warp V accumulators to shared memory (vsum[warp_id * head_dim + lane*4 + i]) */
-    for (unsigned int i = 0u; i < 4u; ++i) vsum[warp_id * head_dim + lane * 4u + i] = acc[i];
+    /* Write per-warp V accumulators to shared memory at vsum[warp_id*head_dim + d + i]. */
+    for (unsigned int b = 0u; b < d_blocks; ++b) {
+        const unsigned int d = b * 128u + lane * 4u;
+        if (d >= head_dim) break;
+        vsum[warp_id * head_dim + d + 0u] = acc[b][0];
+        vsum[warp_id * head_dim + d + 1u] = acc[b][1];
+        vsum[warp_id * head_dim + d + 2u] = acc[b][2];
+        vsum[warp_id * head_dim + d + 3u] = acc[b][3];
+    }
     __syncthreads();
-    /* Reduce across 4 warps: thread tid handles output dim tid (head_dim == blockDim.x = 128) */
+    /* Reduce across 4 warps. Each thread covers head_dim/blockDim.x output dims. */
     for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
         float sum = vsum[0u * head_dim + d]
                   + vsum[1u * head_dim + d]

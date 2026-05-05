@@ -1,9 +1,14 @@
 //! Qwen 3.5 / 3.6 architecture family.
 //!
-//! Dense variants (0.8B, 2B, 4B, 9B, 27B) are plain decoders — structurally
-//! Llama-compatible tensor names. Hybrid MoE variants (35B-A3B, 397B-A17B)
-//! add Gated DeltaNet (GDN) linear-attention layers plus sparse MoE.
-//! The default tensor naming follows Llama conventions.
+//! Dense variants are plain decoders (Llama-compatible tensor names).
+//! Hybrid variants (35B-A3B, 397B-A17B) interleave GDN linear-attention
+//! layers (every 3 out of 4 layers) with full-attention layers, plus sparse MoE.
+//!
+//! Layer type is determined by (in priority order):
+//!   1. Explicit `layer_types` array in config.json.
+//!   2. `full_attention_interval` (every N-th layer is full, rest GDN).
+//!   3. `linear_attn_every_n_layers` legacy field.
+//!   4. If `use_linear_attention` is false / absent → all dense.
 
 use crate::artifact::{HfConfig, ModelArtifact};
 use crate::error::Result;
@@ -26,25 +31,21 @@ impl ModelArchitecture for Qwen3Architecture {
     }
 
     fn layer_kind(&self, layer_idx: usize, config: &HfConfig) -> LayerKind {
-        // Hybrid MoE: interleave MoE and GDN layers.
-        // Pattern: every `linear_attn_every_n_layers`-th layer is GDN; the rest are MoE or dense.
-        if let Some(num_experts) = config.num_experts.filter(|&n| n > 1) {
+        let num_experts = config.num_experts.unwrap_or(0);
+        let has_moe = num_experts > 1;
+        let is_linear = is_linear_attention_layer(layer_idx, config);
+
+        if is_linear {
+            return LayerKind::LinearAttentionDecoder;
+        }
+        if has_moe {
             let top_k = config.num_experts_per_tok.unwrap_or(2);
             let has_shared = config.num_shared_experts.unwrap_or(0) > 0;
-
-            // Check if this layer is a linear-attention layer.
-            if is_linear_attention_layer(layer_idx, config) {
-                return LayerKind::LinearAttentionDecoder;
-            }
             return LayerKind::MoEDecoder {
                 num_experts,
                 top_k,
                 has_shared_expert: has_shared,
             };
-        }
-        // Pure dense (no MoE flag)
-        if is_linear_attention_layer(layer_idx, config) {
-            return LayerKind::LinearAttentionDecoder;
         }
         LayerKind::DenseDecoder
     }
@@ -65,23 +66,33 @@ impl ModelArchitecture for Qwen3Architecture {
     }
 
     fn rope_config(&self, config: &HfConfig) -> RopeConfig {
-        rope_from_hf_config(config, 1.0)
+        let partial = config.partial_rotary_factor.unwrap_or(1.0);
+        rope_from_hf_config(config, partial)
     }
 }
 
-/// Returns true if the layer at `layer_idx` is a linear-attention (GDN) layer.
-fn is_linear_attention_layer(layer_idx: usize, config: &HfConfig) -> bool {
+/// Returns true if layer `layer_idx` is a Gated DeltaNet linear-attention layer.
+pub fn is_linear_attention_layer(layer_idx: usize, config: &HfConfig) -> bool {
+    // 1. Explicit per-layer type array (Qwen3.5-9B, Qwen3.6-35B).
+    if let Some(types) = &config.layer_types {
+        if let Some(t) = types.get(layer_idx) {
+            return t == "linear_attention";
+        }
+    }
+    // 2. full_attention_interval: N → every N-th layer is full, others are GDN.
+    if let Some(interval) = config.full_attention_interval {
+        if interval > 0 {
+            return layer_idx % interval != (interval - 1);
+        }
+    }
+    // 3. Legacy explicit flag / frequency.
     if config.use_linear_attention != Some(true) {
         return false;
     }
-    // Explicit count: the first N layers are linear-attention.
     if let Some(n) = config.num_linear_attention_layers {
         return layer_idx < n;
     }
-    // Frequency-based: every `linear_attn_every_n_layers`-th layer group has one GDN layer.
-    // Pattern for Qwen 3.5 MoE: 3 GDN : 1 full-attention repeating.
     if let Some(freq) = config.linear_attn_every_n_layers {
-        // freq=4 → positions 0,1,2 in each group of 4 are GDN, position 3 is full.
         return layer_idx % freq != (freq - 1);
     }
     false

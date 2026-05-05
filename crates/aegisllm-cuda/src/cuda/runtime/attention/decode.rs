@@ -30,7 +30,7 @@ impl CudaRuntime {
             )));
         }
         let query_len = checked_len("decode_ptr query", num_attention_heads, head_dim)?;
-        if query.len() != query_len || output.len() != query_len {
+        if query.len() < query_len || output.len() < query_len {
             return Err(AegisError::InvalidPlan(
                 "attention_ptr query/output shape mismatch".into(),
             ));
@@ -103,10 +103,11 @@ impl CudaRuntime {
             )));
         }
         let query_len = checked_len("decode_split query", num_attention_heads, head_dim)?;
-        if query.len() != query_len || output.len() != query_len {
-            return Err(AegisError::InvalidPlan(
-                "attention_split_ptr query/output shape mismatch".into(),
-            ));
+        if query.len() < query_len || output.len() < query_len {
+            return Err(AegisError::InvalidPlan(format!(
+                "attention_split_ptr query/output too small: query={} output={} expected_min={}",
+                query.len(), output.len(), query_len
+            )));
         }
         let partial_len = checked_len("decode_split partial", num_attention_heads, DECODE_SPLIT_K)?;
         let partial_acc_len = checked_len("decode_split partial_acc", partial_len, head_dim)?;
@@ -205,7 +206,7 @@ impl CudaRuntime {
             )));
         }
         let query_len = checked_len("fp8_ptr query", num_attention_heads, head_dim)?;
-        if query.len() != query_len || output.len() != query_len {
+        if query.len() < query_len || output.len() < query_len {
             return Err(AegisError::InvalidPlan("attention_ptr_fp8 query/output shape mismatch".into()));
         }
         if !num_attention_heads.is_multiple_of(num_kv_heads) {
@@ -268,7 +269,7 @@ impl CudaRuntime {
             )));
         }
         let query_len = checked_len("fp8_split query", num_attention_heads, head_dim)?;
-        if query.len() != query_len || output.len() != query_len {
+        if query.len() < query_len || output.len() < query_len {
             return Err(AegisError::InvalidPlan("attention_split_fp8 query/output shape mismatch".into()));
         }
         let partial_len     = checked_len("fp8_split partial", num_attention_heads, DECODE_SPLIT_K)?;
@@ -359,7 +360,7 @@ impl CudaRuntime {
         }
         let query_len = checked_len("fp8 decode query", num_attention_heads, head_dim)?;
         let kv_width  = checked_len("fp8 decode kv width", num_kv_heads, head_dim)?;
-        if query.len() != query_len || output.len() != query_len {
+        if query.len() < query_len || output.len() < query_len {
             return Err(AegisError::InvalidPlan("attention_fp8 query/output shape mismatch".into()));
         }
         if seq_len == 0
@@ -439,7 +440,7 @@ impl CudaRuntime {
         }
         let query_len = checked_len("decode query", num_attention_heads, head_dim)?;
         let kv_width = checked_len("decode kv width", num_kv_heads, head_dim)?;
-        if query.len() != query_len || output.len() != query_len {
+        if query.len() < query_len || output.len() < query_len {
             return Err(AegisError::InvalidPlan(
                 "attention query/output shape mismatch".into(),
             ));

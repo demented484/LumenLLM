@@ -41,10 +41,13 @@ impl TextProcessor {
             .iter()
             .map(|id| *id as usize)
             .collect::<Vec<_>>();
-        if ids.is_empty()
-            && let Some(bos) = self.bos_token_id
+        // Prepend BOS if the tokenizer didn't add one and the model has a BOS token defined.
+        // Models like Gemma 4 absolutely require BOS at sequence start; without it the
+        // first token's attention context is wrong and decoding collapses to gibberish.
+        if let Some(bos) = self.bos_token_id
+            && ids.first().copied() != Some(bos)
         {
-            ids.push(bos);
+            ids.insert(0, bos);
         }
         Ok(ids)
     }

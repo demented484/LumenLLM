@@ -77,7 +77,10 @@ impl CudaRuntime {
         context_size: usize,
     ) -> Result<()> {
         let cache_len = checked_len("cache", context_size, kv_width)?;
-        if key.len() != kv_width || value.len() != kv_width {
+        // `key`/`value` are scratch buffers sized for the largest layer's kv_width
+        // (Gemma 4 has heterogeneous global vs sliding kv head counts), so we only
+        // require the buffer to hold at least `kv_width` elements.
+        if key.len() < kv_width || value.len() < kv_width {
             return Err(AegisError::InvalidPlan(
                 "kv_store_ptr vector shape mismatch".into(),
             ));
@@ -306,9 +309,11 @@ impl CudaRuntime {
         dense_metadata: DensePrefillMetadataProof,
         rope: DeviceRopeConfig,
     ) -> Result<()> {
-        if num_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) || head_dim > 256 {
+        // The kernel handles each kv element with its own thread — head_dim is not
+        // capped by the threadblock size. Only require evenness for the rope split.
+        if num_heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(2) {
             return Err(AegisError::InvalidPlan(format!(
-                "slot-mapped roped kv store requires non-zero heads and even head_dim <= 256: heads={} head_dim={}",
+                "slot-mapped roped kv store requires non-zero heads and even head_dim: heads={} head_dim={}",
                 num_heads, head_dim
             )));
         }
