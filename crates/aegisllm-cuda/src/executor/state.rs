@@ -468,6 +468,35 @@ pub(super) struct CudaMoEPrefillScratch {
     pub(super) expert_counts: DeviceBuffer<u32>,
     /// Stride between per-expert lists (= `max_per_expert` = chunk_size * top_k).
     pub(super) expert_list_stride: usize,
+    // ── Phase 2 grouped-MoE scratch (used when VRAM expert cache is on) ────
+    /// CSR prefix-sum over `expert_counts`: `expert_offsets[e]` is the start
+    /// row in the permuted activation buffer for expert `e`. Length is
+    /// `num_experts + 1`; last entry is `total_assignments`.
+    pub(super) expert_offsets: DeviceBuffer<u32>,
+    /// Per-chunk packed-cached-counts upload buffer. For experts cached in
+    /// VRAM the value is the original `expert_counts[e]`; for uncached the
+    /// value is 0 (so the grouped GEMM skips them — they go through the
+    /// per-expert fallback path that still uses staging).
+    pub(super) cached_counts: DeviceBuffer<u32>,
+    /// Per-layer per-matmul-position byte offsets into the VRAM cache buffer.
+    /// Built on host per chunk by looking up each expert's weight name in the
+    /// cache, uploaded before each grouped matvec call. 6 small buffers per
+    /// chunk: (gate, up, down) × (packed, scales). Each is `[num_experts]` u32.
+    pub(super) gate_packed_offsets: DeviceBuffer<u32>,
+    pub(super) gate_scales_offsets: DeviceBuffer<u32>,
+    pub(super) up_packed_offsets: DeviceBuffer<u32>,
+    pub(super) up_scales_offsets: DeviceBuffer<u32>,
+    pub(super) down_packed_offsets: DeviceBuffer<u32>,
+    pub(super) down_scales_offsets: DeviceBuffer<u32>,
+    /// Permuted activation buffer for the grouped MoE pipeline:
+    /// `[chunk_size * top_k, hidden]`.
+    pub(super) permuted_input: DeviceBuffer<f32>,
+    /// Permuted gate-projection output: `[chunk_size * top_k, expert_intermediate]`.
+    pub(super) permuted_gate: DeviceBuffer<f32>,
+    /// Permuted up-projection output (reused as SwiGLU/GeGLU input/output).
+    pub(super) permuted_up: DeviceBuffer<f32>,
+    /// Permuted down-projection output: `[chunk_size * top_k, hidden]`.
+    pub(super) permuted_down: DeviceBuffer<f32>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]

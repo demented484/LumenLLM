@@ -504,6 +504,19 @@ impl CudaLlamaExecutor {
                         expert_weight_lists: self.runtime.alloc_f32(max_experts * max_per_expert)?,
                         expert_counts: self.runtime.alloc_u32(max_experts)?,
                         expert_list_stride: max_per_expert,
+                        // Phase 2 grouped-MoE scratch (used when VRAM cache is on).
+                        expert_offsets: self.runtime.alloc_u32(max_experts + 1)?,
+                        cached_counts: self.runtime.alloc_u32(max_experts)?,
+                        permuted_input: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,
+                        permuted_gate: self.runtime.alloc_f32(cs * max_top_k * max_expert_intermediate)?,
+                        permuted_up: self.runtime.alloc_f32(cs * max_top_k * max_expert_intermediate)?,
+                        permuted_down: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,
+                        gate_packed_offsets: self.runtime.alloc_u32(max_experts)?,
+                        gate_scales_offsets: self.runtime.alloc_u32(max_experts)?,
+                        up_packed_offsets: self.runtime.alloc_u32(max_experts)?,
+                        up_scales_offsets: self.runtime.alloc_u32(max_experts)?,
+                        down_packed_offsets: self.runtime.alloc_u32(max_experts)?,
+                        down_scales_offsets: self.runtime.alloc_u32(max_experts)?,
                     }))
                 } else {
                     None
