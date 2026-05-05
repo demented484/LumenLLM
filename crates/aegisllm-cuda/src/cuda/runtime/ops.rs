@@ -1,4 +1,4 @@
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaView, LaunchConfig, PushKernelArg};
 
 use super::{CudaRuntime, ceil_div, map_cuda_err};
 use crate::cuda::{DeviceBuffer, DeviceRopeConfig};
@@ -1472,6 +1472,59 @@ impl CudaRuntime {
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch scatter_add_weighted_f32"))?;
+        Ok(())
+    }
+
+    /// Sub-slice variant of `scatter_add_weighted_f32_device`. The grouped
+    /// MoE prefill path needs to scatter from the middle of `permuted_down`,
+    /// `expert_token_lists`, and `expert_weight_lists` for one cached expert
+    /// at a time. Slicing inside the launch avoids a per-expert
+    /// `copy_f32_d2d_range` of `count * hidden` floats from `permuted_down`
+    /// into a separate scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scatter_add_weighted_f32_subslice(
+        &self,
+        src: &DeviceBuffer<f32>,
+        src_offset_elems: usize,
+        indices: &DeviceBuffer<u32>,
+        indices_offset_elems: usize,
+        weights: &DeviceBuffer<f32>,
+        weights_offset_elems: usize,
+        count: usize,
+        cols: usize,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if count == 0 || cols == 0 {
+            return Ok(());
+        }
+        let count_u32 = u32_arg("count", count)?;
+        let cols_u32 = u32_arg("cols", cols)?;
+        let cfg = LaunchConfig {
+            grid_dim: (count_u32, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let src_view: CudaView<f32> = src
+            .slice
+            .slice(src_offset_elems..src_offset_elems + count * cols);
+        let idx_view: CudaView<u32> = indices
+            .slice
+            .slice(indices_offset_elems..indices_offset_elems + count);
+        let w_view: CudaView<f32> = weights
+            .slice
+            .slice(weights_offset_elems..weights_offset_elems + count);
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.scatter_add_weighted_f32)
+                .arg(&src_view)
+                .arg(&idx_view)
+                .arg(&w_view)
+                .arg(&count_u32)
+                .arg(&cols_u32)
+                .arg(&mut out.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch scatter_add_weighted_f32 subslice"))?;
         Ok(())
     }
 

@@ -236,6 +236,65 @@ impl CudaLlamaExecutor {
                         inserted,
                         skipped,
                     );
+                    // Drop the host-arena copy of every weight that's now in
+                    // the VRAM cache, and re-pin the (typically very few)
+                    // uncached weights into standalone PinnedHostSlices.
+                    // After this returns, no `HostWeightBytes::Arena` clone
+                    // of the arena Arc remains, so the trailing
+                    // `drop(host_arena)` below releases the entire ~12 GB
+                    // pinned host allocation.
+                    let mut dropped_count = 0usize;
+                    let mut repinned_count = 0usize;
+                    let mut handle_nvfp4 = |proj: &mut crate::cuda::DeviceNvfp4Linear| -> Result<()> {
+                        if !proj.is_host_resident() { return Ok(()); }
+                        if cache.get(&proj.name).is_some() {
+                            crate::cuda::expert_cache::drop_host_weights(proj);
+                            dropped_count += 1;
+                        } else {
+                            crate::cuda::expert_cache::repin_host_weights(&cuda, proj)?;
+                            repinned_count += 1;
+                        }
+                        Ok(())
+                    };
+                    for layer in layers.iter_mut() {
+                        // Attention projections: BF16 typically, but match if NVFP4.
+                        for proj in [&mut layer.q_proj, &mut layer.k_proj, &mut layer.v_proj,
+                                     &mut layer.o_proj] {
+                            if let crate::executor::state::CudaLinear::Nvfp4(n) = proj {
+                                handle_nvfp4(n)?;
+                            }
+                        }
+                        if let Some(qkv) = layer.qkv_proj.as_mut() {
+                            if let crate::executor::state::CudaLinear::Nvfp4(n) = qkv {
+                                handle_nvfp4(n)?;
+                            }
+                        }
+                        // Dense MLP projections (unused on MoE layers but still loaded).
+                        for proj in [&mut layer.gate_proj, &mut layer.up_proj, &mut layer.down_proj] {
+                            handle_nvfp4(proj)?;
+                        }
+                        if let Some(moe) = layer.moe.as_mut() {
+                            // Shared expert
+                            if let Some(shared) = moe.shared_expert.as_mut() {
+                                for proj in [&mut shared.gate_proj, &mut shared.up_proj,
+                                             &mut shared.down_proj] {
+                                    if let crate::executor::state::CudaLinear::Nvfp4(n) = proj {
+                                        handle_nvfp4(n)?;
+                                    }
+                                }
+                            }
+                            // Routed experts
+                            for expert in moe.experts.iter_mut() {
+                                handle_nvfp4(&mut expert.gate_proj)?;
+                                handle_nvfp4(&mut expert.up_proj)?;
+                                handle_nvfp4(&mut expert.down_proj)?;
+                            }
+                        }
+                    }
+                    eprintln!(
+                        "vram-expert-cache: dropped_arena_refs={} repinned_uncached={}",
+                        dropped_count, repinned_count,
+                    );
                     cuda.install_expert_cache(std::sync::Arc::new(cache))?;
                 }
                 Ok(_) => {
@@ -246,6 +305,13 @@ impl CudaLlamaExecutor {
                 }
             }
         }
+        // Release the host arena. By this point the cache (if enabled) has
+        // dropped its `Arc<PinnedArena>` clones for cached experts and re-pinned
+        // any uncached experts standalone, so dropping the local arena Arc and
+        // the loader (which also holds an Arc clone) lets the ~12 GB pinned
+        // host allocation actually go away.
+        drop(cuda_weights);
+        drop(host_arena);
 
         let kv_store = placement.kv_cache.store;
         let kv_first_n_layers = placement.kv_cache.first_n_layers;

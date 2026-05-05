@@ -204,10 +204,18 @@ pub struct DeviceNvfp4Linear {
 }
 
 impl DeviceNvfp4Linear {
-    /// Returns `true` if this linear's weights live in host RAM (StagedHostToDevice residency).
-    /// In that case a staging VRAM pool must be used for H2D transfer at inference time.
+    /// Returns `true` if this linear's weights live in host RAM (StagedHostToDevice
+    /// residency). In that case the inference dispatcher routes through the
+    /// staging path (which transparently uses cache views or H2D-streams from
+    /// `host_weights` depending on whether the weight is in the VRAM cache).
+    ///
+    /// We key on `residency` rather than `host_weights.is_some()` because the
+    /// loader teardown drops `host_weights` for weights that are in the VRAM
+    /// cache to free the host arena — those weights are still
+    /// `StagedHostToDevice` for dispatch purposes (cache-views replace the
+    /// arena copy without changing the kernel choice).
     pub fn is_host_resident(&self) -> bool {
-        self.host_weights.is_some()
+        matches!(self.residency, TensorResidencyPlan::StagedHostToDevice { .. })
     }
 }
 

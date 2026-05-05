@@ -508,39 +508,30 @@ pub(super) fn forward_moe_prefill_chunk_device(
         // produces 1-ULP per-element drift that the router amplifies into
         // flipped expert selections within ~3 layers.)
         //
-        // Compute the prefix sum of `counts_host` on the host so we know each
-        // expert's start row in `permuted_down` without an extra GPU→host sync.
-        let mut off_host = vec![0u64; num_experts + 1];
-        for e in 0..num_experts {
-            off_host[e + 1] = off_host[e] + counts_host[e] as u64;
-        }
+        // Each expert's permuted_down slice and expert_token_lists/
+        // expert_weight_lists slice is already contiguous in VRAM, so we
+        // launch one `scatter_add_weighted_f32_views` per cached expert
+        // pointing directly at those views — no copies, just one kernel per
+        // expert. The `counts_host` prefix sum is computed host-side so we
+        // don't need to download `expert_offsets`.
+        let mut off_host: usize = 0;
         for e in 0..num_experts {
             let count = cached_counts_host[e] as usize;
-            if count == 0 { continue; }
+            let full_count = counts_host[e] as usize;
+            if count == 0 {
+                off_host += full_count;
+                continue;
+            }
             let bucket_off = e * stride;
-            runtime.copy_u32_d2d_range(
+            let perm_row_off = off_host * hidden_size;
+            runtime.scatter_add_weighted_f32_subslice(
+                &moe_scratch.permuted_down, perm_row_off,
                 &moe_scratch.expert_token_lists, bucket_off,
-                &mut moe_scratch.gather_indices, 0, count,
-            )?;
-            runtime.copy_f32_d2d_range(
                 &moe_scratch.expert_weight_lists, bucket_off,
-                &mut moe_scratch.gather_weights, 0, count,
-            )?;
-            // Copy this expert's slice of permuted_down into gather_out so it
-            // can feed scatter_add_weighted (which expects a contiguous
-            // [count, hidden] source).
-            let src_off = (off_host[e] as usize) * hidden_size;
-            runtime.copy_f32_d2d_range(
-                &moe_scratch.permuted_down, src_off,
-                &mut moe_scratch.gather_out, 0, count * hidden_size,
-            )?;
-            runtime.scatter_add_weighted_f32_device(
-                &moe_scratch.gather_out,
-                &moe_scratch.gather_indices,
-                &moe_scratch.gather_weights,
                 count, hidden_size,
                 &mut moe_scratch.moe_acc,
             )?;
+            off_host += full_count;
         }
     }
 

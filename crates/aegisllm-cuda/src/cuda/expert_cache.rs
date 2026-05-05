@@ -182,3 +182,46 @@ pub(crate) fn try_cache_nvfp4_expert(
     let scales_bytes = host.scales.as_bytes()?;
     cache.try_insert(runtime, &expert.name, packed_bytes, scales_bytes)
 }
+
+/// Release a single host-resident NVFP4 expert weight's arena copy now that
+/// it's mirrored in the VRAM cache. Returns the bytes that are now obsolete
+/// in the arena so the caller can drop the `host_weights` field. Used by the
+/// loader teardown helper in `executor::full` to release the pinned host
+/// arena once the cache is populated.
+pub(crate) fn drop_host_weights(expert: &mut DeviceNvfp4Linear) {
+    expert.host_weights = None;
+}
+
+/// Re-pin an uncached host-resident NVFP4 expert's bytes into standalone
+/// `PinnedHostSlice` allocations so the caller can drop the original
+/// arena Arc.
+pub(crate) fn repin_host_weights(
+    runtime: &CudaRuntime,
+    expert: &mut DeviceNvfp4Linear,
+) -> Result<()> {
+    let host = match expert.host_weights.as_mut() {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    let packed_bytes_owned = host.packed.as_bytes()?.to_vec();
+    let scales_bytes_owned = host.scales.as_bytes()?.to_vec();
+    let packed_pinned = alloc_pinned_copy(runtime, &packed_bytes_owned, "repin packed")?;
+    let scales_pinned = alloc_pinned_copy(runtime, &scales_bytes_owned, "repin scales")?;
+    host.packed = super::types::HostWeightBytes::Pinned(packed_pinned);
+    host.scales = super::types::HostWeightBytes::Pinned(scales_pinned);
+    Ok(())
+}
+
+fn alloc_pinned_copy(
+    runtime: &CudaRuntime,
+    bytes: &[u8],
+    label: &'static str,
+) -> Result<cudarc::driver::PinnedHostSlice<u8>> {
+    let mut pinned = unsafe { runtime.stream.context().alloc_pinned::<u8>(bytes.len()) }
+        .map_err(super::runtime::map_cuda_err(label))?;
+    pinned
+        .as_mut_slice()
+        .map_err(super::runtime::map_cuda_err(label))?
+        .copy_from_slice(bytes);
+    Ok(pinned)
+}
