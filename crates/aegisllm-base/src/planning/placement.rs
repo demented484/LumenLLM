@@ -55,6 +55,59 @@ pub struct PlacementPolicy {
     /// MoE/MLP weights.
     pub attention_store_override: Option<StoragePlacement>,
     pub attention_compute_override: Option<ComputePlacement>,
+    /// Per-load-time quantization for attention Q/K/V/O. `Default` keeps
+    /// the checkpoint's storage format (BF16 for our Gemma-4-26B-NVFP4).
+    /// Other values run a load-time per-block-absmax quantizer so the
+    /// resulting weights are smaller and use the matching tensor-core
+    /// GEMM during inference.
+    pub attention_quantization: WeightQuantOverride,
+    /// Per-load-time quantization for the shared expert (always-active
+    /// MLP — `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj` in the
+    /// checkpoint). Same semantics as `attention_quantization`.
+    pub shared_mlp_quantization: WeightQuantOverride,
+}
+
+/// Available load-time weight-quantization formats. `Default` means "keep
+/// whatever the checkpoint stored" (no on-load quantization). The four
+/// non-default formats split into:
+///   * **Float** (`Mxfp4`, `Fp8`) — preserve dynamic range, no
+///     calibration required, ~0.1–0.5% quality cost.
+///   * **Integer** (`Mxint4`, `Int4`, `Int8`) — fixed-point, smaller for
+///     equal bit-width (e.g. INT4 vs MXFP4) but more sensitive to
+///     outliers without calibration data; runtime path uses cuBLASLt
+///     INT8 / CUTLASS INT4 GEMM kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightQuantOverride {
+    /// Keep the checkpoint's storage format (no load-time quant).
+    Default,
+    /// Microsoft / OCP MXFP4: 4-bit float, group_size=32, E8M0 scales.
+    Mxfp4,
+    /// 8-bit float (E4M3 by default).
+    Fp8,
+    /// Microsoft / OCP MXINT4: 4-bit signed int, group_size=32, E8M0 scales.
+    Mxint4,
+    /// Plain INT4 with per-row or per-group scales (no MX framing).
+    Int4,
+    /// Plain INT8 with per-row scale.
+    Int8,
+}
+
+impl WeightQuantOverride {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            // `bf16` is accepted as an alias for `default` since the
+            // checkpoint stores attention/shared-MLP as BF16 and saying
+            // "BF16" reads naturally for users who don't know the
+            // checkpoint's native precision.
+            "default" | "bf16" | "" => Some(Self::Default),
+            "mxfp4" => Some(Self::Mxfp4),
+            "fp8" | "fp8_e4m3" | "fp8-e4m3" => Some(Self::Fp8),
+            "mxint4" => Some(Self::Mxint4),
+            "int4" => Some(Self::Int4),
+            "int8" => Some(Self::Int8),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +136,11 @@ pub struct ResolvedPlacement {
     pub budget: MemoryBudget,
     pub linear_layout: LinearLayoutPolicy,
     pub warnings: Vec<String>,
+    /// Carried through from the source `PlacementPolicy` for the CUDA
+    /// executor to consult when loading attention / shared-expert
+    /// weights. `Default` means "store as the checkpoint stored it".
+    pub attention_quantization: WeightQuantOverride,
+    pub shared_mlp_quantization: WeightQuantOverride,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -158,6 +216,8 @@ impl PlacementPolicy {
                 kv_first_store: None,
                 attention_store_override: None,
                 attention_compute_override: None,
+                attention_quantization: WeightQuantOverride::Default,
+                shared_mlp_quantization: WeightQuantOverride::Default,
             },
             None => Self {
                 weights_store: StoragePlacement::Mmap,
@@ -176,6 +236,8 @@ impl PlacementPolicy {
                 kv_first_store: None,
                 attention_store_override: None,
                 attention_compute_override: None,
+                attention_quantization: WeightQuantOverride::Default,
+                shared_mlp_quantization: WeightQuantOverride::Default,
             },
         }
     }
@@ -249,6 +311,8 @@ impl ResolvedPlacement {
             budget,
             linear_layout: policy.linear_layout.clone(),
             warnings,
+            attention_quantization: policy.attention_quantization,
+            shared_mlp_quantization: policy.shared_mlp_quantization,
         })
     }
 

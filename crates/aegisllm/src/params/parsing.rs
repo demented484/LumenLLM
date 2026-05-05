@@ -6,6 +6,7 @@ use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::generation::SamplingConfig;
 use aegisllm_base::planning::placement::{
     ComputePlacement, LayerSelector, PlacementPolicy, PlacementRule, StoragePlacement,
+    WeightQuantOverride,
 };
 use aegisllm_base::tensor::layout::{LinearLayoutChoice, LinearLayoutPolicy, MaterializationPolicy};
 use aegisllm_base::tensor::quant::KvCacheQuantization;
@@ -152,6 +153,14 @@ impl ParametersFile {
             if let Some(compute) = attn.compute.as_deref() {
                 policy.attention_compute_override = Some(parse_compute(compute, cuda_device)?);
             }
+            if let Some(q) = attn.attention_quantization.as_deref() {
+                policy.attention_quantization = WeightQuantOverride::parse(q).ok_or_else(|| {
+                    AegisError::InvalidConfig(format!(
+                        "unsupported attention-quantization `{q}` \
+                         (use one of: default, mxfp4, fp8, mxint4, int4, int8)"
+                    ))
+                })?;
+            }
         }
 
         // ── `hidden-layers` — per-block weights and per-block KV cache.
@@ -181,6 +190,14 @@ impl ParametersFile {
                         compute: Some(compute),
                     });
                 }
+            }
+            if let Some(q) = hidden_layers.shared_mlp_quantization.as_deref() {
+                policy.shared_mlp_quantization = WeightQuantOverride::parse(q).ok_or_else(|| {
+                    AegisError::InvalidConfig(format!(
+                        "unsupported shared-MLP-quantization `{q}` \
+                         (use one of: default, mxfp4, fp8, mxint4, int4, int8)"
+                    ))
+                })?;
             }
 
             // ── weights sub-section ────────────────────────────────────────────

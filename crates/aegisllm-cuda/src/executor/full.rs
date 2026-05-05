@@ -36,6 +36,26 @@ impl CudaLlamaExecutor {
         cuda_config: CudaRuntimeConfig,
     ) -> Result<Self> {
         validate_cuda_placement(placement, device)?;
+        // Reject load-time quantization overrides that don't yet have a
+        // runtime implementation. The schema parses all of mxfp4 / fp8 /
+        // mxint4 / int4 / int8, but only `default` (alias `bf16`)
+        // currently reaches the loader. Surface this clearly instead of
+        // silently keeping BF16 weights when the user asked for a
+        // smaller format.
+        use aegisllm_base::planning::placement::WeightQuantOverride as Wq;
+        for (label, q) in [
+            ("attention-quantization", placement.attention_quantization),
+            ("shared-MLP-quantization", placement.shared_mlp_quantization),
+        ] {
+            if !matches!(q, Wq::Default) {
+                return Err(AegisError::Unsupported(format!(
+                    "{label}={q:?} not yet wired up; only `default` (alias `bf16`) \
+                     reaches the loader today. Roadmap kernels: mxfp4 (Microsoft MX, \
+                     group=32, E8M0 scales), fp8 (E4M3 cuBLASLt), mxint4 (MX INT4), \
+                     int4, int8."
+                )));
+            }
+        }
         if graph.num_kv_heads == 0 || !graph.num_attention_heads.is_multiple_of(graph.num_kv_heads) {
             return Err(AegisError::InvalidPlan(format!(
                 "CUDA executor requires attention heads divisible by kv heads, got heads={} kv_heads={}",

@@ -77,6 +77,11 @@ pub struct AttentionSection {
     pub mechanism: Option<String>,
     pub store: Option<String>,
     pub compute: Option<String>,
+    /// Re-quantize the attention Q/K/V/O projections at load time.
+    /// One of: "bf16" (default), "nvfp4", "fp8", "int8", "int4".
+    /// Same semantics as `hidden-layers.shared-MLP-quantization`.
+    #[serde(rename = "attention-quantization")]
+    pub attention_quantization: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -115,6 +120,14 @@ pub struct HiddenLayersSection {
     /// When both `store` and `weights.store` are present, `weights.store`
     /// wins (longer form is more specific).
     pub store: Option<String>,
+    /// Re-quantize the shared expert (always-active MLP) at load time.
+    /// One of: "bf16" (default — keep as stored), "nvfp4", "fp8", "int8",
+    /// "int4". The checkpoint stores it as BF16; setting this to e.g.
+    /// `"nvfp4"` runs a load-time quantizer (per-block absmax, no
+    /// calibration) so the weights live in VRAM in the requested format
+    /// and use the matching tensor-core GEMM during inference.
+    #[serde(rename = "shared-MLP-quantization")]
+    pub shared_mlp_quantization: Option<String>,
     pub weights: Option<HiddenLayerWeightsSection>,
     #[serde(rename = "kv-cache")]
     pub kv_cache: Option<HiddenLayerKvCacheSection>,
