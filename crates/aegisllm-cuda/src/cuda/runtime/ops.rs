@@ -374,9 +374,10 @@ impl CudaRuntime {
         scales_offsets: &DeviceBuffer<u32>,
         expert_counts: &DeviceBuffer<u32>,
         expert_first_token_off: &DeviceBuffer<u32>,
+        expert_input_scales: &DeviceBuffer<f32>,
+        expert_output_scales: &DeviceBuffer<f32>,
         rows: usize,
         cols: usize,
-        output_scale: f32,
         permuted_input: &DeviceBuffer<f32>,
         permuted_output: &mut DeviceBuffer<f32>,
         num_experts: usize,
@@ -399,9 +400,10 @@ impl CudaRuntime {
                 .arg(&scales_offsets.slice)
                 .arg(&expert_counts.slice)
                 .arg(&expert_first_token_off.slice)
+                .arg(&expert_input_scales.slice)
+                .arg(&expert_output_scales.slice)
                 .arg(&rows_u32)
                 .arg(&cols_u32)
-                .arg(&output_scale)
                 .arg(&permuted_input.slice)
                 .arg(&mut permuted_output.slice)
                 .launch(cfg)

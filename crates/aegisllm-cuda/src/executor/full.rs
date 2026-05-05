@@ -517,6 +517,12 @@ impl CudaLlamaExecutor {
                         up_scales_offsets: self.runtime.alloc_u32(max_experts)?,
                         down_packed_offsets: self.runtime.alloc_u32(max_experts)?,
                         down_scales_offsets: self.runtime.alloc_u32(max_experts)?,
+                        gate_input_scales: self.runtime.alloc_f32(max_experts)?,
+                        gate_output_scales: self.runtime.alloc_f32(max_experts)?,
+                        up_input_scales: self.runtime.alloc_f32(max_experts)?,
+                        up_output_scales: self.runtime.alloc_f32(max_experts)?,
+                        down_input_scales: self.runtime.alloc_f32(max_experts)?,
+                        down_output_scales: self.runtime.alloc_f32(max_experts)?,
                     }))
                 } else {
                     None

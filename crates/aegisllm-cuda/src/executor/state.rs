@@ -488,6 +488,14 @@ pub(super) struct CudaMoEPrefillScratch {
     pub(super) up_scales_offsets: DeviceBuffer<u32>,
     pub(super) down_packed_offsets: DeviceBuffer<u32>,
     pub(super) down_scales_offsets: DeviceBuffer<u32>,
+    /// Per-expert input/output scales per matmul position. Each is
+    /// `[num_experts]` f32, uploaded before each grouped matvec call.
+    pub(super) gate_input_scales: DeviceBuffer<f32>,
+    pub(super) gate_output_scales: DeviceBuffer<f32>,
+    pub(super) up_input_scales: DeviceBuffer<f32>,
+    pub(super) up_output_scales: DeviceBuffer<f32>,
+    pub(super) down_input_scales: DeviceBuffer<f32>,
+    pub(super) down_output_scales: DeviceBuffer<f32>,
     /// Permuted activation buffer for the grouped MoE pipeline:
     /// `[chunk_size * top_k, hidden]`.
     pub(super) permuted_input: DeviceBuffer<f32>,

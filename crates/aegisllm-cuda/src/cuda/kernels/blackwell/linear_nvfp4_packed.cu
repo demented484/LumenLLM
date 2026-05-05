@@ -303,9 +303,10 @@ extern "C" __global__ void aegis_nvfp4_grouped_matvec_packed(
     const unsigned int*  __restrict__ scales_offsets,       // [num_experts]
     const unsigned int*  __restrict__ expert_counts,        // [num_experts]
     const unsigned int*  __restrict__ expert_first_token_off, // [num_experts + 1]
+    const float* __restrict__ expert_input_scales,           // [num_experts]
+    const float* __restrict__ expert_output_scales,          // [num_experts]
     const unsigned int rows,                                // shared N (output dim)
     const unsigned int cols,                                // shared K (input dim)
-    const float output_scale,
     const float* __restrict__ permuted_input,               // [total_assignments, cols]
     float*       __restrict__ permuted_output               // [total_assignments, rows]
 ) {
@@ -319,6 +320,8 @@ extern "C" __global__ void aegis_nvfp4_grouped_matvec_packed(
     const unsigned int abs_row = expert_first_token_off[expert] + batch_in_expert;
     const unsigned char* packed = base_packed + (size_t)packed_offsets[expert];
     const unsigned char* scales = base_scales + (size_t)scales_offsets[expert];
+    const float input_scale = expert_input_scales[expert];
+    const float output_scale = expert_output_scales[expert];
 
     const unsigned int packed_cols = cols / 2u;
     const unsigned int scale_cols = cols / 16u;
@@ -335,10 +338,12 @@ extern "C" __global__ void aegis_nvfp4_grouped_matvec_packed(
         const unsigned int packed_base = blk * 8u;
         for (unsigned int j = 0u; j < 8u; ++j) {
             const unsigned int b = p_row[packed_base + j];
-            const unsigned int lo = input_base + 2u * j;
-            const unsigned int hi = lo + 1u;
-            sum += float(decode_nvfp4_nibble(b & 0x0Fu)) * bs * in_row[lo];
-            sum += float(decode_nvfp4_nibble(b >> 4)) * bs * in_row[hi];
+            const unsigned int lo_lane = 2u * j;
+            const unsigned int hi_lane = lo_lane + 1u;
+            const float input_lo = maybe_quantize_nvfp4_input(in_row, input_base, lo_lane, input_scale);
+            const float input_hi = maybe_quantize_nvfp4_input(in_row, input_base, hi_lane, input_scale);
+            sum += float(decode_nvfp4_nibble(b & 0x0Fu)) * bs * input_lo;
+            sum += float(decode_nvfp4_nibble(b >> 4)) * bs * input_hi;
         }
     }
     partial[tid] = sum;

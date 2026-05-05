@@ -244,16 +244,242 @@ pub(super) fn forward_moe_prefill_chunk_device(
 
     report(cp_topk, "topk_done");
     let cp_experts = mark("");
-    // ── Step 8: zero accumulator, then per-active-expert grouped GEMM ───────
+    // ── Step 8: zero accumulator, then dispatch experts. ───────────────────
     runtime.zero_f32_device_len(&mut moe_scratch.moe_acc, batch_hidden)?;
-    for expert_idx in 0..num_experts {
+
+    // Phase 2 grouped path lights up when the VRAM expert cache is installed
+    // (env-gated by AEGIS_VRAM_EXPERT_CACHE=1 in `from_artifact`). For cached
+    // experts we run the full layer's gate/up/down via three single grouped
+    // kernel launches; uncached experts fall back to the per-expert loop
+    // immediately below. Both paths atomically accumulate into `moe_acc` so
+    // they coexist without further synchronisation.
+    let cache_handle = runtime.expert_cache().cloned();
+
+    let max_count = counts_host.iter().copied().max().unwrap_or(0) as usize;
+
+    // Build host-side per-layer offset arrays + cached/uncached partitioning.
+    // Done unconditionally (cheap: ~128 HashMap lookups + 6 small Vec::push)
+    // so we know which experts the grouped pass covers and which need the
+    // fallback.
+    let mut gate_packed = vec![0u32; num_experts];
+    let mut gate_scales = vec![0u32; num_experts];
+    let mut up_packed = vec![0u32; num_experts];
+    let mut up_scales = vec![0u32; num_experts];
+    let mut down_packed = vec![0u32; num_experts];
+    let mut down_scales = vec![0u32; num_experts];
+    // Per-expert input/output scales for the three matmuls. Each NVFP4 expert
+    // weight has its own pair, so we cannot use a single scalar across the
+    // grouped GEMM — per-expert arrays are uploaded next to the offset arrays.
+    let mut gate_in_scales = vec![0.0f32; num_experts];
+    let mut gate_out_scales = vec![0.0f32; num_experts];
+    let mut up_in_scales = vec![0.0f32; num_experts];
+    let mut up_out_scales = vec![0.0f32; num_experts];
+    let mut down_in_scales = vec![0.0f32; num_experts];
+    let mut down_out_scales = vec![0.0f32; num_experts];
+    let mut cached_counts_host = vec![0u32; num_experts];
+    let mut uncached_experts: Vec<usize> = Vec::new();
+    if let Some(cache) = cache_handle.as_ref() {
+        for e in 0..num_experts {
+            let count = counts_host[e];
+            if count == 0 {
+                continue;
+            }
+            let expert = &moe.experts[e];
+            let g = cache.get(&expert.gate_proj.name);
+            let u = cache.get(&expert.up_proj.name);
+            let d = cache.get(&expert.down_proj.name);
+            if let (Some(g), Some(u), Some(d)) = (g, u, d) {
+                gate_packed[e] = g.packed_offset as u32;
+                gate_scales[e] = g.scales_offset as u32;
+                up_packed[e] = u.packed_offset as u32;
+                up_scales[e] = u.scales_offset as u32;
+                down_packed[e] = d.packed_offset as u32;
+                down_scales[e] = d.scales_offset as u32;
+                gate_in_scales[e] = expert.gate_proj.input_scale;
+                gate_out_scales[e] = expert.gate_proj.output_scale;
+                up_in_scales[e] = expert.up_proj.input_scale;
+                up_out_scales[e] = expert.up_proj.output_scale;
+                down_in_scales[e] = expert.down_proj.input_scale;
+                down_out_scales[e] = expert.down_proj.output_scale;
+                cached_counts_host[e] = count;
+            } else {
+                uncached_experts.push(e);
+            }
+        }
+    } else {
+        // No cache → everything goes through the per-expert fallback.
+        for e in 0..num_experts {
+            if counts_host[e] > 0 {
+                uncached_experts.push(e);
+            }
+        }
+    }
+
+    // Phase 2 grouped MoE prefill is opt-in via AEGIS_GROUPED_MOE_ENABLE=1.
+    // When disabled (default), every triggered expert goes through the
+    // per-expert fallback path (which transparently uses cache views or the
+    // staging pool depending on whether the expert weight is in the cache).
+    //
+    // The grouped kernels (gate/up/geglu/down) produce numerically correct
+    // outputs per-expert and the resulting `moe_acc` matches a fallback
+    // recompute to ~1e-6, but end-to-end generation diverges from the
+    // fallback baseline — the source of that divergence is not yet pinned
+    // down. Until it is, default behaviour is the verified-correct fallback.
+    let grouped_enabled = std::env::var("AEGIS_GROUPED_MOE_ENABLE").is_ok();
+    let cache_active = grouped_enabled
+        && cache_handle.is_some()
+        && cached_counts_host.iter().any(|&c| c > 0);
+    if !grouped_enabled {
+        uncached_experts.clear();
+        for e in 0..num_experts {
+            if counts_host[e] > 0 {
+                uncached_experts.push(e);
+            }
+        }
+    }
+
+    if cache_active {
+        let cache = cache_handle.as_ref().unwrap();
+        // Upload per-layer offset arrays + cached_counts to the device.
+        runtime.upload_u32_slice_to_device(&cached_counts_host, &mut moe_scratch.cached_counts)?;
+        runtime.upload_u32_slice_to_device(&gate_packed, &mut moe_scratch.gate_packed_offsets)?;
+        runtime.upload_u32_slice_to_device(&gate_scales, &mut moe_scratch.gate_scales_offsets)?;
+        runtime.upload_u32_slice_to_device(&up_packed, &mut moe_scratch.up_packed_offsets)?;
+        runtime.upload_u32_slice_to_device(&up_scales, &mut moe_scratch.up_scales_offsets)?;
+        runtime.upload_u32_slice_to_device(&down_packed, &mut moe_scratch.down_packed_offsets)?;
+        runtime.upload_u32_slice_to_device(&down_scales, &mut moe_scratch.down_scales_offsets)?;
+        runtime.upload_f32_slice_to_device(&gate_in_scales, &mut moe_scratch.gate_input_scales)?;
+        runtime.upload_f32_slice_to_device(&gate_out_scales, &mut moe_scratch.gate_output_scales)?;
+        runtime.upload_f32_slice_to_device(&up_in_scales, &mut moe_scratch.up_input_scales)?;
+        runtime.upload_f32_slice_to_device(&up_out_scales, &mut moe_scratch.up_output_scales)?;
+        runtime.upload_f32_slice_to_device(&down_in_scales, &mut moe_scratch.down_input_scales)?;
+        runtime.upload_f32_slice_to_device(&down_out_scales, &mut moe_scratch.down_output_scales)?;
+
+        // CSR prefix sum over FULL expert_counts: lays out the permuted
+        // activation buffer covering *all* experts (cached + uncached). The
+        // grouped GEMM only writes outputs for cached entries (cached_counts
+        // is 0 for uncached), and unpermute_scatter_add only contributes
+        // from cached entries — uncached rows stay zero in permuted_down.
+        runtime.router_expert_offsets_device(
+            &moe_scratch.expert_counts,
+            num_experts,
+            &mut moe_scratch.expert_offsets,
+        )?;
+
+        // Permute gather: scatter expert_input rows into permuted_input by
+        // expert. Uses full counts because the same buffer is referenced
+        // from both grouped (cached) and fallback (uncached) paths — but
+        // fallback reads expert_input directly, so this is technically
+        // wasted for uncached. Acceptable for first iteration.
+        runtime.permute_gather_f32_device(
+            &moe_scratch.expert_input,
+            &moe_scratch.expert_token_lists,
+            &moe_scratch.expert_counts,
+            &moe_scratch.expert_offsets,
+            stride,
+            num_experts,
+            max_count,
+            hidden_size,
+            &mut moe_scratch.permuted_input,
+        )?;
+
+        // Discover the expert intermediate dim from any cached expert.
+        let exp_intermediate = moe
+            .experts
+            .iter()
+            .find(|_| true)
+            .map(|e| e.gate_proj.rows)
+            .ok_or_else(|| {
+                aegisllm_base::error::AegisError::InvalidPlan(
+                    "MoE layer has no experts (grouped path)".into(),
+                )
+            })?;
+
+        // Grouped gate. The kernel applies per-expert input/output scales
+        // internally (NVFP4 input pseudo-quantization mirrors the per-expert
+        // reference path), so no pre-quantization step is needed.
+        let total_assignments = batch * top_k;
+        runtime.nvfp4_grouped_matvec_packed_device(
+            cache.buffer(),
+            &moe_scratch.gate_packed_offsets,
+            cache.buffer(),
+            &moe_scratch.gate_scales_offsets,
+            &moe_scratch.cached_counts,
+            &moe_scratch.expert_offsets,
+            &moe_scratch.gate_input_scales,
+            &moe_scratch.gate_output_scales,
+            exp_intermediate,
+            hidden_size,
+            &moe_scratch.permuted_input,
+            &mut moe_scratch.permuted_gate,
+            num_experts,
+            max_count,
+        )?;
+        // Grouped up
+        runtime.nvfp4_grouped_matvec_packed_device(
+            cache.buffer(),
+            &moe_scratch.up_packed_offsets,
+            cache.buffer(),
+            &moe_scratch.up_scales_offsets,
+            &moe_scratch.cached_counts,
+            &moe_scratch.expert_offsets,
+            &moe_scratch.up_input_scales,
+            &moe_scratch.up_output_scales,
+            exp_intermediate,
+            hidden_size,
+            &moe_scratch.permuted_input,
+            &mut moe_scratch.permuted_up,
+            num_experts,
+            max_count,
+        )?;
+        // GeGLU(gate, up) → permuted_up (in-place). The kernel iterates
+        // flat over total_assignments × intermediate; uncached rows are
+        // garbage-but-not-read by the down matmul (which uses cached_counts).
+        runtime.geglu_tanh_in_place_device(
+            &moe_scratch.permuted_gate,
+            &mut moe_scratch.permuted_up,
+            total_assignments * exp_intermediate,
+        )?;
+        // Grouped down — input is the SwiGLU intermediate (permuted_up).
+        runtime.nvfp4_grouped_matvec_packed_device(
+            cache.buffer(),
+            &moe_scratch.down_packed_offsets,
+            cache.buffer(),
+            &moe_scratch.down_scales_offsets,
+            &moe_scratch.cached_counts,
+            &moe_scratch.expert_offsets,
+            &moe_scratch.down_input_scales,
+            &moe_scratch.down_output_scales,
+            hidden_size,
+            exp_intermediate,
+            &moe_scratch.permuted_up,
+            &mut moe_scratch.permuted_down,
+            num_experts,
+            max_count,
+        )?;
+        // Unpermute scatter-add: contribute only cached experts. Reads
+        // `cached_counts` for early-exit so uncached entries are skipped.
+        runtime.unpermute_scatter_add_f32_device(
+            &moe_scratch.permuted_down,
+            &moe_scratch.expert_token_lists,
+            &moe_scratch.expert_weight_lists,
+            &moe_scratch.cached_counts,
+            &moe_scratch.expert_offsets,
+            stride,
+            num_experts,
+            max_count,
+            hidden_size,
+            &mut moe_scratch.moe_acc,
+        )?;
+    }
+
+    // Per-expert fallback: covers all experts when no cache is installed,
+    // and only uncached experts when the grouped pass ran above.
+    for &expert_idx in &uncached_experts {
         let count = counts_host[expert_idx] as usize;
         if count == 0 {
             continue;
         }
-        // Pull the per-expert slice out of the bucket-sort output into the
-        // gather scratch buffers via a small device-to-device copy. No host
-        // roundtrip here — bytes never leave VRAM.
         let bucket_off = expert_idx * stride;
         runtime.copy_u32_d2d_range(
             &moe_scratch.expert_token_lists,
@@ -269,7 +495,6 @@ pub(super) fn forward_moe_prefill_chunk_device(
             0,
             count,
         )?;
-        // Gather token rows from `expert_input` → `gather_input`.
         runtime.gather_rows_f32_device(
             &moe_scratch.expert_input,
             &moe_scratch.gather_indices,
@@ -277,10 +502,8 @@ pub(super) fn forward_moe_prefill_chunk_device(
             hidden_size,
             &mut moe_scratch.gather_input,
         )?;
-        // Run this expert's gate/up/down on the gathered batch.
         let expert = &moe.experts[expert_idx];
         let exp_intermediate = expert.gate_proj.rows;
-        // gate / up: input is f32 [count, hidden_size], output [count, exp_intermediate].
         matvec_nvfp4_batched_device_with_scratch(
             runtime, &expert.gate_proj, &moe_scratch.gather_input, count,
             &mut moe_scratch.gather_quant, &mut moe_scratch.gather_mxfp4,
@@ -298,7 +521,6 @@ pub(super) fn forward_moe_prefill_chunk_device(
             &mut moe_scratch.gather_swiglu,
             count * exp_intermediate,
         )?;
-        // down: input [count, exp_intermediate], output [count, hidden_size].
         matvec_nvfp4_batched_device_with_scratch(
             runtime,
             &expert.down_proj,
@@ -309,7 +531,6 @@ pub(super) fn forward_moe_prefill_chunk_device(
             &mut moe_scratch.gather_out,
             if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
         )?;
-        // Scatter-add weighted contributions back into moe_acc by source token idx.
         runtime.scatter_add_weighted_f32_device(
             &moe_scratch.gather_out,
             &moe_scratch.gather_indices,
