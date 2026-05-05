@@ -37,6 +37,15 @@ pub struct ParametersFile {
     #[serde(rename = "server-parameters")]
     pub server: Option<ServerSection>,
     pub model: ModelSection,
+    /// Embed-tokens placement override (per-tensor, applies before layers load).
+    #[serde(rename = "input-layer")]
+    pub input_layer: Option<InputLayerSection>,
+    /// LM-head placement override (per-tensor, applies before layers load).
+    #[serde(rename = "output-layer")]
+    pub output_layer: Option<OutputLayerSection>,
+    /// Per-layer attention (Q/K/V/O) placement override; takes effect inside
+    /// each `layer.N` region independently of the layer's MLP/expert weights.
+    pub attention: Option<AttentionSection>,
     #[serde(rename = "hidden-layers")]
     pub hidden_layers: Option<HiddenLayersSection>,
     #[serde(rename = "linear-layout")]
@@ -44,6 +53,30 @@ pub struct ParametersFile {
     #[serde(rename = "other-parameters")]
     pub other: Option<OtherSection>,
     pub cuda: Option<CudaSection>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InputLayerSection {
+    pub store: Option<String>,
+    pub compute: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OutputLayerSection {
+    pub store: Option<String>,
+    pub compute: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AttentionSection {
+    /// Attention kernel/mechanism selector — passed through to
+    /// `cuda.prefill_attention` (e.g. `"aegis-varlen"`, `"reference"`).
+    pub mechanism: Option<String>,
+    pub store: Option<String>,
+    pub compute: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -78,6 +111,10 @@ pub struct ModelSection {
 #[serde(deny_unknown_fields)]
 pub struct HiddenLayersSection {
     pub compute: Option<String>,
+    /// Shorthand for `weights.store`: applies to all hidden-layer weights.
+    /// When both `store` and `weights.store` are present, `weights.store`
+    /// wins (longer form is more specific).
+    pub store: Option<String>,
     pub weights: Option<HiddenLayerWeightsSection>,
     #[serde(rename = "kv-cache")]
     pub kv_cache: Option<HiddenLayerKvCacheSection>,

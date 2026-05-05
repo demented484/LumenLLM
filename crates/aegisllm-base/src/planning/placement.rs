@@ -48,6 +48,13 @@ pub struct PlacementPolicy {
     /// is `Some`, executor falls back to VRAM derived from `kv_compute` (legacy
     /// behavior preserved for the old `vram_layers` use case).
     pub kv_first_store: Option<StoragePlacement>,
+    /// Per-layer attention (Q/K/V/O) placement override. When set, the
+    /// loader uses this for attention weights regardless of the layer's
+    /// region store. Set by the `attention` section of the parameters
+    /// file to keep attention BF16 in RAM independently of the layer's
+    /// MoE/MLP weights.
+    pub attention_store_override: Option<StoragePlacement>,
+    pub attention_compute_override: Option<ComputePlacement>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -149,6 +156,8 @@ impl PlacementPolicy {
                 rules: Vec::new(),
                 kv_first_n_layers: None,
                 kv_first_store: None,
+                attention_store_override: None,
+                attention_compute_override: None,
             },
             None => Self {
                 weights_store: StoragePlacement::Mmap,
@@ -165,6 +174,8 @@ impl PlacementPolicy {
                 rules: Vec::new(),
                 kv_first_n_layers: None,
                 kv_first_store: None,
+                attention_store_override: None,
+                attention_compute_override: None,
             },
         }
     }

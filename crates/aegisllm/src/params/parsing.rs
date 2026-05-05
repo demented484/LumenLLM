@@ -99,12 +99,89 @@ impl ParametersFile {
             policy.kv_compute = compute;
         }
 
+        // ── `input-layer` — embed_tokens placement override. Embed is a row
+        //    lookup, so RAM placement is cheap (no matmul to stage).
+        if let Some(input) = self.input_layer {
+            let store = input.store.as_deref()
+                .map(|s| parse_storage(s, cuda_device)).transpose()?;
+            let compute = input.compute.as_deref()
+                .map(|c| parse_compute(c, cuda_device)).transpose()?;
+            if store.is_some() || compute.is_some() {
+                policy.rules.push(PlacementRule {
+                    selector: LayerSelector::Region("embed".into()),
+                    store,
+                    compute,
+                });
+            }
+        }
+
+        // ── `output-layer` — lm_head placement override.
+        //
+        // Note on perf: BF16 lm_head in RAM routes through the CPU-rayon
+        // matvec at decode time (`matvec_bf16_host_resident_device`),
+        // which is ~30ms/token vs ~1ms VRAM. Acceptable trade for 1 GiB
+        // VRAM saved on memory-constrained configs; if you want faster
+        // decode keep `output-layer.store = vram`.
+        if let Some(output) = self.output_layer {
+            let store = output.store.as_deref()
+                .map(|s| parse_storage(s, cuda_device)).transpose()?;
+            let compute = output.compute.as_deref()
+                .map(|c| parse_compute(c, cuda_device)).transpose()?;
+            if store.is_some() || compute.is_some() {
+                policy.rules.push(PlacementRule {
+                    selector: LayerSelector::Region("lm_head".into()),
+                    store,
+                    compute,
+                });
+            }
+        }
+
+        // ── `attention` — Q/K/V/O placement *within* each layer. Stored on
+        //    the policy as a separate `attention_store_override`; the loader
+        //    consults it before deciding to force-VRAM the BF16 attention
+        //    weights. `mechanism` maps to `cuda.prefill_attention`.
+        if let Some(attn) = self.attention {
+            if let Some(mech) = attn.mechanism.as_deref() {
+                cuda_runtime.prefill_attention =
+                    CudaPrefillAttentionKernel::parse(mech)?;
+                explicit_cuda_prefill_attention = true;
+            }
+            if let Some(store) = attn.store.as_deref() {
+                policy.attention_store_override = Some(parse_storage(store, cuda_device)?);
+            }
+            if let Some(compute) = attn.compute.as_deref() {
+                policy.attention_compute_override = Some(parse_compute(compute, cuda_device)?);
+            }
+        }
+
         // ── `hidden-layers` — per-block weights and per-block KV cache.
         if let Some(hidden_layers) = self.hidden_layers {
             let parent_compute: Option<ComputePlacement> = hidden_layers.compute
                 .as_deref()
                 .map(|c| parse_compute(c, cuda_device))
                 .transpose()?;
+            // Shorthand `hidden-layers.store=...`: treat as weights.store
+            // applied to all hidden layers when no nested `weights` block
+            // is present.
+            let parent_store: Option<StoragePlacement> = hidden_layers.store
+                .as_deref()
+                .map(|s| parse_storage(s, cuda_device))
+                .transpose()?;
+            if hidden_layers.weights.is_none() {
+                if let Some(store) = parent_store {
+                    policy.rules.push(PlacementRule {
+                        selector: LayerSelector::All,
+                        store: Some(store),
+                        compute: parent_compute,
+                    });
+                } else if let Some(compute) = parent_compute {
+                    policy.rules.push(PlacementRule {
+                        selector: LayerSelector::All,
+                        store: None,
+                        compute: Some(compute),
+                    });
+                }
+            }
 
             // ── weights sub-section ────────────────────────────────────────────
             if let Some(weights) = hidden_layers.weights {

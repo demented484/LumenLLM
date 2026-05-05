@@ -209,6 +209,63 @@ impl CudaLlamaExecutor {
             || (kv_first_n_layers.is_some_and(|n| n < num_layers)
                 && (matches!(kv_store, StoragePlacement::Ram) || first_store_implies_staging));
         let effective_prefill_chunk_size = cuda_prefill_chunk_size(cuda_config);
+
+        // Per-category VRAM accounting. Keep this debug print until the
+        // memory layout stabilises — it's the only honest answer to "where
+        // did the GiBs go".
+        if std::env::var("AEGIS_VRAM_BREAKDOWN").is_ok() {
+            let hd = graph.head_dim;
+            let nh = graph.num_attention_heads;
+            let nkv = graph.num_kv_heads;
+            let nl = graph.num_layers;
+            let h = graph.hidden_size;
+            let q_w = nh * hd;
+            let kv_w = nkv * hd;
+            let bf16 = 2usize;
+            // Attention Q/K/V/O per layer (BF16, force-VRAM).
+            let attn_per_layer = q_w * h * bf16          // q
+                               + kv_w * h * bf16          // k
+                               + kv_w * h * bf16          // v
+                               + h * q_w * bf16;          // o
+            let attn_total = attn_per_layer * nl;
+            let embed_lm_head = artifact.tensors.tensors.get("model.embed_tokens.weight")
+                .map(|t| t.data_len_bytes() as usize).unwrap_or(0);
+            // Try to find shared MLP shapes for one layer, scale by nl.
+            let shared_per_layer = artifact.tensors.tensors.values()
+                .filter(|t: &&aegisllm_base::tensor::core::TensorInfo| {
+                    let n = &t.name;
+                    n.contains("layers.0.mlp.gate_proj.weight")
+                        || n.contains("layers.0.mlp.up_proj.weight")
+                        || n.contains("layers.0.mlp.down_proj.weight")
+                })
+                .map(|t: &aegisllm_base::tensor::core::TensorInfo| t.data_len_bytes() as usize)
+                .sum::<usize>();
+            let shared_total = shared_per_layer * nl;
+            // Routers per layer.
+            let router_per_layer = artifact.tensors.tensors.values()
+                .filter(|t: &&aegisllm_base::tensor::core::TensorInfo| {
+                    let n = &t.name;
+                    n.contains("layers.0.mlp.router.weight")
+                        || n.contains("layers.0.mlp.router.scale")
+                })
+                .map(|t: &aegisllm_base::tensor::core::TensorInfo| t.data_len_bytes() as usize)
+                .sum::<usize>();
+            let router_total = router_per_layer * nl;
+            // KV cache: 2 (k+v) × ctx × kv_w per layer × fp16.
+            let ctx = placement.kv_cache.context_size;
+            let kv_total = 2 * ctx * kv_w * 2 * nl;
+            let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "vram-breakdown: attn(BF16,force-vram)={:.0} MiB | embed+lm_head(BF16)={:.0} MiB | \
+                 shared_mlp(BF16,force-vram)={:.0} MiB | routers={:.0} MiB | kv_cache(fp16,ctx={})={:.0} MiB",
+                mb(attn_total), mb(embed_lm_head * 2), mb(shared_total),
+                mb(router_total), ctx, mb(kv_total),
+            );
+            eprintln!(
+                "vram-breakdown: nl={} hidden={} q_width={} kv_width={} head_dim={}",
+                nl, h, q_w, kv_w, hd,
+            );
+        }
         Ok(Self {
             runtime: cuda,
             hidden_size: graph.hidden_size,
