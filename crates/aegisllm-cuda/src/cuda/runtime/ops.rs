@@ -231,6 +231,185 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Compute device-resident `expert_offsets[num_experts + 1]` (CSR prefix
+    /// sum of `expert_counts`). Used by the grouped-NVFP4 matvec to translate
+    /// `(expert, batch_in_expert)` → row index in the permuted activation
+    /// buffer without a host roundtrip.
+    pub fn router_expert_offsets_device(
+        &self,
+        expert_counts: &DeviceBuffer<u32>,
+        num_experts: usize,
+        expert_offsets: &mut DeviceBuffer<u32>,
+    ) -> Result<()> {
+        if expert_counts.len() < num_experts || expert_offsets.len() < num_experts + 1 {
+            return Err(AegisError::InvalidPlan(format!(
+                "router_expert_offsets shape: counts={} need {}, offsets={} need {}",
+                expert_counts.len(),
+                num_experts,
+                expert_offsets.len(),
+                num_experts + 1,
+            )));
+        }
+        let n = num_experts as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.router_expert_offsets)
+                .arg(&expert_counts.slice)
+                .arg(&n)
+                .arg(&mut expert_offsets.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch router expert offsets"))?;
+        Ok(())
+    }
+
+    /// Permute-gather: scatter `src[batch, hidden]` rows into the expert-
+    /// sorted layout `permuted[total_assignments, hidden]`. Replaces the
+    /// per-expert `gather_rows_f32` calls in the legacy MoE dispatch loop —
+    /// one launch handles all experts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn permute_gather_f32_device(
+        &self,
+        src: &DeviceBuffer<f32>,
+        expert_token_lists: &DeviceBuffer<u32>,
+        expert_counts: &DeviceBuffer<u32>,
+        expert_first_token_off: &DeviceBuffer<u32>,
+        stride: usize,                   // tokens-per-expert stride in expert_token_lists
+        num_experts: usize,
+        max_per_expert: usize,           // grid.y bound
+        hidden: usize,
+        permuted: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let stride_u32 = stride as u32;
+        let hidden_u32 = hidden as u32;
+        const BLOCK_DIM_X: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                ceil_div(hidden_u32, BLOCK_DIM_X),
+                max_per_expert as u32,
+                num_experts as u32,
+            ),
+            block_dim: (BLOCK_DIM_X, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.permute_gather_f32)
+                .arg(&src.slice)
+                .arg(&expert_token_lists.slice)
+                .arg(&expert_counts.slice)
+                .arg(&expert_first_token_off.slice)
+                .arg(&stride_u32)
+                .arg(&hidden_u32)
+                .arg(&mut permuted.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch permute gather f32"))?;
+        Ok(())
+    }
+
+    /// Unpermute-scatter-add: read `permuted[total_assignments, hidden]`,
+    /// multiply each row by its routing weight, atomically add into
+    /// `moe_acc[src_token, hidden]`. Replaces the per-expert
+    /// `scatter_add_weighted` calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unpermute_scatter_add_f32_device(
+        &self,
+        permuted: &DeviceBuffer<f32>,
+        expert_token_lists: &DeviceBuffer<u32>,
+        expert_weight_lists: &DeviceBuffer<f32>,
+        expert_counts: &DeviceBuffer<u32>,
+        expert_first_token_off: &DeviceBuffer<u32>,
+        stride: usize,
+        num_experts: usize,
+        max_per_expert: usize,
+        hidden: usize,
+        moe_acc: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let stride_u32 = stride as u32;
+        let hidden_u32 = hidden as u32;
+        const BLOCK_DIM_X: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                ceil_div(hidden_u32, BLOCK_DIM_X),
+                max_per_expert as u32,
+                num_experts as u32,
+            ),
+            block_dim: (BLOCK_DIM_X, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.unpermute_scatter_add_f32)
+                .arg(&permuted.slice)
+                .arg(&expert_token_lists.slice)
+                .arg(&expert_weight_lists.slice)
+                .arg(&expert_counts.slice)
+                .arg(&expert_first_token_off.slice)
+                .arg(&stride_u32)
+                .arg(&hidden_u32)
+                .arg(&mut moe_acc.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch unpermute scatter add f32"))?;
+        Ok(())
+    }
+
+    /// Grouped NVFP4 matvec: one launch processes ALL experts of a layer for
+    /// one matmul-position. `base_packed`/`base_scales` are typically the
+    /// VRAM expert cache buffer; `packed_offsets`/`scales_offsets` give per-
+    /// expert byte offsets inside it. Output is in the permuted layout
+    /// matching `permuted_input`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvfp4_grouped_matvec_packed_device(
+        &self,
+        base_packed: &DeviceBuffer<u8>,
+        packed_offsets: &DeviceBuffer<u32>,
+        base_scales: &DeviceBuffer<u8>,
+        scales_offsets: &DeviceBuffer<u32>,
+        expert_counts: &DeviceBuffer<u32>,
+        expert_first_token_off: &DeviceBuffer<u32>,
+        rows: usize,
+        cols: usize,
+        output_scale: f32,
+        permuted_input: &DeviceBuffer<f32>,
+        permuted_output: &mut DeviceBuffer<f32>,
+        num_experts: usize,
+        max_per_expert: usize,
+    ) -> Result<()> {
+        let rows_u32 = rows as u32;
+        let cols_u32 = cols as u32;
+        const BLOCK_DIM: u32 = 256;
+        let cfg = LaunchConfig {
+            grid_dim: (rows_u32, max_per_expert as u32, num_experts as u32),
+            block_dim: (BLOCK_DIM, 1, 1),
+            shared_mem_bytes: BLOCK_DIM * std::mem::size_of::<f32>() as u32,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.nvfp4_grouped_matvec_packed)
+                .arg(&base_packed.slice)
+                .arg(&packed_offsets.slice)
+                .arg(&base_scales.slice)
+                .arg(&scales_offsets.slice)
+                .arg(&expert_counts.slice)
+                .arg(&expert_first_token_off.slice)
+                .arg(&rows_u32)
+                .arg(&cols_u32)
+                .arg(&output_scale)
+                .arg(&permuted_input.slice)
+                .arg(&mut permuted_output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch nvfp4 grouped matvec packed"))?;
+        Ok(())
+    }
+
     /// Scatter (token, expert, weight) triples into per-expert lists. Atomic
     /// `expert_counts[expert]` provides each token's slot inside the per-
     /// expert list. After this kernel, the host downloads `expert_counts`

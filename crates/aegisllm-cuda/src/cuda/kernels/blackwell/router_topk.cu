@@ -115,6 +115,29 @@ extern "C" __global__ void aegis_router_zero_expert_counts(
     }
 }
 
+// Compute prefix sum (CSR-style offsets) over `expert_counts[num_experts]`.
+// Output: `expert_offsets[num_experts + 1]` where `expert_offsets[e]` is the
+// starting row in the permuted activation buffer for expert `e`, and
+// `expert_offsets[num_experts]` is the total number of routed assignments.
+//
+// Single-block kernel; serial scan. `num_experts` is small (≤256) so this is
+// fine — sub-microsecond on any modern GPU. Replaces the host-side
+// "build per-expert offsets" loop that grouped-GEMM dispatch would otherwise
+// have to do after a `download_u32(expert_counts)`.
+extern "C" __global__ void aegis_router_expert_offsets(
+    const unsigned int* __restrict__ expert_counts,  // [num_experts]
+    const unsigned int num_experts,
+    unsigned int* __restrict__ expert_offsets         // [num_experts + 1]
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    unsigned int sum = 0;
+    expert_offsets[0] = 0;
+    for (unsigned int e = 0; e < num_experts; ++e) {
+        sum += expert_counts[e];
+        expert_offsets[e + 1] = sum;
+    }
+}
+
 // Scatter (token, expert, weight) triples into per-expert lists. Each thread
 // handles one (token, k) slot from the top-k tables. `atomicAdd` on the
 // expert's count slot gives the position to write to.
@@ -126,6 +149,70 @@ extern "C" __global__ void aegis_router_zero_expert_counts(
 //
 // `stride` is `max_tokens_per_expert`, set on the host to `batch * top_k`
 // (the worst case where every (token, k) slot picks the same expert).
+// Permute-gather: scatter input rows into the expert-sorted (permuted)
+// layout. After this kernel, `permuted[expert_offsets[e]..expert_offsets[e+1]]`
+// holds the hidden states of all tokens routed to expert `e`, in order.
+//
+// Replaces the per-expert `gather_rows_f32` calls in the existing dispatch
+// loop with one kernel that does all experts at once. Output layout is
+// what the grouped-NVFP4-GEMM kernel below consumes.
+extern "C" __global__ void aegis_permute_gather_f32(
+    const float* __restrict__ src,                          // [batch, hidden]
+    const unsigned int* __restrict__ expert_token_lists,    // [num_experts × stride]
+    const unsigned int* __restrict__ expert_counts,         // [num_experts]
+    const unsigned int* __restrict__ expert_first_token_off,// [num_experts + 1]
+    const unsigned int stride,
+    const unsigned int hidden,
+    float* __restrict__ permuted                            // [total_assignments, hidden]
+) {
+    const unsigned int expert = blockIdx.z;
+    const unsigned int batch_in_expert = blockIdx.y;
+    const unsigned int hidden_base = blockIdx.x * blockDim.x;
+    const unsigned int tid = threadIdx.x;
+
+    const unsigned int count = expert_counts[expert];
+    if (batch_in_expert >= count) return;
+    const unsigned int h = hidden_base + tid;
+    if (h >= hidden) return;
+
+    const unsigned int src_token = expert_token_lists[expert * stride + batch_in_expert];
+    const unsigned int dst_row = expert_first_token_off[expert] + batch_in_expert;
+
+    permuted[(size_t)dst_row * hidden + h] = src[(size_t)src_token * hidden + h];
+}
+
+// Unpermute-scatter-add: reads the per-expert output rows from the permuted
+// buffer, multiplies each by its routing weight, and atomically adds into
+// `moe_acc[src_token, h]`. Multiple experts may write to the same source
+// token (top_k > 1), which is why scatter is atomic.
+extern "C" __global__ void aegis_unpermute_scatter_add_f32(
+    const float* __restrict__ permuted,                     // [total_assignments, hidden]
+    const unsigned int* __restrict__ expert_token_lists,    // [num_experts × stride]
+    const float*        __restrict__ expert_weight_lists,   // [num_experts × stride]
+    const unsigned int* __restrict__ expert_counts,
+    const unsigned int* __restrict__ expert_first_token_off,
+    const unsigned int stride,
+    const unsigned int hidden,
+    float* __restrict__ moe_acc                             // [batch, hidden]
+) {
+    const unsigned int expert = blockIdx.z;
+    const unsigned int batch_in_expert = blockIdx.y;
+    const unsigned int hidden_base = blockIdx.x * blockDim.x;
+    const unsigned int tid = threadIdx.x;
+
+    const unsigned int count = expert_counts[expert];
+    if (batch_in_expert >= count) return;
+    const unsigned int h = hidden_base + tid;
+    if (h >= hidden) return;
+
+    const unsigned int src_token = expert_token_lists[expert * stride + batch_in_expert];
+    const float weight = expert_weight_lists[expert * stride + batch_in_expert];
+    const unsigned int src_row = expert_first_token_off[expert] + batch_in_expert;
+
+    const float v = permuted[(size_t)src_row * hidden + h] * weight;
+    atomicAdd(&moe_acc[(size_t)src_token * hidden + h], v);
+}
+
 extern "C" __global__ void aegis_router_bucket_sort(
     const unsigned int* __restrict__ topk_idx,     // [batch, top_k]
     const float*        __restrict__ topk_weights, // [batch, top_k]

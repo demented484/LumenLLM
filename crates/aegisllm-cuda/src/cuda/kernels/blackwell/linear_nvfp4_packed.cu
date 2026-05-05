@@ -276,6 +276,84 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_gemm(
     }
 }
 
+// Grouped NVFP4 matvec (Phase 2 of perf overhaul, MoE prefill).
+//
+// One launch processes ALL active experts of a layer for one matmul-position
+// (gate, up, OR down). Replaces the per-expert dispatch loop's ~50 launches
+// with a single launch — kills launch overhead which dominates for small
+// per-expert batches (~5 tokens × 30 layers × 3 matmuls = ~4500 launches/chunk
+// → ~3 launches/chunk after this). Modeled after the vLLM `fused_moe_kernel`
+// pattern: grid covers all (output_row × batch_in_expert × expert) tiles,
+// per-block early-exit when the expert is empty or the batch slot is past
+// the count.
+//
+// Inputs are in **permuted (expert-sorted) layout** as produced by
+// `aegis_permute_gather_f32`: `permuted_input[expert_first_token_off[e] +
+// batch_in_expert]` is the input row for expert e's `batch_in_expert`-th
+// token. Outputs have the same layout.
+//
+// Weight pointers are taken from a single base buffer (typically the VRAM
+// expert cache) plus per-expert offset arrays. For experts not in the cache
+// the host loop dispatches the legacy per-expert kernel separately and
+// passes 0 for the count here so the grouped kernel skips them.
+extern "C" __global__ void aegis_nvfp4_grouped_matvec_packed(
+    const unsigned char* __restrict__ base_packed,         // big buffer (e.g. cache)
+    const unsigned int*  __restrict__ packed_offsets,       // [num_experts] byte offsets
+    const unsigned char* __restrict__ base_scales,          // typically same as base_packed
+    const unsigned int*  __restrict__ scales_offsets,       // [num_experts]
+    const unsigned int*  __restrict__ expert_counts,        // [num_experts]
+    const unsigned int*  __restrict__ expert_first_token_off, // [num_experts + 1]
+    const unsigned int rows,                                // shared N (output dim)
+    const unsigned int cols,                                // shared K (input dim)
+    const float output_scale,
+    const float* __restrict__ permuted_input,               // [total_assignments, cols]
+    float*       __restrict__ permuted_output               // [total_assignments, rows]
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int batch_in_expert = blockIdx.y;
+    const unsigned int expert = blockIdx.z;
+    if (row >= rows) return;
+    const unsigned int count = expert_counts[expert];
+    if (batch_in_expert >= count) return;
+
+    const unsigned int abs_row = expert_first_token_off[expert] + batch_in_expert;
+    const unsigned char* packed = base_packed + (size_t)packed_offsets[expert];
+    const unsigned char* scales = base_scales + (size_t)scales_offsets[expert];
+
+    const unsigned int packed_cols = cols / 2u;
+    const unsigned int scale_cols = cols / 16u;
+    const unsigned char* p_row = packed + (size_t)row * packed_cols;
+    const unsigned char* s_row = scales + (size_t)row * scale_cols;
+    const float* in_row = permuted_input + (size_t)abs_row * cols;
+
+    extern __shared__ float partial[];
+    float sum = 0.0f;
+    const unsigned int tid = threadIdx.x;
+    for (unsigned int blk = tid; blk < scale_cols; blk += blockDim.x) {
+        const float bs = decode_ue4m3_half(s_row[blk]);
+        const unsigned int input_base = blk * 16u;
+        const unsigned int packed_base = blk * 8u;
+        for (unsigned int j = 0u; j < 8u; ++j) {
+            const unsigned int b = p_row[packed_base + j];
+            const unsigned int lo = input_base + 2u * j;
+            const unsigned int hi = lo + 1u;
+            sum += float(decode_nvfp4_nibble(b & 0x0Fu)) * bs * in_row[lo];
+            sum += float(decode_nvfp4_nibble(b >> 4)) * bs * in_row[hi];
+        }
+    }
+    partial[tid] = sum;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        permuted_output[(size_t)abs_row * rows + row] = partial[0] * output_scale;
+    }
+}
+
 extern "C" __global__ void aegis_nvfp4_linear_reference_batched(
     const unsigned char* packed,
     const unsigned char* scales,
