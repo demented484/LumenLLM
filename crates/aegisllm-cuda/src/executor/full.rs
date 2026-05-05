@@ -508,6 +508,9 @@ impl CudaLlamaExecutor {
                         expert_offsets: self.runtime.alloc_u32(max_experts + 1)?,
                         cached_counts: self.runtime.alloc_u32(max_experts)?,
                         permuted_input: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,
+                        permuted_input_quant: self.runtime.alloc_f32(
+                            cs * max_top_k * self.hidden_size.max(max_expert_intermediate),
+                        )?,
                         permuted_gate: self.runtime.alloc_f32(cs * max_top_k * max_expert_intermediate)?,
                         permuted_up: self.runtime.alloc_f32(cs * max_top_k * max_expert_intermediate)?,
                         permuted_down: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,

@@ -360,13 +360,57 @@ impl CudaRuntime {
         Ok(())
     }
 
-    /// Grouped NVFP4 matvec: one launch processes ALL experts of a layer for
-    /// one matmul-position. `base_packed`/`base_scales` are typically the
-    /// VRAM expert cache buffer; `packed_offsets`/`scales_offsets` give per-
-    /// expert byte offsets inside it. Output is in the permuted layout
-    /// matching `permuted_input`.
+    /// Per-expert NVFP4 input quantizer: applies the NVFP4 round-trip with
+    /// each expert's own `input_scale` to the slice of `permuted_input` that
+    /// belongs to it. Output goes to `permuted_quantized` at the same row
+    /// offsets and is consumed by `nvfp4_grouped_prequant_gemm_device`.
     #[allow(clippy::too_many_arguments)]
-    pub fn nvfp4_grouped_matvec_packed_device(
+    pub fn nvfp4_quantize_input_per_expert_device(
+        &self,
+        permuted_input: &DeviceBuffer<f32>,
+        expert_counts: &DeviceBuffer<u32>,
+        expert_first_token_off: &DeviceBuffer<u32>,
+        expert_input_scales: &DeviceBuffer<f32>,
+        cols: usize,
+        num_experts: usize,
+        max_per_expert: usize,
+        permuted_quantized: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if max_per_expert == 0 || num_experts == 0 || cols == 0 {
+            return Ok(());
+        }
+        let cols_u32 = cols as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                ceil_div(cols_u32, 16),
+                max_per_expert as u32,
+                num_experts as u32,
+            ),
+            block_dim: (16, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.nvfp4_quantize_input_per_expert)
+                .arg(&permuted_input.slice)
+                .arg(&expert_counts.slice)
+                .arg(&expert_first_token_off.slice)
+                .arg(&expert_input_scales.slice)
+                .arg(&cols_u32)
+                .arg(&mut permuted_quantized.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch nvfp4 quantize input per-expert"))?;
+        Ok(())
+    }
+
+    /// Grouped prequantized NVFP4 GEMM. 8-warp tile GEMM (mirrors
+    /// `aegis_nvfp4_linear_prequantized_batched_gemm`) with an outer
+    /// expert-dispatch dimension so a single launch handles every cached
+    /// expert in a layer for one matmul position. Input must be
+    /// per-expert pre-quantized via `nvfp4_quantize_input_per_expert_device`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nvfp4_grouped_prequant_gemm_device(
         &self,
         base_packed: &DeviceBuffer<u8>,
         packed_offsets: &DeviceBuffer<u32>,
@@ -374,41 +418,44 @@ impl CudaRuntime {
         scales_offsets: &DeviceBuffer<u32>,
         expert_counts: &DeviceBuffer<u32>,
         expert_first_token_off: &DeviceBuffer<u32>,
-        expert_input_scales: &DeviceBuffer<f32>,
         expert_output_scales: &DeviceBuffer<f32>,
         rows: usize,
         cols: usize,
-        permuted_input: &DeviceBuffer<f32>,
+        permuted_quantized_input: &DeviceBuffer<f32>,
         permuted_output: &mut DeviceBuffer<f32>,
         num_experts: usize,
         max_per_expert: usize,
     ) -> Result<()> {
+        if num_experts == 0 || max_per_expert == 0 || rows == 0 {
+            return Ok(());
+        }
         let rows_u32 = rows as u32;
         let cols_u32 = cols as u32;
-        const BLOCK_DIM: u32 = 256;
+        const BATCH_PER_BLOCK: u32 = 8;
+        let grid_y = ((max_per_expert as u32) + BATCH_PER_BLOCK - 1) / BATCH_PER_BLOCK;
+        let shared = (cols / 2 + cols / 16) as u32;
         let cfg = LaunchConfig {
-            grid_dim: (rows_u32, max_per_expert as u32, num_experts as u32),
-            block_dim: (BLOCK_DIM, 1, 1),
-            shared_mem_bytes: BLOCK_DIM * std::mem::size_of::<f32>() as u32,
+            grid_dim: (rows_u32, grid_y, num_experts as u32),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: shared,
         };
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.nvfp4_grouped_matvec_packed)
+                .launch_builder(&self.kernels.nvfp4_grouped_prequant_gemm)
                 .arg(&base_packed.slice)
                 .arg(&packed_offsets.slice)
                 .arg(&base_scales.slice)
                 .arg(&scales_offsets.slice)
                 .arg(&expert_counts.slice)
                 .arg(&expert_first_token_off.slice)
-                .arg(&expert_input_scales.slice)
                 .arg(&expert_output_scales.slice)
                 .arg(&rows_u32)
                 .arg(&cols_u32)
-                .arg(&permuted_input.slice)
+                .arg(&permuted_quantized_input.slice)
                 .arg(&mut permuted_output.slice)
                 .launch(cfg)
         }
-        .map_err(map_cuda_err("launch nvfp4 grouped matvec packed"))?;
+        .map_err(map_cuda_err("launch nvfp4 grouped prequant gemm"))?;
         Ok(())
     }
 

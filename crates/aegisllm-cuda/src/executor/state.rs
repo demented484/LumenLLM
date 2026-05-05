@@ -499,6 +499,12 @@ pub(super) struct CudaMoEPrefillScratch {
     /// Permuted activation buffer for the grouped MoE pipeline:
     /// `[chunk_size * top_k, hidden]`.
     pub(super) permuted_input: DeviceBuffer<f32>,
+    /// Per-expert NVFP4-prequantized copy of the permuted activation. Written
+    /// by `nvfp4_quantize_input_per_expert_device` (different `input_scale`
+    /// per expert) and consumed by the grouped prequant GEMM. Sized to fit
+    /// either the gate/up input (hidden) or the down input (intermediate),
+    /// using the larger of the two.
+    pub(super) permuted_input_quant: DeviceBuffer<f32>,
     /// Permuted gate-projection output: `[chunk_size * top_k, expert_intermediate]`.
     pub(super) permuted_gate: DeviceBuffer<f32>,
     /// Permuted up-projection output (reused as SwiGLU/GeGLU input/output).

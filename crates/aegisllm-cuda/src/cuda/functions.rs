@@ -59,7 +59,8 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) router_expert_offsets: CudaFunction,
     pub(crate) permute_gather_f32: CudaFunction,
     pub(crate) unpermute_scatter_add_f32: CudaFunction,
-    pub(crate) nvfp4_grouped_matvec_packed: CudaFunction,
+    pub(crate) nvfp4_quantize_input_per_expert: CudaFunction,
+    pub(crate) nvfp4_grouped_prequant_gemm: CudaFunction,
     pub(crate) kv_store: CudaFunction,
     pub(crate) kv_store_ptr: CudaFunction,
     pub(crate) kv_store_batched: CudaFunction,
@@ -202,7 +203,12 @@ impl CudaKernelFunctions {
             router_expert_offsets: load(&module, "aegis_router_expert_offsets")?,
             permute_gather_f32: load(&module, "aegis_permute_gather_f32")?,
             unpermute_scatter_add_f32: load(&module, "aegis_unpermute_scatter_add_f32")?,
-            nvfp4_grouped_matvec_packed: load(&module, "aegis_nvfp4_grouped_matvec_packed")?,
+            nvfp4_quantize_input_per_expert: load(
+                &module, "aegis_nvfp4_quantize_input_per_expert",
+            )?,
+            nvfp4_grouped_prequant_gemm: load(
+                &module, "aegis_nvfp4_grouped_prequant_gemm",
+            )?,
             kv_store: load(&module, "aegis_kv_store")?,
             kv_store_ptr: load(&module, "aegis_kv_store_ptr")?,
             kv_store_batched: load(&module, "aegis_kv_store_batched")?,

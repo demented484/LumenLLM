@@ -276,86 +276,145 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_gemm(
     }
 }
 
-// Grouped NVFP4 matvec (Phase 2 of perf overhaul, MoE prefill).
+// Per-expert NVFP4 input quantizer for the grouped MoE prefill pipeline.
 //
-// One launch processes ALL active experts of a layer for one matmul-position
-// (gate, up, OR down). Replaces the per-expert dispatch loop's ~50 launches
-// with a single launch — kills launch overhead which dominates for small
-// per-expert batches (~5 tokens × 30 layers × 3 matmuls = ~4500 launches/chunk
-// → ~3 launches/chunk after this). Modeled after the vLLM `fused_moe_kernel`
-// pattern: grid covers all (output_row × batch_in_expert × expert) tiles,
-// per-block early-exit when the expert is empty or the batch slot is past
-// the count.
+// Mirrors `aegis_nvfp4_quantize_input_batched` but takes a per-expert
+// `expert_input_scales[num_experts]` array and the same prefix-sum/count
+// arrays the rest of the grouped pipeline uses, so each (expert, row-in-
+// expert) pair applies its own input_scale during the NVFP4 round-trip.
 //
-// Inputs are in **permuted (expert-sorted) layout** as produced by
-// `aegis_permute_gather_f32`: `permuted_input[expert_first_token_off[e] +
-// batch_in_expert]` is the input row for expert e's `batch_in_expert`-th
-// token. Outputs have the same layout.
-//
-// Weight pointers are taken from a single base buffer (typically the VRAM
-// expert cache) plus per-expert offset arrays. For experts not in the cache
-// the host loop dispatches the legacy per-expert kernel separately and
-// passes 0 for the count here so the grouped kernel skips them.
-extern "C" __global__ void aegis_nvfp4_grouped_matvec_packed(
-    const unsigned char* __restrict__ base_packed,         // big buffer (e.g. cache)
-    const unsigned int*  __restrict__ packed_offsets,       // [num_experts] byte offsets
-    const unsigned char* __restrict__ base_scales,          // typically same as base_packed
-    const unsigned int*  __restrict__ scales_offsets,       // [num_experts]
-    const unsigned int*  __restrict__ expert_counts,        // [num_experts]
-    const unsigned int*  __restrict__ expert_first_token_off, // [num_experts + 1]
-    const float* __restrict__ expert_input_scales,           // [num_experts]
-    const float* __restrict__ expert_output_scales,          // [num_experts]
-    const unsigned int rows,                                // shared N (output dim)
-    const unsigned int cols,                                // shared K (input dim)
-    const float* __restrict__ permuted_input,               // [total_assignments, cols]
-    float*       __restrict__ permuted_output               // [total_assignments, rows]
+// Grid: (ceil(cols/16), max_count, num_experts), block: (16, 1, 1).
+// Reads `permuted_input` and writes `permuted_quantized` at the same row
+// offsets — out-of-range (batch_in_expert >= count[expert]) blocks early-exit.
+extern "C" __global__ void aegis_nvfp4_quantize_input_per_expert(
+    const float*         __restrict__ permuted_input,
+    const unsigned int*  __restrict__ expert_counts,
+    const unsigned int*  __restrict__ expert_first_token_off,
+    const float*         __restrict__ expert_input_scales,
+    const unsigned int cols,
+    float*               __restrict__ permuted_quantized
 ) {
-    const unsigned int row = blockIdx.x;
+    const unsigned int group = blockIdx.x;
     const unsigned int batch_in_expert = blockIdx.y;
     const unsigned int expert = blockIdx.z;
-    if (row >= rows) return;
+    const unsigned int lane = threadIdx.x;
+    if (lane >= 16u) return;
+
     const unsigned int count = expert_counts[expert];
     if (batch_in_expert >= count) return;
 
+    const unsigned int base = group * 16u;
+    if (base + lane >= cols) return;
+
     const unsigned int abs_row = expert_first_token_off[expert] + batch_in_expert;
-    const unsigned char* packed = base_packed + (size_t)packed_offsets[expert];
-    const unsigned char* scales = base_scales + (size_t)scales_offsets[expert];
     const float input_scale = expert_input_scales[expert];
-    const float output_scale = expert_output_scales[expert];
+
+    const float* input_row  = permuted_input     + (size_t)abs_row * cols;
+    float*       output_row = permuted_quantized + (size_t)abs_row * cols;
+
+    if (!(input_scale > 0.0f)) {
+        output_row[base + lane] = input_row[base + lane];
+        return;
+    }
+    const float inv = 1.0f / input_scale;
+    float amax = 0.0f;
+    for (unsigned int j = 0u; j < 16u && base + j < cols; ++j) {
+        amax = fmaxf(amax, fabsf(input_row[base + j] * inv));
+    }
+    if (amax == 0.0f) {
+        output_row[base + lane] = 0.0f;
+        return;
+    }
+    const float block_scale = decode_ue4m3_half(fp32_to_ue4m3_halfbits(amax / 6.0f));
+    const unsigned int nibble = best_nvfp4_index(input_row[base + lane] * inv, block_scale);
+    output_row[base + lane] = float(decode_nvfp4_nibble(nibble)) * block_scale * input_scale;
+}
+
+// Grouped NVFP4 prequantized GEMM for MoE prefill.
+//
+// Modelled byte-for-byte on `aegis_nvfp4_linear_prequantized_batched_gemm`
+// (8 warps share one weight row in shared memory, 8 batch rows per block,
+// warp-level shfl_down reduction, output_scale applied at write) — but
+// adds an outer `blockIdx.z = expert` dimension and per-expert weight
+// pointer / output-scale lookups.
+//
+// Pre-condition: `permuted_quantized_input` was produced by
+// `aegis_nvfp4_quantize_input_per_expert` so each row already encodes the
+// expert-specific input_scale; the kernel itself never touches input_scale.
+//
+// Grid: (rows, ceil(max_count / BATCH_PER_BLOCK), num_experts).
+// Block: 256 threads (8 warps).
+// Shared mem: packed_cols + scale_cols bytes (one weight row).
+extern "C" __global__ void aegis_nvfp4_grouped_prequant_gemm(
+    const unsigned char* __restrict__ base_packed,
+    const unsigned int*  __restrict__ packed_offsets,        // [num_experts]
+    const unsigned char* __restrict__ base_scales,
+    const unsigned int*  __restrict__ scales_offsets,        // [num_experts]
+    const unsigned int*  __restrict__ expert_counts,         // [num_experts] (cached_counts)
+    const unsigned int*  __restrict__ expert_first_token_off, // [num_experts + 1] CSR start
+    const float*         __restrict__ expert_output_scales,   // [num_experts]
+    const unsigned int rows,
+    const unsigned int cols,
+    const float*         __restrict__ permuted_quantized_input, // [total_assignments, cols]
+    float*               __restrict__ permuted_output           // [total_assignments, rows]
+) {
+    const unsigned int WARP_SIZE       = 32u;
+    const unsigned int BATCH_PER_BLOCK = 8u;
+
+    const unsigned int row        = blockIdx.x;
+    const unsigned int batch_base = blockIdx.y * BATCH_PER_BLOCK;
+    const unsigned int expert     = blockIdx.z;
+    if (row >= rows) return;
+
+    const unsigned int count = expert_counts[expert];
+    if (batch_base >= count) return;
+
+    const unsigned int tid     = threadIdx.x;
+    const unsigned int warp_id = tid / WARP_SIZE;
+    const unsigned int lane    = tid & (WARP_SIZE - 1u);
 
     const unsigned int packed_cols = cols / 2u;
-    const unsigned int scale_cols = cols / 16u;
-    const unsigned char* p_row = packed + (size_t)row * packed_cols;
-    const unsigned char* s_row = scales + (size_t)row * scale_cols;
-    const float* in_row = permuted_input + (size_t)abs_row * cols;
+    const unsigned int scale_cols  = cols / 16u;
 
-    extern __shared__ float partial[];
-    float sum = 0.0f;
-    const unsigned int tid = threadIdx.x;
-    for (unsigned int blk = tid; blk < scale_cols; blk += blockDim.x) {
-        const float bs = decode_ue4m3_half(s_row[blk]);
-        const unsigned int input_base = blk * 16u;
-        const unsigned int packed_base = blk * 8u;
-        for (unsigned int j = 0u; j < 8u; ++j) {
-            const unsigned int b = p_row[packed_base + j];
-            const unsigned int lo_lane = 2u * j;
-            const unsigned int hi_lane = lo_lane + 1u;
-            const float input_lo = maybe_quantize_nvfp4_input(in_row, input_base, lo_lane, input_scale);
-            const float input_hi = maybe_quantize_nvfp4_input(in_row, input_base, hi_lane, input_scale);
-            sum += float(decode_nvfp4_nibble(b & 0x0Fu)) * bs * input_lo;
-            sum += float(decode_nvfp4_nibble(b >> 4)) * bs * input_hi;
-        }
-    }
-    partial[tid] = sum;
+    const unsigned char* w_packed = base_packed + (size_t)packed_offsets[expert]
+                                  + (size_t)row * packed_cols;
+    const unsigned char* w_scales = base_scales + (size_t)scales_offsets[expert]
+                                  + (size_t)row * scale_cols;
+
+    extern __shared__ unsigned char sh[];
+    unsigned char* sh_packed = sh;
+    unsigned char* sh_scales = sh + packed_cols;
+
+    // Collaborative load of the weight row — ALL 256 threads cooperate even
+    // if their `batch_in_expert` slot is past `count`; otherwise we'd lose
+    // bandwidth from idle warps.
+    for (unsigned int i = tid; i < packed_cols; i += 256u) sh_packed[i] = w_packed[i];
+    for (unsigned int i = tid; i < scale_cols;  i += 256u) sh_scales[i] = w_scales[i];
     __syncthreads();
-    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
-        if (tid < stride) {
-            partial[tid] += partial[tid + stride];
+
+    const unsigned int batch_in_expert = batch_base + warp_id;
+    if (batch_in_expert >= count) return;
+
+    const unsigned int abs_row = expert_first_token_off[expert] + batch_in_expert;
+    const float* input_row = permuted_quantized_input + (size_t)abs_row * cols;
+
+    float sum = 0.0f;
+    for (unsigned int block_idx = lane; block_idx < scale_cols; block_idx += WARP_SIZE) {
+        const float blk_scale  = decode_ue4m3_half(sh_scales[block_idx]);
+        const unsigned int input_base  = block_idx * 16u;
+        const unsigned int packed_base = block_idx * 8u;
+        for (unsigned int j = 0u; j < 8u; ++j) {
+            const unsigned int byte = sh_packed[packed_base + j];
+            sum += (float)decode_nvfp4_nibble(byte & 0x0Fu) * blk_scale * input_row[input_base + 2u*j];
+            sum += (float)decode_nvfp4_nibble(byte >> 4u)   * blk_scale * input_row[input_base + 2u*j + 1u];
         }
-        __syncthreads();
     }
-    if (tid == 0u) {
-        permuted_output[(size_t)abs_row * rows + row] = partial[0] * output_scale;
+
+    for (unsigned int stride = WARP_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        sum += __shfl_down_sync(0xffffffffu, sum, stride);
+    }
+    if (lane == 0u) {
+        permuted_output[(size_t)abs_row * rows + row] = sum * expert_output_scales[expert];
     }
 }
 

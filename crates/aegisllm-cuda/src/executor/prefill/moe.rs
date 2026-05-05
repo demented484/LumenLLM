@@ -395,64 +395,106 @@ pub(super) fn forward_moe_prefill_chunk_device(
                 )
             })?;
 
-        // Grouped gate. The kernel applies per-expert input/output scales
-        // internally (NVFP4 input pseudo-quantization mirrors the per-expert
-        // reference path), so no pre-quantization step is needed.
+        // Pipeline (mirrors vLLM `fused_moe` / TRT-LLM permuted-activation
+        // grouped GEMM):
+        //   1. NVFP4-quantize permuted_input with each cached expert's
+        //      gate.input_scale → permuted_input_quant.
+        //   2. Grouped prequant GEMM (8-warp tiled, shared-mem weight load,
+        //      one launch handles all cached experts) → permuted_gate.
+        //   3. Re-quantize permuted_input with each expert's up.input_scale
+        //      and run grouped GEMM → permuted_up.
+        //   4. GeGLU(permuted_gate, permuted_up) → permuted_up (in-place).
+        //   5. Quantize permuted_up with each expert's down.input_scale and
+        //      run grouped GEMM (rows=hidden, cols=intermediate) → permuted_down.
         let total_assignments = batch * top_k;
-        runtime.nvfp4_grouped_matvec_packed_device(
+        let _ = total_assignments;
+
+        // Step 1+2: gate
+        runtime.nvfp4_quantize_input_per_expert_device(
+            &moe_scratch.permuted_input,
+            &moe_scratch.cached_counts,
+            &moe_scratch.expert_offsets,
+            &moe_scratch.gate_input_scales,
+            hidden_size,
+            num_experts,
+            max_count,
+            &mut moe_scratch.permuted_input_quant,
+        )?;
+        runtime.nvfp4_grouped_prequant_gemm_device(
             cache.buffer(),
             &moe_scratch.gate_packed_offsets,
             cache.buffer(),
             &moe_scratch.gate_scales_offsets,
             &moe_scratch.cached_counts,
             &moe_scratch.expert_offsets,
-            &moe_scratch.gate_input_scales,
             &moe_scratch.gate_output_scales,
             exp_intermediate,
             hidden_size,
-            &moe_scratch.permuted_input,
+            &moe_scratch.permuted_input_quant,
             &mut moe_scratch.permuted_gate,
             num_experts,
             max_count,
         )?;
-        // Grouped up
-        runtime.nvfp4_grouped_matvec_packed_device(
+
+        // Step 3: up (re-quantize input with up.input_scale, then grouped GEMM)
+        runtime.nvfp4_quantize_input_per_expert_device(
+            &moe_scratch.permuted_input,
+            &moe_scratch.cached_counts,
+            &moe_scratch.expert_offsets,
+            &moe_scratch.up_input_scales,
+            hidden_size,
+            num_experts,
+            max_count,
+            &mut moe_scratch.permuted_input_quant,
+        )?;
+        runtime.nvfp4_grouped_prequant_gemm_device(
             cache.buffer(),
             &moe_scratch.up_packed_offsets,
             cache.buffer(),
             &moe_scratch.up_scales_offsets,
             &moe_scratch.cached_counts,
             &moe_scratch.expert_offsets,
-            &moe_scratch.up_input_scales,
             &moe_scratch.up_output_scales,
             exp_intermediate,
             hidden_size,
-            &moe_scratch.permuted_input,
+            &moe_scratch.permuted_input_quant,
             &mut moe_scratch.permuted_up,
             num_experts,
             max_count,
         )?;
-        // GeGLU(gate, up) → permuted_up (in-place). The kernel iterates
-        // flat over total_assignments × intermediate; uncached rows are
-        // garbage-but-not-read by the down matmul (which uses cached_counts).
+
+        // Step 4: GeGLU(gate, up) → permuted_up (in-place). Iterates flat
+        // over total_assignments × intermediate; positions for non-cached
+        // experts get processed but later down/scatter steps skip them via
+        // cached_counts so the garbage never contributes to moe_acc.
         runtime.geglu_tanh_in_place_device(
             &moe_scratch.permuted_gate,
             &mut moe_scratch.permuted_up,
-            total_assignments * exp_intermediate,
+            batch * top_k * exp_intermediate,
         )?;
-        // Grouped down — input is the SwiGLU intermediate (permuted_up).
-        runtime.nvfp4_grouped_matvec_packed_device(
+
+        // Step 5: down (quantize permuted_up with down.input_scale, grouped GEMM)
+        runtime.nvfp4_quantize_input_per_expert_device(
+            &moe_scratch.permuted_up,
+            &moe_scratch.cached_counts,
+            &moe_scratch.expert_offsets,
+            &moe_scratch.down_input_scales,
+            exp_intermediate,
+            num_experts,
+            max_count,
+            &mut moe_scratch.permuted_input_quant,
+        )?;
+        runtime.nvfp4_grouped_prequant_gemm_device(
             cache.buffer(),
             &moe_scratch.down_packed_offsets,
             cache.buffer(),
             &moe_scratch.down_scales_offsets,
             &moe_scratch.cached_counts,
             &moe_scratch.expert_offsets,
-            &moe_scratch.down_input_scales,
             &moe_scratch.down_output_scales,
             hidden_size,
             exp_intermediate,
-            &moe_scratch.permuted_up,
+            &moe_scratch.permuted_input_quant,
             &mut moe_scratch.permuted_down,
             num_experts,
             max_count,
