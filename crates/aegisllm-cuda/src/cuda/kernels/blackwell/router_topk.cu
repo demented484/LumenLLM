@@ -85,21 +85,32 @@ extern "C" __global__ void aegis_router_softmax_topk(
         local_logits[best_i] = -1.0f;
     }
 
-    // Pass 4: optional per-expert scale + renormalise so weights sum to 1.
+    // Pass 4: renormalise top-k probabilities so they sum to 1.
+    // ORDER MATTERS: HF Gemma4TextRouter.forward renormalises THEN multiplies
+    // by per_expert_scale — and does NOT renormalise again. Doing the scale
+    // before the renormalise (the previous order here) silently undoes the
+    // per-expert weighting because dividing by `sum(scaled)` gives back the
+    // unscaled proportions. Mirrors the CPU `softmax_top_k_normalized` path
+    // in `executor/mlp.rs`.
+    float renorm_sum = 0.0f;
+    for (unsigned int k = 0; k < top_k; ++k) renorm_sum += picked_w[k];
+    const float inv_renorm = (renorm_sum > 0.0f) ? (1.0f / renorm_sum) : 0.0f;
+    for (unsigned int k = 0; k < top_k; ++k) {
+        picked_w[k] *= inv_renorm;
+    }
+
+    // Pass 5: optional per-expert scale (no further renormalise).
     if (per_expert_scale != nullptr) {
         for (unsigned int k = 0; k < top_k; ++k) {
             picked_w[k] *= per_expert_scale[picked_idx[k]];
         }
     }
-    float renorm_sum = 0.0f;
-    for (unsigned int k = 0; k < top_k; ++k) renorm_sum += picked_w[k];
-    const float inv_renorm = (renorm_sum > 0.0f) ? (1.0f / renorm_sum) : 0.0f;
 
     unsigned int* out_i = out_idx     + (size_t)token * top_k;
     float*        out_w = out_weights + (size_t)token * top_k;
     for (unsigned int k = 0; k < top_k; ++k) {
         out_i[k] = picked_idx[k];
-        out_w[k] = picked_w[k] * inv_renorm;
+        out_w[k] = picked_w[k];
     }
 }
 
