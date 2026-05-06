@@ -325,6 +325,7 @@ fn parse_perplexity(args: &[String]) -> Result<Command> {
     let mut text_file: Option<PathBuf> = None;
     let mut max_tokens: Option<usize> = None;
     let mut context_tokens: Option<usize> = None;
+    let mut apply_chat_template = false;
     let mut filtered: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -341,6 +342,9 @@ fn parse_perplexity(args: &[String]) -> Result<Command> {
             }
             "--context-tokens" => {
                 context_tokens = Some(parse_value(args, &mut i, flag)?);
+            }
+            "--apply-chat-template" => {
+                apply_chat_template = true;
             }
             other if is_engine_flag(other) => {
                 filtered.push(args[i].clone());
@@ -384,6 +388,7 @@ fn parse_perplexity(args: &[String]) -> Result<Command> {
             text: resolved_text,
             max_tokens,
             context_tokens,
+            raw_text: !apply_chat_template,
         },
     ))
 }

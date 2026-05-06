@@ -132,6 +132,16 @@ impl GenerationBackendPrimitives for CudaExecutorProvider {
         text.encode_prompt(prompt)
     }
 
+    fn encode_text_raw(&self, prompt: &str) -> Result<Vec<usize>> {
+        let text = self.text.as_ref().ok_or_else(|| {
+            AegisError::Unsupported(format!(
+                "CUDA executor provider is registered but not initialized: {}",
+                self.limitations.join("; ")
+            ))
+        })?;
+        text.encode_text_raw(prompt)
+    }
+
     fn decode_tokens(&self, tokens: &[usize]) -> Result<String> {
         let text = self.text.as_ref().ok_or_else(|| {
             AegisError::Unsupported(format!(

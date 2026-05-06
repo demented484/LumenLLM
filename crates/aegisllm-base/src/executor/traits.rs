@@ -60,6 +60,13 @@ where
 
 pub trait GenerationBackendPrimitives: Debug + Send + Sync {
     fn encode_prompt(&self, prompt: &str) -> Result<Vec<usize>>;
+    /// Tokenize raw text — bypasses any chat template. BOS still
+    /// prepended. Used by perplexity / pretrain-quality tooling. Default
+    /// impl falls back to `encode_prompt` so backends without a chat
+    /// template don't have to override.
+    fn encode_text_raw(&self, text: &str) -> Result<Vec<usize>> {
+        self.encode_prompt(text)
+    }
     fn decode_tokens(&self, tokens: &[usize]) -> Result<String>;
     fn is_eos(&self, token: usize) -> bool;
     fn new_sequence_state(&self) -> Result<Box<dyn GenerationState>>;

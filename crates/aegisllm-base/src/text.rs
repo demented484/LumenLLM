@@ -29,7 +29,24 @@ impl TextProcessor {
     }
 
     pub fn encode_prompt(&self, prompt: &str) -> Result<Vec<usize>> {
-        let prompt = self.chat_template.apply(prompt);
+        self.encode_with_options(prompt, true)
+    }
+
+    /// Encode the input as raw text — bypasses the chat template even for
+    /// chat-tuned models. BOS is still prepended. Used by tooling that
+    /// needs to score the model's pretrain language-modeling ability
+    /// (e.g. perplexity), where the chat wrap would introduce role tokens
+    /// that pollute the measurement.
+    pub fn encode_text_raw(&self, text: &str) -> Result<Vec<usize>> {
+        self.encode_with_options(text, false)
+    }
+
+    fn encode_with_options(&self, prompt: &str, apply_chat_template: bool) -> Result<Vec<usize>> {
+        let prompt = if apply_chat_template {
+            self.chat_template.apply(prompt)
+        } else {
+            prompt.to_string()
+        };
         let encoding = self
             .tokenizer
             .encode(prompt.as_str(), false)

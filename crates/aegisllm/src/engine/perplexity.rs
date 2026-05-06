@@ -25,6 +25,11 @@ pub struct PerplexityRequest {
     /// scoring them dominates the average. Standard llama.cpp practice.
     /// Defaults to 16 if `None`.
     pub context_tokens: Option<usize>,
+    /// When `true`, bypass the model's chat template and score raw-text
+    /// language modeling (pretrain ability). Defaults to `true` because
+    /// PPL with the chat wrap on a chat-tuned model measures "predict
+    /// continuation of user-role text", which is artificially hard.
+    pub raw_text: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +62,11 @@ pub fn compute_perplexity(
             owned.as_str()
         }
     };
-    let mut tokens = backend.encode_prompt(text)?;
+    let mut tokens = if request.raw_text {
+        backend.encode_text_raw(text)?
+    } else {
+        backend.encode_prompt(text)?
+    };
     if let Some(limit) = request.max_tokens {
         tokens.truncate(limit);
     }
