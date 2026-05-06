@@ -80,7 +80,7 @@ pub(super) fn forward_moe_prefill_chunk_device(
         &mut pf.input_normed,
     )?;
 
-    // ── Step 2: shared MLP (BF16, batched) ──────────────────────────────────
+    // ── Step 2: shared MLP (BF16 or load-time-quantized MXFP4, batched) ────
     // Reuses `gather_intermediate` (cs × max_intermediate) for gate, then
     // `gather_swiglu` for up. After geglu we run down → `gather_out`.
     let shared = moe.shared_expert.as_ref().ok_or_else(|| {
@@ -88,57 +88,80 @@ pub(super) fn forward_moe_prefill_chunk_device(
             "Gemma 4 MoE prefill requires a shared MLP (mlp.gate/up/down_proj.weight)".into(),
         )
     })?;
-    let shared_gate = shared.gate_proj.as_bf16().ok_or_else(|| {
-        AegisError::InvalidPlan("MoE prefill expects BF16 shared MLP gate_proj".into())
-    })?;
-    let shared_up = shared.up_proj.as_bf16().ok_or_else(|| {
-        AegisError::InvalidPlan("MoE prefill expects BF16 shared MLP up_proj".into())
-    })?;
-    let shared_down = shared.down_proj.as_bf16().ok_or_else(|| {
-        AegisError::InvalidPlan("MoE prefill expects BF16 shared MLP down_proj".into())
-    })?;
-    let intermediate = shared_gate.rows;
+    let intermediate = shared.gate_proj.rows();
 
     let cp_shared = mark("");
-    // cuBLASLt BF16 GEMM (Phase C). Shared MLP weights are force-VRAM at load,
-    // so the cublaslt path applies. Falls back to reference if any reason
-    // VRAM-residency is unmet.
-    if runtime.cublaslt_bf16_enabled_for(shared_gate) {
-        runtime.matmul_bf16_cublaslt_device(
-            shared_gate, &pf.input_normed, batch,
-            &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
-            &mut moe_scratch.gather_intermediate,
-        )?;
-        runtime.matmul_bf16_cublaslt_device(
-            shared_up, &pf.input_normed, batch,
-            &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
-            &mut moe_scratch.gather_swiglu,
-        )?;
-        runtime.geglu_tanh_in_place_device(
-            &moe_scratch.gather_intermediate,
-            &mut moe_scratch.gather_swiglu,
-            batch * intermediate,
-        )?;
-        runtime.matmul_bf16_cublaslt_device(
-            shared_down, &moe_scratch.gather_swiglu, batch,
-            &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
-            &mut moe_scratch.gather_out,
-        )?;
-    } else {
-        runtime.matmul_bf16_reference_batched_device(
-            shared_gate, &pf.input_normed, batch, &mut moe_scratch.gather_intermediate,
-        )?;
-        runtime.matmul_bf16_reference_batched_device(
-            shared_up, &pf.input_normed, batch, &mut moe_scratch.gather_swiglu,
-        )?;
-        runtime.geglu_tanh_in_place_device(
-            &moe_scratch.gather_intermediate,
-            &mut moe_scratch.gather_swiglu,
-            batch * intermediate,
-        )?;
-        runtime.matmul_bf16_reference_batched_device(
-            shared_down, &moe_scratch.gather_swiglu, batch, &mut moe_scratch.gather_out,
-        )?;
+    use crate::executor::state::CudaLinear as CL;
+    match (&shared.gate_proj, &shared.up_proj, &shared.down_proj) {
+        (CL::Bf16(g), CL::Bf16(u), CL::Bf16(d)) => {
+            // cuBLASLt BF16 GEMM. Shared MLP weights are force-VRAM at load,
+            // so the cublaslt path applies. Falls back to reference if any
+            // reason VRAM-residency is unmet.
+            if runtime.cublaslt_bf16_enabled_for(g) {
+                runtime.matmul_bf16_cublaslt_device(
+                    g, &pf.input_normed, batch,
+                    &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
+                    &mut moe_scratch.gather_intermediate,
+                )?;
+                runtime.matmul_bf16_cublaslt_device(
+                    u, &pf.input_normed, batch,
+                    &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
+                    &mut moe_scratch.gather_swiglu,
+                )?;
+                runtime.geglu_tanh_in_place_device(
+                    &moe_scratch.gather_intermediate,
+                    &mut moe_scratch.gather_swiglu,
+                    batch * intermediate,
+                )?;
+                runtime.matmul_bf16_cublaslt_device(
+                    d, &moe_scratch.gather_swiglu, batch,
+                    &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
+                    &mut moe_scratch.gather_out,
+                )?;
+            } else {
+                runtime.matmul_bf16_reference_batched_device(
+                    g, &pf.input_normed, batch, &mut moe_scratch.gather_intermediate,
+                )?;
+                runtime.matmul_bf16_reference_batched_device(
+                    u, &pf.input_normed, batch, &mut moe_scratch.gather_swiglu,
+                )?;
+                runtime.geglu_tanh_in_place_device(
+                    &moe_scratch.gather_intermediate,
+                    &mut moe_scratch.gather_swiglu,
+                    batch * intermediate,
+                )?;
+                runtime.matmul_bf16_reference_batched_device(
+                    d, &moe_scratch.gather_swiglu, batch, &mut moe_scratch.gather_out,
+                )?;
+            }
+        }
+        (CL::Mxfp4(g), CL::Mxfp4(u), CL::Mxfp4(d)) => {
+            // Load-time MXFP4-quantized shared expert. Activations get
+            // MXFP4-quantized in `matmul_mxfp4_standalone_batched_device`
+            // (it runs `quantize_mxfp4_input_batched_device` internally).
+            // Gate and up share the same input (`pf.input_normed`) but
+            // each kernel re-quantizes from f32 — minor extra cost; if it
+            // shows up we can pre-quantize once and use the
+            // `_prepacked_` variant.
+            runtime.matmul_mxfp4_standalone_batched_device(
+                g, &pf.input_normed, batch, &mut moe_scratch.gather_intermediate,
+            )?;
+            runtime.matmul_mxfp4_standalone_batched_device(
+                u, &pf.input_normed, batch, &mut moe_scratch.gather_swiglu,
+            )?;
+            runtime.geglu_tanh_in_place_device(
+                &moe_scratch.gather_intermediate,
+                &mut moe_scratch.gather_swiglu,
+                batch * intermediate,
+            )?;
+            runtime.matmul_mxfp4_standalone_batched_device(
+                d, &moe_scratch.gather_swiglu, batch, &mut moe_scratch.gather_out,
+            )?;
+        }
+        _ => return Err(AegisError::InvalidPlan(
+            "MoE prefill expects shared expert with all three projections in the same \
+             format (BF16 or MXFP4)".into(),
+        )),
     }
 
     report(cp_shared, "shared_mlp_done");

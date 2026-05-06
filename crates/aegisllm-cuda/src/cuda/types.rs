@@ -226,6 +226,26 @@ pub(super) struct DeviceMxfp4Linear {
     pub data: CudaSlice<u8>,
 }
 
+/// Standalone MXFP4 linear weight (Microsoft / OCP format, group_size=32,
+/// E8M0 scale per block). The legacy `DeviceMxfp4Linear` above is the
+/// optional companion to `DeviceNvfp4Linear` (re-pack of NVFP4 source);
+/// this one is for weights loaded **directly as MXFP4** — e.g. the
+/// load-time BF16 → MXFP4 quantizer for the shared expert.
+#[derive(Debug)]
+pub struct StandaloneMxfp4Linear {
+    pub name: String,
+    pub rows: usize,
+    pub cols: usize,
+    pub bytes: usize,
+    pub blocks_per_row: usize,
+    pub output_scale: f32,
+    pub(super) data: CudaSlice<u8>,
+}
+
+impl StandaloneMxfp4Linear {
+    pub(super) fn data_slice(&self) -> &CudaSlice<u8> { &self.data }
+}
+
 #[derive(Debug)]
 pub(super) struct DeviceCutlassNvfp4Linear {
     pub layout: CutlassNvfp4LinearLayout,

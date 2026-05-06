@@ -95,11 +95,7 @@ pub enum WeightQuantOverride {
 impl WeightQuantOverride {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            // `bf16` is accepted as an alias for `default` since the
-            // checkpoint stores attention/shared-MLP as BF16 and saying
-            // "BF16" reads naturally for users who don't know the
-            // checkpoint's native precision.
-            "default" | "bf16" | "" => Some(Self::Default),
+            "default" | "" => Some(Self::Default),
             "mxfp4" => Some(Self::Mxfp4),
             "fp8" | "fp8_e4m3" | "fp8-e4m3" => Some(Self::Fp8),
             "mxint4" => Some(Self::Mxint4),

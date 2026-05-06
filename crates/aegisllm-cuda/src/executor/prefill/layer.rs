@@ -575,6 +575,11 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
                 )?;
             }
         }
+        CudaLinear::Mxfp4(o) => {
+            runtime.matmul_mxfp4_standalone_batched_device(
+                o, &prefill.qkv, params.batch, &mut prefill.input_normed,
+            )?;
+        }
     }
     record_prefill_stage(runtime, timings, o_proj_start, |timings, elapsed| {
         timings.o_proj_us += elapsed

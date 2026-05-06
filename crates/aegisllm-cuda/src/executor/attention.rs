@@ -284,6 +284,9 @@ pub(super) fn forward_attention_device(
         CudaLinear::Bf16(o) => {
             runtime.matvec_bf16_reference_device(o, &scratch.attn_context, &mut scratch.attn_out)?;
         }
+        CudaLinear::Mxfp4(o) => {
+            runtime.matvec_mxfp4_standalone_device(o, &scratch.attn_context, &mut scratch.attn_out)?;
+        }
     }
     if let Some(ref post_norm) = layer.post_attn_sublayer_norm {
         // Gemma 4 PrePost: normalize attention output before adding to residual.

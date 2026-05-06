@@ -38,23 +38,27 @@ impl CudaLlamaExecutor {
         validate_cuda_placement(placement, device)?;
         // Reject load-time quantization overrides that don't yet have a
         // runtime implementation. The schema parses all of mxfp4 / fp8 /
-        // mxint4 / int4 / int8, but only `default` (alias `bf16`)
-        // currently reaches the loader. Surface this clearly instead of
-        // silently keeping BF16 weights when the user asked for a
-        // smaller format.
+        // mxint4 / int4 / int8, but only the formats below have a wired
+        // loader path today; the rest fail with a clear error.
         use aegisllm_base::planning::placement::WeightQuantOverride as Wq;
-        for (label, q) in [
-            ("attention-quantization", placement.attention_quantization),
-            ("shared-MLP-quantization", placement.shared_mlp_quantization),
-        ] {
-            if !matches!(q, Wq::Default) {
-                return Err(AegisError::Unsupported(format!(
-                    "{label}={q:?} not yet wired up; only `default` (alias `bf16`) \
-                     reaches the loader today. Roadmap kernels: mxfp4 (Microsoft MX, \
-                     group=32, E8M0 scales), fp8 (E4M3 cuBLASLt), mxint4 (MX INT4), \
-                     int4, int8."
-                )));
-            }
+        // Attention-quantization: only `default` for now (BF16 staging
+        // path lands in a follow-up commit).
+        if !matches!(placement.attention_quantization, Wq::Default) {
+            return Err(AegisError::Unsupported(format!(
+                "attention-quantization={:?} not yet wired up; only `default` reaches \
+                 the loader today. Next: mxfp4, then fp8.",
+                placement.attention_quantization
+            )));
+        }
+        // shared-MLP-quantization: `default` (BF16, force-VRAM) and
+        // `mxfp4` (load-time quantize) are wired. The rest still need
+        // their kernels.
+        match placement.shared_mlp_quantization {
+            Wq::Default | Wq::Mxfp4 => {}
+            other => return Err(AegisError::Unsupported(format!(
+                "shared-MLP-quantization={other:?} not yet wired up; supported today: \
+                 default, mxfp4. Roadmap: fp8, mxint4, int4, int8."
+            ))),
         }
         if graph.num_kv_heads == 0 || !graph.num_attention_heads.is_multiple_of(graph.num_kv_heads) {
             return Err(AegisError::InvalidPlan(format!(
@@ -118,6 +122,7 @@ impl CudaLlamaExecutor {
         )?;
 
         let mut layers = Vec::with_capacity(graph.num_layers);
+        let shared_mlp_q = placement.shared_mlp_quantization;
         for layer in 0..graph.num_layers {
             let region_id = RegionId(format!("layer.{layer}"));
             let region = graph
@@ -182,6 +187,7 @@ impl CudaLlamaExecutor {
                 },
                 window_size,
                 partial_dim,
+                shared_mlp_q,
                 &mut loader,
             )?);
         }

@@ -509,6 +509,201 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Single-token matvec against a standalone (load-time-quantized)
+    /// MXFP4 weight. Handles input quantization internally — caller
+    /// passes raw f32 hidden state.
+    pub fn matvec_mxfp4_standalone_device(
+        &self,
+        linear: &super::super::StandaloneMxfp4Linear,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let mut input_mxfp4 = self.alloc_u8(Self::mxfp4_vector_bytes(input.len())?)?;
+        self.quantize_mxfp4_input_device(input, &mut input_mxfp4)?;
+        self.matvec_mxfp4_standalone_prepacked_device(linear, &input_mxfp4, output)
+    }
+
+    /// Single-token matvec against a standalone MXFP4 weight; activations
+    /// already MXFP4-quantized.
+    pub fn matvec_mxfp4_standalone_prepacked_device(
+        &self,
+        linear: &super::super::StandaloneMxfp4Linear,
+        input_mxfp4: &DeviceBuffer<u8>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let expected_input_bytes = Self::mxfp4_vector_bytes(linear.cols)?;
+        if input_mxfp4.len() != expected_input_bytes || output.len() < linear.rows {
+            return Err(AegisError::InvalidPlan(format!(
+                "standalone mxfp4 matvec shape mismatch for {}: expected input_bytes={} output={}, got input_bytes={} output={}",
+                linear.name, expected_input_bytes, linear.rows,
+                input_mxfp4.len(), output.len(),
+            )));
+        }
+        if !linear.cols.is_multiple_of(64) {
+            return Err(AegisError::InvalidPlan(format!(
+                "standalone mxfp4 matvec for `{}` requires cols divisible by 64, got {}",
+                linear.name, linear.cols
+            )));
+        }
+        let rows = linear.rows as u32;
+        let cols = linear.cols as u32;
+        let blocks_per_row = linear.blocks_per_row as u32;
+        let output_scale = linear.output_scale;
+        let (block_dim, kernel, tag) = if linear.cols.is_multiple_of(64 * 16) {
+            (512u32, &self.kernels.mxfp4_matvec_16warp, "16warp")
+        } else if linear.cols.is_multiple_of(64 * 4) {
+            (128u32, &self.kernels.mxfp4_matvec_4warp, "4warp")
+        } else {
+            (32u32, &self.kernels.mxfp4_matvec, "1warp")
+        };
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(rows, 16), 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(kernel)
+                .arg(linear.data_slice())
+                .arg(&input_mxfp4.slice)
+                .arg(&rows)
+                .arg(&cols)
+                .arg(&blocks_per_row)
+                .arg(&output_scale)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err(match tag {
+            "16warp" => "launch standalone mxfp4 matvec 16warp",
+            "4warp"  => "launch standalone mxfp4 matvec 4warp",
+            _        => "launch standalone mxfp4 matvec 1warp",
+        }))?;
+        Ok(())
+    }
+
+    /// Batched matmul against a standalone MXFP4 weight (prefill path).
+    /// Handles input quantization (BF16-style → MXFP4) internally; caller
+    /// passes raw f32 [batch × cols].
+    pub fn matmul_mxfp4_standalone_batched_device(
+        &self,
+        linear: &super::super::StandaloneMxfp4Linear,
+        input: &DeviceBuffer<f32>,
+        batch: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let row_bytes = Self::mxfp4_vector_bytes(linear.cols)?;
+        let total_input_bytes = checked_len("batched standalone mxfp4 input", batch, row_bytes)?;
+        let mut input_mxfp4 = self.alloc_u8(total_input_bytes)?;
+        self.quantize_mxfp4_input_batched_device(input, batch, linear.cols, &mut input_mxfp4)?;
+        self.matmul_mxfp4_standalone_prepacked_batched_device(
+            linear, &input_mxfp4, batch, output,
+        )
+    }
+
+    /// Same as `matmul_mxfp4_standalone_batched_device` but with input
+    /// already MXFP4-quantized (used when the same input feeds two GEMMs
+    /// — e.g. shared MLP gate + up).
+    pub fn matmul_mxfp4_standalone_prepacked_batched_device(
+        &self,
+        linear: &super::super::StandaloneMxfp4Linear,
+        input_mxfp4: &DeviceBuffer<u8>,
+        batch: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let row_bytes = Self::mxfp4_vector_bytes(linear.cols)?;
+        let expected_input_bytes = checked_len("batched standalone mxfp4 input", batch, row_bytes)?;
+        let expected_output = checked_len("batched standalone mxfp4 output", batch, linear.rows)?;
+        if input_mxfp4.len() < expected_input_bytes || output.len() < expected_output {
+            return Err(AegisError::InvalidPlan(format!(
+                "batched standalone mxfp4 matmul shape mismatch for {}: expected input>={} output>={}, got input={} output={}",
+                linear.name, expected_input_bytes, expected_output,
+                input_mxfp4.len(), output.len(),
+            )));
+        }
+        if !linear.cols.is_multiple_of(64) {
+            return Err(AegisError::InvalidPlan(format!(
+                "batched standalone mxfp4 matmul for `{}` requires cols divisible by 64, got {}",
+                linear.name, linear.cols
+            )));
+        }
+        let rows = u32_arg("rows", linear.rows)?;
+        let cols = u32_arg("cols", linear.cols)?;
+        let blocks_per_row = u32_arg("blocks_per_row", linear.blocks_per_row)?;
+        let batch_u32 = u32_arg("batch", batch)?;
+        let output_scale = linear.output_scale;
+        let use_prefill_tile_kernel = batch >= 16;
+        let use_n8_kernel = batch > 1 && !use_prefill_tile_kernel;
+        if use_prefill_tile_kernel {
+            let use_n64_tile = rows >= 64;
+            let row_tile = if use_n64_tile { 64 } else { 32 };
+            let block_dim = if use_n64_tile { 256 } else { 128 };
+            let kernel = if use_n64_tile {
+                &self.kernels.mxfp4_matmul_tile_m16n64
+            } else {
+                &self.kernels.mxfp4_matmul_tile_m16n32
+            };
+            let cfg = LaunchConfig {
+                grid_dim: (ceil_div(rows, row_tile), ceil_div(batch_u32, 16), 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(kernel)
+                    .arg(linear.data_slice())
+                    .arg(&input_mxfp4.slice)
+                    .arg(&rows)
+                    .arg(&cols)
+                    .arg(&blocks_per_row)
+                    .arg(&batch_u32)
+                    .arg(&output_scale)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch tiled standalone mxfp4 prefill gemm"))?;
+        } else if use_n8_kernel {
+            let cfg = LaunchConfig {
+                grid_dim: (ceil_div(rows, 16), ceil_div(batch_u32, 8), 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.mxfp4_matmul_n8)
+                    .arg(linear.data_slice())
+                    .arg(&input_mxfp4.slice)
+                    .arg(&rows)
+                    .arg(&cols)
+                    .arg(&blocks_per_row)
+                    .arg(&batch_u32)
+                    .arg(&output_scale)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch standalone mxfp4 matmul n8"))?;
+        } else {
+            let cfg = LaunchConfig {
+                grid_dim: (ceil_div(rows, 16), batch_u32, 1),
+                block_dim: (32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.mxfp4_matvec)
+                    .arg(linear.data_slice())
+                    .arg(&input_mxfp4.slice)
+                    .arg(&rows)
+                    .arg(&cols)
+                    .arg(&blocks_per_row)
+                    .arg(&output_scale)
+                    .arg(&mut output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch standalone mxfp4 matvec"))?;
+        }
+        Ok(())
+    }
+
     pub fn matvec_mxfp4_native_device(
         &self,
         linear: &DeviceNvfp4Linear,

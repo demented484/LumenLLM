@@ -283,6 +283,52 @@ impl CudaWeightLoader<'_> {
         })
     }
 
+    /// Load a BF16 matrix from `tensor` and quantize it to native MXFP4 at
+    /// load time. Used by `shared-MLP-quantization = "mxfp4"` (and by
+    /// `attention-quantization = "mxfp4"` once that path lands).
+    /// The packed bytes go straight to VRAM; nothing stays in the host
+    /// arena. ~3.5× smaller than BF16 with no calibration data needed
+    /// (per-block absmax → E8M0 scale → E2M1 nibbles).
+    pub fn load_bf16_as_mxfp4_linear(
+        &self,
+        tensor: &TensorInfo,
+        loader: &mut TensorStorageLoader,
+    ) -> Result<crate::cuda::StandaloneMxfp4Linear> {
+        if tensor.dtype != TensorDType::BF16 || tensor.shape.len() != 2 {
+            return Err(AegisError::InvalidPlan(format!(
+                "`{}` must be a 2D BF16 matrix to be quantized to MXFP4",
+                tensor.name
+            )));
+        }
+        let rows = tensor.shape[0];
+        let cols = tensor.shape[1];
+        if !cols.is_multiple_of(32) {
+            return Err(AegisError::InvalidPlan(format!(
+                "`{}` MXFP4 quantization needs cols divisible by 32, got {}",
+                tensor.name, cols,
+            )));
+        }
+        // Read BF16 bytes (CPU side), repack to MXFP4 packed-block layout.
+        let loaded = loader.load_for_store(tensor, StoragePlacement::Ram)?;
+        let packed = super::repack::repack_bf16_to_mxfp4_host(rows, cols, loaded.as_bytes())?;
+        let blocks_per_row = cols / 32;
+        let bytes = packed.len();
+        let data = self
+            .runtime
+            .stream
+            .clone_htod(&packed)
+            .map_err(map_cuda_err("htod mxfp4 from bf16"))?;
+        Ok(crate::cuda::StandaloneMxfp4Linear {
+            name: tensor.name.clone(),
+            rows,
+            cols,
+            bytes,
+            blocks_per_row,
+            output_scale: 1.0,
+            data,
+        })
+    }
+
     pub fn load_nvfp4_linear(
         &self,
         artifact: &ModelArtifact,

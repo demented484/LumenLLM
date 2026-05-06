@@ -230,6 +230,9 @@ pub(super) fn matvec_cuda_linear_with_scratch(
         CudaLinear::Bf16(m) => {
             runtime.matvec_bf16_reference_device(m, input, output)
         }
+        CudaLinear::Mxfp4(m) => {
+            runtime.matvec_mxfp4_standalone_device(m, input, output)
+        }
     }
 }
 

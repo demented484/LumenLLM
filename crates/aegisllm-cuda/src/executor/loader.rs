@@ -52,6 +52,7 @@ pub(super) fn cuda_residency_for_store(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn load_cuda_layer(
     cuda: &CudaWeightLoader<'_>,
     artifact: &ModelArtifact,
@@ -63,6 +64,7 @@ pub(super) fn load_cuda_layer(
     shape: CudaLayerShape,
     window_size: usize,
     partial_dim: usize,
+    shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<CudaLayer> {
     if region_kind != GraphRegionKind::TransformerBlock {
@@ -134,6 +136,7 @@ pub(super) fn load_cuda_layer(
             placement.store,
             residency,
             resident_layout,
+            shared_mlp_quantization,
             loader,
         )?))
     } else {
@@ -311,6 +314,7 @@ fn load_cuda_moe(
     store: StoragePlacement,
     residency: TensorResidencyPlan,
     resident_layout: LinearResidentLayout,
+    shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<CudaMoE> {
     let prefix = format!("{text_prefix}layers.{layer}");
@@ -420,19 +424,34 @@ fn load_cuda_moe(
         )?);
         Some(CudaMoEShared { gate_proj, up_proj, down_proj })
     } else if artifact.tensors.has(&format!("{prefix}.mlp.gate_proj.weight")) {
-        // Gemma 4 style: mlp.* is always-active shared expert (BF16). Force-VRAM —
-        // shared MLP runs every layer (3 matvecs/layer) and the CPU path bottlenecks
-        // the entire forward pass. Total VRAM cost: ~1 GB across 30 layers.
+        // Gemma 4 style: mlp.* is always-active shared expert. Stored as
+        // BF16 in the checkpoint; the user can opt into a smaller format
+        // via `hidden-layers.shared-MLP-quantization`. Default keeps BF16
+        // (force-VRAM since the CPU rayon path is the only host-resident
+        // alternative and bottlenecks everything).
         let sp = format!("{prefix}.mlp");
         let gate_tensor = require_tensor(artifact, &format!("{sp}.gate_proj.weight"))?;
-        let up_tensor = require_tensor(artifact, &format!("{sp}.up_proj.weight"))?;
+        let up_tensor   = require_tensor(artifact, &format!("{sp}.up_proj.weight"))?;
         let down_tensor = require_tensor(artifact, &format!("{sp}.down_proj.weight"))?;
-        let residency_store = cuda_residency_for_store(store, cuda.device_index())?;
-        Some(CudaMoEShared {
-            gate_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store_opts(gate_tensor, store, residency_store, loader, true)?),
-            up_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store_opts(up_tensor, store, residency_store, loader, true)?),
-            down_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store_opts(down_tensor, store, residency_store, loader, true)?),
-        })
+        use aegisllm_base::planning::placement::WeightQuantOverride as Wq;
+        match shared_mlp_quantization {
+            Wq::Mxfp4 => Some(CudaMoEShared {
+                gate_proj: CudaLinear::Mxfp4(cuda.load_bf16_as_mxfp4_linear(gate_tensor, loader)?),
+                up_proj:   CudaLinear::Mxfp4(cuda.load_bf16_as_mxfp4_linear(up_tensor,   loader)?),
+                down_proj: CudaLinear::Mxfp4(cuda.load_bf16_as_mxfp4_linear(down_tensor, loader)?),
+            }),
+            Wq::Default => {
+                let residency_store = cuda_residency_for_store(store, cuda.device_index())?;
+                Some(CudaMoEShared {
+                    gate_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store_opts(gate_tensor, store, residency_store, loader, true)?),
+                    up_proj:   CudaLinear::Bf16(cuda.load_bf16_matrix_with_store_opts(up_tensor,   store, residency_store, loader, true)?),
+                    down_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store_opts(down_tensor, store, residency_store, loader, true)?),
+                })
+            }
+            other => return Err(AegisError::Unsupported(format!(
+                "shared-MLP-quantization={other:?} not yet wired into the loader"
+            ))),
+        }
     } else {
         None
     };

@@ -11,26 +11,53 @@ use aegisllm_base::planning::placement::StoragePlacement;
 pub(super) enum CudaLinear {
     Nvfp4(DeviceNvfp4Linear),
     Bf16(DeviceBf16Matrix),
+    /// Standalone MXFP4 (Microsoft / OCP, group=32, E8M0). Produced by the
+    /// load-time `bf16 → mxfp4` quantizer when the user sets
+    /// `shared-MLP-quantization = "mxfp4"` (or the equivalent for
+    /// attention). Unrelated to the optional `native_mxfp4` companion on
+    /// `DeviceNvfp4Linear`, which is a re-pack of NVFP4 source weights.
+    Mxfp4(crate::cuda::StandaloneMxfp4Linear),
 }
 
 impl CudaLinear {
     pub(super) fn rows(&self) -> usize {
-        match self { Self::Nvfp4(l) => l.rows, Self::Bf16(m) => m.rows }
+        match self {
+            Self::Nvfp4(l) => l.rows,
+            Self::Bf16(m) => m.rows,
+            Self::Mxfp4(m) => m.rows,
+        }
     }
     pub(super) fn cols(&self) -> usize {
-        match self { Self::Nvfp4(l) => l.cols, Self::Bf16(m) => m.cols }
+        match self {
+            Self::Nvfp4(l) => l.cols,
+            Self::Bf16(m) => m.cols,
+            Self::Mxfp4(m) => m.cols,
+        }
     }
     pub(super) fn name(&self) -> &str {
-        match self { Self::Nvfp4(l) => &l.name, Self::Bf16(m) => &m.name }
+        match self {
+            Self::Nvfp4(l) => &l.name,
+            Self::Bf16(m) => &m.name,
+            Self::Mxfp4(m) => &m.name,
+        }
     }
     pub(super) fn is_host_resident(&self) -> bool {
-        match self { Self::Nvfp4(l) => l.is_host_resident(), Self::Bf16(m) => m.is_host_resident() }
+        match self {
+            Self::Nvfp4(l) => l.is_host_resident(),
+            Self::Bf16(m) => m.is_host_resident(),
+            // Standalone MXFP4 always lives in VRAM (load-time quantizer
+            // writes directly to a CudaSlice).
+            Self::Mxfp4(_) => false,
+        }
     }
     pub(super) fn as_nvfp4(&self) -> Option<&DeviceNvfp4Linear> {
         match self { Self::Nvfp4(l) => Some(l), _ => None }
     }
     pub(super) fn as_bf16(&self) -> Option<&DeviceBf16Matrix> {
         match self { Self::Bf16(m) => Some(m), _ => None }
+    }
+    pub(super) fn as_mxfp4(&self) -> Option<&crate::cuda::StandaloneMxfp4Linear> {
+        match self { Self::Mxfp4(m) => Some(m), _ => None }
     }
     pub(super) fn cutlass_nvfp4_enabled(&self, runtime: &CudaRuntime) -> bool {
         match self { Self::Nvfp4(l) => runtime.cutlass_nvfp4_inference_enabled_for(l), _ => false }
