@@ -65,7 +65,6 @@ pub(super) fn load_cuda_layer(
     window_size: usize,
     partial_dim: usize,
     shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
-    attention_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<CudaLayer> {
     if region_kind != GraphRegionKind::TransformerBlock {
@@ -222,12 +221,12 @@ pub(super) fn load_cuda_layer(
         q_proj: load_cuda_linear(
             cuda, artifact, &format!("{prefix}.self_attn.q_proj"),
             placement.store, residency, resident_layout,
-            q_width, hidden, is_sliced, attention_quantization, loader,
+            q_width, hidden, is_sliced, loader,
         )?,
         k_proj: load_cuda_linear(
             cuda, artifact, &format!("{prefix}.self_attn.k_proj"),
             placement.store, residency, resident_layout,
-            kv_width, hidden, is_sliced, attention_quantization, loader,
+            kv_width, hidden, is_sliced, loader,
         )?,
         v_proj: {
             // Gemma 4 global layers have attention_k_eq_v=true: no separate v_proj,
@@ -242,20 +241,14 @@ pub(super) fn load_cuda_layer(
             load_cuda_linear(
                 cuda, artifact, &v_prefix,
                 placement.store, residency, resident_layout,
-                kv_width, hidden, is_sliced, attention_quantization, loader,
+                kv_width, hidden, is_sliced, loader,
             )?
         },
         // CUTLASS fused QKV group is not supported for sliced models.
-        // Only attempt fused QKV for NVFP4 layers (BF16 / load-time quantized
-        // attention skip this).
+        // Only attempt fused QKV for NVFP4 layers (BF16 attn layers skip this).
         qkv_proj: if is_sliced {
             None
-        } else if artifact.tensors.has(&format!("{prefix}.self_attn.q_proj.weight_scale"))
-            && matches!(
-                attention_quantization,
-                aegisllm_base::planning::placement::WeightQuantOverride::Default
-            )
-        {
+        } else if artifact.tensors.has(&format!("{prefix}.self_attn.q_proj.weight_scale")) {
             cuda.load_cutlass_qkv_group_with_layout(
                 artifact,
                 &format!("{prefix}.self_attn.q_proj"),
@@ -272,7 +265,7 @@ pub(super) fn load_cuda_layer(
         o_proj: load_cuda_linear(
             cuda, artifact, &format!("{prefix}.self_attn.o_proj"),
             placement.store, residency, resident_layout,
-            hidden, q_width, is_sliced, attention_quantization, loader,
+            hidden, q_width, is_sliced, loader,
         )?,
         // Gemma 4: per-head RMS norm on Q (applied between q_proj and RoPE).
         q_norm_weight: load_optional_norm_weight(
@@ -543,41 +536,25 @@ fn load_cuda_linear(
     eff_rows: usize,
     eff_logical_cols: usize,
     is_sliced: bool,
-    attention_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<CudaLinear> {
-    use aegisllm_base::planning::placement::WeightQuantOverride as Wq;
     let has_scale = artifact.tensors.has(&format!("{prefix}.weight_scale"));
     if has_scale {
-        // Already-quantized NVFP4 in the checkpoint. Load-time
-        // re-quantization to a different format is not supported (would lose
-        // precision). Fall through to NVFP4 regardless of the override.
         let l = load_nvfp4_maybe_sliced_linear(
             cuda, artifact, prefix, store, residency, resident_layout,
             eff_rows, eff_logical_cols, is_sliced, loader,
         )?;
-        return Ok(CudaLinear::Nvfp4(l));
-    }
-    let tensor = require_tensor(artifact, &format!("{prefix}.weight"))?;
-    match attention_quantization {
-        Wq::Default => {
-            // BF16 host-resident matvec routes through `matvec_bf16_host_resident_device`
-            // which does D2H(input) → CPU rayon matmul → H2D(output). For Gemma 4 attention
-            // (Q/K/V/O × 30 layers = 120 calls/token) this dominates wall time. Force these
-            // weights into VRAM — total ~600 MB across all attention layers.
-            let m = cuda.load_bf16_matrix_with_store_opts(tensor, store, residency, loader, true)?;
-            Ok(CudaLinear::Bf16(m))
-        }
-        Wq::Mxfp4 => {
-            // BF16 → MXFP4 at load time. Packed bytes go to VRAM; ~3.5×
-            // smaller than BF16, no calibration data needed.
-            let l = cuda.load_bf16_as_mxfp4_linear(tensor, loader)?;
-            Ok(CudaLinear::Mxfp4(l))
-        }
-        other => Err(AegisError::Unsupported(format!(
-            "attention-quantization={other:?} not yet wired up for `{prefix}`; \
-             supported: default, mxfp4."
-        ))),
+        Ok(CudaLinear::Nvfp4(l))
+    } else {
+        let tensor = require_tensor(artifact, &format!("{prefix}.weight"))?;
+        // BF16 host-resident matvec routes through `matvec_bf16_host_resident_device`
+        // which does D2H(input) → CPU rayon matmul → H2D(output). For Gemma 4 attention
+        // (Q/K/V/O × 30 layers = 120 calls/token) this dominates wall time. Force these
+        // weights into VRAM — total ~600 MB across all attention layers, well within
+        // a free-VRAM budget of several GB. Routed-expert weights remain streamed
+        // because they're an order of magnitude larger.
+        let m = cuda.load_bf16_matrix_with_store_opts(tensor, store, residency, loader, true)?;
+        Ok(CudaLinear::Bf16(m))
     }
 }
 

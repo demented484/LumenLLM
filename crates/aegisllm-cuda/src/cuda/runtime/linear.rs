@@ -518,18 +518,8 @@ impl CudaRuntime {
         input: &DeviceBuffer<f32>,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
-        // Size scratch from `linear.cols`, not `input.len()` — for
-        // heterogeneous-head models (Gemma 4 global vs sliding) the o_proj
-        // input scratch (`attn_context`) is allocated to max_q_width across
-        // all layers, which exceeds per-layer cols.
-        if input.len() < linear.cols {
-            return Err(AegisError::InvalidPlan(format!(
-                "standalone mxfp4 matvec input too short for `{}`: input.len()={} < cols={}",
-                linear.name, input.len(), linear.cols,
-            )));
-        }
-        let mut input_mxfp4 = self.alloc_u8(Self::mxfp4_vector_bytes(linear.cols)?)?;
-        self.quantize_mxfp4_input_batched_device(input, 1, linear.cols, &mut input_mxfp4)?;
+        let mut input_mxfp4 = self.alloc_u8(Self::mxfp4_vector_bytes(input.len())?)?;
+        self.quantize_mxfp4_input_device(input, &mut input_mxfp4)?;
         self.matvec_mxfp4_standalone_prepacked_device(linear, &input_mxfp4, output)
     }
 

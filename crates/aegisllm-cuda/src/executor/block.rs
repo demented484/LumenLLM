@@ -122,7 +122,6 @@ impl CudaLayerBlockExecutor {
                     window_size,
                     partial_dim,
                     aegisllm_base::planning::placement::WeightQuantOverride::Default,
-                    aegisllm_base::planning::placement::WeightQuantOverride::Default,
                     &mut loader,
                 )?,
             );

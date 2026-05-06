@@ -230,8 +230,15 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             )?;
         }
     } else {
-        // Non-NVFP4 attention path (Gemma 4 26B): BF16 in checkpoint, optionally
-        // quantized to MXFP4 at load time via attention-quantization.
+        // BF16 attention path (Gemma 4 26B): batched matmul Q/K/V with VRAM-resident
+        // weights (host-resident BF16 attention is forced to VRAM at load time). All
+        // attention norms are run batched — q_norm, k_norm, v_norm (no learned weight).
+        let q_bf16 = layer.q_proj.as_bf16().ok_or_else(|| AegisError::InvalidPlan(
+            "BF16 attention prefill: q_proj must be BF16".into()))?;
+        let k_bf16 = layer.k_proj.as_bf16().ok_or_else(|| AegisError::InvalidPlan(
+            "BF16 attention prefill: k_proj must be BF16".into()))?;
+        let v_bf16 = layer.v_proj.as_bf16().ok_or_else(|| AegisError::InvalidPlan(
+            "BF16 attention prefill: v_proj must be BF16".into()))?;
         runtime.rms_norm_batched_device(
             &prefill.hidden,
             &layer.input_norm_weight,
@@ -239,56 +246,38 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.rms_norm_eps,
             &mut prefill.input_normed,
         )?;
-        match (&layer.q_proj, &layer.k_proj, &layer.v_proj) {
-            (CudaLinear::Bf16(q_bf16), CudaLinear::Bf16(k_bf16), CudaLinear::Bf16(v_bf16)) => {
-                // Phase C: cuBLASLt BF16 GEMM for Q/K/V projections. Falls back to
-                // reference if any is host-resident (shouldn't happen — Gemma 4 BF16
-                // attention is force-VRAM).
-                if runtime.cublaslt_bf16_enabled_for(q_bf16)
-                    && runtime.cublaslt_bf16_enabled_for(k_bf16)
-                    && runtime.cublaslt_bf16_enabled_for(v_bf16)
-                {
-                    runtime.matmul_bf16_cublaslt_device(
-                        q_bf16, &prefill.input_normed, params.batch,
-                        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
-                        &mut prefill.gate,
-                    )?;
-                    runtime.matmul_bf16_cublaslt_device(
-                        k_bf16, &prefill.input_normed, params.batch,
-                        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
-                        &mut prefill.up,
-                    )?;
-                    runtime.matmul_bf16_cublaslt_device(
-                        v_bf16, &prefill.input_normed, params.batch,
-                        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
-                        &mut prefill.v,
-                    )?;
-                } else {
-                    runtime.matmul_bf16_reference_batched_device(
-                        q_bf16, &prefill.input_normed, params.batch, &mut prefill.gate,
-                    )?;
-                    runtime.matmul_bf16_reference_batched_device(
-                        k_bf16, &prefill.input_normed, params.batch, &mut prefill.up,
-                    )?;
-                    runtime.matmul_bf16_reference_batched_device(
-                        v_bf16, &prefill.input_normed, params.batch, &mut prefill.v,
-                    )?;
-                }
-            }
-            (CudaLinear::Mxfp4(q_mx), CudaLinear::Mxfp4(k_mx), CudaLinear::Mxfp4(v_mx)) => {
-                runtime.matmul_mxfp4_standalone_batched_device(
-                    q_mx, &prefill.input_normed, params.batch, &mut prefill.gate,
-                )?;
-                runtime.matmul_mxfp4_standalone_batched_device(
-                    k_mx, &prefill.input_normed, params.batch, &mut prefill.up,
-                )?;
-                runtime.matmul_mxfp4_standalone_batched_device(
-                    v_mx, &prefill.input_normed, params.batch, &mut prefill.v,
-                )?;
-            }
-            _ => return Err(AegisError::InvalidPlan(
-                "non-NVFP4 attention prefill: q/k/v must all be BF16 or all MXFP4".into(),
-            )),
+        // Phase C: cuBLASLt BF16 GEMM for Q/K/V projections. Falls back to
+        // reference if any of the three is host-resident (shouldn't happen in
+        // practice — Gemma 4 attention BF16 weights are force-VRAM).
+        if runtime.cublaslt_bf16_enabled_for(q_bf16)
+            && runtime.cublaslt_bf16_enabled_for(k_bf16)
+            && runtime.cublaslt_bf16_enabled_for(v_bf16)
+        {
+            runtime.matmul_bf16_cublaslt_device(
+                q_bf16, &prefill.input_normed, params.batch,
+                &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
+                &mut prefill.gate,
+            )?;
+            runtime.matmul_bf16_cublaslt_device(
+                k_bf16, &prefill.input_normed, params.batch,
+                &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
+                &mut prefill.up,
+            )?;
+            runtime.matmul_bf16_cublaslt_device(
+                v_bf16, &prefill.input_normed, params.batch,
+                &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
+                &mut prefill.v,
+            )?;
+        } else {
+            runtime.matmul_bf16_reference_batched_device(
+                q_bf16, &prefill.input_normed, params.batch, &mut prefill.gate,
+            )?;
+            runtime.matmul_bf16_reference_batched_device(
+                k_bf16, &prefill.input_normed, params.batch, &mut prefill.up,
+            )?;
+            runtime.matmul_bf16_reference_batched_device(
+                v_bf16, &prefill.input_normed, params.batch, &mut prefill.v,
+            )?;
         }
         // Per-head q_norm/k_norm (with weight) + v_norm (no weight). Each per-head
         // RMS norm acts on a row of head_dim values across (batch * num_heads) rows.

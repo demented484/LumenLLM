@@ -41,15 +41,14 @@ impl CudaLlamaExecutor {
         // mxint4 / int4 / int8, but only the formats below have a wired
         // loader path today; the rest fail with a clear error.
         use aegisllm_base::planning::placement::WeightQuantOverride as Wq;
-        // Attention-quantization: `default` (BF16, force-VRAM) and `mxfp4`
-        // (load-time quantize) are wired. `fp8` and integer quants are not
-        // yet supported.
-        match placement.attention_quantization {
-            Wq::Default | Wq::Mxfp4 => {}
-            other => return Err(AegisError::Unsupported(format!(
-                "attention-quantization={other:?} not yet wired up; supported today: \
-                 default, mxfp4. Roadmap: fp8."
-            ))),
+        // Attention-quantization: only `default` for now (BF16 staging
+        // path lands in a follow-up commit).
+        if !matches!(placement.attention_quantization, Wq::Default) {
+            return Err(AegisError::Unsupported(format!(
+                "attention-quantization={:?} not yet wired up; only `default` reaches \
+                 the loader today. Next: mxfp4, then fp8.",
+                placement.attention_quantization
+            )));
         }
         // shared-MLP-quantization: `default` (BF16, force-VRAM) and
         // `mxfp4` (load-time quantize) are wired. The rest still need
@@ -60,18 +59,6 @@ impl CudaLlamaExecutor {
                 "shared-MLP-quantization={other:?} not yet wired up; supported today: \
                  default, mxfp4. Roadmap: fp8, mxint4, int4, int8."
             ))),
-        }
-        // attn=mxfp4 + shared=mxfp4 currently produces gibberish decode
-        // (each path verified working in isolation; cause not yet
-        // diagnosed). Reject the combo until fixed.
-        if matches!(placement.attention_quantization, Wq::Mxfp4)
-            && matches!(placement.shared_mlp_quantization, Wq::Mxfp4)
-        {
-            return Err(AegisError::Unsupported(
-                "attention-quantization=mxfp4 combined with shared-MLP-quantization=mxfp4 \
-                 currently produces incoherent decode output. Use one at a time, or wait for FP8."
-                    .into(),
-            ));
         }
         if graph.num_kv_heads == 0 || !graph.num_attention_heads.is_multiple_of(graph.num_kv_heads) {
             return Err(AegisError::InvalidPlan(format!(
@@ -136,7 +123,6 @@ impl CudaLlamaExecutor {
 
         let mut layers = Vec::with_capacity(graph.num_layers);
         let shared_mlp_q = placement.shared_mlp_quantization;
-        let attention_q = placement.attention_quantization;
         for layer in 0..graph.num_layers {
             let region_id = RegionId(format!("layer.{layer}"));
             let region = graph
@@ -202,7 +188,6 @@ impl CudaLlamaExecutor {
                 window_size,
                 partial_dim,
                 shared_mlp_q,
-                attention_q,
                 &mut loader,
             )?);
         }
