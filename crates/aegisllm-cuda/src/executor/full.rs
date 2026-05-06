@@ -338,6 +338,7 @@ impl CudaLlamaExecutor {
             kv_store,
             kv_first_n_layers,
             kv_first_store,
+            kv_quantization: placement.kv_cache.quantization,
         })
     }
 
@@ -591,10 +592,20 @@ impl CudaLlamaExecutor {
                     };
                     let kv = match layer_store {
                         StoragePlacement::Vram { .. } => {
-                            CudaKvCache::dense(&self.runtime, self.kv_context_size, layer_kv_width)?
+                            CudaKvCache::dense(
+                                &self.runtime,
+                                self.kv_context_size,
+                                layer_kv_width,
+                                self.kv_quantization,
+                            )?
                         }
                         StoragePlacement::Ram | StoragePlacement::Mmap => {
-                            CudaKvCache::staged_host(&self.runtime, self.kv_context_size, layer_kv_width)?
+                            CudaKvCache::staged_host(
+                                &self.runtime,
+                                self.kv_context_size,
+                                layer_kv_width,
+                                self.kv_quantization,
+                            )?
                         }
                     };
                     Ok(CudaLayerState { kv })

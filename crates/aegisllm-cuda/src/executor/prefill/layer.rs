@@ -471,9 +471,18 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             kv_width,
         )?;
     } else {
+        use crate::executor::state::KvBuffer;
+        let (keys, values) = match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
+            (KvBuffer::F16(k), KvBuffer::F16(v)) => (k, v),
+            _ => return Err(aegisllm_base::error::AegisError::Unsupported(
+                "prefill attention with FP8 KV cache is not yet implemented; \
+                 use type-k=f16, type-v=f16 (decode-only FP8 KV is not supported \
+                 because prefill writes K/V to the cache too)".into(),
+            )),
+        };
         runtime.store_kv_slots_batched_rope_key_device(
-            &mut layer_state.kv.keys,
-            &mut layer_state.kv.values,
+            keys,
+            values,
             &mut prefill.up,
             &prefill.v,
             &prefill.positions,
@@ -490,9 +499,12 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         })?;
 
         let attention_start = Instant::now();
+        // F16 KV is enforced by the dispatch above (FP8 path bails out with Unsupported).
+        let keys_f16 = layer_state.kv.keys.as_f16().expect("FP8 KV rejected upstream");
+        let values_f16 = layer_state.kv.values.as_f16().expect("FP8 KV rejected upstream");
         runtime.attention_prefill_dense_compat_device(
-            &layer_state.kv.keys,
-            &layer_state.kv.values,
+            keys_f16,
+            values_f16,
             &prefill.up,
             &prefill.v,
             &prefill.gate,

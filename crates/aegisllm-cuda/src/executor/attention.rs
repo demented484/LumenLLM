@@ -222,29 +222,41 @@ pub(super) fn forward_attention_device(
             &mut scratch.attn_context,
         )?;
     } else {
-        runtime.store_kv_ptr_device(
-            &mut layer_state.kv.keys,
-            &mut layer_state.kv.values,
-            &scratch.k,
-            &scratch.v,
-            p_position,
-            kv_width,
-            kv_context_size,
-        )?;
-        runtime.attention_decode_split_ptr_device(
-            &layer_state.kv.keys,
-            &layer_state.kv.values,
-            &scratch.q,
-            p_seq_len,
-            num_attention_heads,
-            num_kv_heads,
-            head_dim,
-            layer.window_size,
-            &mut scratch.attn_split_acc,
-            &mut scratch.attn_split_m,
-            &mut scratch.attn_split_l,
-            &mut scratch.attn_context,
-        )?;
+        use crate::executor::state::KvBuffer;
+        // Branch on KV cache dtype: F16/BF16 (u16-backed) → existing kernels;
+        // FP8 (u8-backed) → fp8 store + decode_split_fp8 kernels. The math is
+        // identical, only the wire format of the KV stored bytes differs.
+        match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
+            (KvBuffer::F16(keys), KvBuffer::F16(values)) => {
+                runtime.store_kv_ptr_device(
+                    keys, values, &scratch.k, &scratch.v, p_position, kv_width, kv_context_size,
+                )?;
+                runtime.attention_decode_split_ptr_device(
+                    keys, values, &scratch.q, p_seq_len, num_attention_heads, num_kv_heads,
+                    head_dim, layer.window_size,
+                    &mut scratch.attn_split_acc,
+                    &mut scratch.attn_split_m,
+                    &mut scratch.attn_split_l,
+                    &mut scratch.attn_context,
+                )?;
+            }
+            (KvBuffer::Fp8(keys), KvBuffer::Fp8(values)) => {
+                runtime.store_kv_fp8_ptr_device(
+                    keys, values, &scratch.k, &scratch.v, p_position, kv_width, kv_context_size,
+                )?;
+                runtime.attention_decode_split_ptr_fp8_device(
+                    keys, values, &scratch.q, p_seq_len, num_attention_heads, num_kv_heads,
+                    head_dim, layer.window_size,
+                    &mut scratch.attn_split_acc,
+                    &mut scratch.attn_split_m,
+                    &mut scratch.attn_split_l,
+                    &mut scratch.attn_context,
+                )?;
+            }
+            _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
+                "KV cache keys/values dtype mismatch (one F16, one FP8)".into(),
+            )),
+        }
     }
     if let Ok(tag) = std::env::var("AEGIS_DUMP_ATTNOUT") {
         thread_local! { static C2: std::cell::RefCell<usize> = std::cell::RefCell::new(0); }

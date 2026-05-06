@@ -167,6 +167,8 @@ pub(super) struct CudaLlamaExecutor {
     /// from compute" (legacy behavior preserved for the simple force-VRAM-first-N case).
     pub(super) kv_first_n_layers: Option<usize>,
     pub(super) kv_first_store: Option<StoragePlacement>,
+    /// Storage dtype for the KV cache (f16/bf16/fp8). Per-layer is uniform.
+    pub(super) kv_quantization: aegisllm_base::tensor::quant::KvCacheQuantization,
 }
 
 #[derive(Debug)]
@@ -272,12 +274,44 @@ pub(super) struct KvStagingPool {
 #[allow(dead_code)]
 pub(super) struct CudaKvCache {
     pub(super) layout: CudaKvCacheLayout,
+    /// Storage dtype: F16/BF16 → u16 buffer (2 bytes/elem), FP8 → u8 buffer
+    /// (1 byte/elem). The `keys`/`values` enums hold the actual VRAM
+    /// allocation; downstream kernel dispatch matches on this to pick the
+    /// right per-token store + attention kernel pair.
+    pub(super) quantization: aegisllm_base::tensor::quant::KvCacheQuantization,
     /// VRAM: full-sized for Dense, 1-element stub for HostResident.
-    pub(super) keys: DeviceBuffer<u16>,
+    pub(super) keys: KvBuffer,
     /// VRAM: full-sized for Dense, 1-element stub for HostResident.
-    pub(super) values: DeviceBuffer<u16>,
+    pub(super) values: KvBuffer,
     /// Non-None when `kv-cache.store=ram`: actual KV lives in pinned host RAM.
     pub(super) host: Option<Box<HostKvWeights>>,
+}
+
+/// VRAM-resident KV-cache half (keys or values). The bit-width matches the
+/// configured `KvCacheQuantization` of the parent `CudaKvCache`.
+#[derive(Debug)]
+pub(super) enum KvBuffer {
+    /// F16 / BF16 — 2 bytes per element. Same wire format as our existing
+    /// `kv_store_*` and `attention_decode_*` kernels.
+    F16(DeviceBuffer<u16>),
+    /// FP8 (E4M3) — 1 byte per element. Dispatches to the `*_fp8_*`
+    /// runtime methods.
+    Fp8(DeviceBuffer<u8>),
+}
+
+impl KvBuffer {
+    pub(super) fn as_f16(&self) -> Option<&DeviceBuffer<u16>> {
+        match self { Self::F16(b) => Some(b), _ => None }
+    }
+    pub(super) fn as_f16_mut(&mut self) -> Option<&mut DeviceBuffer<u16>> {
+        match self { Self::F16(b) => Some(b), _ => None }
+    }
+    pub(super) fn as_fp8(&self) -> Option<&DeviceBuffer<u8>> {
+        match self { Self::Fp8(b) => Some(b), _ => None }
+    }
+    pub(super) fn as_fp8_mut(&mut self) -> Option<&mut DeviceBuffer<u8>> {
+        match self { Self::Fp8(b) => Some(b), _ => None }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,20 +333,37 @@ impl CudaKvCache {
         runtime: &CudaRuntime,
         context_size: usize,
         kv_width: usize,
+        quantization: aegisllm_base::tensor::quant::KvCacheQuantization,
     ) -> aegisllm_base::error::Result<Self> {
+        use aegisllm_base::error::AegisError;
+        use aegisllm_base::tensor::quant::KvCacheQuantization;
         let len = context_size.checked_mul(kv_width).ok_or_else(|| {
-            aegisllm_base::error::AegisError::InvalidPlan(format!(
+            AegisError::InvalidPlan(format!(
                 "CUDA dense KV cache length overflow: context={} kv_width={}",
                 context_size, kv_width
             ))
         })?;
+        let (keys, values) = match quantization {
+            KvCacheQuantization::F16 | KvCacheQuantization::Bf16 => (
+                KvBuffer::F16(runtime.alloc_u16(len)?),
+                KvBuffer::F16(runtime.alloc_u16(len)?),
+            ),
+            KvCacheQuantization::Fp8 => (
+                KvBuffer::Fp8(runtime.alloc_u8(len)?),
+                KvBuffer::Fp8(runtime.alloc_u8(len)?),
+            ),
+            other => return Err(AegisError::Unsupported(format!(
+                "kv-cache quantization {other:?} not yet wired into CUDA executor; supported: f16, bf16, fp8"
+            ))),
+        };
         Ok(Self {
             layout: CudaKvCacheLayout::Dense {
                 context_size,
                 kv_width,
             },
-            keys: runtime.alloc_u16(len)?,
-            values: runtime.alloc_u16(len)?,
+            quantization,
+            keys,
+            values,
             host: None,
         })
     }
@@ -323,8 +374,18 @@ impl CudaKvCache {
         runtime: &CudaRuntime,
         context_size: usize,
         kv_width: usize,
+        quantization: aegisllm_base::tensor::quant::KvCacheQuantization,
     ) -> aegisllm_base::error::Result<Self> {
         use aegisllm_base::error::AegisError;
+        use aegisllm_base::tensor::quant::KvCacheQuantization;
+        if !matches!(
+            quantization,
+            KvCacheQuantization::F16 | KvCacheQuantization::Bf16
+        ) {
+            return Err(AegisError::Unsupported(format!(
+                "host-resident KV cache only supports f16/bf16 today, got {quantization:?}"
+            )));
+        }
         let len = context_size.checked_mul(kv_width).ok_or_else(|| {
             AegisError::InvalidPlan(format!(
                 "CUDA host-resident KV length overflow: context={context_size} kv_width={kv_width}"
@@ -338,8 +399,9 @@ impl CudaKvCache {
                 context_size,
                 kv_width,
             },
-            keys: runtime.alloc_u16(1)?,
-            values: runtime.alloc_u16(1)?,
+            quantization,
+            keys: KvBuffer::F16(runtime.alloc_u16(1)?),
+            values: KvBuffer::F16(runtime.alloc_u16(1)?),
             host: Some(Box::new(HostKvWeights {
                 keys: keys_host,
                 values: values_host,
