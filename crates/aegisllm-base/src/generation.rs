@@ -12,6 +12,10 @@ pub struct SamplingConfig {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    /// Minimum-probability filter: keep candidates with `p >= min_p * p_max`,
+    /// where `p_max` is the highest post-temperature probability. `0.0`
+    /// disables the filter. Applied after `top_k` and before `top_p`.
+    pub min_p: f32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +65,7 @@ impl Default for SamplingConfig {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
         }
     }
 }

@@ -177,6 +177,8 @@ pub struct OtherSection {
     pub top_p: Option<f32>,
     #[serde(rename = "top-k")]
     pub top_k: Option<usize>,
+    #[serde(rename = "min-p")]
+    pub min_p: Option<f32>,
     #[serde(rename = "batch-size")]
     pub batch_size: Option<usize>,
     #[serde(rename = "ubatch-size")]

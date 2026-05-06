@@ -29,6 +29,7 @@ pub fn run_quality_smoke(config: EngineConfig) -> Result<Vec<QualitySmokeResult>
                     temperature: 0.0,
                     top_k: 1,
                     top_p: 1.0,
+                    min_p: 0.0,
                 },
             })?;
             validate_quality_output(&case, &output.text)?;

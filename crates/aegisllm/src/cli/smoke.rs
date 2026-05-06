@@ -147,6 +147,7 @@ fn cuda_prefill_compare_one_chunk(config: EngineConfig, configured_chunk: usize)
                 temperature: 0.0,
                 top_k: 1,
                 top_p: 1.0,
+                min_p: 0.0,
             },
         })
         .collect::<Vec<_>>();

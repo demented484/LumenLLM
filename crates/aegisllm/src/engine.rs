@@ -3,6 +3,7 @@ use std::path::PathBuf;
 pub mod bench;
 pub mod perplexity;
 pub mod quality;
+pub mod sample_diversity;
 
 mod report;
 

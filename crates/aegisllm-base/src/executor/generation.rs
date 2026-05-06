@@ -181,6 +181,19 @@ pub fn sample_next_token(logits: &[f32], sampling: &SamplingConfig) -> Result<us
         return Ok(argmax(logits));
     }
 
+    // min_p: keep tokens with `weight >= min_p * weight_max`. Since weights
+    // are post-temperature and proportional to probabilities, the ratio is
+    // the same as `p / p_max`. weighted is already sorted desc by logit so
+    // weighted[0] has the largest weight.
+    if sampling.min_p > 0.0 {
+        let max_weight = weighted[0].1;
+        let cutoff = max_weight * sampling.min_p;
+        weighted.retain(|(_, weight)| *weight >= cutoff);
+        if weighted.is_empty() {
+            return Ok(argmax(logits));
+        }
+    }
+
     let total: f32 = weighted.iter().map(|(_, weight)| *weight).sum();
     if sampling.top_p > 0.0 && sampling.top_p < 1.0 && total > 0.0 {
         let mut cumulative = 0.0_f32;

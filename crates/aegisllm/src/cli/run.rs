@@ -11,6 +11,7 @@ use super::smoke::{
 use super::{Command, parse_args};
 use crate::engine::bench::run_generation_bench;
 use crate::engine::perplexity::compute_perplexity;
+use crate::engine::sample_diversity::run_sample_diversity;
 use crate::engine::{AegisEngine, EngineConfig};
 use aegisllm_base::error::{AegisError, Result};
 use crate::executor::readiness_for_plan;
@@ -161,6 +162,29 @@ pub fn run_env() -> Result<()> {
                 "perplexity: tokens_scored={} mean_neg_logp={:.6} ppl={:.4}",
                 result.num_tokens_scored, result.mean_neg_log_prob, result.perplexity,
             );
+        }
+        Command::SampleDiversity(config, request) => {
+            let prompt_preview = request.prompt.clone();
+            let result = run_sample_diversity(config, request)?;
+            println!(
+                "sample-diversity: runs={} sampling=temp={:.2}/top_k={}/top_p={:.2}/min_p={:.3}",
+                result.runs,
+                result.sampling.temperature,
+                result.sampling.top_k,
+                result.sampling.top_p,
+                result.sampling.min_p,
+            );
+            println!("prompt: {prompt_preview:?}");
+            println!("first-token distribution:");
+            for (tok, count) in &result.first_token_distribution {
+                let pct = (*count as f64 / result.runs as f64) * 100.0;
+                println!("  {count:>3}/{} ({pct:>5.1}%) — {tok:?}", result.runs);
+            }
+            println!("completion distribution (top 5):");
+            for (text, count) in result.distribution.iter().take(5) {
+                let preview: String = text.chars().take(80).collect();
+                println!("  {count:>3}× {preview:?}");
+            }
         }
         Command::Serve(config) => {
             let default_sampling = config.engine.generation;

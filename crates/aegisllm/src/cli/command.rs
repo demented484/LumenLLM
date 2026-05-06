@@ -4,6 +4,7 @@ use crate::cli::gates::GatesConfig;
 use crate::engine::EngineConfig;
 use crate::engine::bench::BenchGenerateRequest;
 use crate::engine::perplexity::PerplexityRequest;
+use crate::engine::sample_diversity::SampleDiversityRequest;
 use aegisllm_base::generation::GenerateRequest;
 use crate::params::ServeConfig;
 
@@ -52,4 +53,10 @@ pub enum Command {
     /// teacher forcing. Useful as a fitness function for quantization
     /// changes — coherent text is too noisy a signal.
     Perplexity(EngineConfig, PerplexityRequest),
+    /// Run the same prompt N times under non-greedy sampling (one model
+    /// load) and report the distribution of completions / first tokens.
+    /// Diagnostic for "are token probabilities sane" — under reasonable
+    /// settings (temp=1.0, top-k=50, min-p=0.05) a factual prompt should
+    /// concentrate on the right answer but show varied phrasing.
+    SampleDiversity(EngineConfig, SampleDiversityRequest),
 }

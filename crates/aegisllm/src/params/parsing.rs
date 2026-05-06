@@ -331,6 +331,9 @@ impl ParametersFile {
             if let Some(value) = other.top_k {
                 generation.top_k = value;
             }
+            if let Some(value) = other.min_p {
+                generation.min_p = value;
+            }
         }
 
         Ok(EngineConfigFragment {

@@ -340,6 +340,7 @@ fn generate_http_response(
             temperature: json_f32(&parsed, "temperature", default_sampling.temperature),
             top_p: json_f32(&parsed, "top_p", default_sampling.top_p),
             top_k: json_usize(&parsed, "top_k", default_sampling.top_k),
+            min_p: json_f32(&parsed, "min_p", default_sampling.min_p),
         },
     };
     let started = Instant::now();
@@ -435,6 +436,7 @@ fn generate_anthropic_response(
             temperature: json_f32(&parsed, "temperature", default_sampling.temperature),
             top_p: json_f32(&parsed, "top_p", default_sampling.top_p),
             top_k: json_usize(&parsed, "top_k", default_sampling.top_k),
+            min_p: json_f32(&parsed, "min_p", default_sampling.min_p),
         },
     };
     let started = Instant::now();
@@ -509,6 +511,7 @@ fn generate_google_response(
             ),
             top_p: json_f32(generation_config, "topP", default_sampling.top_p),
             top_k: json_usize(generation_config, "topK", default_sampling.top_k),
+            min_p: json_f32(generation_config, "minP", default_sampling.min_p),
         },
     };
     let started = Instant::now();
@@ -650,6 +653,7 @@ fn sse_openai(
             temperature: json_f32(parsed, "temperature", default_sampling.temperature),
             top_p: json_f32(parsed, "top_p", default_sampling.top_p),
             top_k: json_usize(parsed, "top_k", default_sampling.top_k),
+            min_p: json_f32(parsed, "min_p", default_sampling.min_p),
         },
     };
 
@@ -750,6 +754,7 @@ fn sse_anthropic(
             temperature: json_f32(parsed, "temperature", default_sampling.temperature),
             top_p: json_f32(parsed, "top_p", default_sampling.top_p),
             top_k: json_usize(parsed, "top_k", default_sampling.top_k),
+            min_p: json_f32(parsed, "min_p", default_sampling.min_p),
         },
     };
 
@@ -856,6 +861,7 @@ fn sse_google(
             temperature: json_f32(generation_config, "temperature", default_sampling.temperature),
             top_p: json_f32(generation_config, "topP", default_sampling.top_p),
             top_k: json_usize(generation_config, "topK", default_sampling.top_k),
+            min_p: json_f32(generation_config, "minP", default_sampling.min_p),
         },
     };
 

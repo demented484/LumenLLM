@@ -34,6 +34,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("quality-diff") => parse_quality_diff(&args[1..]),
         Some("bench-generate") => parse_bench_generate(&args[1..]),
         Some("perplexity") => parse_perplexity(&args[1..]),
+        Some("sample-diversity") => parse_sample_diversity(&args[1..]),
         Some("gates") => parse_gates(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
             Err(AegisError::InvalidConfig(usage()))
@@ -389,6 +390,78 @@ fn parse_perplexity(args: &[String]) -> Result<Command> {
             max_tokens,
             context_tokens,
             raw_text: !apply_chat_template,
+        },
+    ))
+}
+
+fn parse_sample_diversity(args: &[String]) -> Result<Command> {
+    use crate::engine::sample_diversity::SampleDiversityRequest;
+    let mut prompt: Option<String> = None;
+    let mut runs: usize = 10;
+    let mut max_tokens: usize = 12;
+    // Per-CLI overrides for sampling. If unset, fall through to the values
+    // baked into the parsed config (parameters.json `other-parameters`).
+    let mut temperature: Option<f32> = None;
+    let mut top_k: Option<usize> = None;
+    let mut top_p: Option<f32> = None;
+    let mut min_p: Option<f32> = None;
+    let mut filtered: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = &args[i];
+        match flag.as_str() {
+            "--prompt" => prompt = Some(take_value(args, &mut i, flag)?),
+            "--runs" => runs = parse_value(args, &mut i, flag)?,
+            "--max-tokens" => max_tokens = parse_value(args, &mut i, flag)?,
+            "--temperature" => temperature = Some(parse_value(args, &mut i, flag)?),
+            "--top-k" => top_k = Some(parse_value(args, &mut i, flag)?),
+            "--top-p" => top_p = Some(parse_value(args, &mut i, flag)?),
+            "--min-p" => min_p = Some(parse_value(args, &mut i, flag)?),
+            other if is_engine_flag(other) => {
+                filtered.push(args[i].clone());
+                if flag_takes_value(other) {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(AegisError::InvalidConfig(format!(
+                            "sample-diversity flag `{other}` requires a value"
+                        )));
+                    }
+                    filtered.push(args[i].clone());
+                }
+            }
+            other => {
+                return Err(AegisError::InvalidConfig(format!(
+                    "unknown sample-diversity flag `{other}`"
+                )));
+            }
+        }
+        i += 1;
+    }
+    let prompt = prompt.ok_or_else(|| {
+        AegisError::InvalidConfig("sample-diversity requires --prompt <text>".into())
+    })?;
+    let parsed = parse_engine_flags(&filtered)?;
+    let mut sampling = parsed.generation;
+    if let Some(v) = temperature {
+        sampling.temperature = v;
+    }
+    if let Some(v) = top_k {
+        sampling.top_k = v;
+    }
+    if let Some(v) = top_p {
+        sampling.top_p = v;
+    }
+    if let Some(v) = min_p {
+        sampling.min_p = v;
+    }
+    let config = parsed.engine_config(true);
+    Ok(Command::SampleDiversity(
+        config,
+        SampleDiversityRequest {
+            prompt,
+            runs,
+            max_tokens,
+            sampling: Some(sampling),
         },
     ))
 }
