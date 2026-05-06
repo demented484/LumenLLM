@@ -80,6 +80,9 @@ impl TextProcessor {
 enum ChatTemplate {
     None,
     Llama3Instruct,
+    /// Gemma 4 turn format: `<|turn>user\n…<turn|>\n<|turn>model\n`.
+    /// Detected by presence of `<|turn>` in the model's chat_template.jinja.
+    Gemma4,
 }
 
 impl ChatTemplate {
@@ -97,6 +100,12 @@ impl ChatTemplate {
             && artifact.config.model_type == "llama"
         {
             Self::Llama3Instruct
+        } else if template.contains("<|turn>") {
+            // Gemma 4 family. Without this wrap, the chat-tuned model is
+            // fed BOS + raw text — i.e. an out-of-distribution start —
+            // and produces low-quality completions (e.g. `" own"` for
+            // every short prompt).
+            Self::Gemma4
         } else {
             Self::None
         }
@@ -110,6 +119,11 @@ impl ChatTemplate {
                 "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
                 prompt.trim()
             ),
+            Self::Gemma4 if looks_preformatted_gemma4(prompt) => prompt.to_string(),
+            Self::Gemma4 => format!(
+                "<|turn>user\n{}<turn|>\n<|turn>model\n",
+                prompt.trim()
+            ),
         }
     }
 
@@ -119,6 +133,7 @@ impl ChatTemplate {
                 "chat completions require a supported model chat template".into(),
             )),
             Self::Llama3Instruct => render_llama3_messages(messages),
+            Self::Gemma4 => render_gemma4_messages(messages),
         }
     }
 }
@@ -127,6 +142,32 @@ fn looks_preformatted_chat(prompt: &str) -> bool {
     prompt.contains("<|start_header_id|>")
         || prompt.contains("<|begin_of_text|>")
         || prompt.contains("<|eot_id|>")
+}
+
+fn looks_preformatted_gemma4(prompt: &str) -> bool {
+    prompt.contains("<|turn>") || prompt.contains("<turn|>")
+}
+
+fn render_gemma4_messages(messages: &[ChatMessage]) -> Result<String> {
+    let mut prompt = String::new();
+    for message in messages {
+        let role = match message.role.as_str() {
+            "system" | "user" => message.role.as_str(),
+            "assistant" => "model",
+            other => {
+                return Err(AegisError::InvalidConfig(format!(
+                    "Gemma 4 chat template: unsupported role `{other}`"
+                )));
+            }
+        };
+        prompt.push_str("<|turn>");
+        prompt.push_str(role);
+        prompt.push('\n');
+        prompt.push_str(message.content.trim());
+        prompt.push_str("<turn|>\n");
+    }
+    prompt.push_str("<|turn>model\n");
+    Ok(prompt)
 }
 
 fn render_llama3_messages(messages: &[ChatMessage]) -> Result<String> {
