@@ -220,6 +220,31 @@ impl CudaLlamaExecutor {
         drop(host_arena);
         let _ = has_staged_layers;
 
+        // Trim the device's default cudaMallocAsync memory pool back to its
+        // live working set. Loading layers in sequence builds up the pool's
+        // peak reservation, but most of those allocations are short-lived
+        // (host-side tensor buffers, transient repacked weights). Without
+        // this trim, the pool retains those blocks indefinitely, inflating
+        // nvidia-smi VRAM usage by 500-1000 MiB above what the model
+        // actually needs at steady state.
+        let mp_before = crate::cuda::runtime::memory::read_mempool_stats(device).ok();
+        if crate::cuda::runtime::memory::trim_default_mempool(device, 0).is_ok() {
+            if std::env::var("AEGIS_VRAM_BREAKDOWN").is_ok() {
+                let mp_after = crate::cuda::runtime::memory::read_mempool_stats(device).ok();
+                let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+                if let (Some(b), Some(a)) = (mp_before, mp_after) {
+                    eprintln!(
+                        "vram-breakdown: mempool BEFORE trim: reserved={:.0} MiB, used={:.0} MiB, cached={:.0} MiB",
+                        mb(b.reserved_current), mb(b.used_current), mb(b.cached_bytes()),
+                    );
+                    eprintln!(
+                        "vram-breakdown: mempool AFTER  trim: reserved={:.0} MiB, used={:.0} MiB, cached={:.0} MiB",
+                        mb(a.reserved_current), mb(a.used_current), mb(a.cached_bytes()),
+                    );
+                }
+            }
+        }
+
         let kv_store = placement.kv_cache.store;
         let kv_first_n_layers = placement.kv_cache.first_n_layers;
         let kv_first_store = placement.kv_cache.first_store;

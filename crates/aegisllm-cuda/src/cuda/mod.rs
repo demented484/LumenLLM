@@ -5,7 +5,7 @@ pub(crate) mod host_arena;
 mod kernels;
 pub(crate) mod loader;
 mod repack;
-mod runtime;
+pub(crate) mod runtime;
 pub(crate) mod staging;
 mod types;
 

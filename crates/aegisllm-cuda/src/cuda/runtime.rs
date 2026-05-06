@@ -16,7 +16,7 @@ mod gemm;
 mod graph;
 mod kv;
 mod linear;
-mod memory;
+pub(crate) mod memory;
 mod ops;
 mod quant;
 mod sampling;

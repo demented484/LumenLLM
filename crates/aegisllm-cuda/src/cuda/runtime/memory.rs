@@ -1,8 +1,78 @@
 use cudarc::driver::PinnedHostSlice;
+use cudarc::driver::result::{device as cu_device, mem_pool as cu_mempool};
+use cudarc::driver::sys::CUmemPool_attribute;
 
 use super::{CudaRuntime, map_cuda_err};
 use crate::cuda::DeviceBuffer;
 use aegisllm_base::error::{AegisError, Result};
+
+/// Snapshot of the device's default async-mem-pool occupancy. Both numbers
+/// are in bytes. `reserved_current` is the total VRAM the pool has
+/// requested from the driver (including unused-but-cached blocks).
+/// `used_current` is what's actually live for callers.
+#[derive(Debug, Clone, Copy)]
+pub struct MemPoolStats {
+    pub reserved_current: usize,
+    pub used_current: usize,
+}
+
+impl MemPoolStats {
+    pub fn cached_bytes(&self) -> usize {
+        self.reserved_current.saturating_sub(self.used_current)
+    }
+}
+
+/// Read the device's default mempool occupancy. Used to diagnose VRAM gaps
+/// where the pool grows above peak-live usage during loading and never
+/// shrinks back (the classic cause of "we save 800 MiB by quantizing but
+/// only see 400 MiB drop in nvidia-smi").
+pub fn read_mempool_stats(device_index: usize) -> Result<MemPoolStats> {
+    let dev = cu_device::get(device_index as i32)
+        .map_err(map_cuda_err("cuDeviceGet for mempool stats"))?;
+    let pool = unsafe {
+        cu_device::get_default_mem_pool(dev)
+            .map_err(map_cuda_err("cuDeviceGetDefaultMemPool"))?
+    };
+    let mut reserved: u64 = 0;
+    let mut used: u64 = 0;
+    unsafe {
+        cu_mempool::get_attribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            &mut reserved as *mut u64 as *mut _,
+        )
+        .map_err(map_cuda_err("cuMemPoolGetAttribute reserved"))?;
+        cu_mempool::get_attribute(
+            pool,
+            CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+            &mut used as *mut u64 as *mut _,
+        )
+        .map_err(map_cuda_err("cuMemPoolGetAttribute used"))?;
+    }
+    Ok(MemPoolStats {
+        reserved_current: reserved as usize,
+        used_current: used as usize,
+    })
+}
+
+/// Release unused blocks in the device's default async-mempool back to the
+/// driver. Pass `min_bytes_to_keep = 0` to release everything that isn't
+/// currently allocated. Safe and effectively free (no-op if the pool is
+/// already trimmed). Should be called after the load phase peaks and
+/// before steady-state inference begins.
+pub fn trim_default_mempool(device_index: usize, min_bytes_to_keep: usize) -> Result<()> {
+    let dev = cu_device::get(device_index as i32)
+        .map_err(map_cuda_err("cuDeviceGet for mempool trim"))?;
+    let pool = unsafe {
+        cu_device::get_default_mem_pool(dev)
+            .map_err(map_cuda_err("cuDeviceGetDefaultMemPool"))?
+    };
+    unsafe {
+        cu_mempool::trim_to(pool, min_bytes_to_keep)
+            .map_err(map_cuda_err("cuMemPoolTrimTo"))?;
+    }
+    Ok(())
+}
 
 impl CudaRuntime {
     pub fn alloc_f32(&self, len: usize) -> Result<DeviceBuffer<f32>> {
