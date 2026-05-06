@@ -33,6 +33,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("generate") => parse_generate(&args[1..]),
         Some("quality-diff") => parse_quality_diff(&args[1..]),
         Some("bench-generate") => parse_bench_generate(&args[1..]),
+        Some("perplexity") => parse_perplexity(&args[1..]),
         Some("gates") => parse_gates(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
             Err(AegisError::InvalidConfig(usage()))
@@ -316,6 +317,75 @@ fn parse_usize_list(value: &str, flag: &str) -> Result<Vec<usize>> {
             })
         })
         .collect()
+}
+
+fn parse_perplexity(args: &[String]) -> Result<Command> {
+    use crate::engine::perplexity::PerplexityRequest;
+    let mut text: Option<String> = None;
+    let mut text_file: Option<PathBuf> = None;
+    let mut max_tokens: Option<usize> = None;
+    let mut context_tokens: Option<usize> = None;
+    let mut filtered: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = &args[i];
+        match flag.as_str() {
+            "--text" => {
+                text = Some(take_value(args, &mut i, flag)?);
+            }
+            "--text-file" => {
+                text_file = Some(PathBuf::from(take_value(args, &mut i, flag)?));
+            }
+            "--max-tokens" => {
+                max_tokens = Some(parse_value(args, &mut i, flag)?);
+            }
+            "--context-tokens" => {
+                context_tokens = Some(parse_value(args, &mut i, flag)?);
+            }
+            other if is_engine_flag(other) => {
+                filtered.push(args[i].clone());
+                if flag_takes_value(other) {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(AegisError::InvalidConfig(format!(
+                            "perplexity flag `{other}` requires a value"
+                        )));
+                    }
+                    filtered.push(args[i].clone());
+                }
+            }
+            other => {
+                return Err(AegisError::InvalidConfig(format!(
+                    "unknown perplexity flag `{other}`"
+                )));
+            }
+        }
+        i += 1;
+    }
+    if text.is_some() && text_file.is_some() {
+        return Err(AegisError::InvalidConfig(
+            "perplexity: pass either --text or --text-file, not both".into(),
+        ));
+    }
+    let resolved_text = match (text, text_file) {
+        (Some(s), _) => Some(s),
+        (None, Some(path)) => Some(std::fs::read_to_string(&path).map_err(|e| {
+            AegisError::InvalidConfig(format!(
+                "perplexity: cannot read --text-file {}: {e}",
+                path.display()
+            ))
+        })?),
+        _ => None,
+    };
+    let config = parse_engine_flags(&filtered)?.engine_config(true);
+    Ok(Command::Perplexity(
+        config,
+        PerplexityRequest {
+            text: resolved_text,
+            max_tokens,
+            context_tokens,
+        },
+    ))
 }
 
 fn parse_bench_format(value: &str) -> Result<BenchOutputFormat> {

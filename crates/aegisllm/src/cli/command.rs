@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::cli::gates::GatesConfig;
 use crate::engine::EngineConfig;
 use crate::engine::bench::BenchGenerateRequest;
+use crate::engine::perplexity::PerplexityRequest;
 use aegisllm_base::generation::GenerateRequest;
 use crate::params::ServeConfig;
 
@@ -47,4 +48,8 @@ pub enum Command {
     ),
     Gates(EngineConfig, GatesConfig),
     Serve(ServeConfig),
+    /// Compute perplexity on a small built-in (or user-supplied) text via
+    /// teacher forcing. Useful as a fitness function for quantization
+    /// changes — coherent text is too noisy a signal.
+    Perplexity(EngineConfig, PerplexityRequest),
 }

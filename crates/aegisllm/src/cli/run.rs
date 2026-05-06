@@ -10,6 +10,7 @@ use super::smoke::{
 };
 use super::{Command, parse_args};
 use crate::engine::bench::run_generation_bench;
+use crate::engine::perplexity::compute_perplexity;
 use crate::engine::{AegisEngine, EngineConfig};
 use aegisllm_base::error::{AegisError, Result};
 use crate::executor::readiness_for_plan;
@@ -153,6 +154,13 @@ pub fn run_env() -> Result<()> {
                 }
             }
             print_generate_bench_sweep(&results, format);
+        }
+        Command::Perplexity(config, request) => {
+            let result = compute_perplexity(config, request)?;
+            println!(
+                "perplexity: tokens_scored={} mean_neg_logp={:.6} ppl={:.4}",
+                result.num_tokens_scored, result.mean_neg_log_prob, result.perplexity,
+            );
         }
         Command::Serve(config) => {
             let default_sampling = config.engine.generation;
