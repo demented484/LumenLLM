@@ -412,12 +412,25 @@ fn transfer_policy(store: StoragePlacement, compute: ComputePlacement) -> Transf
 
 fn estimate_kv_cache_bytes(graph: &ModelGraph, policy: &PlacementPolicy) -> u64 {
     let elem = (policy.kv_quantization.bytes_per_element() * 2.0).ceil() as u64;
-    let values = graph
-        .num_layers
+    // Sliding-window layers allocate a ring-buffer of `window_size` slots
+    // (not the full context), so estimate per-layer:
+    //   cap = window_size > 0 ? min(window_size, ctx) : ctx
+    // For Gemma-4-26B-A4B (25 sliding window=1024 + 5 global) at ctx=32k
+    // this drops the planner's KV estimate from ~7.7 GiB to ~1.5 GiB.
+    let mut total_tokens: u64 = 0;
+    for layer_idx in 0..graph.num_layers {
+        let layer_cap = match graph.layer(layer_idx).map(|m| &m.attention_pattern) {
+            Some(crate::model::AttentionPattern::SlidingWindow { size }) => {
+                (*size).min(policy.context_size)
+            }
+            _ => policy.context_size,
+        };
+        total_tokens = total_tokens.saturating_add(layer_cap as u64);
+    }
+    let values = total_tokens
         .saturating_mul(2)
-        .saturating_mul(graph.num_kv_heads)
-        .saturating_mul(graph.head_dim)
-        .saturating_mul(policy.context_size) as u64;
+        .saturating_mul(graph.num_kv_heads as u64)
+        .saturating_mul(graph.head_dim as u64);
     values.saturating_mul(elem).div_ceil(2)
 }
 
