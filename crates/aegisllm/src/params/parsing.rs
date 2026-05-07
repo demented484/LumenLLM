@@ -157,7 +157,7 @@ impl ParametersFile {
                 policy.attention_quantization = WeightQuantOverride::parse(q).ok_or_else(|| {
                     AegisError::InvalidConfig(format!(
                         "unsupported attention-quantization `{q}` \
-                         (use one of: default, mxfp4, fp8, mxint4, int4, int8)"
+                         (use one of: default, fp8, mxint4, int4, int8)"
                     ))
                 })?;
             }
@@ -195,7 +195,7 @@ impl ParametersFile {
                 policy.shared_mlp_quantization = WeightQuantOverride::parse(q).ok_or_else(|| {
                     AegisError::InvalidConfig(format!(
                         "unsupported shared-MLP-quantization `{q}` \
-                         (use one of: default, mxfp4, fp8, mxint4, int4, int8)"
+                         (use one of: default, fp8, mxint4, int4, int8)"
                     ))
                 })?;
             }

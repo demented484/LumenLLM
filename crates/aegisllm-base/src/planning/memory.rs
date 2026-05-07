@@ -505,6 +505,8 @@ mod tests {
             },
             linear_layout: crate::tensor::layout::LinearLayoutPolicy::default(),
             warnings: Vec::new(),
+            attention_quantization: crate::planning::placement::WeightQuantOverride::Default,
+            shared_mlp_quantization: crate::planning::placement::WeightQuantOverride::Default,
         };
         let runtime = RuntimePlan {
             kernels: vec![KernelPlan {

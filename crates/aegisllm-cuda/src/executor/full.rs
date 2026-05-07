@@ -41,23 +41,24 @@ impl CudaLlamaExecutor {
         // mxint4 / int4 / int8, but only the formats below have a wired
         // loader path today; the rest fail with a clear error.
         use aegisllm_base::planning::placement::WeightQuantOverride as Wq;
-        // Attention-quantization: only `default` for now (BF16 staging
-        // path lands in a follow-up commit).
-        if !matches!(placement.attention_quantization, Wq::Default) {
-            return Err(AegisError::Unsupported(format!(
-                "attention-quantization={:?} not yet wired up; only `default` reaches \
-                 the loader today. Next: mxfp4, then fp8.",
-                placement.attention_quantization
-            )));
+        // attention-quantization: `default` (BF16) and `fp8` (load-time
+        // BF16→E4M3 with per-row FP32 scales) are wired. NVFP4 layers (with
+        // checkpoint-side weight_scale tensors) ignore this knob — they're
+        // already 4-bit.
+        match placement.attention_quantization {
+            Wq::Default | Wq::Fp8 => {}
+            other => return Err(AegisError::Unsupported(format!(
+                "attention-quantization={other:?} not yet wired up; supported today: \
+                 default, fp8. Roadmap: mxint4, int4, int8."
+            ))),
         }
-        // shared-MLP-quantization: `default` (BF16, force-VRAM) and
-        // `mxfp4` (load-time quantize) are wired. The rest still need
-        // their kernels.
+        // shared-MLP-quantization: `default` (BF16, force-VRAM) and `fp8`
+        // (load-time BF16→E4M3 with per-row FP32 scales) are wired.
         match placement.shared_mlp_quantization {
-            Wq::Default | Wq::Mxfp4 => {}
+            Wq::Default | Wq::Fp8 => {}
             other => return Err(AegisError::Unsupported(format!(
                 "shared-MLP-quantization={other:?} not yet wired up; supported today: \
-                 default, mxfp4. Roadmap: fp8, mxint4, int4, int8."
+                 default, fp8. Roadmap: mxint4, int4, int8."
             ))),
         }
         if graph.num_kv_heads == 0 || !graph.num_attention_heads.is_multiple_of(graph.num_kv_heads) {
@@ -123,6 +124,7 @@ impl CudaLlamaExecutor {
 
         let mut layers = Vec::with_capacity(graph.num_layers);
         let shared_mlp_q = placement.shared_mlp_quantization;
+        let attention_q = placement.attention_quantization;
         for layer in 0..graph.num_layers {
             let region_id = RegionId(format!("layer.{layer}"));
             let region = graph
@@ -188,6 +190,7 @@ impl CudaLlamaExecutor {
                 window_size,
                 partial_dim,
                 shared_mlp_q,
+                attention_q,
                 &mut loader,
             )?);
         }
@@ -520,6 +523,33 @@ impl CudaLlamaExecutor {
                 bf16_out_scratch: self.runtime.alloc_u16(
                     self.prefill_chunk_size * intermediate.max(self.hidden_size).max(max_q_width)
                 )?,
+                // FP8 weight-dequant scratch — sized for the largest single
+                // FP8 projection in the model. Allocated only when at least
+                // one FP8 weight is present (saves ~46 MiB on BF16-only
+                // configs); otherwise zero-length.
+                fp8_dequant_scratch: {
+                    use crate::executor::state::CudaLinear as CL;
+                    let max_fp8_elems = self
+                        .layers
+                        .iter()
+                        .flat_map(|l| {
+                            let attn_projs = [&l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj];
+                            let shared_iter = l
+                                .moe
+                                .as_ref()
+                                .and_then(|m| m.shared_expert.as_ref())
+                                .into_iter()
+                                .flat_map(|se| {
+                                    [&se.gate_proj, &se.up_proj, &se.down_proj].into_iter()
+                                });
+                            attn_projs.into_iter().chain(shared_iter)
+                        })
+                        .filter(|p| matches!(p, CL::Fp8(_)))
+                        .map(|p| p.rows() * p.cols())
+                        .max()
+                        .unwrap_or(0);
+                    self.runtime.alloc_u16(max_fp8_elems.max(1))?
+                },
                 moe: if moe_intermediate > 0 {
                     let cs = self.prefill_chunk_size;
                     let max_experts = self.layers.iter()
@@ -560,6 +590,19 @@ impl CudaLlamaExecutor {
                         expert_weight_lists: self.runtime.alloc_f32(max_experts * max_per_expert)?,
                         expert_counts: self.runtime.alloc_u32(max_experts)?,
                         expert_list_stride: max_per_expert,
+                        // Permuted MoE scratch. Total assignments per chunk
+                        // = chunk_size * top_k (each token routes to top_k
+                        // experts). For Gemma-4-26B at chunk=1024, top_k=8:
+                        // ~92 MiB input/output, ~23 MiB intermediate/swiglu.
+                        expert_offsets: self.runtime.alloc_u32(max_experts + 1)?,
+                        permuted_input: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,
+                        permuted_intermediate: self
+                            .runtime
+                            .alloc_f32(cs * max_top_k * max_expert_intermediate)?,
+                        permuted_swiglu: self
+                            .runtime
+                            .alloc_f32(cs * max_top_k * max_expert_intermediate)?,
+                        permuted_output: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,
                     }))
                 } else {
                     None
@@ -966,9 +1009,15 @@ fn compute_host_arena_capacity(
 }
 
 fn cuda_prefill_chunk_size(config: CudaRuntimeConfig) -> usize {
+    // Default 1024: large enough that with Gemma-4 routing (top_k=8 over 128
+    // experts), the average per-expert batch is 1024*8/128 = 64, well above
+    // the WMMA NVFP4 GEMM kernel's gate (batch>=32). Smaller chunks (default
+    // 128) gave avg batch=8 which forces the scalar reference path. This
+    // value is a stop-gap until grouped MoE lands; once that ships, chunk
+    // size will only affect prefill latency, not throughput.
     config
         .prefill_chunk_size
-        .unwrap_or(128)
+        .unwrap_or(1024)
         .clamp(1, CUDA_PREFILL_CHUNK_MAX)
 }
 

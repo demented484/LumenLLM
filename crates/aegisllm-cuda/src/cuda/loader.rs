@@ -283,49 +283,73 @@ impl CudaWeightLoader<'_> {
         })
     }
 
-    /// Load a BF16 matrix from `tensor` and quantize it to native MXFP4 at
-    /// load time. Used by `shared-MLP-quantization = "mxfp4"` (and by
-    /// `attention-quantization = "mxfp4"` once that path lands).
-    /// The packed bytes go straight to VRAM; nothing stays in the host
-    /// arena. ~3.5× smaller than BF16 with no calibration data needed
-    /// (per-block absmax → E8M0 scale → E2M1 nibbles).
-    pub fn load_bf16_as_mxfp4_linear(
+    /// Load a BF16 matrix from `tensor` and quantize it to FP8 E4M3 with
+    /// per-row FP32 scales at load time. Used by
+    /// `shared-MLP-quantization = "fp8"` (and `attention-quantization = "fp8"`
+    /// once that path lands).
+    ///
+    /// Path: stage BF16 directly into a temporary VRAM buffer, then run the
+    /// `aegis_quantize_bf16_to_fp8_per_row` kernel which computes per-row
+    /// absmax → scale = amax / 448 → encode each element as E4M3. The
+    /// transient BF16 buffer is dropped on return; only FP8 + scales
+    /// remain (~2× smaller than BF16). No host-side quantizer arithmetic;
+    /// reuses the device-side `float_to_fp8_e4m3_bits` helper.
+    pub fn load_bf16_as_fp8_linear(
         &self,
         tensor: &TensorInfo,
         loader: &mut TensorStorageLoader,
-    ) -> Result<crate::cuda::StandaloneMxfp4Linear> {
+    ) -> Result<crate::cuda::StandaloneFp8Linear> {
         if tensor.dtype != TensorDType::BF16 || tensor.shape.len() != 2 {
             return Err(AegisError::InvalidPlan(format!(
-                "`{}` must be a 2D BF16 matrix to be quantized to MXFP4",
+                "`{}` must be a 2D BF16 matrix to be quantized to FP8",
                 tensor.name
             )));
         }
         let rows = tensor.shape[0];
         let cols = tensor.shape[1];
-        if !cols.is_multiple_of(32) {
+        let total = rows.checked_mul(cols).ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "`{}` BF16→FP8 element count overflow: rows={} cols={}",
+                tensor.name, rows, cols
+            ))
+        })?;
+
+        // Stage BF16 into a transient VRAM buffer.
+        let loaded = loader.load_for_store(tensor, StoragePlacement::Ram)?;
+        let bf16_host: Vec<u16> = loaded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        if bf16_host.len() != total {
             return Err(AegisError::InvalidPlan(format!(
-                "`{}` MXFP4 quantization needs cols divisible by 32, got {}",
-                tensor.name, cols,
+                "`{}` BF16→FP8: bf16 source size mismatch: got {} u16, expected {}",
+                tensor.name, bf16_host.len(), total
             )));
         }
-        // Read BF16 bytes (CPU side), repack to MXFP4 packed-block layout.
-        let loaded = loader.load_for_store(tensor, StoragePlacement::Ram)?;
-        let packed = super::repack::repack_bf16_to_mxfp4_host(rows, cols, loaded.as_bytes())?;
-        let blocks_per_row = cols / 32;
-        let bytes = packed.len();
-        let data = self
+        let bf16_dev_slice = self
             .runtime
             .stream
-            .clone_htod(&packed)
-            .map_err(map_cuda_err("htod mxfp4 from bf16"))?;
-        Ok(crate::cuda::StandaloneMxfp4Linear {
+            .clone_htod(&bf16_host)
+            .map_err(map_cuda_err("htod bf16 transient for fp8 quantize"))?;
+        let bf16_dev = DeviceBuffer { slice: bf16_dev_slice };
+
+        // Allocate FP8 + per-row scales output buffers.
+        let mut fp8_dev = self.runtime.alloc_u8(total)?;
+        let mut row_scales_dev = self.runtime.alloc_f32(rows)?;
+
+        // Run the quantize kernel. After this returns, `bf16_dev` is no
+        // longer needed and is dropped at end of scope.
+        self.runtime
+            .quantize_bf16_to_fp8_per_row_device(&bf16_dev, rows, cols, &mut fp8_dev, &mut row_scales_dev)?;
+
+        Ok(crate::cuda::StandaloneFp8Linear {
             name: tensor.name.clone(),
             rows,
             cols,
-            bytes,
-            blocks_per_row,
-            output_scale: 1.0,
-            data,
+            bytes: total,
+            data: fp8_dev.slice,
+            row_scales: row_scales_dev.slice,
         })
     }
 

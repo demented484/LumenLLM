@@ -63,6 +63,8 @@ mod tests {
             },
             linear_layout: aegisllm_base::tensor::layout::LinearLayoutPolicy::default(),
             warnings: Vec::new(),
+            attention_quantization: aegisllm_base::planning::placement::WeightQuantOverride::Default,
+            shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride::Default,
         };
         let runtime = RuntimePlan {
             kernels: vec![KernelPlan {
@@ -122,6 +124,8 @@ mod tests {
             },
             linear_layout: aegisllm_base::tensor::layout::LinearLayoutPolicy::default(),
             warnings: Vec::new(),
+            attention_quantization: aegisllm_base::planning::placement::WeightQuantOverride::Default,
+            shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride::Default,
         };
 
         let runtime = RuntimePlan {

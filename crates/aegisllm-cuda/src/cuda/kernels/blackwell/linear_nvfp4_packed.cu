@@ -296,6 +296,111 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_gemm(
     }
 }
 
+// =============================================================================
+// WMMA BF16 tensor-core variant of the prequantized batched GEMM.
+//
+// Replaces the scalar 1-warp-per-row reduction in
+// `aegis_nvfp4_linear_prequantized_batched_gemm` with a tiled BF16 WMMA path.
+// Per K-tile we dequant a 16x16 block of NVFP4 weights to BF16 in shared
+// memory, convert a 16x16 block of f32 input to BF16, then run one
+// `mma.sync` (m16n16k16 bf16 → f32). Accumulates in f32 across all K-tiles
+// and stores back as `acc * output_scale`.
+//
+// Portability: m16n16k16 BF16 WMMA is supported on SM 7.5+ (Turing and
+// newer NVIDIA GPUs). Native FP4 mma.sync (mxf4nvf4) is Blackwell-only and
+// stays as a separate optional kernel.
+//
+// Grid : (ceil(rows/16), ceil(total_batch/16))
+// Block: 32 threads (one warp)
+// Shared mem: 2 * 16*16 bytes for BF16 tiles = 1 KiB; plus 16*16 floats for
+//   output staging = 1 KiB. Total ~2 KiB.
+// =============================================================================
+extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_gemm_wmma_bf16(
+    const unsigned char* __restrict__ packed,
+    const unsigned char* __restrict__ scales,
+    const float*         __restrict__ input,
+    const unsigned int rows,
+    const unsigned int cols,
+    const unsigned int total_batch,
+    const float output_scale,
+    float*               __restrict__ output
+) {
+    using namespace nvcuda;
+    constexpr int M = 16, N = 16, K = 16;
+
+    const unsigned int tile_row = blockIdx.x * (unsigned int)M;
+    const unsigned int tile_col = blockIdx.y * (unsigned int)N;
+    if (tile_row >= rows) return;
+
+    const unsigned int tid = threadIdx.x;  // 0..31
+
+    __shared__ __nv_bfloat16 sh_a[M * K];   // weight tile [M rows, K cols] row-major
+    __shared__ __nv_bfloat16 sh_b[K * N];   // input  tile [K cols, N batch] col-major
+    __shared__ float          sh_c[M * N];  // output tile [M rows, N batch] row-major
+
+    wmma::fragment<wmma::matrix_a, M, N, K, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, M, N, K, __nv_bfloat16, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, M, N, K, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    const unsigned int packed_cols = cols / 2u;
+    const unsigned int scale_cols  = cols / 16u;
+
+    // K-loop: iterate cols / K tiles.
+    for (unsigned int k_tile = 0u; k_tile < cols; k_tile += (unsigned int)K) {
+        // Load 16x16 weight tile. 256 elements / 32 threads = 8 elements per
+        // thread. Each element decodes one NVFP4 nibble × per-block scale.
+        for (unsigned int e = tid; e < (unsigned int)(M * K); e += 32u) {
+            const unsigned int m = e / (unsigned int)K;
+            const unsigned int k = e % (unsigned int)K;
+            const unsigned int row_g = tile_row + m;
+            const unsigned int col_g = k_tile + k;
+            float v = 0.0f;
+            if (row_g < rows && col_g < cols) {
+                const size_t packed_idx = (size_t)row_g * packed_cols + (size_t)(col_g / 2u);
+                const unsigned int byte = packed[packed_idx];
+                const unsigned int nibble = (col_g & 1u) ? (byte >> 4u) : (byte & 0x0Fu);
+                const size_t scale_idx = (size_t)row_g * scale_cols + (size_t)(col_g / 16u);
+                const float blk_scale = decode_ue4m3_half(scales[scale_idx]);
+                v = (float)decode_nvfp4_nibble(nibble) * blk_scale;
+            }
+            sh_a[m * (unsigned int)K + k] = __float2bfloat16(v);
+        }
+
+        // Load 16x16 input tile, col-major: sh_b[n*K + k] = input[batch=n, col=k].
+        for (unsigned int e = tid; e < (unsigned int)(K * N); e += 32u) {
+            const unsigned int n = e / (unsigned int)K;
+            const unsigned int k = e % (unsigned int)K;
+            const unsigned int batch_g = tile_col + n;
+            const unsigned int col_g   = k_tile + k;
+            float v = 0.0f;
+            if (batch_g < total_batch && col_g < cols) {
+                v = input[(size_t)batch_g * cols + col_g];
+            }
+            sh_b[n * (unsigned int)K + k] = __float2bfloat16(v);
+        }
+        __syncthreads();
+
+        wmma::load_matrix_sync(a_frag, sh_a, K);
+        wmma::load_matrix_sync(b_frag, sh_b, K);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        __syncthreads();
+    }
+
+    // Store 16x16 output tile to shared, then strided write to global with
+    // boundary masking. Result layout: output[batch, row].
+    wmma::store_matrix_sync(sh_c, c_frag, N, wmma::mem_row_major);
+    for (unsigned int e = tid; e < (unsigned int)(M * N); e += 32u) {
+        const unsigned int m = e / (unsigned int)N;
+        const unsigned int n = e % (unsigned int)N;
+        const unsigned int row_g   = tile_row + m;
+        const unsigned int batch_g = tile_col + n;
+        if (row_g < rows && batch_g < total_batch) {
+            output[(size_t)batch_g * rows + row_g] = sh_c[m * (unsigned int)N + n] * output_scale;
+        }
+    }
+}
+
 extern "C" __global__ void aegis_nvfp4_linear_reference_batched(
     const unsigned char* packed,
     const unsigned char* scales,

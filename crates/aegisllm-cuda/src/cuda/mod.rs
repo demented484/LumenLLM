@@ -28,5 +28,5 @@ pub(crate) const DECODE_MAX_CHUNK_LEN: usize = CUDA_GRAPH_ATTN_MAX_SEQ_LEN / DEC
 pub use types::{
     CudaAttentionRequest, CudaAttentionSplitScratch,
     DensePrefillMetadataProof, DeviceBf16Matrix, DeviceBuffer,
-    DeviceNvfp4Linear, DeviceRopeConfig, StandaloneMxfp4Linear,
+    DeviceNvfp4Linear, DeviceRopeConfig, StandaloneFp8Linear,
 };

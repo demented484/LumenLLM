@@ -169,6 +169,171 @@ impl CudaRuntime {
         self.launch_bf16_matvec_reference(matrix, &input.slice, &mut output.slice)
     }
 
+    /// Quantize a VRAM-resident BF16 matrix to FP8 E4M3 with per-row FP32 scales.
+    /// Used at load time by `load_bf16_as_fp8_linear`. The output buffers must be
+    /// pre-allocated to `rows*cols` bytes (fp8) and `rows` floats (scales).
+    pub fn quantize_bf16_to_fp8_per_row_device(
+        &self,
+        bf16: &DeviceBuffer<u16>,
+        rows: usize,
+        cols: usize,
+        fp8_out: &mut DeviceBuffer<u8>,
+        row_scales_out: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if bf16.len() < rows * cols {
+            return Err(AegisError::InvalidPlan(format!(
+                "fp8 quantize: bf16 buffer too small: have {} need {}*{}={}",
+                bf16.len(), rows, cols, rows * cols
+            )));
+        }
+        if fp8_out.len() < rows * cols {
+            return Err(AegisError::InvalidPlan(format!(
+                "fp8 quantize: output buffer too small: have {} need {}",
+                fp8_out.len(), rows * cols
+            )));
+        }
+        if row_scales_out.len() < rows {
+            return Err(AegisError::InvalidPlan(format!(
+                "fp8 quantize: scales buffer too small: have {} need {}",
+                row_scales_out.len(), rows
+            )));
+        }
+        let rows_u32 = u32_arg("rows", rows)?;
+        let cols_u32 = u32_arg("cols", cols)?;
+        let block_dim = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows_u32, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: block_dim * std::mem::size_of::<f32>() as u32,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.fp8_quantize_bf16_per_row)
+                .arg(&bf16.slice)
+                .arg(&mut fp8_out.slice)
+                .arg(&mut row_scales_out.slice)
+                .arg(&rows_u32)
+                .arg(&cols_u32)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch fp8 quantize bf16 per row"))?;
+        Ok(())
+    }
+
+    /// Single-token matvec against a standalone FP8 weight (decode path).
+    pub fn matvec_fp8_standalone_device(
+        &self,
+        linear: &super::super::StandaloneFp8Linear,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if input.len() < linear.cols || output.len() < linear.rows {
+            return Err(AegisError::InvalidPlan(format!(
+                "fp8 matvec shape mismatch for {}: input={} need {}, output={} need {}",
+                linear.name, input.len(), linear.cols, output.len(), linear.rows
+            )));
+        }
+        let rows = u32_arg("rows", linear.rows)?;
+        let cols = u32_arg("cols", linear.cols)?;
+        let block_dim = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows, 1, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: block_dim * std::mem::size_of::<f32>() as u32,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.fp8_matvec)
+                .arg(linear.data_slice())
+                .arg(linear.row_scales_slice())
+                .arg(&input.slice)
+                .arg(&rows)
+                .arg(&cols)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch fp8 matvec"))?;
+        Ok(())
+    }
+
+    /// Dequantize an FP8 weight matrix into a BF16 scratch buffer in-place.
+    /// Used by the cuBLASLt-backed FP8 prefill path: dequant once per call,
+    /// then run BF16×BF16 GEMM via tensor cores.
+    pub fn dequant_fp8_to_bf16_device(
+        &self,
+        linear: &super::super::StandaloneFp8Linear,
+        bf16_out: &mut DeviceBuffer<u16>,
+    ) -> Result<()> {
+        let total = linear.rows * linear.cols;
+        if bf16_out.len() < total {
+            return Err(AegisError::InvalidPlan(format!(
+                "fp8→bf16 dequant: scratch too small for `{}`: have {} need {}",
+                linear.name, bf16_out.len(), total
+            )));
+        }
+        let rows = u32_arg("rows", linear.rows)?;
+        let cols = u32_arg("cols", linear.cols)?;
+        let block_dim = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows, ceil_div(cols, block_dim), 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.fp8_dequant_to_bf16)
+                .arg(linear.data_slice())
+                .arg(linear.row_scales_slice())
+                .arg(&mut bf16_out.slice)
+                .arg(&rows)
+                .arg(&cols)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch fp8 dequant to bf16"))?;
+        Ok(())
+    }
+
+    /// Batched matmul against a standalone FP8 weight (prefill path).
+    pub fn matmul_fp8_standalone_batched_device(
+        &self,
+        linear: &super::super::StandaloneFp8Linear,
+        input: &DeviceBuffer<f32>,
+        batch: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let total_in = checked_len("fp8 matmul input", batch, linear.cols)?;
+        let total_out = checked_len("fp8 matmul output", batch, linear.rows)?;
+        if input.len() < total_in || output.len() < total_out {
+            return Err(AegisError::InvalidPlan(format!(
+                "fp8 matmul shape mismatch for {}: input={} need {}, output={} need {}",
+                linear.name, input.len(), total_in, output.len(), total_out
+            )));
+        }
+        let rows = u32_arg("rows", linear.rows)?;
+        let cols = u32_arg("cols", linear.cols)?;
+        let batch_u32 = u32_arg("batch", batch)?;
+        let block_dim = 128u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows, batch_u32, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: block_dim * std::mem::size_of::<f32>() as u32,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.fp8_matmul_batched)
+                .arg(linear.data_slice())
+                .arg(linear.row_scales_slice())
+                .arg(&input.slice)
+                .arg(&rows)
+                .arg(&cols)
+                .arg(&batch_u32)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch fp8 matmul batched"))?;
+        Ok(())
+    }
+
     /// Batched BF16 GEMM-like matmul over `batch` token rows. Requires the matrix
     /// to be VRAM-resident (host-resident BF16 hot-path is the slow CPU rayon
     /// fallback and is intentionally not supported here — chunked prefill always
@@ -465,6 +630,41 @@ impl CudaRuntime {
         let cols_u32 = linear.cols as u32;
         let batch_u32 = batch as u32;
         if batch > 1 {
+            // Prefer the BF16 WMMA tensor-core path when shapes align to 16
+            // AND batch is large enough to keep SM grid saturated (~32 N-tiles
+            // worth). For per-expert MoE dispatch with batch~8, the scalar
+            // 8-warp kernel actually wins because its 256-thread blocks fill
+            // SMs better than WMMA's 32-thread blocks. WMMA pays off once
+            // grouped MoE delivers larger per-call batches.
+            let wmma_disabled = std::env::var("AEGIS_NVFP4_WMMA_DISABLE").is_ok();
+            let wmma_eligible = !wmma_disabled
+                && linear.rows % 16 == 0
+                && linear.cols % 16 == 0
+                && batch >= 32;
+            if wmma_eligible {
+                let grid_x = (linear.rows / 16) as u32;
+                let grid_y = ((batch + 15) / 16) as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_x, grid_y, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,  // sh_a/sh_b/sh_c are static __shared__
+                };
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.kernels.nvfp4_prequant_batched_gemm_wmma_bf16)
+                        .arg(&linear.packed)
+                        .arg(&linear.scales)
+                        .arg(&input.slice)
+                        .arg(&rows_u32)
+                        .arg(&cols_u32)
+                        .arg(&batch_u32)
+                        .arg(&linear.output_scale)
+                        .arg(&mut output.slice)
+                        .launch(cfg)
+                }
+                .map_err(map_cuda_err("launch batched nvfp4 gemm wmma bf16"))?;
+                return Ok(());
+            }
             let grid_y = ((batch + 7) / 8) as u32;
             let shared = (linear.cols / 2 + linear.cols / 16) as u32;
             let cfg = LaunchConfig {
@@ -505,201 +705,6 @@ impl CudaRuntime {
                     .launch(cfg)
             }
             .map_err(map_cuda_err("launch batched nvfp4 matvec prequantized"))?;
-        }
-        Ok(())
-    }
-
-    /// Single-token matvec against a standalone (load-time-quantized)
-    /// MXFP4 weight. Handles input quantization internally — caller
-    /// passes raw f32 hidden state.
-    pub fn matvec_mxfp4_standalone_device(
-        &self,
-        linear: &super::super::StandaloneMxfp4Linear,
-        input: &DeviceBuffer<f32>,
-        output: &mut DeviceBuffer<f32>,
-    ) -> Result<()> {
-        let mut input_mxfp4 = self.alloc_u8(Self::mxfp4_vector_bytes(input.len())?)?;
-        self.quantize_mxfp4_input_device(input, &mut input_mxfp4)?;
-        self.matvec_mxfp4_standalone_prepacked_device(linear, &input_mxfp4, output)
-    }
-
-    /// Single-token matvec against a standalone MXFP4 weight; activations
-    /// already MXFP4-quantized.
-    pub fn matvec_mxfp4_standalone_prepacked_device(
-        &self,
-        linear: &super::super::StandaloneMxfp4Linear,
-        input_mxfp4: &DeviceBuffer<u8>,
-        output: &mut DeviceBuffer<f32>,
-    ) -> Result<()> {
-        let expected_input_bytes = Self::mxfp4_vector_bytes(linear.cols)?;
-        if input_mxfp4.len() != expected_input_bytes || output.len() < linear.rows {
-            return Err(AegisError::InvalidPlan(format!(
-                "standalone mxfp4 matvec shape mismatch for {}: expected input_bytes={} output={}, got input_bytes={} output={}",
-                linear.name, expected_input_bytes, linear.rows,
-                input_mxfp4.len(), output.len(),
-            )));
-        }
-        if !linear.cols.is_multiple_of(64) {
-            return Err(AegisError::InvalidPlan(format!(
-                "standalone mxfp4 matvec for `{}` requires cols divisible by 64, got {}",
-                linear.name, linear.cols
-            )));
-        }
-        let rows = linear.rows as u32;
-        let cols = linear.cols as u32;
-        let blocks_per_row = linear.blocks_per_row as u32;
-        let output_scale = linear.output_scale;
-        let (block_dim, kernel, tag) = if linear.cols.is_multiple_of(64 * 16) {
-            (512u32, &self.kernels.mxfp4_matvec_16warp, "16warp")
-        } else if linear.cols.is_multiple_of(64 * 4) {
-            (128u32, &self.kernels.mxfp4_matvec_4warp, "4warp")
-        } else {
-            (32u32, &self.kernels.mxfp4_matvec, "1warp")
-        };
-        let cfg = LaunchConfig {
-            grid_dim: (ceil_div(rows, 16), 1, 1),
-            block_dim: (block_dim, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            self.stream
-                .launch_builder(kernel)
-                .arg(linear.data_slice())
-                .arg(&input_mxfp4.slice)
-                .arg(&rows)
-                .arg(&cols)
-                .arg(&blocks_per_row)
-                .arg(&output_scale)
-                .arg(&mut output.slice)
-                .launch(cfg)
-        }
-        .map_err(map_cuda_err(match tag {
-            "16warp" => "launch standalone mxfp4 matvec 16warp",
-            "4warp"  => "launch standalone mxfp4 matvec 4warp",
-            _        => "launch standalone mxfp4 matvec 1warp",
-        }))?;
-        Ok(())
-    }
-
-    /// Batched matmul against a standalone MXFP4 weight (prefill path).
-    /// Handles input quantization (BF16-style → MXFP4) internally; caller
-    /// passes raw f32 [batch × cols].
-    pub fn matmul_mxfp4_standalone_batched_device(
-        &self,
-        linear: &super::super::StandaloneMxfp4Linear,
-        input: &DeviceBuffer<f32>,
-        batch: usize,
-        output: &mut DeviceBuffer<f32>,
-    ) -> Result<()> {
-        let row_bytes = Self::mxfp4_vector_bytes(linear.cols)?;
-        let total_input_bytes = checked_len("batched standalone mxfp4 input", batch, row_bytes)?;
-        let mut input_mxfp4 = self.alloc_u8(total_input_bytes)?;
-        self.quantize_mxfp4_input_batched_device(input, batch, linear.cols, &mut input_mxfp4)?;
-        self.matmul_mxfp4_standalone_prepacked_batched_device(
-            linear, &input_mxfp4, batch, output,
-        )
-    }
-
-    /// Same as `matmul_mxfp4_standalone_batched_device` but with input
-    /// already MXFP4-quantized (used when the same input feeds two GEMMs
-    /// — e.g. shared MLP gate + up).
-    pub fn matmul_mxfp4_standalone_prepacked_batched_device(
-        &self,
-        linear: &super::super::StandaloneMxfp4Linear,
-        input_mxfp4: &DeviceBuffer<u8>,
-        batch: usize,
-        output: &mut DeviceBuffer<f32>,
-    ) -> Result<()> {
-        let row_bytes = Self::mxfp4_vector_bytes(linear.cols)?;
-        let expected_input_bytes = checked_len("batched standalone mxfp4 input", batch, row_bytes)?;
-        let expected_output = checked_len("batched standalone mxfp4 output", batch, linear.rows)?;
-        if input_mxfp4.len() < expected_input_bytes || output.len() < expected_output {
-            return Err(AegisError::InvalidPlan(format!(
-                "batched standalone mxfp4 matmul shape mismatch for {}: expected input>={} output>={}, got input={} output={}",
-                linear.name, expected_input_bytes, expected_output,
-                input_mxfp4.len(), output.len(),
-            )));
-        }
-        if !linear.cols.is_multiple_of(64) {
-            return Err(AegisError::InvalidPlan(format!(
-                "batched standalone mxfp4 matmul for `{}` requires cols divisible by 64, got {}",
-                linear.name, linear.cols
-            )));
-        }
-        let rows = u32_arg("rows", linear.rows)?;
-        let cols = u32_arg("cols", linear.cols)?;
-        let blocks_per_row = u32_arg("blocks_per_row", linear.blocks_per_row)?;
-        let batch_u32 = u32_arg("batch", batch)?;
-        let output_scale = linear.output_scale;
-        let use_prefill_tile_kernel = batch >= 16;
-        let use_n8_kernel = batch > 1 && !use_prefill_tile_kernel;
-        if use_prefill_tile_kernel {
-            let use_n64_tile = rows >= 64;
-            let row_tile = if use_n64_tile { 64 } else { 32 };
-            let block_dim = if use_n64_tile { 256 } else { 128 };
-            let kernel = if use_n64_tile {
-                &self.kernels.mxfp4_matmul_tile_m16n64
-            } else {
-                &self.kernels.mxfp4_matmul_tile_m16n32
-            };
-            let cfg = LaunchConfig {
-                grid_dim: (ceil_div(rows, row_tile), ceil_div(batch_u32, 16), 1),
-                block_dim: (block_dim, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                self.stream
-                    .launch_builder(kernel)
-                    .arg(linear.data_slice())
-                    .arg(&input_mxfp4.slice)
-                    .arg(&rows)
-                    .arg(&cols)
-                    .arg(&blocks_per_row)
-                    .arg(&batch_u32)
-                    .arg(&output_scale)
-                    .arg(&mut output.slice)
-                    .launch(cfg)
-            }
-            .map_err(map_cuda_err("launch tiled standalone mxfp4 prefill gemm"))?;
-        } else if use_n8_kernel {
-            let cfg = LaunchConfig {
-                grid_dim: (ceil_div(rows, 16), ceil_div(batch_u32, 8), 1),
-                block_dim: (32, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                self.stream
-                    .launch_builder(&self.kernels.mxfp4_matmul_n8)
-                    .arg(linear.data_slice())
-                    .arg(&input_mxfp4.slice)
-                    .arg(&rows)
-                    .arg(&cols)
-                    .arg(&blocks_per_row)
-                    .arg(&batch_u32)
-                    .arg(&output_scale)
-                    .arg(&mut output.slice)
-                    .launch(cfg)
-            }
-            .map_err(map_cuda_err("launch standalone mxfp4 matmul n8"))?;
-        } else {
-            let cfg = LaunchConfig {
-                grid_dim: (ceil_div(rows, 16), batch_u32, 1),
-                block_dim: (32, 1, 1),
-                shared_mem_bytes: 0,
-            };
-            unsafe {
-                self.stream
-                    .launch_builder(&self.kernels.mxfp4_matvec)
-                    .arg(linear.data_slice())
-                    .arg(&input_mxfp4.slice)
-                    .arg(&rows)
-                    .arg(&cols)
-                    .arg(&blocks_per_row)
-                    .arg(&output_scale)
-                    .arg(&mut output.slice)
-                    .launch(cfg)
-            }
-            .map_err(map_cuda_err("launch standalone mxfp4 matvec"))?;
         }
         Ok(())
     }
@@ -1361,6 +1366,41 @@ impl CudaRuntime {
         let cols_u32 = cols as u32;
         let batch_u32 = batch as u32;
         if batch > 1 {
+            // Same WMMA gating as the device-buffer path (see
+            // matvec_nvfp4_prequantized_batched_device). Routed-expert
+            // weights stream through here, so this is the hottest dispatch
+            // for prefill — but per-expert batch (~8 for typical chunk_size)
+            // is too small for WMMA's 32-thread blocks to saturate SMs.
+            // Gate on batch>=32; grouped MoE will deliver larger batches.
+            let wmma_disabled = std::env::var("AEGIS_NVFP4_WMMA_DISABLE").is_ok();
+            let wmma_eligible = !wmma_disabled
+                && rows % 16 == 0
+                && cols % 16 == 0
+                && batch >= 32;
+            if wmma_eligible {
+                let grid_x = (rows / 16) as u32;
+                let grid_y = ((batch + 15) / 16) as u32;
+                let cfg = LaunchConfig {
+                    grid_dim: (grid_x, grid_y, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.kernels.nvfp4_prequant_batched_gemm_wmma_bf16)
+                        .arg(packed)
+                        .arg(scales)
+                        .arg(quantized_input)
+                        .arg(&rows_u32)
+                        .arg(&cols_u32)
+                        .arg(&batch_u32)
+                        .arg(&output_scale)
+                        .arg(output)
+                        .launch(cfg)
+                }
+                .map_err(map_cuda_err("launch staged nvfp4 wmma bf16 batched gemm"))?;
+                return Ok(());
+            }
             let grid_y = ((batch + 7) / 8) as u32;
             let shared = (cols / 2 + cols / 16) as u32;
             let cfg = LaunchConfig {

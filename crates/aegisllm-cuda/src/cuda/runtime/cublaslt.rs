@@ -23,7 +23,7 @@ use cudarc::cublaslt::{Matmul, MatmulConfig};
 
 use super::CudaRuntime;
 use super::map_cuda_err;
-use crate::cuda::{DeviceBf16Matrix, DeviceBuffer};
+use crate::cuda::{DeviceBf16Matrix, DeviceBuffer, StandaloneFp8Linear};
 use aegisllm_base::error::{AegisError, Result};
 
 impl CudaRuntime {
@@ -150,6 +150,117 @@ impl CudaRuntime {
         })?;
 
         // Step 3: BF16 output → F32.
+        self.bf16_to_f32_device(output_bf16, out_len, output)?;
+        Ok(())
+    }
+
+    /// Compute `output = input @ weight^T` for an FP8 standalone weight by
+    /// dequantizing into a BF16 scratch and routing through the existing
+    /// BF16 cuBLASLt tensor-core path. Activates Blackwell SM_120 BF16
+    /// tensor cores (~150 TFLOPs) at the cost of one streaming dequant per
+    /// call. Native FP8 tensor cores (~700 TFLOPs) require raw cuBLASLt FFI
+    /// and will land as a follow-up.
+    ///
+    /// * `weight` — standalone FP8 `[rows, cols]`, VRAM-resident.
+    /// * `weight_dequant_scratch` — BF16 scratch sized for `rows*cols`, reused
+    ///   across all FP8 GEMMs in the same chunk; caller-allocated.
+    pub fn matmul_fp8_via_bf16_cublaslt_device(
+        &self,
+        weight: &StandaloneFp8Linear,
+        weight_dequant_scratch: &mut DeviceBuffer<u16>,
+        input: &DeviceBuffer<f32>,
+        batch: usize,
+        input_bf16: &mut DeviceBuffer<u16>,
+        output_bf16: &mut DeviceBuffer<u16>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let rows = weight.rows;
+        let cols = weight.cols;
+        let weight_elems = rows
+            .checked_mul(cols)
+            .ok_or_else(|| AegisError::InvalidPlan("fp8 dequant weight elem overflow".into()))?;
+        if weight_dequant_scratch.len() < weight_elems {
+            return Err(AegisError::InvalidPlan(format!(
+                "fp8 cublaslt scratch too small for `{}`: have {} need {}",
+                weight.name, weight_dequant_scratch.len(), weight_elems
+            )));
+        }
+        let in_len = batch
+            .checked_mul(cols)
+            .ok_or_else(|| AegisError::InvalidPlan("fp8 cublaslt input len overflow".into()))?;
+        let out_len = batch
+            .checked_mul(rows)
+            .ok_or_else(|| AegisError::InvalidPlan("fp8 cublaslt output len overflow".into()))?;
+        if input.len() < in_len || input_bf16.len() < in_len
+            || output_bf16.len() < out_len || output.len() < out_len
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "fp8 cublaslt shape mismatch for `{}`: input={}/{} input_bf16={}/{} output_bf16={}/{} output={}/{}",
+                weight.name,
+                input.len(), in_len,
+                input_bf16.len(), in_len,
+                output_bf16.len(), out_len,
+                output.len(), out_len,
+            )));
+        }
+
+        // Step 1: FP8 weight → BF16 scratch (dequant).
+        self.dequant_fp8_to_bf16_device(weight, weight_dequant_scratch)?;
+
+        // Step 2: F32 input → BF16 scratch.
+        self.f32_to_bf16_device(input, in_len, input_bf16)?;
+
+        // Step 3: BF16 GEMM via cuBLASLt. Same row-major-via-col-major-flip
+        // pattern as `matmul_bf16_cublaslt_device`.
+        let cfg = MatmulConfig {
+            transa: true,
+            transb: false,
+            transc: false,
+            m: rows as u64,
+            n: batch as u64,
+            k: cols as u64,
+            alpha: 1.0,
+            lda: cols as i64,
+            ldb: cols as i64,
+            beta: 0.0,
+            ldc: rows as i64,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        };
+
+        let weight_view = unsafe {
+            weight_dequant_scratch.slice.transmute::<half::bf16>(weight_elems)
+        }
+        .ok_or_else(|| {
+            AegisError::Unsupported(format!(
+                "fp8 dequant scratch u16→bf16 transmute failed for `{}` (len={})",
+                weight.name, weight_elems
+            ))
+        })?;
+        let in_view = unsafe { input_bf16.slice.transmute::<half::bf16>(in_len) }
+            .ok_or_else(|| {
+                AegisError::Unsupported("fp8 cublaslt input u16→bf16 transmute failed".into())
+            })?;
+        let mut out_view = unsafe { output_bf16.slice.transmute_mut::<half::bf16>(out_len) }
+            .ok_or_else(|| {
+                AegisError::Unsupported("fp8 cublaslt output u16→bf16 transmute failed".into())
+            })?;
+
+        unsafe {
+            self.cublas_lt
+                .matmul(cfg, &weight_view, &in_view, &mut out_view, None, None)
+        }
+        .map_err(|e| {
+            AegisError::Unsupported(format!(
+                "fp8-dequant cuBLASLt BF16 matmul failed for `{}` (m={} n={} k={}): {e:?}",
+                weight.name, rows, batch, cols
+            ))
+        })?;
+
+        // Step 4: BF16 output → F32.
         self.bf16_to_f32_device(output_bf16, out_len, output)?;
         Ok(())
     }

@@ -242,6 +242,7 @@ mod tests {
             temperature: 0.0,
             top_k: 64,
             top_p: 0.95,
+            min_p: 0.0,
         };
         assert_eq!(sample_next_token(&[0.0, 3.0, 1.0], &sampling).unwrap(), 1);
     }

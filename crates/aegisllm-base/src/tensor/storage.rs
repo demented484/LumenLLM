@@ -268,6 +268,36 @@ impl TensorStorageLoader {
         self.mmaps.insert(path.clone(), map.clone());
         Ok(map)
     }
+
+    /// Force the kernel to drop every page the loader paged in. Linux's
+    /// `MADV_DONTNEED` on a file-backed mmap removes the mapping from this
+    /// process's page tables but does NOT reliably evict the page-cache
+    /// entries — the kernel keeps them around in case any other process (or
+    /// a future open) needs them. After loading a 14 GiB model, that's 14
+    /// GiB of "Cached" memory that's effectively dead weight on memory-tight
+    /// hosts (32 GiB systems, OS, IDE, etc.). `posix_fadvise(DONTNEED)` on
+    /// the file descriptor is the canonical knob to evict file-backed cache
+    /// pages: it tells the kernel "this is the last access for this range,
+    /// you can drop it". We re-`File::open` per shard since the original
+    /// `File` was consumed by `MmapOptions::map`; the open is cheap.
+    pub fn release_page_cache(&self) {
+        for path in self.mmaps.keys() {
+            if let Ok(file) = File::open(path) {
+                let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                if len > 0 {
+                    fadvise_dont_need(&file, 0, len);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for TensorStorageLoader {
+    fn drop(&mut self) {
+        // Best-effort page-cache eviction at the end of weight loading.
+        // Safe to skip on errors (we just keep the cache; not fatal).
+        self.release_page_cache();
+    }
 }
 
 impl LoadedHostTensor {

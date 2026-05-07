@@ -65,6 +65,7 @@ pub(super) fn load_cuda_layer(
     window_size: usize,
     partial_dim: usize,
     shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
+    attention_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<CudaLayer> {
     if region_kind != GraphRegionKind::TransformerBlock {
@@ -221,12 +222,12 @@ pub(super) fn load_cuda_layer(
         q_proj: load_cuda_linear(
             cuda, artifact, &format!("{prefix}.self_attn.q_proj"),
             placement.store, residency, resident_layout,
-            q_width, hidden, is_sliced, loader,
+            q_width, hidden, is_sliced, attention_quantization, loader,
         )?,
         k_proj: load_cuda_linear(
             cuda, artifact, &format!("{prefix}.self_attn.k_proj"),
             placement.store, residency, resident_layout,
-            kv_width, hidden, is_sliced, loader,
+            kv_width, hidden, is_sliced, attention_quantization, loader,
         )?,
         v_proj: {
             // Gemma 4 global layers have attention_k_eq_v=true: no separate v_proj,
@@ -241,7 +242,7 @@ pub(super) fn load_cuda_layer(
             load_cuda_linear(
                 cuda, artifact, &v_prefix,
                 placement.store, residency, resident_layout,
-                kv_width, hidden, is_sliced, loader,
+                kv_width, hidden, is_sliced, attention_quantization, loader,
             )?
         },
         // CUTLASS fused QKV group is not supported for sliced models.
@@ -265,7 +266,7 @@ pub(super) fn load_cuda_layer(
         o_proj: load_cuda_linear(
             cuda, artifact, &format!("{prefix}.self_attn.o_proj"),
             placement.store, residency, resident_layout,
-            hidden, q_width, is_sliced, loader,
+            hidden, q_width, is_sliced, attention_quantization, loader,
         )?,
         // Gemma 4: per-head RMS norm on Q (applied between q_proj and RoPE).
         q_norm_weight: load_optional_norm_weight(
@@ -435,11 +436,6 @@ fn load_cuda_moe(
         let down_tensor = require_tensor(artifact, &format!("{sp}.down_proj.weight"))?;
         use aegisllm_base::planning::placement::WeightQuantOverride as Wq;
         match shared_mlp_quantization {
-            Wq::Mxfp4 => Some(CudaMoEShared {
-                gate_proj: CudaLinear::Mxfp4(cuda.load_bf16_as_mxfp4_linear(gate_tensor, loader)?),
-                up_proj:   CudaLinear::Mxfp4(cuda.load_bf16_as_mxfp4_linear(up_tensor,   loader)?),
-                down_proj: CudaLinear::Mxfp4(cuda.load_bf16_as_mxfp4_linear(down_tensor, loader)?),
-            }),
             Wq::Default => {
                 let residency_store = cuda_residency_for_store(store, cuda.device_index())?;
                 Some(CudaMoEShared {
@@ -448,6 +444,11 @@ fn load_cuda_moe(
                     down_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store_opts(down_tensor, store, residency_store, loader, true)?),
                 })
             }
+            Wq::Fp8 => Some(CudaMoEShared {
+                gate_proj: CudaLinear::Fp8(cuda.load_bf16_as_fp8_linear(gate_tensor, loader)?),
+                up_proj:   CudaLinear::Fp8(cuda.load_bf16_as_fp8_linear(up_tensor,   loader)?),
+                down_proj: CudaLinear::Fp8(cuda.load_bf16_as_fp8_linear(down_tensor, loader)?),
+            }),
             other => return Err(AegisError::Unsupported(format!(
                 "shared-MLP-quantization={other:?} not yet wired into the loader"
             ))),
@@ -524,7 +525,9 @@ fn load_optional_norm_weight(
     Ok(None)
 }
 
-/// Loads a projection as NVFP4 if `{prefix}.weight_scale` exists, otherwise as BF16.
+/// Loads a projection as NVFP4 if `{prefix}.weight_scale` exists, otherwise as
+/// BF16 (or FP8 when `quant_override == Fp8`). NVFP4 layers ignore the quant
+/// override since they're already 4-bit.
 #[allow(clippy::too_many_arguments)]
 fn load_cuda_linear(
     cuda: &CudaWeightLoader<'_>,
@@ -536,6 +539,7 @@ fn load_cuda_linear(
     eff_rows: usize,
     eff_logical_cols: usize,
     is_sliced: bool,
+    quant_override: aegisllm_base::planning::placement::WeightQuantOverride,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<CudaLinear> {
     let has_scale = artifact.tensors.has(&format!("{prefix}.weight_scale"));
@@ -544,17 +548,25 @@ fn load_cuda_linear(
             cuda, artifact, prefix, store, residency, resident_layout,
             eff_rows, eff_logical_cols, is_sliced, loader,
         )?;
-        Ok(CudaLinear::Nvfp4(l))
-    } else {
-        let tensor = require_tensor(artifact, &format!("{prefix}.weight"))?;
-        // BF16 host-resident matvec routes through `matvec_bf16_host_resident_device`
-        // which does D2H(input) → CPU rayon matmul → H2D(output). For Gemma 4 attention
-        // (Q/K/V/O × 30 layers = 120 calls/token) this dominates wall time. Force these
-        // weights into VRAM — total ~600 MB across all attention layers, well within
-        // a free-VRAM budget of several GB. Routed-expert weights remain streamed
-        // because they're an order of magnitude larger.
-        let m = cuda.load_bf16_matrix_with_store_opts(tensor, store, residency, loader, true)?;
-        Ok(CudaLinear::Bf16(m))
+        return Ok(CudaLinear::Nvfp4(l));
+    }
+    let tensor = require_tensor(artifact, &format!("{prefix}.weight"))?;
+    use aegisllm_base::planning::placement::WeightQuantOverride as Wq;
+    match quant_override {
+        Wq::Default => {
+            // BF16 host-resident matvec routes through `matvec_bf16_host_resident_device`
+            // which does D2H(input) → CPU rayon matmul → H2D(output). For Gemma 4 attention
+            // (Q/K/V/O × 30 layers = 120 calls/token) this dominates wall time. Force these
+            // weights into VRAM — total ~600 MB across all attention layers, well within
+            // a free-VRAM budget of several GB. Routed-expert weights remain streamed
+            // because they're an order of magnitude larger.
+            let m = cuda.load_bf16_matrix_with_store_opts(tensor, store, residency, loader, true)?;
+            Ok(CudaLinear::Bf16(m))
+        }
+        Wq::Fp8 => Ok(CudaLinear::Fp8(cuda.load_bf16_as_fp8_linear(tensor, loader)?)),
+        other => Err(AegisError::Unsupported(format!(
+            "attention-quantization={other:?} not yet wired into the loader"
+        ))),
     }
 }
 

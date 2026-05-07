@@ -174,66 +174,6 @@ pub(crate) fn cached_repack_nvfp4_to_mxfp4_host(
     Ok(repacked)
 }
 
-/// Convert a row-major BF16 weight tensor `[rows, cols]` to the native
-/// MXFP4 packed layout: `(cols / 32)` blocks per row, each block 17 bytes
-/// (1 byte E8M0 exponent scale + 16 bytes of E2M1 nibbles, 2 nibbles per
-/// byte). Per-block absmax → E8M0 scale → encode each value as the
-/// closest MXFP4 codepoint times the scale.
-///
-/// Used by the load-time quantizer when `shared-MLP-quantization = mxfp4`
-/// (or `attention-quantization = mxfp4`): we read BF16 from the
-/// safetensors file and convert directly to the inference-time format,
-/// skipping the intermediate NVFP4 representation.
-pub(crate) fn repack_bf16_to_mxfp4_host(
-    rows: usize,
-    cols: usize,
-    bf16_bytes: &[u8],
-) -> Result<Vec<u8>> {
-    if !cols.is_multiple_of(32) {
-        return Err(AegisError::InvalidPlan(format!(
-            "MXFP4 repack requires cols divisible by 32, got rows={} cols={}",
-            rows, cols
-        )));
-    }
-    let total_elements = rows.checked_mul(cols).ok_or_else(|| {
-        AegisError::InvalidPlan("BF16→MXFP4 element count overflow".into())
-    })?;
-    if bf16_bytes.len() != total_elements * 2 {
-        return Err(AegisError::InvalidPlan(format!(
-            "BF16→MXFP4 source size mismatch: got {} bytes, expected {}*{}*2={}",
-            bf16_bytes.len(), rows, cols, total_elements * 2,
-        )));
-    }
-    let blocks_per_row = cols / 32;
-    let mut repacked = vec![0u8; rows * blocks_per_row * 17];
-    let mut values = [0.0f32; 32];
-    for row in 0..rows {
-        let row_byte_offset = row * cols * 2;
-        for block in 0..blocks_per_row {
-            let col_base = block * 32;
-            let mut amax = 0.0f32;
-            for lane in 0..32 {
-                let off = row_byte_offset + (col_base + lane) * 2;
-                // BF16 = high 16 bits of f32 (little-endian shard files).
-                let bits = u16::from_le_bytes([bf16_bytes[off], bf16_bytes[off + 1]]);
-                let value = f32::from_bits((bits as u32) << 16);
-                values[lane] = value;
-                amax = amax.max(value.abs());
-            }
-            let e = compute_e8m0_scale_host(amax);
-            let d = e8m0_to_f32_half_host(e);
-            let out_base = (row * blocks_per_row + block) * 17;
-            repacked[out_base] = e;
-            for lane in 0..16 {
-                let lo = best_mxfp4_index(values[lane], d);
-                let hi = best_mxfp4_index(values[lane + 16], d);
-                repacked[out_base + 1 + lane] = lo | (hi << 4);
-            }
-        }
-    }
-    Ok(repacked)
-}
-
 pub(crate) fn repack_nvfp4_to_mxfp4_host(
     spec: &Nvfp4LinearSpec,
     packed: &[u8],

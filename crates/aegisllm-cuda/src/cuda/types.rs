@@ -226,26 +226,6 @@ pub(super) struct DeviceMxfp4Linear {
     pub data: CudaSlice<u8>,
 }
 
-/// Standalone MXFP4 linear weight (Microsoft / OCP format, group_size=32,
-/// E8M0 scale per block). The legacy `DeviceMxfp4Linear` above is the
-/// optional companion to `DeviceNvfp4Linear` (re-pack of NVFP4 source);
-/// this one is for weights loaded **directly as MXFP4** — e.g. the
-/// load-time BF16 → MXFP4 quantizer for the shared expert.
-#[derive(Debug)]
-pub struct StandaloneMxfp4Linear {
-    pub name: String,
-    pub rows: usize,
-    pub cols: usize,
-    pub bytes: usize,
-    pub blocks_per_row: usize,
-    pub output_scale: f32,
-    pub(super) data: CudaSlice<u8>,
-}
-
-impl StandaloneMxfp4Linear {
-    pub(super) fn data_slice(&self) -> &CudaSlice<u8> { &self.data }
-}
-
 #[derive(Debug)]
 pub(super) struct DeviceCutlassNvfp4Linear {
     pub layout: CutlassNvfp4LinearLayout,
@@ -279,6 +259,33 @@ impl DeviceBf16Matrix {
     pub fn is_host_resident(&self) -> bool {
         self.host_values.is_some()
     }
+}
+
+/// Standalone FP8 E4M3 linear weight, produced by the load-time
+/// `bf16 → fp8` quantizer when the user sets
+/// `shared-MLP-quantization = "fp8"` (or `attention-quantization = "fp8"`).
+///
+/// Layout: `data` is `rows × cols` bytes of E4M3 (NVIDIA convention,
+/// NaN=0x7f/0xff, max=448). `row_scales[r]` is the FP32 per-row dequant
+/// scale: the original BF16 value at `(r, c)` ≈
+/// `fp8_e4m3_bits_to_float(data[r*cols + c]) * row_scales[r]`. Per-row
+/// (rather than per-group) trades a small amount of accuracy for
+/// simplicity and a tiny scale buffer (`rows * 4` bytes). VRAM-resident
+/// only; the load-time quantizer writes both buffers directly to the
+/// device.
+#[derive(Debug)]
+pub struct StandaloneFp8Linear {
+    pub name: String,
+    pub rows: usize,
+    pub cols: usize,
+    pub bytes: usize,
+    pub(super) data: CudaSlice<u8>,
+    pub(super) row_scales: CudaSlice<f32>,
+}
+
+impl StandaloneFp8Linear {
+    pub(super) fn data_slice(&self) -> &CudaSlice<u8> { &self.data }
+    pub(super) fn row_scales_slice(&self) -> &CudaSlice<f32> { &self.row_scales }
 }
 
 #[derive(Debug, Clone, Copy)]

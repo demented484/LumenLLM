@@ -506,6 +506,8 @@ mod tests {
             },
             linear_layout: Default::default(),
             warnings: Vec::new(),
+            attention_quantization: aegisllm_base::planning::placement::WeightQuantOverride::Default,
+            shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride::Default,
         };
         let runtime = RuntimePlan {
             kernels: vec![

@@ -8,7 +8,7 @@ use super::gemm::{
     prefill_qkv_mxfp4_native_device,
 };
 use super::timings::record_prefill_stage;
-use crate::cuda::{CudaRuntime, DensePrefillMetadataProof};
+use crate::cuda::{CudaRuntime, DensePrefillMetadataProof, DeviceBuffer};
 use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::error::{AegisError, Result};
 use crate::executor::state::{
@@ -230,15 +230,9 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             )?;
         }
     } else {
-        // BF16 attention path (Gemma 4 26B): batched matmul Q/K/V with VRAM-resident
-        // weights (host-resident BF16 attention is forced to VRAM at load time). All
-        // attention norms are run batched — q_norm, k_norm, v_norm (no learned weight).
-        let q_bf16 = layer.q_proj.as_bf16().ok_or_else(|| AegisError::InvalidPlan(
-            "BF16 attention prefill: q_proj must be BF16".into()))?;
-        let k_bf16 = layer.k_proj.as_bf16().ok_or_else(|| AegisError::InvalidPlan(
-            "BF16 attention prefill: k_proj must be BF16".into()))?;
-        let v_bf16 = layer.v_proj.as_bf16().ok_or_else(|| AegisError::InvalidPlan(
-            "BF16 attention prefill: v_proj must be BF16".into()))?;
+        // BF16/FP8 attention path (Gemma 4 26B): batched matmul Q/K/V with VRAM-resident
+        // weights. All attention norms are run batched — q_norm, k_norm, v_norm (no
+        // learned weight).
         runtime.rms_norm_batched_device(
             &prefill.hidden,
             &layer.input_norm_weight,
@@ -246,39 +240,43 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.rms_norm_eps,
             &mut prefill.input_normed,
         )?;
-        // Phase C: cuBLASLt BF16 GEMM for Q/K/V projections. Falls back to
-        // reference if any of the three is host-resident (shouldn't happen in
-        // practice — Gemma 4 attention BF16 weights are force-VRAM).
-        if runtime.cublaslt_bf16_enabled_for(q_bf16)
-            && runtime.cublaslt_bf16_enabled_for(k_bf16)
-            && runtime.cublaslt_bf16_enabled_for(v_bf16)
-        {
-            runtime.matmul_bf16_cublaslt_device(
-                q_bf16, &prefill.input_normed, params.batch,
-                &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
-                &mut prefill.gate,
-            )?;
-            runtime.matmul_bf16_cublaslt_device(
-                k_bf16, &prefill.input_normed, params.batch,
-                &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
-                &mut prefill.up,
-            )?;
-            runtime.matmul_bf16_cublaslt_device(
-                v_bf16, &prefill.input_normed, params.batch,
-                &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
-                &mut prefill.v,
-            )?;
-        } else {
-            runtime.matmul_bf16_reference_batched_device(
-                q_bf16, &prefill.input_normed, params.batch, &mut prefill.gate,
-            )?;
-            runtime.matmul_bf16_reference_batched_device(
-                k_bf16, &prefill.input_normed, params.batch, &mut prefill.up,
-            )?;
-            runtime.matmul_bf16_reference_batched_device(
-                v_bf16, &prefill.input_normed, params.batch, &mut prefill.v,
-            )?;
+        // Per-projection dispatch: BF16 → cuBLASLt (or reference) GEMM,
+        // FP8 → dequant-to-BF16 + cuBLASLt GEMM (shared dequant scratch).
+        // Mixed BF16/FP8 across q/k/v is fine since each is dispatched
+        // independently. NVFP4 layers go through an earlier branch.
+        macro_rules! dispatch_attn_proj {
+            ($proj:expr, $output:expr) => {{
+                match $proj {
+                    CudaLinear::Bf16(b) => {
+                        if runtime.cublaslt_bf16_enabled_for(b) {
+                            runtime.matmul_bf16_cublaslt_device(
+                                b, &prefill.input_normed, params.batch,
+                                &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
+                                $output,
+                            )?;
+                        } else {
+                            runtime.matmul_bf16_reference_batched_device(
+                                b, &prefill.input_normed, params.batch, $output,
+                            )?;
+                        }
+                    }
+                    CudaLinear::Fp8(f) => {
+                        runtime.matmul_fp8_via_bf16_cublaslt_device(
+                            f, &mut prefill.fp8_dequant_scratch,
+                            &prefill.input_normed, params.batch,
+                            &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
+                            $output,
+                        )?;
+                    }
+                    CudaLinear::Nvfp4(_) => return Err(AegisError::InvalidPlan(
+                        "BF16/FP8 attention prefill called on NVFP4 projection".into(),
+                    )),
+                }
+            }};
         }
+        dispatch_attn_proj!(&layer.q_proj, &mut prefill.gate);
+        dispatch_attn_proj!(&layer.k_proj, &mut prefill.up);
+        dispatch_attn_proj!(&layer.v_proj, &mut prefill.v);
         // Per-head q_norm/k_norm (with weight) + v_norm (no weight). Each per-head
         // RMS norm acts on a row of head_dim values across (batch * num_heads) rows.
         if let Some(ref qnw) = layer.q_norm_weight {
@@ -587,9 +585,12 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
                 )?;
             }
         }
-        CudaLinear::Mxfp4(o) => {
-            runtime.matmul_mxfp4_standalone_batched_device(
-                o, &prefill.qkv, params.batch, &mut prefill.input_normed,
+        CudaLinear::Fp8(o) => {
+            runtime.matmul_fp8_via_bf16_cublaslt_device(
+                o, &mut prefill.fp8_dequant_scratch,
+                &prefill.qkv, params.batch,
+                &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
+                &mut prefill.input_normed,
             )?;
         }
     }

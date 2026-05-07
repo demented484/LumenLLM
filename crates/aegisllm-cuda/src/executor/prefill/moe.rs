@@ -135,32 +135,39 @@ pub(super) fn forward_moe_prefill_chunk_device(
                 )?;
             }
         }
-        (CL::Mxfp4(g), CL::Mxfp4(u), CL::Mxfp4(d)) => {
-            // Load-time MXFP4-quantized shared expert. Activations get
-            // MXFP4-quantized in `matmul_mxfp4_standalone_batched_device`
-            // (it runs `quantize_mxfp4_input_batched_device` internally).
-            // Gate and up share the same input (`pf.input_normed`) but
-            // each kernel re-quantizes from f32 — minor extra cost; if it
-            // shows up we can pre-quantize once and use the
-            // `_prepacked_` variant.
-            runtime.matmul_mxfp4_standalone_batched_device(
-                g, &pf.input_normed, batch, &mut moe_scratch.gather_intermediate,
+        (CL::Fp8(g), CL::Fp8(u), CL::Fp8(d)) => {
+            // Standalone FP8 shared expert via dequant-to-BF16 + cuBLASLt
+            // tensor-core path. Each projection dequants its weight into
+            // the shared `pf.fp8_dequant_scratch` (one buffer reused across
+            // all four GEMMs in the chunk; safe because each call's
+            // weight-dequant precedes its own matmul).
+            runtime.matmul_fp8_via_bf16_cublaslt_device(
+                g, &mut pf.fp8_dequant_scratch,
+                &pf.input_normed, batch,
+                &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
+                &mut moe_scratch.gather_intermediate,
             )?;
-            runtime.matmul_mxfp4_standalone_batched_device(
-                u, &pf.input_normed, batch, &mut moe_scratch.gather_swiglu,
+            runtime.matmul_fp8_via_bf16_cublaslt_device(
+                u, &mut pf.fp8_dequant_scratch,
+                &pf.input_normed, batch,
+                &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
+                &mut moe_scratch.gather_swiglu,
             )?;
             runtime.geglu_tanh_in_place_device(
                 &moe_scratch.gather_intermediate,
                 &mut moe_scratch.gather_swiglu,
                 batch * intermediate,
             )?;
-            runtime.matmul_mxfp4_standalone_batched_device(
-                d, &moe_scratch.gather_swiglu, batch, &mut moe_scratch.gather_out,
+            runtime.matmul_fp8_via_bf16_cublaslt_device(
+                d, &mut pf.fp8_dequant_scratch,
+                &moe_scratch.gather_swiglu, batch,
+                &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
+                &mut moe_scratch.gather_out,
             )?;
         }
         _ => return Err(AegisError::InvalidPlan(
             "MoE prefill expects shared expert with all three projections in the same \
-             format (BF16 or MXFP4)".into(),
+             format (BF16 or FP8)".into(),
         )),
     }
 

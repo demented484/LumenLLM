@@ -68,20 +68,17 @@ pub struct PlacementPolicy {
 }
 
 /// Available load-time weight-quantization formats. `Default` means "keep
-/// whatever the checkpoint stored" (no on-load quantization). The four
+/// whatever the checkpoint stored" (no on-load quantization). The
 /// non-default formats split into:
-///   * **Float** (`Mxfp4`, `Fp8`) — preserve dynamic range, no
-///     calibration required, ~0.1–0.5% quality cost.
+///   * **Float** (`Fp8`) — preserves dynamic range, no calibration
+///     required, ~0.1–0.5% quality cost.
 ///   * **Integer** (`Mxint4`, `Int4`, `Int8`) — fixed-point, smaller for
-///     equal bit-width (e.g. INT4 vs MXFP4) but more sensitive to
-///     outliers without calibration data; runtime path uses cuBLASLt
-///     INT8 / CUTLASS INT4 GEMM kernels.
+///     equal bit-width but more sensitive to outliers without calibration
+///     data; runtime path uses cuBLASLt INT8 / CUTLASS INT4 GEMM kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightQuantOverride {
     /// Keep the checkpoint's storage format (no load-time quant).
     Default,
-    /// Microsoft / OCP MXFP4: 4-bit float, group_size=32, E8M0 scales.
-    Mxfp4,
     /// 8-bit float (E4M3 by default).
     Fp8,
     /// Microsoft / OCP MXINT4: 4-bit signed int, group_size=32, E8M0 scales.
@@ -96,7 +93,6 @@ impl WeightQuantOverride {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "default" | "" => Some(Self::Default),
-            "mxfp4" => Some(Self::Mxfp4),
             "fp8" | "fp8_e4m3" | "fp8-e4m3" => Some(Self::Fp8),
             "mxint4" => Some(Self::Mxint4),
             "int4" => Some(Self::Int4),
@@ -602,6 +598,7 @@ mod tests {
                 kind: crate::model::LayerKind::DenseDecoder,
                 attention_pattern: crate::model::AttentionPattern::FullCausal,
                 head_dim: 128,
+                num_kv_heads: 8,
             }],
             norm_pattern: crate::model::NormPattern::PreOnly,
             lm_head_softcap: None,

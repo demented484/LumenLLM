@@ -2,21 +2,16 @@ use std::fmt;
 
 use cudarc::driver::{CudaGraph, PinnedHostSlice};
 
-use crate::cuda::{CudaRuntime, DeviceBf16Matrix, DeviceBuffer, DeviceNvfp4Linear};
+use crate::cuda::{CudaRuntime, DeviceBf16Matrix, DeviceBuffer, DeviceNvfp4Linear, StandaloneFp8Linear};
 use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::planning::placement::StoragePlacement;
 
-/// Wraps either an NVFP4 or BF16 linear projection.
+/// Wraps a linear projection in NVFP4, BF16, or FP8 storage.
 #[derive(Debug)]
 pub(super) enum CudaLinear {
     Nvfp4(DeviceNvfp4Linear),
     Bf16(DeviceBf16Matrix),
-    /// Standalone MXFP4 (Microsoft / OCP, group=32, E8M0). Produced by the
-    /// load-time `bf16 → mxfp4` quantizer when the user sets
-    /// `shared-MLP-quantization = "mxfp4"` (or the equivalent for
-    /// attention). Unrelated to the optional `native_mxfp4` companion on
-    /// `DeviceNvfp4Linear`, which is a re-pack of NVFP4 source weights.
-    Mxfp4(crate::cuda::StandaloneMxfp4Linear),
+    Fp8(StandaloneFp8Linear),
 }
 
 impl CudaLinear {
@@ -24,30 +19,29 @@ impl CudaLinear {
         match self {
             Self::Nvfp4(l) => l.rows,
             Self::Bf16(m) => m.rows,
-            Self::Mxfp4(m) => m.rows,
+            Self::Fp8(m) => m.rows,
         }
     }
     pub(super) fn cols(&self) -> usize {
         match self {
             Self::Nvfp4(l) => l.cols,
             Self::Bf16(m) => m.cols,
-            Self::Mxfp4(m) => m.cols,
+            Self::Fp8(m) => m.cols,
         }
     }
     pub(super) fn name(&self) -> &str {
         match self {
             Self::Nvfp4(l) => &l.name,
             Self::Bf16(m) => &m.name,
-            Self::Mxfp4(m) => &m.name,
+            Self::Fp8(m) => &m.name,
         }
     }
     pub(super) fn is_host_resident(&self) -> bool {
         match self {
             Self::Nvfp4(l) => l.is_host_resident(),
             Self::Bf16(m) => m.is_host_resident(),
-            // Standalone MXFP4 always lives in VRAM (load-time quantizer
-            // writes directly to a CudaSlice).
-            Self::Mxfp4(_) => false,
+            // FP8 standalone: load-time quantizer writes directly to VRAM.
+            Self::Fp8(_) => false,
         }
     }
     pub(super) fn as_nvfp4(&self) -> Option<&DeviceNvfp4Linear> {
@@ -55,9 +49,6 @@ impl CudaLinear {
     }
     pub(super) fn as_bf16(&self) -> Option<&DeviceBf16Matrix> {
         match self { Self::Bf16(m) => Some(m), _ => None }
-    }
-    pub(super) fn as_mxfp4(&self) -> Option<&crate::cuda::StandaloneMxfp4Linear> {
-        match self { Self::Mxfp4(m) => Some(m), _ => None }
     }
     pub(super) fn cutlass_nvfp4_enabled(&self, runtime: &CudaRuntime) -> bool {
         match self { Self::Nvfp4(l) => runtime.cutlass_nvfp4_inference_enabled_for(l), _ => false }
@@ -513,6 +504,12 @@ pub(super) struct CudaPrefillScratch {
     pub(super) bf16_in_scratch: DeviceBuffer<u16>,
     /// BF16 scratch for cuBLASLt output (before BF16→F32 conversion). Same size.
     pub(super) bf16_out_scratch: DeviceBuffer<u16>,
+    /// BF16 scratch for FP8-weight dequant. Sized for the largest projection:
+    /// `max(hidden*hidden, hidden*intermediate, hidden*q_width, hidden*kv_width)`
+    /// elements. Reused per-call across all FP8 prefill GEMMs (one shared
+    /// scratch, not per-layer). Empty (zero-length) when no FP8 weights are
+    /// loaded — initialized lazily by the FP8 prefill path.
+    pub(super) fp8_dequant_scratch: DeviceBuffer<u16>,
     /// MoE prefill scratch (allocated only when the model has MoE layers).
     pub(super) moe: Option<Box<CudaMoEPrefillScratch>>,
 }
@@ -562,6 +559,24 @@ pub(super) struct CudaMoEPrefillScratch {
     pub(super) expert_counts: DeviceBuffer<u32>,
     /// Stride between per-expert lists (= `max_per_expert` = chunk_size * top_k).
     pub(super) expert_list_stride: usize,
+    // ── Permuted MoE scratch (grouped path) ────────────────────────────────
+    /// Per-expert prefix-sum offsets: `[num_experts + 1]`. Built by
+    /// `aegis_router_expert_offsets` from `expert_counts`. Defines slice
+    /// boundaries in the permuted-activation buffers.
+    pub(super) expert_offsets: DeviceBuffer<u32>,
+    /// Permuted input: `[chunk_size * top_k, hidden_size]`. Filled by
+    /// `aegis_permute_gather_f32`: tokens grouped by expert, in order of
+    /// `expert_offsets`. Each routed-expert call reads its slice
+    /// `[expert_offsets[e]..expert_offsets[e+1])` directly — no per-call
+    /// `gather_rows`.
+    pub(super) permuted_input: DeviceBuffer<f32>,
+    /// Permuted gate output: `[chunk_size * top_k, expert_intermediate]`.
+    pub(super) permuted_intermediate: DeviceBuffer<f32>,
+    /// Permuted up output (also reused as GeGLU output for down input).
+    pub(super) permuted_swiglu: DeviceBuffer<f32>,
+    /// Permuted down_proj output: `[chunk_size * top_k, hidden_size]`. Read
+    /// by `aegis_unpermute_scatter_add_f32` to write back into `moe_acc`.
+    pub(super) permuted_output: DeviceBuffer<f32>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]

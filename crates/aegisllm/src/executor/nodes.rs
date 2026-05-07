@@ -69,6 +69,8 @@ mod tests {
             },
             linear_layout: LinearLayoutPolicy::default(),
             warnings: Vec::new(),
+            attention_quantization: aegisllm_base::planning::placement::WeightQuantOverride::Default,
+            shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride::Default,
         };
 
         let plan = ExecutorGraphPlan::from_resolved_placement(&placement);

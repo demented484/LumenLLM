@@ -1247,6 +1247,143 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Build per-expert prefix-sum offsets from `expert_counts`. Output is
+    /// `expert_offsets[num_experts+1]` where `expert_offsets[e]` is the
+    /// starting row in the permuted-activation buffer for expert `e`. Used
+    /// by grouped MoE: replaces a host-side prefix-sum + upload after the
+    /// per-token softmax+topk produced `expert_counts` on device.
+    pub fn router_expert_offsets_device(
+        &self,
+        expert_counts: &DeviceBuffer<u32>,
+        num_experts: usize,
+        expert_offsets: &mut DeviceBuffer<u32>,
+    ) -> Result<()> {
+        if expert_counts.len() < num_experts {
+            return Err(AegisError::InvalidPlan(format!(
+                "router_expert_offsets counts too small: have {} need {}",
+                expert_counts.len(), num_experts
+            )));
+        }
+        if expert_offsets.len() < num_experts + 1 {
+            return Err(AegisError::InvalidPlan(format!(
+                "router_expert_offsets out too small: have {} need {}",
+                expert_offsets.len(), num_experts + 1
+            )));
+        }
+        let num_experts_u32 = u32_arg("num_experts", num_experts)?;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (1, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.router_expert_offsets)
+                .arg(&expert_counts.slice)
+                .arg(&num_experts_u32)
+                .arg(&mut expert_offsets.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch router_expert_offsets"))?;
+        Ok(())
+    }
+
+    /// Permute-gather: scatter source rows into expert-sorted layout. After
+    /// this kernel, `permuted[expert_offsets[e]..expert_offsets[e+1]]` holds
+    /// hidden states of all tokens routed to expert `e`. Single launch
+    /// replaces the per-expert `gather_rows_f32_device` calls in the
+    /// grouped MoE prefill path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn permute_gather_f32_device(
+        &self,
+        src: &DeviceBuffer<f32>,
+        expert_token_lists: &DeviceBuffer<u32>,
+        expert_counts: &DeviceBuffer<u32>,
+        expert_offsets: &DeviceBuffer<u32>,
+        stride: usize,
+        num_experts: usize,
+        max_tokens_per_expert: usize,
+        hidden: usize,
+        permuted: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if hidden == 0 || num_experts == 0 || max_tokens_per_expert == 0 {
+            return Ok(());
+        }
+        let stride_u32 = u32_arg("stride", stride)?;
+        let hidden_u32 = u32_arg("hidden", hidden)?;
+        let num_experts_u32 = u32_arg("num_experts", num_experts)?;
+        let max_tok_u32 = u32_arg("max_tokens_per_expert", max_tokens_per_expert)?;
+        let block_dim = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(hidden_u32, block_dim), max_tok_u32, num_experts_u32),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.permute_gather_f32)
+                .arg(&src.slice)
+                .arg(&expert_token_lists.slice)
+                .arg(&expert_counts.slice)
+                .arg(&expert_offsets.slice)
+                .arg(&stride_u32)
+                .arg(&hidden_u32)
+                .arg(&mut permuted.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch permute_gather_f32"))?;
+        Ok(())
+    }
+
+    /// Unpermute-scatter-add: reads per-expert output rows from the permuted
+    /// buffer, multiplies each by its routing weight, and atomically adds
+    /// into `moe_acc[src_token, h]`. Multiple experts write to the same
+    /// source token (top_k > 1) — atomicAdd handles the contention. Single
+    /// launch replaces N `scatter_add_weighted_f32` calls.
+    #[allow(clippy::too_many_arguments)]
+    pub fn unpermute_scatter_add_f32_device(
+        &self,
+        permuted: &DeviceBuffer<f32>,
+        expert_token_lists: &DeviceBuffer<u32>,
+        expert_weight_lists: &DeviceBuffer<f32>,
+        expert_counts: &DeviceBuffer<u32>,
+        expert_offsets: &DeviceBuffer<u32>,
+        stride: usize,
+        num_experts: usize,
+        max_tokens_per_expert: usize,
+        hidden: usize,
+        moe_acc: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if hidden == 0 || num_experts == 0 || max_tokens_per_expert == 0 {
+            return Ok(());
+        }
+        let stride_u32 = u32_arg("stride", stride)?;
+        let hidden_u32 = u32_arg("hidden", hidden)?;
+        let num_experts_u32 = u32_arg("num_experts", num_experts)?;
+        let max_tok_u32 = u32_arg("max_tokens_per_expert", max_tokens_per_expert)?;
+        let block_dim = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(hidden_u32, block_dim), max_tok_u32, num_experts_u32),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.unpermute_scatter_add_f32)
+                .arg(&permuted.slice)
+                .arg(&expert_token_lists.slice)
+                .arg(&expert_weight_lists.slice)
+                .arg(&expert_counts.slice)
+                .arg(&expert_offsets.slice)
+                .arg(&stride_u32)
+                .arg(&hidden_u32)
+                .arg(&mut moe_acc.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch unpermute_scatter_add_f32"))?;
+        Ok(())
+    }
+
     /// Element-wise multiply in-place: `out[i] *= scale[i]`. Lengths must match.
     pub fn mul_vec_inplace_device(
         &self,

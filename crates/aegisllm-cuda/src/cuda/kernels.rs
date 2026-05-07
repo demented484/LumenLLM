@@ -9,6 +9,8 @@ pub(crate) const BLACKWELL_FP4_KERNEL_SRC: &str = concat!(
     "\n",
     include_str!("kernels/blackwell/kv_fp8.cu"),
     "\n",
+    include_str!("kernels/blackwell/linear_fp8.cu"),
+    "\n",
     include_str!("kernels/blackwell/attention_utils.cuh"),
     "\n",
     include_str!("kernels/blackwell/attention_decode.cu"),
