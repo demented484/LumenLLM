@@ -578,26 +578,36 @@ pub(super) struct CudaMoEPrefillScratch {
     /// by `aegis_unpermute_scatter_add_f32` to write back into `moe_acc`.
     pub(super) permuted_output: DeviceBuffer<f32>,
     // ── Bulk expert weight staging (grouped GEMM path) ─────────────────────
-    /// Bulk packed weight buffer: holds the packed bytes of ALL active
-    /// experts' currently-staged projection (gate, up, or down — reused
-    /// across the three within one layer). Capacity sized for
-    /// `num_experts * max(gate_bytes, up_bytes, down_bytes)`. ~127 MiB on
-    /// Gemma-4-26B (128 experts × ~990 KiB packed per projection).
-    pub(super) bulk_packed: DeviceBuffer<u8>,
-    /// Bulk per-block scales buffer (UE4M3). ~16 MiB on Gemma-4-26B.
-    pub(super) bulk_scales: DeviceBuffer<u8>,
-    /// Per-active-expert byte offsets into `bulk_packed`. Uploaded once
-    /// per projection. Length = `num_experts` (worst case all active).
-    pub(super) bulk_packed_offsets: DeviceBuffer<u32>,
-    /// Per-active-expert byte offsets into `bulk_scales`.
-    pub(super) bulk_scales_offsets: DeviceBuffer<u32>,
-    /// Per-active-expert FP32 output_scale. The grouped GEMM kernel reads
-    /// `output_scales[ae]` and multiplies the accumulator before writing.
-    pub(super) bulk_output_scales: DeviceBuffer<f32>,
+    /// Three projections per layer (gate / up / down) need three independent
+    /// staging slots so the transfer stream can stage projection N+1 while
+    /// the compute stream's grouped-GEMM kernel for projection N is still
+    /// reading from its own slot. Each slot is sized for the worst-case
+    /// (all 128 experts active) projection footprint (~127 MiB packed +
+    /// ~16 MiB scales + tiny metadata). 3-slot total: ~430 MiB transient
+    /// VRAM. Required for Phase B.3 (dual-stream H2D/compute overlap).
+    pub(super) bulk_slots: [GroupedStagingSlot; 3],
     /// Per-active-expert prefix-sum of token counts: `expert_token_offsets[ae+1]
     /// - expert_token_offsets[ae]` is the number of tokens routed to the
-    /// ae-th active expert. Length = `num_experts + 1`.
+    /// ae-th active expert. Length = `num_experts + 1`. Independent of
+    /// projection so a single buffer is fine — written once per layer
+    /// before any GEMM and not modified between projections.
     pub(super) bulk_token_offsets: DeviceBuffer<u32>,
+}
+
+/// One physical staging slot for a single MoE projection (gate / up /
+/// down). Holds the packed/scales bytes plus per-active-expert metadata
+/// so the grouped-GEMM kernel can dispatch the projection independently
+/// of the other two slots. The kernel reads `*_offsets` and
+/// `output_scales` at execution time, so each projection needs its own
+/// metadata to avoid races with the next projection's H2D into the
+/// shared bulk buffer.
+#[derive(Debug)]
+pub(super) struct GroupedStagingSlot {
+    pub(super) bulk_packed: DeviceBuffer<u8>,
+    pub(super) bulk_scales: DeviceBuffer<u8>,
+    pub(super) bulk_packed_offsets: DeviceBuffer<u32>,
+    pub(super) bulk_scales_offsets: DeviceBuffer<u32>,
+    pub(super) bulk_output_scales: DeviceBuffer<f32>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]

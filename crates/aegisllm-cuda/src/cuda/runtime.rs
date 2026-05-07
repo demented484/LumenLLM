@@ -121,7 +121,7 @@ impl CudaRuntime {
 
     /// Record an event on the compute stream. Used to signal "kernel finished writing
     /// to staging" so the transfer stream can issue D2H writeback or reuse the slot.
-    pub(crate) fn record_compute_event(&self) -> Result<CudaEvent> {
+    pub fn record_compute_event(&self) -> Result<CudaEvent> {
         self.stream
             .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
             .map_err(map_cuda_err("record compute event"))
@@ -129,7 +129,7 @@ impl CudaRuntime {
 
     /// Record an event on the transfer stream. Used to signal "H2D upload finished"
     /// so the compute stream can read the staging slot.
-    pub(crate) fn record_transfer_event(&self) -> Result<CudaEvent> {
+    pub fn record_transfer_event(&self) -> Result<CudaEvent> {
         self.transfer_stream
             .record_event(Some(sys::CUevent_flags::CU_EVENT_DISABLE_TIMING))
             .map_err(map_cuda_err("record transfer event"))
@@ -137,7 +137,7 @@ impl CudaRuntime {
 
     /// Make the compute stream wait until `event` has been signaled.
     /// All future kernels on the compute stream will not start until then.
-    pub(crate) fn compute_wait_event(&self, event: &CudaEvent) -> Result<()> {
+    pub fn compute_wait_event(&self, event: &CudaEvent) -> Result<()> {
         self.stream
             .wait(event)
             .map_err(map_cuda_err("compute stream wait event"))

@@ -276,6 +276,74 @@ impl CudaRuntime {
             .map_err(map_cuda_err("h2d pinned u8"))
     }
 
+    /// Same as `copy_host_u8_to_device_at_offset` but issues the H2D on the
+    /// transfer stream instead of the compute stream. Used by grouped MoE
+    /// bulk staging to overlap weight uploads with kernel execution: the
+    /// caller records a transfer event afterwards and makes the compute
+    /// stream `wait` on that event before launching the consumer GEMM.
+    pub fn copy_host_u8_to_device_at_offset_async(
+        &self,
+        src: &[u8],
+        dst: &mut DeviceBuffer<u8>,
+        dst_offset: usize,
+    ) -> Result<()> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        if dst_offset.saturating_add(src.len()) > dst.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "copy_host_u8_to_device_at_offset_async out of bounds: dst.len={} dst_off={} src.len={}",
+                dst.len(), dst_offset, src.len()
+            )));
+        }
+        let mut dst_view = dst.slice.slice_mut(dst_offset..dst_offset + src.len());
+        self.transfer_stream
+            .memcpy_htod(src, &mut dst_view)
+            .map_err(map_cuda_err("h2d u8 transfer-stream"))
+    }
+
+    /// Same as `upload_u32_slice_to_device` but on the transfer stream.
+    pub fn upload_u32_slice_to_device_async(
+        &self,
+        values: &[u32],
+        buffer: &mut DeviceBuffer<u32>,
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        if buffer.len() < values.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "upload_u32_slice_to_device_async buffer too small: have {} need {}",
+                buffer.len(), values.len()
+            )));
+        }
+        let mut dst = buffer.slice.slice_mut(0..values.len());
+        self.transfer_stream
+            .memcpy_htod(values, &mut dst)
+            .map_err(map_cuda_err("htod u32 transfer-stream"))
+    }
+
+    /// Same as `upload_f32_slice_to_device` but on the transfer stream.
+    pub fn upload_f32_slice_to_device_async(
+        &self,
+        values: &[f32],
+        buffer: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        if buffer.len() < values.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "upload_f32_slice_to_device_async buffer too small: have {} need {}",
+                buffer.len(), values.len()
+            )));
+        }
+        let mut dst = buffer.slice.slice_mut(0..values.len());
+        self.transfer_stream
+            .memcpy_htod(values, &mut dst)
+            .map_err(map_cuda_err("htod f32 transfer-stream"))
+    }
+
     /// Copy a host byte slice into a u8 device buffer at `dst_offset`.
     /// Used by grouped MoE bulk staging to concatenate per-expert weight
     /// bytes into a single contiguous VRAM buffer.

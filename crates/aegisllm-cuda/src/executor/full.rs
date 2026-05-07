@@ -603,12 +603,15 @@ impl CudaLlamaExecutor {
                             .runtime
                             .alloc_f32(cs * max_top_k * max_expert_intermediate)?,
                         permuted_output: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,
-                        // Bulk expert staging — sized for worst-case all-experts-
-                        // active for one projection. Per-expert max packed/scales
-                        // bytes pulled from the layer's NVFP4 experts (gate / up /
-                        // down all share roughly the same dimensions for routed
-                        // experts; we take the max to be safe).
-                        bulk_packed: {
+                        // 3-slot grouped staging (gate / up / down each get
+                        // their own slot). Allows transfer stream to fill
+                        // projection N+1's slot while compute stream's
+                        // grouped-GEMM kernel for projection N is still
+                        // reading from its own slot. ~143 MiB per slot on
+                        // Gemma-4-26B; total ~430 MiB transient VRAM. The
+                        // win is ~30% reduction in MoE per-layer time when
+                        // H2D and compute would otherwise serialize.
+                        bulk_slots: {
                             let max_packed = self
                                 .layers
                                 .iter()
@@ -620,9 +623,6 @@ impl CudaLlamaExecutor {
                                 .map(|p| p.packed_bytes)
                                 .max()
                                 .unwrap_or(0);
-                            self.runtime.alloc_u8(max_experts * max_packed.max(1))?
-                        },
-                        bulk_scales: {
                             let max_scales = self
                                 .layers
                                 .iter()
@@ -634,11 +634,26 @@ impl CudaLlamaExecutor {
                                 .map(|p| p.scale_bytes)
                                 .max()
                                 .unwrap_or(0);
-                            self.runtime.alloc_u8(max_experts * max_scales.max(1))?
+                            let mut slots = Vec::with_capacity(3);
+                            for _ in 0..3 {
+                                slots.push(super::state::GroupedStagingSlot {
+                                    bulk_packed: self
+                                        .runtime
+                                        .alloc_u8(max_experts * max_packed.max(1))?,
+                                    bulk_scales: self
+                                        .runtime
+                                        .alloc_u8(max_experts * max_scales.max(1))?,
+                                    bulk_packed_offsets: self.runtime.alloc_u32(max_experts)?,
+                                    bulk_scales_offsets: self.runtime.alloc_u32(max_experts)?,
+                                    bulk_output_scales: self.runtime.alloc_f32(max_experts)?,
+                                });
+                            }
+                            slots.try_into().map_err(|_: Vec<_>| {
+                                AegisError::Unsupported(
+                                    "internal: bulk staging slot vec→array mismatch".into(),
+                                )
+                            })?
                         },
-                        bulk_packed_offsets: self.runtime.alloc_u32(max_experts)?,
-                        bulk_scales_offsets: self.runtime.alloc_u32(max_experts)?,
-                        bulk_output_scales: self.runtime.alloc_f32(max_experts)?,
                         bulk_token_offsets: self.runtime.alloc_u32(max_experts + 1)?,
                     }))
                 } else {

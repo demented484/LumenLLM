@@ -479,14 +479,14 @@ enum ExpertProjKind {
     Down,
 }
 
-/// Stage one projection of all active experts into the bulk VRAM buffers.
-/// Each per-expert pair of memcpy_htod calls writes into a pre-allocated
-/// offset of the bulk buffer. Pinned bounce coalescing was tried and lost
-/// to per-expert because `as_mut_slice` synchronises on the bounce's prior
-/// DMA — that serialises across projections and wipes the overlap pool's
-/// gain. Per-expert via `memcpy_htod` keeps the existing pipeline behaviour.
+/// Stage one projection of all active experts into the bulk VRAM buffers
+/// **on the dedicated transfer stream** (Phase B.3 dual-stream overlap).
+/// Returns a `CudaEvent` recorded on the transfer stream after all H2D
+/// ops complete. The caller arranges for the compute stream to `wait`
+/// on this event before launching the consumer GEMM, so kernel work for
+/// projection N runs concurrently with H2D for projection N+1.
 #[allow(clippy::too_many_arguments)]
-fn stage_active_experts_projection(
+fn stage_active_experts_projection_async(
     runtime: &CudaRuntime,
     experts: &[crate::executor::state::CudaMoEExpert],
     active_experts: &[usize],
@@ -496,7 +496,7 @@ fn stage_active_experts_projection(
     bulk_packed_offsets: &mut DeviceBuffer<u32>,
     bulk_scales_offsets: &mut DeviceBuffer<u32>,
     bulk_output_scales: &mut DeviceBuffer<f32>,
-) -> Result<()> {
+) -> Result<cudarc::driver::CudaEvent> {
     let mut packed_offsets_host: Vec<u32> = Vec::with_capacity(active_experts.len());
     let mut scales_offsets_host: Vec<u32> = Vec::with_capacity(active_experts.len());
     let mut output_scales_host: Vec<f32> = Vec::with_capacity(active_experts.len());
@@ -518,16 +518,16 @@ fn stage_active_experts_projection(
         packed_offsets_host.push(packed_off as u32);
         scales_offsets_host.push(scales_off as u32);
         output_scales_host.push(proj.output_scale);
-        runtime.copy_host_u8_to_device_at_offset(packed_bytes, bulk_packed, packed_off)?;
-        runtime.copy_host_u8_to_device_at_offset(scales_bytes, bulk_scales, scales_off)?;
+        runtime.copy_host_u8_to_device_at_offset_async(packed_bytes, bulk_packed, packed_off)?;
+        runtime.copy_host_u8_to_device_at_offset_async(scales_bytes, bulk_scales, scales_off)?;
         packed_off += packed_bytes.len();
         scales_off += scales_bytes.len();
     }
 
-    runtime.upload_u32_slice_to_device(&packed_offsets_host, bulk_packed_offsets)?;
-    runtime.upload_u32_slice_to_device(&scales_offsets_host, bulk_scales_offsets)?;
-    runtime.upload_f32_slice_to_device(&output_scales_host, bulk_output_scales)?;
-    Ok(())
+    runtime.upload_u32_slice_to_device_async(&packed_offsets_host, bulk_packed_offsets)?;
+    runtime.upload_u32_slice_to_device_async(&scales_offsets_host, bulk_scales_offsets)?;
+    runtime.upload_f32_slice_to_device_async(&output_scales_host, bulk_output_scales)?;
+    runtime.record_transfer_event()
 }
 
 /// Run all routed-expert GEMMs (gate / up / down) for one chunk in three
@@ -598,37 +598,64 @@ fn forward_moe_grouped_routed_experts(
     let down_cols       = first.down_proj.cols;   // == intermediate
     let num_active = active_experts.len();
 
-    // ── Gate projection (input: permuted_input → output: permuted_intermediate) ──
-    stage_active_experts_projection(
+    // ── Phase B.3: dual-stream H2D / compute overlap. Issue all 3
+    //   projections' H2Ds upfront on the transfer stream so the driver
+    //   can pipeline them; compute stream waits per-projection events
+    //   right before each grouped GEMM. Each projection has its own slot
+    //   so transfer-stream writes to slot N+1 don't race with the kernel
+    //   reading slot N's metadata. ──
+    let gate_event = stage_active_experts_projection_async(
         runtime, &moe.experts, active_experts, ExpertProjKind::Gate,
-        &mut moe_scratch.bulk_packed, &mut moe_scratch.bulk_scales,
-        &mut moe_scratch.bulk_packed_offsets, &mut moe_scratch.bulk_scales_offsets,
-        &mut moe_scratch.bulk_output_scales,
+        &mut moe_scratch.bulk_slots[0].bulk_packed,
+        &mut moe_scratch.bulk_slots[0].bulk_scales,
+        &mut moe_scratch.bulk_slots[0].bulk_packed_offsets,
+        &mut moe_scratch.bulk_slots[0].bulk_scales_offsets,
+        &mut moe_scratch.bulk_slots[0].bulk_output_scales,
     )?;
-    runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
-        &moe_scratch.bulk_packed, &moe_scratch.bulk_scales,
-        &moe_scratch.bulk_packed_offsets, &moe_scratch.bulk_scales_offsets,
-        &moe_scratch.bulk_output_scales, &moe_scratch.bulk_token_offsets,
-        &moe_scratch.permuted_input,
-        exp_intermediate, exp_cols_in, max_tokens_per_active, num_active,
-        &mut moe_scratch.permuted_intermediate,
+    let up_event = stage_active_experts_projection_async(
+        runtime, &moe.experts, active_experts, ExpertProjKind::Up,
+        &mut moe_scratch.bulk_slots[1].bulk_packed,
+        &mut moe_scratch.bulk_slots[1].bulk_scales,
+        &mut moe_scratch.bulk_slots[1].bulk_packed_offsets,
+        &mut moe_scratch.bulk_slots[1].bulk_scales_offsets,
+        &mut moe_scratch.bulk_slots[1].bulk_output_scales,
+    )?;
+    let down_event = stage_active_experts_projection_async(
+        runtime, &moe.experts, active_experts, ExpertProjKind::Down,
+        &mut moe_scratch.bulk_slots[2].bulk_packed,
+        &mut moe_scratch.bulk_slots[2].bulk_scales,
+        &mut moe_scratch.bulk_slots[2].bulk_packed_offsets,
+        &mut moe_scratch.bulk_slots[2].bulk_scales_offsets,
+        &mut moe_scratch.bulk_slots[2].bulk_output_scales,
     )?;
 
+    // ── Gate projection (input: permuted_input → output: permuted_intermediate) ──
+    runtime.compute_wait_event(&gate_event)?;
+    {
+        let slot = &moe_scratch.bulk_slots[0];
+        runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+            &slot.bulk_packed, &slot.bulk_scales,
+            &slot.bulk_packed_offsets, &slot.bulk_scales_offsets,
+            &slot.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+            &moe_scratch.permuted_input,
+            exp_intermediate, exp_cols_in, max_tokens_per_active, num_active,
+            &mut moe_scratch.permuted_intermediate,
+        )?;
+    }
+
     // ── Up projection (input: permuted_input → output: permuted_swiglu) ──
-    stage_active_experts_projection(
-        runtime, &moe.experts, active_experts, ExpertProjKind::Up,
-        &mut moe_scratch.bulk_packed, &mut moe_scratch.bulk_scales,
-        &mut moe_scratch.bulk_packed_offsets, &mut moe_scratch.bulk_scales_offsets,
-        &mut moe_scratch.bulk_output_scales,
-    )?;
-    runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
-        &moe_scratch.bulk_packed, &moe_scratch.bulk_scales,
-        &moe_scratch.bulk_packed_offsets, &moe_scratch.bulk_scales_offsets,
-        &moe_scratch.bulk_output_scales, &moe_scratch.bulk_token_offsets,
-        &moe_scratch.permuted_input,
-        exp_intermediate, exp_cols_in, max_tokens_per_active, num_active,
-        &mut moe_scratch.permuted_swiglu,
-    )?;
+    runtime.compute_wait_event(&up_event)?;
+    {
+        let slot = &moe_scratch.bulk_slots[1];
+        runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+            &slot.bulk_packed, &slot.bulk_scales,
+            &slot.bulk_packed_offsets, &slot.bulk_scales_offsets,
+            &slot.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+            &moe_scratch.permuted_input,
+            exp_intermediate, exp_cols_in, max_tokens_per_active, num_active,
+            &mut moe_scratch.permuted_swiglu,
+        )?;
+    }
 
     // GeGLU (Gemma 4): permuted_swiglu = geglu_tanh(permuted_intermediate, permuted_swiglu).
     runtime.geglu_tanh_in_place_device(
@@ -637,21 +664,19 @@ fn forward_moe_grouped_routed_experts(
         total_active_tokens * exp_intermediate,
     )?;
 
-    // ── Down projection (input: permuted_swiglu → output: permuted_output) ──
-    stage_active_experts_projection(
-        runtime, &moe.experts, active_experts, ExpertProjKind::Down,
-        &mut moe_scratch.bulk_packed, &mut moe_scratch.bulk_scales,
-        &mut moe_scratch.bulk_packed_offsets, &mut moe_scratch.bulk_scales_offsets,
-        &mut moe_scratch.bulk_output_scales,
-    )?;
-    runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
-        &moe_scratch.bulk_packed, &moe_scratch.bulk_scales,
-        &moe_scratch.bulk_packed_offsets, &moe_scratch.bulk_scales_offsets,
-        &moe_scratch.bulk_output_scales, &moe_scratch.bulk_token_offsets,
-        &moe_scratch.permuted_swiglu,
-        down_rows, down_cols, max_tokens_per_active, num_active,
-        &mut moe_scratch.permuted_output,
-    )?;
+    // ── Down projection ──
+    runtime.compute_wait_event(&down_event)?;
+    {
+        let slot = &moe_scratch.bulk_slots[2];
+        runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+            &slot.bulk_packed, &slot.bulk_scales,
+            &slot.bulk_packed_offsets, &slot.bulk_scales_offsets,
+            &slot.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+            &moe_scratch.permuted_swiglu,
+            down_rows, down_cols, max_tokens_per_active, num_active,
+            &mut moe_scratch.permuted_output,
+        )?;
+    }
 
     // Inverse permute + weighted scatter into moe_acc.
     runtime.unpermute_scatter_add_f32_device(
