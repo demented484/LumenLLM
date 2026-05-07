@@ -577,6 +577,27 @@ pub(super) struct CudaMoEPrefillScratch {
     /// Permuted down_proj output: `[chunk_size * top_k, hidden_size]`. Read
     /// by `aegis_unpermute_scatter_add_f32` to write back into `moe_acc`.
     pub(super) permuted_output: DeviceBuffer<f32>,
+    // ── Bulk expert weight staging (grouped GEMM path) ─────────────────────
+    /// Bulk packed weight buffer: holds the packed bytes of ALL active
+    /// experts' currently-staged projection (gate, up, or down — reused
+    /// across the three within one layer). Capacity sized for
+    /// `num_experts * max(gate_bytes, up_bytes, down_bytes)`. ~127 MiB on
+    /// Gemma-4-26B (128 experts × ~990 KiB packed per projection).
+    pub(super) bulk_packed: DeviceBuffer<u8>,
+    /// Bulk per-block scales buffer (UE4M3). ~16 MiB on Gemma-4-26B.
+    pub(super) bulk_scales: DeviceBuffer<u8>,
+    /// Per-active-expert byte offsets into `bulk_packed`. Uploaded once
+    /// per projection. Length = `num_experts` (worst case all active).
+    pub(super) bulk_packed_offsets: DeviceBuffer<u32>,
+    /// Per-active-expert byte offsets into `bulk_scales`.
+    pub(super) bulk_scales_offsets: DeviceBuffer<u32>,
+    /// Per-active-expert FP32 output_scale. The grouped GEMM kernel reads
+    /// `output_scales[ae]` and multiplies the accumulator before writing.
+    pub(super) bulk_output_scales: DeviceBuffer<f32>,
+    /// Per-active-expert prefix-sum of token counts: `expert_token_offsets[ae+1]
+    /// - expert_token_offsets[ae]` is the number of tokens routed to the
+    /// ae-th active expert. Length = `num_experts + 1`.
+    pub(super) bulk_token_offsets: DeviceBuffer<u32>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]

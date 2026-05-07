@@ -603,6 +603,43 @@ impl CudaLlamaExecutor {
                             .runtime
                             .alloc_f32(cs * max_top_k * max_expert_intermediate)?,
                         permuted_output: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,
+                        // Bulk expert staging — sized for worst-case all-experts-
+                        // active for one projection. Per-expert max packed/scales
+                        // bytes pulled from the layer's NVFP4 experts (gate / up /
+                        // down all share roughly the same dimensions for routed
+                        // experts; we take the max to be safe).
+                        bulk_packed: {
+                            let max_packed = self
+                                .layers
+                                .iter()
+                                .filter_map(|l| l.moe.as_ref())
+                                .flat_map(|m| m.experts.iter())
+                                .flat_map(|e| {
+                                    [&e.gate_proj, &e.up_proj, &e.down_proj].into_iter()
+                                })
+                                .map(|p| p.packed_bytes)
+                                .max()
+                                .unwrap_or(0);
+                            self.runtime.alloc_u8(max_experts * max_packed.max(1))?
+                        },
+                        bulk_scales: {
+                            let max_scales = self
+                                .layers
+                                .iter()
+                                .filter_map(|l| l.moe.as_ref())
+                                .flat_map(|m| m.experts.iter())
+                                .flat_map(|e| {
+                                    [&e.gate_proj, &e.up_proj, &e.down_proj].into_iter()
+                                })
+                                .map(|p| p.scale_bytes)
+                                .max()
+                                .unwrap_or(0);
+                            self.runtime.alloc_u8(max_experts * max_scales.max(1))?
+                        },
+                        bulk_packed_offsets: self.runtime.alloc_u32(max_experts)?,
+                        bulk_scales_offsets: self.runtime.alloc_u32(max_experts)?,
+                        bulk_output_scales: self.runtime.alloc_f32(max_experts)?,
+                        bulk_token_offsets: self.runtime.alloc_u32(max_experts + 1)?,
                     }))
                 } else {
                     None

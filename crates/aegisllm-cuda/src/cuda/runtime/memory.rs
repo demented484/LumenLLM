@@ -235,6 +235,30 @@ impl CudaRuntime {
             .map_err(map_cuda_err("d2d u32 range"))
     }
 
+    /// Copy a host byte slice into a u8 device buffer at `dst_offset`.
+    /// Used by grouped MoE bulk staging to concatenate per-expert weight
+    /// bytes into a single contiguous VRAM buffer.
+    pub fn copy_host_u8_to_device_at_offset(
+        &self,
+        src: &[u8],
+        dst: &mut DeviceBuffer<u8>,
+        dst_offset: usize,
+    ) -> Result<()> {
+        if src.is_empty() {
+            return Ok(());
+        }
+        if dst_offset.saturating_add(src.len()) > dst.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "copy_host_u8_to_device_at_offset out of bounds: dst.len={} dst_off={} src.len={}",
+                dst.len(), dst_offset, src.len()
+            )));
+        }
+        let mut dst_view = dst.slice.slice_mut(dst_offset..dst_offset + src.len());
+        self.stream
+            .memcpy_htod(src, &mut dst_view)
+            .map_err(map_cuda_err("h2d u8 range"))
+    }
+
     pub fn copy_f32_d2d_range(
         &self,
         src: &DeviceBuffer<f32>,
