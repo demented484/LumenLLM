@@ -773,7 +773,8 @@ extern "C" __global__ void aegis_rope_kv_store_slots_batched(
     const float low_freq_factor,
     const float high_freq_factor,
     const unsigned int original_max_position_embeddings,
-    const unsigned int partial_dim  /* 0 = full head_dim; >0 = first N dims rotated (p-RoPE) */
+    const unsigned int partial_dim,  /* 0 = full head_dim; >0 = first N dims rotated (p-RoPE) */
+    const unsigned int cache_capacity  /* slot wrap; pass cache_capacity == context_size for global */
 ) {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned int batch_idx = blockIdx.y;
@@ -781,10 +782,12 @@ extern "C" __global__ void aegis_rope_kv_store_slots_batched(
     if (batch_idx >= batch || idx >= width) {
         return;
     }
-    const unsigned int slot = slot_mapping[batch_idx];
-    if (slot >= context_size) {
+    const unsigned int raw_slot = slot_mapping[batch_idx];
+    if (raw_slot >= context_size) {
         return;
     }
+    /* Sliding-window layers: ring-buffer with `cache_capacity` slots. */
+    const unsigned int slot = (cache_capacity > 0u) ? (raw_slot % cache_capacity) : raw_slot;
 
     const size_t src_base = size_t(batch_idx) * width;
     const size_t dst_base = size_t(slot) * width;

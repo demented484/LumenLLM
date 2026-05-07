@@ -334,13 +334,18 @@ impl CudaKvCache {
         context_size: usize,
         kv_width: usize,
         quantization: aegisllm_base::tensor::quant::KvCacheQuantization,
+        effective_capacity: usize,
     ) -> aegisllm_base::error::Result<Self> {
         use aegisllm_base::error::AegisError;
         use aegisllm_base::tensor::quant::KvCacheQuantization;
-        let len = context_size.checked_mul(kv_width).ok_or_else(|| {
+        // `effective_capacity` is the number of token slots actually
+        // allocated. Sliding-window layers pass `window_size` (cache wraps
+        // every `window_size` tokens via `slot = pos % window_size`).
+        // Global / full-attention layers pass `context_size`.
+        let len = effective_capacity.checked_mul(kv_width).ok_or_else(|| {
             AegisError::InvalidPlan(format!(
-                "CUDA dense KV cache length overflow: context={} kv_width={}",
-                context_size, kv_width
+                "CUDA dense KV cache length overflow: cap={} kv_width={}",
+                effective_capacity, kv_width
             ))
         })?;
         let (keys, values) = match quantization {

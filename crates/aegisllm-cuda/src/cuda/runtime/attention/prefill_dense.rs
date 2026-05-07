@@ -67,6 +67,10 @@ impl CudaRuntime {
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * head_dim as usize),
+        )?;
         let block_dim = CUDA_ATTENTION_BLOCK_DIM;
         let legacy_shared_bytes = (max_seq_len + block_dim as usize) * std::mem::size_of::<f32>();
         let selected_kernel = select_prefill_batched_kernel(
@@ -113,6 +117,7 @@ impl CudaRuntime {
                     .arg(&num_attention_heads)
                     .arg(&num_kv_heads)
                     .arg(&head_dim)
+                    .arg(&cache_capacity_u32)
                     .arg(&mut output.slice)
                     .launch(cfg)
             }
@@ -130,6 +135,7 @@ impl CudaRuntime {
                     .arg(&num_attention_heads)
                     .arg(&num_kv_heads)
                     .arg(&head_dim)
+                    .arg(&cache_capacity_u32)
                     .arg(&mut output.slice)
                     .launch(cfg)
             }
@@ -502,7 +508,12 @@ impl CudaRuntime {
                 q_tokens
             )));
         }
-        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than `context_len * kv_width`); the kernel addresses it via
+        // ring-buffer slots = `pos % cache_capacity`. We only require that
+        // key and value caches have the same size and are aligned to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len() || key_cache.len() % kv_width != 0 || key_cache.is_empty() {
             return Err(AegisError::InvalidPlan(format!(
                 "dense halfq attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
                 key_cache.len(),
@@ -537,6 +548,10 @@ impl CudaRuntime {
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * head_dim as usize),
+        )?;
         unsafe {
             self.stream
                 .launch_builder(&self.kernels.attention_prefill_dense_halfq_block4)
@@ -549,6 +564,7 @@ impl CudaRuntime {
                 .arg(&num_attention_heads)
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
+                .arg(&cache_capacity_u32)
                 .arg(&mut output.slice)
                 .launch(cfg)
         }
@@ -582,7 +598,12 @@ impl CudaRuntime {
                 q_tokens
             )));
         }
-        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than `context_len * kv_width`); the kernel addresses it via
+        // ring-buffer slots = `pos % cache_capacity`. We only require that
+        // key and value caches have the same size and are aligned to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len() || key_cache.len() % kv_width != 0 || key_cache.is_empty() {
             return Err(AegisError::InvalidPlan(format!(
                 "dense warp-tile attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
                 key_cache.len(),
@@ -616,6 +637,10 @@ impl CudaRuntime {
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * head_dim as usize),
+        )?;
         unsafe {
             self.stream
                 .launch_builder(&self.kernels.attention_prefill_dense_halfq_warp_tile_hdim128)
@@ -628,6 +653,7 @@ impl CudaRuntime {
                 .arg(&num_attention_heads)
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
+                .arg(&cache_capacity_u32)
                 .arg(&mut output.slice)
                 .launch(cfg)
         }
@@ -663,7 +689,12 @@ impl CudaRuntime {
                 q_tokens
             )));
         }
-        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than `context_len * kv_width`); the kernel addresses it via
+        // ring-buffer slots = `pos % cache_capacity`. We only require that
+        // key and value caches have the same size and are aligned to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len() || key_cache.len() % kv_width != 0 || key_cache.is_empty() {
             return Err(AegisError::InvalidPlan(format!(
                 "dense wmma attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
                 key_cache.len(),
@@ -702,6 +733,10 @@ impl CudaRuntime {
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * head_dim as usize),
+        )?;
         unsafe {
             self.stream
                 .launch_builder(&self.kernels.attention_prefill_dense_halfq_wmma_hdim128)
@@ -714,6 +749,7 @@ impl CudaRuntime {
                 .arg(&num_attention_heads)
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
+                .arg(&cache_capacity_u32)
                 .arg(&mut output.slice)
                 .launch(cfg)
         }
@@ -747,7 +783,12 @@ impl CudaRuntime {
                 q_tokens
             )));
         }
-        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than `context_len * kv_width`); the kernel addresses it via
+        // ring-buffer slots = `pos % cache_capacity`. We only require that
+        // key and value caches have the same size and are aligned to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len() || key_cache.len() % kv_width != 0 || key_cache.is_empty() {
             return Err(AegisError::InvalidPlan(format!(
                 "dense fa wmma attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
                 key_cache.len(),
@@ -788,6 +829,10 @@ impl CudaRuntime {
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * head_dim as usize),
+        )?;
         unsafe {
             self.stream
                 .launch_builder(&self.kernels.attention_prefill_dense_halfq_wmma_hdim128_fa)
@@ -800,6 +845,7 @@ impl CudaRuntime {
                 .arg(&num_attention_heads)
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
+                .arg(&cache_capacity_u32)
                 .arg(&mut output.slice)
                 .launch(cfg)
         }
@@ -847,7 +893,12 @@ impl CudaRuntime {
                 q_tokens
             )));
         }
-        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than `context_len * kv_width`); the kernel addresses it via
+        // ring-buffer slots = `pos % cache_capacity`. We only require that
+        // key and value caches have the same size and are aligned to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len() || key_cache.len() % kv_width != 0 || key_cache.is_empty() {
             return Err(AegisError::InvalidPlan(format!(
                 "dense gqa4 wmma attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
                 key_cache.len(),
@@ -894,6 +945,10 @@ impl CudaRuntime {
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * head_dim as usize),
+        )?;
         unsafe {
             self.stream
                 .launch_builder(&self.kernels.attention_prefill_dense_halfq_wmma_hdim128_gqa4)
@@ -906,6 +961,7 @@ impl CudaRuntime {
                 .arg(&num_attention_heads)
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
+                .arg(&cache_capacity_u32)
                 .arg(&mut output.slice)
                 .launch(cfg)
         }
@@ -976,7 +1032,12 @@ impl CudaRuntime {
                 q_tokens
             )));
         }
-        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than `context_len * kv_width`); the kernel addresses it via
+        // ring-buffer slots = `pos % cache_capacity`. We only require that
+        // key and value caches have the same size and are aligned to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len() || key_cache.len() % kv_width != 0 || key_cache.is_empty() {
             return Err(AegisError::InvalidPlan(format!(
                 "dense gqa4 split wmma attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
                 key_cache.len(),
@@ -997,6 +1058,10 @@ impl CudaRuntime {
         let num_attention_heads_u32 = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * head_dim as usize),
+        )?;
         let split_tokens = u32_arg(
             "dense gqa4 split wmma split tokens",
             DENSE_WMMA_SPLIT_K_TOKENS,
@@ -1018,6 +1083,7 @@ impl CudaRuntime {
                 .arg(&num_attention_heads_u32)
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
+                .arg(&cache_capacity_u32)
                 .arg(&split_tokens)
                 .arg(&split_count_u32)
                 .arg(&mut split_acc.slice)
@@ -1109,7 +1175,12 @@ impl CudaRuntime {
                 q_tokens
             )));
         }
-        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than `context_len * kv_width`); the kernel addresses it via
+        // ring-buffer slots = `pos % cache_capacity`. We only require that
+        // key and value caches have the same size and are aligned to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len() || key_cache.len() % kv_width != 0 || key_cache.is_empty() {
             return Err(AegisError::InvalidPlan(format!(
                 "dense cluster2 wmma attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
                 key_cache.len(),
@@ -1138,6 +1209,10 @@ impl CudaRuntime {
         let num_attention_heads_u32 = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * head_dim as usize),
+        )?;
         unsafe {
             self.stream
                 .launch_builder(
@@ -1154,6 +1229,7 @@ impl CudaRuntime {
                 .arg(&num_attention_heads_u32)
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
+                .arg(&cache_capacity_u32)
                 .arg(&mut output.slice)
                 .launch(LaunchConfig {
                     grid_dim: (
@@ -1207,7 +1283,12 @@ impl CudaRuntime {
                 q_tokens
             )));
         }
-        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than `context_len * kv_width`); the kernel addresses it via
+        // ring-buffer slots = `pos % cache_capacity`. We only require that
+        // key and value caches have the same size and are aligned to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len() || key_cache.len() % kv_width != 0 || key_cache.is_empty() {
             return Err(AegisError::InvalidPlan(format!(
                 "dense q32 wmma attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
                 key_cache.len(),
@@ -1241,6 +1322,10 @@ impl CudaRuntime {
         let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * head_dim as usize),
+        )?;
         unsafe {
             self.stream
                 .launch_builder(&self.kernels.attention_prefill_dense_halfq_wmma_hdim128_q32)
@@ -1253,6 +1338,7 @@ impl CudaRuntime {
                 .arg(&num_attention_heads)
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
+                .arg(&cache_capacity_u32)
                 .arg(&mut output.slice)
                 .launch(LaunchConfig {
                     grid_dim: (
@@ -1306,7 +1392,12 @@ impl CudaRuntime {
                 q_tokens
             )));
         }
-        if key_cache.len() < cache_len || value_cache.len() < cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than `context_len * kv_width`); the kernel addresses it via
+        // ring-buffer slots = `pos % cache_capacity`. We only require that
+        // key and value caches have the same size and are aligned to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len() || key_cache.len() % kv_width != 0 || key_cache.is_empty() {
             return Err(AegisError::InvalidPlan(format!(
                 "dense split wmma attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
                 key_cache.len(),
@@ -1351,6 +1442,10 @@ impl CudaRuntime {
         let num_attention_heads_u32 = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * head_dim as usize),
+        )?;
         let split_tokens = u32_arg("dense split wmma split tokens", DENSE_WMMA_SPLIT_K_TOKENS)?;
         let split_count_u32 = u32_arg("dense split wmma split count", split_count)?;
         unsafe {
@@ -1369,6 +1464,7 @@ impl CudaRuntime {
                 .arg(&num_attention_heads_u32)
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
+                .arg(&cache_capacity_u32)
                 .arg(&split_tokens)
                 .arg(&split_count_u32)
                 .arg(&mut split_acc.slice)

@@ -578,6 +578,17 @@ impl CudaLlamaExecutor {
                 .map(|(layer_idx, layer)| {
                     // Per-layer KV width (differs for Gemma 4 global vs sliding layers).
                     let layer_kv_width = layer.layer_num_kv_heads * layer.layer_head_dim;
+                    // Per-layer effective KV capacity. Sliding-window layers
+                    // need only `window_size` slots (ring buffer); global /
+                    // full-attention layers (window_size == 0) need the full
+                    // context. For Gemma-4-26B-A4B with 25 sliding layers
+                    // (window=1024) + 5 global at ctx=32768, this drops the
+                    // KV-cache VRAM from ~7.7 GiB to ~1.5 GiB.
+                    let layer_kv_capacity = if layer.window_size > 0 {
+                        layer.window_size.min(self.kv_context_size)
+                    } else {
+                        self.kv_context_size
+                    };
                     // Resolve per-layer KV store: first_store for layers < first_n_layers,
                     // else the tail kv_store. first_store=None with first_n_layers=Some(_)
                     // means "VRAM derived from compute" — preserve legacy behavior by
@@ -597,6 +608,7 @@ impl CudaLlamaExecutor {
                                 self.kv_context_size,
                                 layer_kv_width,
                                 self.kv_quantization,
+                                layer_kv_capacity,
                             )?
                         }
                         StoragePlacement::Ram | StoragePlacement::Mmap => {

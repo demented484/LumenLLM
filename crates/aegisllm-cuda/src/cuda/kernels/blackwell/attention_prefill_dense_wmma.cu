@@ -1,4 +1,13 @@
 
+// Ring-buffer slot lookup: maps an absolute token position to its slot in the
+// KV cache. For sliding-window layers the cache is sized to `window_size`
+// (`cache_capacity > 0`) and the slot wraps; for global layers the cache is
+// sized to the full context (callers pass `cache_capacity == context_size`)
+// and the modulo collapses to the identity for any `pos < context_size`.
+__device__ __forceinline__ unsigned int kv_slot(unsigned int pos, unsigned int cache_capacity) {
+    return (cache_capacity > 0u) ? (pos % cache_capacity) : pos;
+}
+
 extern "C" __global__ void aegis_attention_prefill_batched(
     const unsigned short* key_cache,
     const unsigned short* value_cache,
@@ -8,6 +17,7 @@ extern "C" __global__ void aegis_attention_prefill_batched(
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* output
 ) {
     const unsigned int head = blockIdx.x;
@@ -28,7 +38,7 @@ extern "C" __global__ void aegis_attention_prefill_batched(
 
     float local_max = -3.402823466e38f;
     for (unsigned int pos = tid; pos < seq_len; pos += blockDim.x) {
-        const unsigned short* k = key_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+        const unsigned short* k = key_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
         float score = 0.0f;
         for (unsigned int dim = 0u; dim < head_dim; ++dim) {
             score += q[dim] * f16_bits_to_float(k[dim]);
@@ -67,7 +77,7 @@ extern "C" __global__ void aegis_attention_prefill_batched(
         float acc = 0.0f;
         for (unsigned int pos = 0u; pos < seq_len; ++pos) {
             const float weight = scores[pos] / denom;
-            const unsigned short* v = value_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+            const unsigned short* v = value_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
             acc += weight * f16_bits_to_float(v[dim]);
         }
         out[dim] = acc;
@@ -85,6 +95,7 @@ extern "C" __global__ void aegis_attention_prefill_batched_mixed(
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* output
 ) {
     const unsigned int head = blockIdx.x;
@@ -108,7 +119,7 @@ extern "C" __global__ void aegis_attention_prefill_batched_mixed(
         float score = 0.0f;
         if (pos < start_position) {
             const unsigned short* k =
-                key_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+                key_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
             for (unsigned int dim = 0u; dim < head_dim; ++dim) {
                 score += q[dim] * f16_bits_to_float(k[dim]);
             }
@@ -156,7 +167,7 @@ extern "C" __global__ void aegis_attention_prefill_batched_mixed(
             const float weight = scores[pos] / denom;
             if (pos < start_position) {
                 const unsigned short* v =
-                    value_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+                    value_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
                 acc += weight * f16_bits_to_float(v[dim]);
             } else {
                 const unsigned int chunk_pos = pos - start_position;
@@ -180,6 +191,7 @@ extern "C" __global__ void aegis_attention_prefill_continuation(
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* output
 ) {
     const unsigned int head = blockIdx.x;
@@ -209,7 +221,7 @@ extern "C" __global__ void aegis_attention_prefill_continuation(
     for (unsigned int pos = 0u; pos < seq_len; ++pos) {
         float dot = 0.0f;
         const unsigned short* k =
-            key_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+            key_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
         for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
             dot += q[dim] * f16_bits_to_float(k[dim]);
         }
@@ -240,7 +252,7 @@ extern "C" __global__ void aegis_attention_prefill_continuation(
     for (unsigned int pos = 0u; pos < seq_len; ++pos) {
         float dot = 0.0f;
         const unsigned short* k =
-            key_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+            key_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
         for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
             dot += q[dim] * f16_bits_to_float(k[dim]);
         }
@@ -261,7 +273,7 @@ extern "C" __global__ void aegis_attention_prefill_continuation(
 
         const float weight = scalars[2];
         const unsigned short* v =
-            value_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+            value_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
         for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
             acc[dim] += weight * f16_bits_to_float(v[dim]);
         }
@@ -284,6 +296,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_block4(
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* output
 ) {
     const unsigned int q_block = 4u;
@@ -348,9 +361,9 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_block4(
 
     for (unsigned int pos = 0u; pos < max_visible; ++pos) {
         const unsigned short* k =
-            key_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+            key_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
         const unsigned short* v =
-            value_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+            value_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
         for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
             k_shared[dim] = f16_bits_to_float(k[dim]);
             v_shared[dim] = f16_bits_to_float(v[dim]);
@@ -439,6 +452,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_warp_tile_hdim128
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* __restrict__ output
 ) {
     constexpr unsigned int hdim = 128u;
@@ -502,7 +516,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_warp_tile_hdim128
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
-                (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
+                (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
             k_shared_vec[vec] = valid_k
                 ? *reinterpret_cast<const uint4*>(key_cache + kv_offset)
                 : zero_vec;
@@ -587,6 +601,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* __restrict__ output
 ) {
     constexpr unsigned int hdim = 128u;
@@ -654,7 +669,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
-                (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
+                (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
             k_shared_vec[vec] = valid_k
                 ? *reinterpret_cast<const uint4*>(key_cache + kv_offset)
                 : zero_vec;
@@ -773,6 +788,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_fa(
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* __restrict__ output
 ) {
     constexpr unsigned int hdim = 128u;
@@ -839,7 +855,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_fa(
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
-                (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
+                (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
             k_shared_vec[vec] = valid_k
                 ? *reinterpret_cast<const uint4*>(key_cache + kv_offset)
                 : zero_vec;
@@ -953,6 +969,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* __restrict__ output
 ) {
     constexpr unsigned int hdim = 128u;
@@ -1056,7 +1073,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
-                (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
+                (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
             k_shared_vec[vec] = valid_k
                 ? *reinterpret_cast<const uint4*>(key_cache + kv_offset)
                 : zero_vec;
@@ -1176,6 +1193,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     const unsigned int split_tokens,
     const unsigned int split_count,
     float* __restrict__ partial_acc,
@@ -1296,7 +1314,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_gqa4
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
-                (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
+                (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
             k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
             v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
         }
@@ -1431,6 +1449,7 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim128_cluster2(
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* __restrict__ output
 ) {
     namespace cg = cooperative_groups;
@@ -1498,7 +1517,7 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim128_cluster2(
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
-                (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
+                (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
             k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
             v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
         }
@@ -1622,6 +1641,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_q32(
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* __restrict__ output
 ) {
     constexpr unsigned int hdim = 128u;
@@ -1683,7 +1703,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_q32(
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
-                (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
+                (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
             k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
             v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
         }
@@ -1801,6 +1821,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_spli
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     const unsigned int split_tokens,
     const unsigned int split_count,
     float* __restrict__ partial_acc,
@@ -1881,7 +1902,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_spli
             const unsigned int pos = tile_start + col;
             const bool valid_k = col < tile_count;
             const size_t kv_offset =
-                (size_t(pos) * num_kv_heads + kv_head) * hdim + dim;
+                (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
             k_shared[idx] = valid_k ? key_cache[kv_offset] : 0u;
             v_shared[idx] = valid_k ? value_cache[kv_offset] : 0u;
         }
@@ -2079,6 +2100,7 @@ extern "C" __global__ void aegis_attention_prefill_batched_warp(
     const unsigned int num_attention_heads,
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
+    const unsigned int cache_capacity,
     float* output
 ) {
     const unsigned int head = blockIdx.x;
@@ -2102,7 +2124,7 @@ extern "C" __global__ void aegis_attention_prefill_batched_warp(
 
     float local_max = -3.402823466e38f;
     for (unsigned int pos = warp; pos < seq_len; pos += nwarps) {
-        const unsigned short* k = key_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+        const unsigned short* k = key_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
         float score = 0.0f;
         for (unsigned int dim = lane; dim < head_dim; dim += 32u) {
             score += q[dim] * f16_bits_to_float(k[dim]);
@@ -2155,7 +2177,7 @@ extern "C" __global__ void aegis_attention_prefill_batched_warp(
     for (unsigned int dim = tid; dim < head_dim; dim += blockDim.x) {
         float acc = 0.0f;
         for (unsigned int pos = 0u; pos < seq_len; ++pos) {
-            const unsigned short* v = value_cache + (size_t(pos) * num_kv_heads + kv_head) * head_dim;
+            const unsigned short* v = value_cache + (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * head_dim;
             acc += (scores[pos] / denom) * f16_bits_to_float(v[dim]);
         }
         out[dim] = acc;

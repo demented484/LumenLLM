@@ -194,6 +194,7 @@ impl CudaLayerBlockExecutor {
                                 self.kv_context_size,
                                 kv_width,
                                 aegisllm_base::tensor::quant::KvCacheQuantization::F16,
+                                self.kv_context_size,
                             )?,
                         },
                     ))

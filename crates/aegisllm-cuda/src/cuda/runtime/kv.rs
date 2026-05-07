@@ -85,7 +85,14 @@ impl CudaRuntime {
                 "kv_store_ptr vector shape mismatch".into(),
             ));
         }
-        if key_cache.len() != cache_len || value_cache.len() != cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than full `context_size * kv_width`); accept any size as
+        // long as keys/values match and align to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len()
+            || key_cache.len() % kv_width != 0
+            || key_cache.is_empty()
+        {
             return Err(AegisError::InvalidPlan(format!(
                 "kv_store_ptr cache shape mismatch: key_cache={} value_cache={} context={} width={}",
                 key_cache.len(),
@@ -328,7 +335,17 @@ impl CudaRuntime {
         }
         let kv_width = checked_len("slot-mapped roped kv width", num_heads, head_dim)?;
         let vector_len = checked_len("slot-mapped roped key/value", batch, kv_width)?;
-        let cache_len = checked_len("slot-mapped roped cache", context_size, kv_width)?;
+        // For sliding-window layers the cache may be smaller than the full
+        // context (ring-buffer of `window_size` slots). Derive the actual
+        // capacity from the cache buffer size and validate against that.
+        let cache_capacity = key_cache.len() / kv_width;
+        if value_cache.len() / kv_width != cache_capacity {
+            return Err(AegisError::InvalidPlan(format!(
+                "slot-mapped roped kv cache key/value capacity mismatch: key={} value={} kv_width={}",
+                key_cache.len(), value_cache.len(), kv_width
+            )));
+        }
+        let cache_len = checked_len("slot-mapped roped cache", cache_capacity, kv_width)?;
         if dense_metadata.batch() != batch || dense_metadata.context_len() > context_size {
             return Err(AegisError::InvalidPlan(format!(
                 "slot-mapped roped kv store requires matching dense identity proof: batch={} context={} proof_batch={} proof_context={}",
@@ -349,7 +366,7 @@ impl CudaRuntime {
             || value_cache.len() != cache_len
         {
             return Err(AegisError::InvalidPlan(format!(
-                "slot-mapped roped kv cache shape mismatch: key_cache={} value_cache={} key={} value={} positions={} slots={} batch={} context={} width={}",
+                "slot-mapped roped kv cache shape mismatch: key_cache={} value_cache={} key={} value={} positions={} slots={} batch={} cache_cap={} width={}",
                 key_cache.len(),
                 value_cache.len(),
                 key.len(),
@@ -357,7 +374,7 @@ impl CudaRuntime {
                 positions.len(),
                 slot_mapping.len(),
                 batch,
-                context_size,
+                cache_capacity,
                 kv_width
             )));
         }
@@ -365,7 +382,8 @@ impl CudaRuntime {
         let num_heads = u32_arg("num_heads", num_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
         let kv_width = u32_arg("kv_width", kv_width)?;
-        let context_size = u32_arg("context_size", context_size)?;
+        let context_size_u32 = u32_arg("context_size", context_size)?;
+        let cache_capacity_u32 = u32_arg("cache_capacity", cache_capacity)?;
         let cfg = LaunchConfig {
             grid_dim: (ceil_div(kv_width, 256), batch, 1),
             block_dim: (256, 1, 1),
@@ -383,13 +401,14 @@ impl CudaRuntime {
                 .arg(&batch)
                 .arg(&num_heads)
                 .arg(&head_dim)
-                .arg(&context_size)
+                .arg(&context_size_u32)
                 .arg(&rope.theta)
                 .arg(&rope.factor)
                 .arg(&rope.low_freq_factor)
                 .arg(&rope.high_freq_factor)
                 .arg(&rope.original_max_position_embeddings)
                 .arg(&rope.partial_dim)
+                .arg(&cache_capacity_u32)
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch slot-mapped roped batched kv store"))?;
@@ -418,7 +437,14 @@ impl CudaRuntime {
         if key.len() != kv_width || value.len() != kv_width {
             return Err(AegisError::InvalidPlan("kv_store_fp8_ptr vector shape mismatch".into()));
         }
-        if key_cache.len() != cache_len || value_cache.len() != cache_len {
+        // Sliding-window layers may allocate cache to `window_size * kv_width`
+        // (smaller than full `context_size * kv_width`); accept any size as
+        // long as keys/values match and align to kv_width.
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len()
+            || key_cache.len() % kv_width != 0
+            || key_cache.is_empty()
+        {
             return Err(AegisError::InvalidPlan(format!(
                 "kv_store_fp8_ptr cache shape mismatch: key={} value={} context={} width={}",
                 key_cache.len(), value_cache.len(), context_size, kv_width
