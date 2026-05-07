@@ -43,6 +43,9 @@ pub enum GpuArchitecture {
 pub enum ComputeDevice {
     Cpu,
     Cuda { index: usize },
+    /// wgpu adapter — Vulkan / Metal / D3D12 abstracted via cudarc-style
+    /// indexing. Treated as a GPU-class device for storage planning.
+    Wgpu { index: usize },
 }
 
 impl HardwareInventory {
@@ -71,6 +74,7 @@ impl HardwareInventory {
                 .find(|gpu| gpu.index == index)
                 .map(|gpu| format!("cuda:{index}:{}", gpu.name))
                 .unwrap_or_else(|| format!("cuda:{index}")),
+            ComputeDevice::Wgpu { index } => format!("wgpu:{index}"),
         }
     }
 }

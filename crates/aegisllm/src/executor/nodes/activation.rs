@@ -11,7 +11,9 @@ impl ActivationResidency {
     pub fn from_compute(compute: ComputePlacement) -> Self {
         match compute {
             ComputePlacement::Cpu => Self::Host,
-            ComputePlacement::Cuda { device } => Self::Device { device },
+            ComputePlacement::Cuda { device } | ComputePlacement::Wgpu { device } => {
+                Self::Device { device }
+            }
         }
     }
 }

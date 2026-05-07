@@ -130,6 +130,7 @@ impl From<ComputePlacement> for BackendKind {
         match value {
             ComputePlacement::Cpu => Self::Cpu,
             ComputePlacement::Cuda { device } => Self::Cuda { device },
+            ComputePlacement::Wgpu { device } => Self::Wgpu { device },
         }
     }
 }

@@ -463,9 +463,18 @@ pub fn parse_compute(value: &str, default_device: usize) -> Result<ComputePlacem
         "cuda" | "gpu" => Ok(ComputePlacement::Cuda {
             device: default_device,
         }),
+        "wgpu" => Ok(ComputePlacement::Wgpu {
+            device: default_device,
+        }),
         other if other.starts_with("cuda:") => Ok(ComputePlacement::Cuda {
             device: other
                 .trim_start_matches("cuda:")
+                .parse::<usize>()
+                .map_err(|_| AegisError::InvalidConfig(format!("invalid compute `{value}`")))?,
+        }),
+        other if other.starts_with("wgpu:") => Ok(ComputePlacement::Wgpu {
+            device: other
+                .trim_start_matches("wgpu:")
                 .parse::<usize>()
                 .map_err(|_| AegisError::InvalidConfig(format!("invalid compute `{value}`")))?,
         }),

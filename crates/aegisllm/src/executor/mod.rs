@@ -153,6 +153,19 @@ fn select_provider_plan(
     planned_cpu_regions: usize,
     planned_cuda_regions: usize,
 ) -> Option<ExecutorProviderPlan> {
+    // Wgpu has highest priority when ANY region or KV cache is placed on
+    // wgpu — surface "wgpu skeleton: forward not implemented" instead of
+    // silently falling through to a CPU/CUDA provider that can't read
+    // wgpu-bound bytes anyway.
+    let any_wgpu = matches!(placement.kv_cache.compute, ComputePlacement::Wgpu { .. })
+        || placement
+            .region_placements
+            .iter()
+            .any(|r| matches!(r.compute, ComputePlacement::Wgpu { .. }));
+    if any_wgpu {
+        return Some(WgpuExecutorProvider::plan());
+    }
+
     if planned_cuda_regions == 0 {
         return Some(CpuReferenceExecutor::plan(placement));
     }

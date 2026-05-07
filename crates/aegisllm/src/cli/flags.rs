@@ -297,6 +297,6 @@ fn storage_cuda_device(storage: StoragePlacement) -> Option<usize> {
 fn compute_cuda_device(compute: ComputePlacement) -> Option<usize> {
     match compute {
         ComputePlacement::Cuda { device } => Some(device),
-        ComputePlacement::Cpu => None,
+        ComputePlacement::Cpu | ComputePlacement::Wgpu { .. } => None,
     }
 }

@@ -25,6 +25,13 @@ pub enum StoragePlacement {
 pub enum ComputePlacement {
     Cpu,
     Cuda { device: usize },
+    /// wgpu (Vulkan/Metal/D3D12 compute) on the given adapter index.
+    /// First-class citizen alongside Cuda — the planner / provider
+    /// selection treats Wgpu the same as Cuda for storage placement
+    /// rules (`StoragePlacement::Vram { device }`). The wgpu executor
+    /// is currently a skeleton and returns Unsupported for forward, but
+    /// the placement layer routes correctly.
+    Wgpu { device: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -347,6 +354,7 @@ impl Display for ComputePlacement {
         match self {
             Self::Cpu => f.write_str("cpu"),
             Self::Cuda { device } => write!(f, "cuda:{device}"),
+            Self::Wgpu { device } => write!(f, "wgpu:{device}"),
         }
     }
 }
@@ -394,15 +402,20 @@ fn transfer_policy(store: StoragePlacement, compute: ComputePlacement) -> Transf
         (StoragePlacement::Vram { device: a }, ComputePlacement::Cuda { device: b }) if a == b => {
             TransferPolicy::None
         }
-        (StoragePlacement::Ram | StoragePlacement::Mmap, ComputePlacement::Cuda { .. }) => {
-            TransferPolicy::HostToDeviceEachUse
+        (StoragePlacement::Vram { device: a }, ComputePlacement::Wgpu { device: b }) if a == b => {
+            TransferPolicy::None
         }
+        (
+            StoragePlacement::Ram | StoragePlacement::Mmap,
+            ComputePlacement::Cuda { .. } | ComputePlacement::Wgpu { .. },
+        ) => TransferPolicy::HostToDeviceEachUse,
         (StoragePlacement::Vram { .. }, ComputePlacement::Cpu) => {
             TransferPolicy::DeviceToHostEachUse
         }
-        (StoragePlacement::Vram { .. }, ComputePlacement::Cuda { .. }) => {
-            TransferPolicy::CrossDevice
-        }
+        (
+            StoragePlacement::Vram { .. },
+            ComputePlacement::Cuda { .. } | ComputePlacement::Wgpu { .. },
+        ) => TransferPolicy::CrossDevice,
     }
 }
 
@@ -479,6 +492,7 @@ impl From<ComputePlacement> for ComputeDevice {
         match value {
             ComputePlacement::Cpu => Self::Cpu,
             ComputePlacement::Cuda { device } => Self::Cuda { index: device },
+            ComputePlacement::Wgpu { device } => Self::Wgpu { index: device },
         }
     }
 }

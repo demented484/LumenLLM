@@ -106,6 +106,12 @@ impl HybridExecutorProvider {
                         "hybrid executor cannot schedule layer.{layer} on cuda:{device}; selected cuda:{cuda_device}"
                     )));
                 }
+                ComputePlacement::Wgpu { device } => {
+                    return Err(AegisError::Unsupported(format!(
+                        "hybrid executor cannot schedule layer.{layer} on wgpu:{device}; \
+                         hybrid path is currently CPU+CUDA only"
+                    )));
+                }
             }
         }
 
@@ -306,6 +312,11 @@ impl HybridTopology {
                 ComputePlacement::Cpu => topology.has_cpu = true,
                 ComputePlacement::Cuda { device } => {
                     topology.cuda_devices.insert(device);
+                }
+                ComputePlacement::Wgpu { .. } => {
+                    // Hybrid topology currently only models CPU+CUDA.
+                    // Wgpu placements are deferred to the wgpu provider
+                    // (which the hybrid scheduler does not call).
                 }
             }
         }

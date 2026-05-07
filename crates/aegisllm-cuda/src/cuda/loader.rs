@@ -1008,6 +1008,10 @@ impl CudaWeightLoader<'_> {
                 "region `{}` is compute=cpu; CUDA resident loader refused to load it",
                 region.id.0
             ))),
+            (_, ComputePlacement::Wgpu { device }) => Err(AegisError::Unsupported(format!(
+                "region `{}` is compute=wgpu:{device}; CUDA resident loader refused to load it",
+                region.id.0
+            ))),
         }
     }
 
@@ -1095,6 +1099,10 @@ impl CudaWeightLoader<'_> {
             }
             (_, ComputePlacement::Cpu) => Err(AegisError::Unsupported(format!(
                 "region `{}` is compute=cpu; CUDA resident loader refused to load it",
+                region.id.0
+            ))),
+            (_, ComputePlacement::Wgpu { device }) => Err(AegisError::Unsupported(format!(
+                "region `{}` is compute=wgpu:{device}; CUDA resident loader refused to load it",
                 region.id.0
             ))),
         }

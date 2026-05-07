@@ -39,6 +39,13 @@ pub enum KernelFamily {
     /// Phase 7 stub — kernel not implemented; any plan containing this family
     /// will be rejected by `cuda_kernel_limitations`.
     CudaMambaScan,
+    /// wgpu (Vulkan / Metal / D3D12 compute) reference compute. Selected
+    /// for any region with `compute=wgpu:N`. The actual forward path is
+    /// not yet implemented — `WgpuExecutorProvider::plan` reports the
+    /// limitation, and the executor returns Unsupported on construction.
+    /// Listed here so runtime planning can place wgpu regions instead of
+    /// rejecting them at the backend dispatch level.
+    WgpuReference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +79,7 @@ pub struct KernelCandidate {
 pub enum KernelDeviceClass {
     Cpu,
     Cuda,
+    Wgpu,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +155,7 @@ impl RuntimePlan {
                 | KernelFamily::CudaMambaScan => SyncPolicy::StreamOrdered,
                 KernelFamily::CudaQuantizedReference => SyncPolicy::ExplicitBoundary,
                 KernelFamily::CpuScalar | KernelFamily::CpuSimd => SyncPolicy::StreamOrdered,
+                KernelFamily::WgpuReference => SyncPolicy::ExplicitBoundary,
             };
             kernels.push(KernelPlan {
                 name: region.region_id.0.clone(),
@@ -311,6 +320,25 @@ impl Default for KernelRegistry {
                     required_precision: None,
                     priority: 10,
                 },
+                // wgpu reference candidate — matches any region placed on a
+                // wgpu adapter regardless of quant format. Selected for both
+                // dense and quantized regions because the wgpu executor is a
+                // skeleton; the real format-specific candidates land when
+                // forward is wired.
+                KernelCandidate {
+                    family: KernelFamily::WgpuReference,
+                    device_class: KernelDeviceClass::Wgpu,
+                    format_match: QuantFormatMatch::Dense,
+                    required_precision: None,
+                    priority: 1,
+                },
+                KernelCandidate {
+                    family: KernelFamily::WgpuReference,
+                    device_class: KernelDeviceClass::Wgpu,
+                    format_match: QuantFormatMatch::Quantized,
+                    required_precision: None,
+                    priority: 1,
+                },
             ],
         }
     }
@@ -340,9 +368,11 @@ impl KernelCandidate {
         match (self.device_class, backend.kind) {
             (KernelDeviceClass::Cpu, BackendKind::Cpu) => true,
             (KernelDeviceClass::Cuda, BackendKind::Cuda { .. }) => true,
-            (KernelDeviceClass::Cpu, BackendKind::Cuda { .. })
-            | (KernelDeviceClass::Cuda, BackendKind::Cpu)
-            | (_, BackendKind::Wgpu { .. }) => false,
+            (KernelDeviceClass::Wgpu, BackendKind::Wgpu { .. }) => true,
+            // Cross-class dispatch never matches.
+            (KernelDeviceClass::Cpu, _)
+            | (KernelDeviceClass::Cuda, _)
+            | (KernelDeviceClass::Wgpu, _) => false,
         }
     }
 

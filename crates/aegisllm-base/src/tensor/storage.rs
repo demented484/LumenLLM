@@ -404,32 +404,33 @@ impl StorageTotals {
 }
 
 fn residency_for(store: StoragePlacement, compute: ComputePlacement) -> TensorResidencyPlan {
+    // Treat Cuda and Wgpu identically here: both are GPU-class devices
+    // with VRAM-resident or staged-host-to-device residency. The actual
+    // backend is chosen at executor construction; the residency plan just
+    // describes where bytes live and whether they need staging.
     match (store, compute) {
         (StoragePlacement::Ram, ComputePlacement::Cpu) => TensorResidencyPlan::RamResident,
         (StoragePlacement::Mmap, ComputePlacement::Cpu) => TensorResidencyPlan::FileBackedMmap,
-        (
-            StoragePlacement::Vram {
-                device: store_device,
-            },
-            ComputePlacement::Cuda { device },
-        ) if store_device == device => TensorResidencyPlan::VramResident { device },
-        (StoragePlacement::Ram | StoragePlacement::Mmap, ComputePlacement::Cuda { device }) => {
+        (StoragePlacement::Vram { device: store_device },
+         ComputePlacement::Cuda { device } | ComputePlacement::Wgpu { device })
+            if store_device == device =>
+        {
+            TensorResidencyPlan::VramResident { device }
+        }
+        (StoragePlacement::Ram | StoragePlacement::Mmap,
+         ComputePlacement::Cuda { device } | ComputePlacement::Wgpu { device }) =>
+        {
             TensorResidencyPlan::StagedHostToDevice { device }
         }
         (StoragePlacement::Vram { device }, ComputePlacement::Cpu) => {
             TensorResidencyPlan::StagedDeviceToHost { device }
         }
-        (
-            StoragePlacement::Vram {
-                device: store_device,
-            },
-            ComputePlacement::Cuda {
-                device: compute_device,
-            },
-        ) => TensorResidencyPlan::CrossDevice {
-            store_device,
-            compute_device,
-        },
+        (StoragePlacement::Vram { device: store_device },
+         ComputePlacement::Cuda { device: compute_device }
+         | ComputePlacement::Wgpu { device: compute_device }) =>
+        {
+            TensorResidencyPlan::CrossDevice { store_device, compute_device }
+        }
     }
 }
 
