@@ -39,8 +39,8 @@ pub use aegisllm_cpu::{
 };
 pub use aegisllm_cuda::{CudaExecutorProvider, CudaRuntime, DeviceBf16Matrix, DeviceBuffer, DeviceNvfp4Linear};
 pub use aegisllm_wgpu::{
-    decode_attention_gpu, embedding_gpu, matmul_f32_gpu, residual_add_gpu, rms_norm_gpu, rope_gpu,
-    swiglu_gpu, WgpuContext, WgpuExecutorProvider,
+    decode_attention_gpu, dequant_nvfp4_gpu, embedding_gpu, matmul_f32_gpu, residual_add_gpu,
+    rms_norm_gpu, rope_gpu, swiglu_gpu, WgpuContext, WgpuExecutorProvider,
 };
 
 pub use engine::{AegisEngine, EngineConfig, EngineReport};

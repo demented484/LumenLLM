@@ -18,6 +18,12 @@ pub struct WgpuContext {
     pub(super) embedding: KernelPipeline,
     // Matmul: same 4-binding layout but different uniform shape (m,n,k,_pad).
     pub(super) matmul: KernelPipeline,
+    /// NVFP4 → f32 dequantization (`shaders/dequant_nvfp4.wgsl`). Bridges
+    /// quantized weight buffers (Gemma-4 routed experts, attention proj
+    /// in NVFP4 source) to the f32-only matmul kernel. Same 4-binding
+    /// layout as everyone else: packed (ro), scales (ro), output (rw),
+    /// uniform.
+    pub(super) dequant_nvfp4: KernelPipeline,
     // RoPE: storage rw + 2 storage read + uniform.
     pub(super) rope: KernelPipeline,
     // Decode attention: storage rw (out) + 2 storage read (q, kv) + uniform.
@@ -76,6 +82,12 @@ impl WgpuContext {
             &standard_4_layout,
             "matmul",
         );
+        let dequant_nvfp4 = build_kernel(
+            &device,
+            include_str!("shaders/dequant_nvfp4.wgsl"),
+            &standard_4_layout,
+            "dequant_nvfp4",
+        );
         let embedding = build_kernel(
             &device,
             include_str!("shaders/embedding.wgsl"),
@@ -105,6 +117,7 @@ impl WgpuContext {
             residual_add,
             embedding,
             matmul,
+            dequant_nvfp4,
             rope,
             decode_attention,
         })

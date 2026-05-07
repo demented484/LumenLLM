@@ -241,6 +241,127 @@ pub fn matmul_f32_gpu(
     )
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct DequantParams {
+    rows: u32,
+    cols: u32,
+    output_scale_bits: u32,
+    _pad: u32,
+}
+
+/// Dequantize a row-major NVFP4 weight `[rows, cols]` to f32 on the GPU.
+///
+/// `packed_bytes`: `rows * cols / 2` bytes (low nibble = even col).
+/// `scales_bytes`: `rows * cols / 16` bytes (UE4M3-half, NVFP4 0.5× tail
+/// included via shader's `decode_ue4m3_half`).
+/// `output_scale`: per-tensor f32 multiplier (the `output_scale` field of
+/// `DeviceNvfp4Linear`); `1.0` if the tensor has none.
+///
+/// Returns a `Vec<f32>` of length `rows * cols`. Suitable as the `b`
+/// matrix for `matmul_f32_gpu`. This is the bridge that lets the wgpu
+/// forward path consume Gemma-4 NVFP4 weights without committing to an
+/// f32 weight upload.
+pub fn dequant_nvfp4_gpu(
+    ctx: &WgpuContext,
+    packed_bytes: &[u8],
+    scales_bytes: &[u8],
+    rows: usize,
+    cols: usize,
+    output_scale: f32,
+) -> Result<Vec<f32>> {
+    if cols % 16 != 0 {
+        return Err(AegisError::InvalidPlan(format!(
+            "dequant_nvfp4: cols ({cols}) must be a multiple of 16",
+        )));
+    }
+    let expected_packed = rows * cols / 2;
+    let expected_scales = rows * cols / 16;
+    if packed_bytes.len() != expected_packed || scales_bytes.len() != expected_scales {
+        return Err(AegisError::InvalidPlan(format!(
+            "dequant_nvfp4 size mismatch: packed={} expected={} scales={} expected={}",
+            packed_bytes.len(), expected_packed, scales_bytes.len(), expected_scales,
+        )));
+    }
+    // wgpu storage buffers are read as `array<u32>` in WGSL; pad input
+    // byte arrays to u32 alignment so the shader's word-shifting is safe
+    // for any row/col combination.
+    let pad_to_u32 = |bytes: &[u8]| -> Vec<u8> {
+        let pad = (4 - bytes.len() % 4) % 4;
+        let mut v = Vec::with_capacity(bytes.len() + pad);
+        v.extend_from_slice(bytes);
+        v.extend(std::iter::repeat(0u8).take(pad));
+        v
+    };
+    let packed_u32 = pad_to_u32(packed_bytes);
+    let scales_u32 = pad_to_u32(scales_bytes);
+    let out_len = rows * cols;
+    let out_bytes = (out_len * std::mem::size_of::<f32>()) as u64;
+
+    let packed_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("dequant_nvfp4 packed"),
+        contents: &packed_u32,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let scales_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("dequant_nvfp4 scales"),
+        contents: &scales_u32,
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let out_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dequant_nvfp4 out"),
+        size: out_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let params = DequantParams {
+        rows: rows as u32,
+        cols: cols as u32,
+        output_scale_bits: output_scale.to_bits(),
+        _pad: 0,
+    };
+    let uniform_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("dequant_nvfp4 uniform"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let staging_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dequant_nvfp4 staging"),
+        size: out_bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("dequant_nvfp4 bind"),
+        layout: &ctx.dequant_nvfp4.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: packed_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: scales_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: uniform_buf.as_entire_binding() },
+        ],
+    });
+
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dequant_nvfp4 enc") });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("dequant_nvfp4 pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&ctx.dequant_nvfp4.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        let groups = ((out_len + 63) / 64) as u32;
+        pass.dispatch_workgroups(groups, 1, 1);
+    }
+    encoder.copy_buffer_to_buffer(&out_buf, 0, &staging_buf, 0, out_bytes);
+    ctx.queue.submit(Some(encoder.finish()));
+
+    readback_f32(&ctx.device, &staging_buf, out_bytes, "dequant_nvfp4")
+}
+
 /// Embedding lookup on wgpu: returns row `token_id` of `embed_table` (shape [vocab, hidden]).
 /// Returns the hidden_size-element row as a Vec<f32>.
 pub fn embedding_gpu(
