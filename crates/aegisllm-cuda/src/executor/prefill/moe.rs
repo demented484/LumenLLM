@@ -284,6 +284,30 @@ pub(super) fn forward_moe_prefill_chunk_device(
             active_experts.push(e);
         }
     }
+
+    // ── GROUPED PATH (B.2) ────────────────────────────────────────────────
+    // Single-launch grouped GEMM per projection (gate/up/down) instead of
+    // 30-active-experts × 3-projections = 90 launches. Activated by default
+    // when the NVFP4 routed-expert weights are host-resident (the common
+    // case for `hidden-layers.store=ram`). Set `AEGIS_GROUPED_MOE_DISABLE=1`
+    // to fall back to the per-expert path for diagnostics.
+    let grouped_disabled = std::env::var("AEGIS_GROUPED_MOE_DISABLE").is_ok();
+    let first_expert_host_resident = active_experts
+        .first()
+        .map(|&e| moe.experts[e].gate_proj.is_host_resident())
+        .unwrap_or(false);
+    let use_grouped = !grouped_disabled
+        && !active_experts.is_empty()
+        && first_expert_host_resident;
+
+    if use_grouped {
+        forward_moe_grouped_routed_experts(
+            runtime, moe, moe_scratch, &active_experts, &counts_host,
+            stride, num_experts, hidden_size,
+        )?;
+        report(cp_experts, "experts_done");
+        // Skip the per-expert dispatch below.
+    } else {
     // Per-expert dispatch. Each active expert: copy its bucketed indices /
     // weights into gather_*, gather rows from `expert_input`, run the three
     // NVFP4 matmuls + GeGLU, then scatter-add weighted into `moe_acc`.
@@ -352,8 +376,8 @@ pub(super) fn forward_moe_prefill_chunk_device(
             &mut moe_scratch.moe_acc,
         )?;
     }
-
     report(cp_experts, "experts_done");
+    }
     // ── Step 9: post_ffn_norm_2(moe_acc) (stream2). In-place is safe — each
     //   thread reads/writes its own column index per the rms_norm kernel layout.
     if let Some(ref n2) = layer.post_feedforward_layernorm_2 {
@@ -440,4 +464,210 @@ fn softmax_top_k_normalized(
         }
     }
     (indices, weights)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Grouped MoE forward (Phase B.2): single-launch GEMM per projection.
+// Replaces ~90 per-expert kernel calls with 3 grouped calls (gate/up/down)
+// + one fused permute_gather + one fused unpermute_scatter_add.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum ExpertProjKind {
+    Gate,
+    Up,
+    Down,
+}
+
+/// Stage one projection of all active experts into the bulk VRAM buffers.
+/// Records per-active-expert byte offsets into `bulk_packed` / `bulk_scales`
+/// and the f32 output_scale, then uploads them as device arrays for the
+/// grouped GEMM kernel to read.
+#[allow(clippy::too_many_arguments)]
+fn stage_active_experts_projection(
+    runtime: &CudaRuntime,
+    experts: &[crate::executor::state::CudaMoEExpert],
+    active_experts: &[usize],
+    projection: ExpertProjKind,
+    bulk_packed: &mut DeviceBuffer<u8>,
+    bulk_scales: &mut DeviceBuffer<u8>,
+    bulk_packed_offsets: &mut DeviceBuffer<u32>,
+    bulk_scales_offsets: &mut DeviceBuffer<u32>,
+    bulk_output_scales: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    let mut packed_off = 0u64;
+    let mut scales_off = 0u64;
+    let mut packed_offsets_host: Vec<u32> = Vec::with_capacity(active_experts.len());
+    let mut scales_offsets_host: Vec<u32> = Vec::with_capacity(active_experts.len());
+    let mut output_scales_host: Vec<f32> = Vec::with_capacity(active_experts.len());
+
+    for &expert_idx in active_experts {
+        let expert = &experts[expert_idx];
+        let proj = match projection {
+            ExpertProjKind::Gate => &expert.gate_proj,
+            ExpertProjKind::Up => &expert.up_proj,
+            ExpertProjKind::Down => &expert.down_proj,
+        };
+        let (packed_bytes, scales_bytes) = proj
+            .host_packed_scales_bytes()
+            .ok_or_else(|| AegisError::InvalidPlan(format!(
+                "grouped MoE staging: expert `{}` is not host-resident", proj.name
+            )))??;
+        packed_offsets_host.push(u32::try_from(packed_off).map_err(|_| {
+            AegisError::InvalidPlan("grouped MoE: packed offset > u32".into())
+        })?);
+        scales_offsets_host.push(u32::try_from(scales_off).map_err(|_| {
+            AegisError::InvalidPlan("grouped MoE: scales offset > u32".into())
+        })?);
+        output_scales_host.push(proj.output_scale);
+        runtime.copy_host_u8_to_device_at_offset(packed_bytes, bulk_packed, packed_off as usize)?;
+        runtime.copy_host_u8_to_device_at_offset(scales_bytes, bulk_scales, scales_off as usize)?;
+        packed_off += packed_bytes.len() as u64;
+        scales_off += scales_bytes.len() as u64;
+    }
+
+    runtime.upload_u32_slice_to_device(&packed_offsets_host, bulk_packed_offsets)?;
+    runtime.upload_u32_slice_to_device(&scales_offsets_host, bulk_scales_offsets)?;
+    runtime.upload_f32_slice_to_device(&output_scales_host, bulk_output_scales)?;
+    Ok(())
+}
+
+/// Run all routed-expert GEMMs (gate / up / down) for one chunk in three
+/// grouped kernel launches instead of `30 active × 3 = 90` per-expert
+/// launches. Result is written into `moe_scratch.moe_acc` exactly as the
+/// per-expert path does (atomic scatter-add of weighted per-token outputs).
+#[allow(clippy::too_many_arguments)]
+fn forward_moe_grouped_routed_experts(
+    runtime: &CudaRuntime,
+    moe: &CudaMoE,
+    moe_scratch: &mut crate::executor::state::CudaMoEPrefillScratch,
+    active_experts: &[usize],
+    counts_host: &[u32],
+    stride: usize,
+    num_experts: usize,
+    hidden_size: usize,
+) -> Result<()> {
+    if active_experts.is_empty() {
+        return Ok(());
+    }
+
+    // Per-active-expert token-offset prefix sum (used by the grouped GEMM).
+    // Indexes into the permuted_input layout: since inactive experts have
+    // 0-width slots, active prefix-sum offsets coincide with the all-experts
+    // offsets at active positions.
+    let mut active_token_offsets_host: Vec<u32> = Vec::with_capacity(active_experts.len() + 1);
+    active_token_offsets_host.push(0);
+    let mut max_tokens_per_active = 0usize;
+    for &expert_idx in active_experts {
+        let count = counts_host[expert_idx];
+        max_tokens_per_active = max_tokens_per_active.max(count as usize);
+        let prev = *active_token_offsets_host.last().unwrap();
+        active_token_offsets_host.push(prev + count);
+    }
+    let total_active_tokens = *active_token_offsets_host.last().unwrap() as usize;
+    runtime.upload_u32_slice_to_device(
+        &active_token_offsets_host,
+        &mut moe_scratch.bulk_token_offsets,
+    )?;
+
+    // All-experts prefix-sum (used by permute_gather / unpermute_scatter).
+    runtime.router_expert_offsets_device(
+        &moe_scratch.expert_counts,
+        num_experts,
+        &mut moe_scratch.expert_offsets,
+    )?;
+
+    // Permute: expert_input[batch, hidden] → permuted_input[total_routed, hidden].
+    let max_per_expert_overall = counts_host.iter().copied().max().unwrap_or(0) as usize;
+    runtime.permute_gather_f32_device(
+        &moe_scratch.expert_input,
+        &moe_scratch.expert_token_lists,
+        &moe_scratch.expert_counts,
+        &moe_scratch.expert_offsets,
+        stride,
+        num_experts,
+        max_per_expert_overall,
+        hidden_size,
+        &mut moe_scratch.permuted_input,
+    )?;
+
+    // Shape constants. All routed experts share dimensions for the same
+    // projection family on Gemma-4 (704 / 2816). Read from first active expert.
+    let first = &moe.experts[active_experts[0]];
+    let exp_intermediate = first.gate_proj.rows;  // gate/up output rows
+    let exp_cols_in     = first.gate_proj.cols;   // gate/up cols (== hidden)
+    let down_rows       = first.down_proj.rows;   // == hidden
+    let down_cols       = first.down_proj.cols;   // == intermediate
+    let num_active = active_experts.len();
+
+    // ── Gate projection (input: permuted_input → output: permuted_intermediate) ──
+    stage_active_experts_projection(
+        runtime, &moe.experts, active_experts, ExpertProjKind::Gate,
+        &mut moe_scratch.bulk_packed, &mut moe_scratch.bulk_scales,
+        &mut moe_scratch.bulk_packed_offsets, &mut moe_scratch.bulk_scales_offsets,
+        &mut moe_scratch.bulk_output_scales,
+    )?;
+    runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+        &moe_scratch.bulk_packed, &moe_scratch.bulk_scales,
+        &moe_scratch.bulk_packed_offsets, &moe_scratch.bulk_scales_offsets,
+        &moe_scratch.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+        &moe_scratch.permuted_input,
+        exp_intermediate, exp_cols_in, max_tokens_per_active, num_active,
+        &mut moe_scratch.permuted_intermediate,
+    )?;
+
+    // ── Up projection (input: permuted_input → output: permuted_swiglu) ──
+    stage_active_experts_projection(
+        runtime, &moe.experts, active_experts, ExpertProjKind::Up,
+        &mut moe_scratch.bulk_packed, &mut moe_scratch.bulk_scales,
+        &mut moe_scratch.bulk_packed_offsets, &mut moe_scratch.bulk_scales_offsets,
+        &mut moe_scratch.bulk_output_scales,
+    )?;
+    runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+        &moe_scratch.bulk_packed, &moe_scratch.bulk_scales,
+        &moe_scratch.bulk_packed_offsets, &moe_scratch.bulk_scales_offsets,
+        &moe_scratch.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+        &moe_scratch.permuted_input,
+        exp_intermediate, exp_cols_in, max_tokens_per_active, num_active,
+        &mut moe_scratch.permuted_swiglu,
+    )?;
+
+    // GeGLU (Gemma 4): permuted_swiglu = geglu_tanh(permuted_intermediate, permuted_swiglu).
+    runtime.geglu_tanh_in_place_device(
+        &moe_scratch.permuted_intermediate,
+        &mut moe_scratch.permuted_swiglu,
+        total_active_tokens * exp_intermediate,
+    )?;
+
+    // ── Down projection (input: permuted_swiglu → output: permuted_output) ──
+    stage_active_experts_projection(
+        runtime, &moe.experts, active_experts, ExpertProjKind::Down,
+        &mut moe_scratch.bulk_packed, &mut moe_scratch.bulk_scales,
+        &mut moe_scratch.bulk_packed_offsets, &mut moe_scratch.bulk_scales_offsets,
+        &mut moe_scratch.bulk_output_scales,
+    )?;
+    runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+        &moe_scratch.bulk_packed, &moe_scratch.bulk_scales,
+        &moe_scratch.bulk_packed_offsets, &moe_scratch.bulk_scales_offsets,
+        &moe_scratch.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+        &moe_scratch.permuted_swiglu,
+        down_rows, down_cols, max_tokens_per_active, num_active,
+        &mut moe_scratch.permuted_output,
+    )?;
+
+    // Inverse permute + weighted scatter into moe_acc.
+    runtime.unpermute_scatter_add_f32_device(
+        &moe_scratch.permuted_output,
+        &moe_scratch.expert_token_lists,
+        &moe_scratch.expert_weight_lists,
+        &moe_scratch.expert_counts,
+        &moe_scratch.expert_offsets,
+        stride,
+        num_experts,
+        max_per_expert_overall,
+        hidden_size,
+        &mut moe_scratch.moe_acc,
+    )?;
+
+    Ok(())
 }

@@ -217,6 +217,19 @@ impl DeviceNvfp4Linear {
     pub fn is_host_resident(&self) -> bool {
         matches!(self.residency, TensorResidencyPlan::StagedHostToDevice { .. })
     }
+
+    /// Borrow the packed + scales host bytes for a host-resident weight.
+    /// Returns `None` for VRAM-resident weights or when `host_weights` was
+    /// dropped (e.g. weights now live in the VRAM expert cache). Used by
+    /// grouped MoE bulk staging to concatenate active experts' weights
+    /// into the bulk VRAM buffers.
+    pub fn host_packed_scales_bytes(&self) -> Option<Result<(&[u8], &[u8])>> {
+        let host = self.host_weights.as_ref()?;
+        Some(match (host.packed.as_bytes(), host.scales.as_bytes()) {
+            (Ok(p), Ok(s)) => Ok((p, s)),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        })
+    }
 }
 
 #[derive(Debug)]
