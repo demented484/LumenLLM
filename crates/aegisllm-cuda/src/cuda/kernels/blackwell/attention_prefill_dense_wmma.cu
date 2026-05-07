@@ -591,7 +591,20 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_warp_tile_hdim128
     }
 }
 
-extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
+// Templated implementation of the WMMA-based dense prefill attention
+// kernel. The compile-time `HDIM` parameter parametrises:
+//   * shared-memory tile sizes (Q/K/V/scores/acc all scale with HDIM)
+//   * the inner Q*K WMMA K-loop (HDIM/16 mma.sync calls per K-tile)
+//   * the output P*V WMMA work distribution (HDIM/16 warps cooperate
+//     on a 16×HDIM output tile)
+//   * the launch constraint: blockDim.x ≥ (HDIM/16)*32
+//
+// `extern "C"` instantiations below dispatch by head_dim. We pre-bake
+// HDIM ∈ {128, 256} today; HDIM=512 (Gemma-4 global layers) falls back
+// to the slow paged path until shared-memory + thread-block budget for
+// 32-warp blocks is sized in.
+template<unsigned int HDIM>
+__device__ __forceinline__ void aegis_attention_prefill_dense_halfq_wmma_impl(
     const unsigned short* __restrict__ key_cache,
     const unsigned short* __restrict__ value_cache,
     const unsigned short* __restrict__ query,
@@ -604,15 +617,17 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
     const unsigned int cache_capacity,
     float* __restrict__ output
 ) {
-    constexpr unsigned int hdim = 128u;
+    static_assert(HDIM % 16u == 0u, "HDIM must be a multiple of WMMA tile size 16");
+    constexpr unsigned int hdim = HDIM;
     constexpr unsigned int q_block = 16u;
     constexpr unsigned int k_tile = 32u;
+    constexpr unsigned int output_warps = HDIM / 16u;
     const unsigned int head = blockIdx.x;
     const unsigned int global_q_base = blockIdx.y * q_block;
     const unsigned int tid = threadIdx.x;
     const unsigned int lane = tid & 31u;
     const unsigned int warp = tid >> 5u;
-    if (head_dim != hdim || head >= num_attention_heads || blockDim.x < 128u) {
+    if (head_dim != hdim || head >= num_attention_heads || blockDim.x < output_warps * 32u) {
         return;
     }
 
@@ -736,7 +751,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
         __syncthreads();
 
 #if __CUDA_ARCH__ >= 800
-        if (warp < 8u) {
+        if (warp < output_warps) {
             using namespace nvcuda;
             const unsigned int n_off = warp * 16u;
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
@@ -776,6 +791,47 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
         const float denom = fmaxf(scalars[row * 3u + 1u], 1.0e-20f);
         output[(size_t(global_q) * num_attention_heads + head) * hdim + dim] = acc[idx] / denom;
     }
+}
+
+// `extern "C"` instantiations consumed by the Rust dispatcher. Each
+// targets a specific architectural head_dim; selection happens in
+// `attention_prefill_dense_compat_device` based on the layer's metadata.
+extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
+    const unsigned short* __restrict__ key_cache,
+    const unsigned short* __restrict__ value_cache,
+    const unsigned short* __restrict__ query,
+    const unsigned int start_position,
+    const unsigned int total_q,
+    const unsigned int context_len,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int cache_capacity,
+    float* __restrict__ output
+) {
+    aegis_attention_prefill_dense_halfq_wmma_impl<128u>(
+        key_cache, value_cache, query, start_position, total_q, context_len,
+        num_attention_heads, num_kv_heads, head_dim, cache_capacity, output
+    );
+}
+
+extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim256(
+    const unsigned short* __restrict__ key_cache,
+    const unsigned short* __restrict__ value_cache,
+    const unsigned short* __restrict__ query,
+    const unsigned int start_position,
+    const unsigned int total_q,
+    const unsigned int context_len,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int cache_capacity,
+    float* __restrict__ output
+) {
+    aegis_attention_prefill_dense_halfq_wmma_impl<256u>(
+        key_cache, value_cache, query, start_position, total_q, context_len,
+        num_attention_heads, num_kv_heads, head_dim, cache_capacity, output
+    );
 }
 
 extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_fa(

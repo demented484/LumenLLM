@@ -208,6 +208,43 @@ impl CudaRuntime {
         let legacy_shared_bytes = (dense_metadata.context_len()
             + CUDA_ATTENTION_BLOCK_DIM as usize)
             * std::mem::size_of::<f32>();
+        // hdim=256 path (Gemma-4 sliding layers): the parametric WMMA
+        // kernel handles it via the templated impl. Other hdim≠128 paths
+        // still fall through to the slow paged kernel until we add their
+        // optimized fa/gqa4/etc variants.
+        if matches!(
+            self.config.prefill_attention,
+            CudaPrefillAttentionKernel::Auto
+                | CudaPrefillAttentionKernel::AegisVarlen
+                | CudaPrefillAttentionKernel::WarpFlash
+        ) && head_dim == 256
+            && batch >= DENSE_WARP_TILE_Q_BLOCK
+        {
+            let q_len = checked_len(
+                "dense wmma hdim256 query half width",
+                batch,
+                checked_len(
+                    "dense wmma hdim256 q width",
+                    num_attention_heads,
+                    head_dim,
+                )?,
+            )?;
+            if !query_half_ready {
+                self.f32_to_f16_device(query, q_len, query_half)?;
+            }
+            return self.attention_prefill_dense_halfq_wmma_hdim_device(
+                key_cache,
+                value_cache,
+                query_half,
+                start_position,
+                batch,
+                dense_metadata.context_len(),
+                num_attention_heads,
+                num_kv_heads,
+                head_dim,
+                output,
+            );
+        }
         if matches!(
             self.config.prefill_attention,
             CudaPrefillAttentionKernel::Auto
@@ -339,7 +376,7 @@ impl CudaRuntime {
                     output,
                 )
             } else if dense_wmma_legacy_enabled() {
-                self.attention_prefill_dense_halfq_wmma_hdim128_device(
+                self.attention_prefill_dense_halfq_wmma_hdim_device(
                     key_cache,
                     value_cache,
                     query_half,
@@ -348,6 +385,7 @@ impl CudaRuntime {
                     dense_metadata.context_len(),
                     num_attention_heads,
                     num_kv_heads,
+                    head_dim,
                     output,
                 )
             } else {
@@ -663,8 +701,13 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Dense WMMA prefill attention with parametric head_dim.
+    /// Selects the kernel instantiation by `head_dim` (currently 128 / 256;
+    /// 512 is not yet templated and falls back to the slow paged path
+    /// upstream). Block size scales as `(head_dim/16) * 32` threads so the
+    /// output P*V WMMA distributes one 16-column slice per warp.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn attention_prefill_dense_halfq_wmma_hdim128_device(
+    pub(super) fn attention_prefill_dense_halfq_wmma_hdim_device(
         &self,
         key_cache: &DeviceBuffer<u16>,
         value_cache: &DeviceBuffer<u16>,
@@ -674,9 +717,16 @@ impl CudaRuntime {
         context_len: usize,
         num_attention_heads: usize,
         num_kv_heads: usize,
+        head_dim: usize,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
-        let head_dim = 128usize;
+        let kernel = match head_dim {
+            128 => &self.kernels.attention_prefill_dense_halfq_wmma_hdim128,
+            256 => &self.kernels.attention_prefill_dense_halfq_wmma_hdim256,
+            other => return Err(AegisError::Unsupported(format!(
+                "dense wmma prefill attention requires head_dim ∈ {{128, 256}}; got {other}",
+            ))),
+        };
         let q_width = checked_len("dense wmma q width", num_attention_heads, head_dim)?;
         let q_tokens = checked_len("dense wmma q tokens", batch, q_width)?;
         let kv_width = checked_len("dense wmma kv width", num_kv_heads, head_dim)?;
@@ -714,17 +764,25 @@ impl CudaRuntime {
             + DENSE_WMMA_Q_BLOCK * head_dim
             + DENSE_WMMA_Q_BLOCK * head_dim
             + DENSE_WMMA_Q_BLOCK * 3;
+        // Block size = (head_dim/16) * 32 — one warp per output 16-col
+        // slice for the P*V WMMA stage. hdim128 → 256, hdim256 → 512.
+        let output_warps = (head_dim / 16) as u32;
+        let block_threads = output_warps * 32;
         let cfg = LaunchConfig {
             grid_dim: (
                 u32_arg("num_attention_heads", num_attention_heads)?,
                 u32_arg("dense wmma q blocks", batch.div_ceil(DENSE_WMMA_Q_BLOCK))?,
                 1,
             ),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: validate_dynamic_shared_bytes(
-                "prefill_dense_halfq_wmma_hdim128",
+            block_dim: (block_threads, 1, 1),
+            // hdim=256 exceeds the default 48 KiB shared-mem cap; the
+            // function has been opted into 96 KiB at load time
+            // (functions.rs). Use the higher cap.
+            shared_mem_bytes: super::validate_dynamic_shared_bytes_with_cap(
+                "prefill_dense_halfq_wmma",
                 half_values * std::mem::size_of::<u16>()
                     + float_values * std::mem::size_of::<f32>(),
+                96 * 1024,
             )?,
         };
         let start_position = u32_arg("start_position", start_position)?;
@@ -739,7 +797,7 @@ impl CudaRuntime {
         )?;
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.attention_prefill_dense_halfq_wmma_hdim128)
+                .launch_builder(kernel)
                 .arg(&key_cache.slice)
                 .arg(&value_cache.slice)
                 .arg(&query_half.slice)

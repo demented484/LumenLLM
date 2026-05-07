@@ -94,6 +94,7 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) attention_prefill_dense_halfq_block4: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_warp_tile_hdim128: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128: CudaFunction,
+    pub(crate) attention_prefill_dense_halfq_wmma_hdim256: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_fa: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4_split: CudaFunction,
@@ -266,6 +267,22 @@ impl CudaKernelFunctions {
                 &module,
                 "aegis_attention_prefill_dense_halfq_wmma_hdim128",
             )?,
+            attention_prefill_dense_halfq_wmma_hdim256: {
+                let f = load(&module, "aegis_attention_prefill_dense_halfq_wmma_hdim256")?;
+                // hdim=256 needs ~75 KiB dynamic shared memory; default cap
+                // is 48 KiB. Opt into the larger pool (Blackwell supports up
+                // to 228 KiB per SM). Set once at load time; persists for the
+                // lifetime of the function.
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on hdim256 kernel: {e:?}"
+                )))?;
+                f
+            },
             attention_prefill_dense_halfq_wmma_hdim128_fa: load(
                 &module,
                 "aegis_attention_prefill_dense_halfq_wmma_hdim128_fa",

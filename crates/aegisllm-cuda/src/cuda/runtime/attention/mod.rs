@@ -41,6 +41,23 @@ pub(super) fn validate_dynamic_shared_bytes(kernel: &str, bytes: usize) -> Resul
     Ok(bytes as u32)
 }
 
+/// Same as [`validate_dynamic_shared_bytes`] but accepts a higher cap for
+/// kernels that have opted into more shared memory via
+/// `cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, max_bytes)`
+/// at load time. Used by the hdim256 attention path which needs ~75 KiB.
+pub(super) fn validate_dynamic_shared_bytes_with_cap(
+    kernel: &str,
+    bytes: usize,
+    max_bytes: usize,
+) -> Result<u32> {
+    if bytes > max_bytes {
+        return Err(AegisError::InvalidPlan(format!(
+            "CUDA kernel `{kernel}` requires {bytes} bytes of dynamic shared memory, exceeding the configured {max_bytes}-byte limit"
+        )));
+    }
+    Ok(bytes as u32)
+}
+
 pub(super) const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
 pub(super) const FLASH_SPLIT_K_TOKENS: usize = 256;
 pub(super) const FLASH_SPLIT_Q_BLOCK: usize = 4;
