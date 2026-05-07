@@ -95,6 +95,12 @@ impl CudaRuntime {
             )));
         }
         let width = u32_arg("kv_width", kv_width)?;
+        // For sliding-window layers the cache is sized to `window_size`
+        // (ring buffer). For now we always pass `context_size` as the
+        // capacity, so `slot = pos % ctx == pos` for `pos < ctx` — same as
+        // pre-ring-buffer behaviour. Per-layer wrap is opt-in once the
+        // matching prefill kernels (TODO) understand ring slots too.
+        let cap = u32_arg("cache_capacity", context_size)?;
         let cfg = LaunchConfig {
             grid_dim: (ceil_div(width, 256), 1, 1),
             block_dim: (256, 1, 1),
@@ -109,6 +115,7 @@ impl CudaRuntime {
                 .arg(&value.slice)
                 .arg(&p_position.slice)
                 .arg(&width)
+                .arg(&cap)
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch kv_store_ptr"))?;
@@ -147,6 +154,7 @@ impl CudaRuntime {
         }
         let position = u32_arg("position", position)?;
         let width = u32_arg("kv_width", kv_width)?;
+        let cap = u32_arg("cache_capacity", context_size)?;
         let cfg = LaunchConfig {
             grid_dim: (ceil_div(width, 256), 1, 1),
             block_dim: (256, 1, 1),
@@ -161,6 +169,7 @@ impl CudaRuntime {
                 .arg(&value.slice)
                 .arg(&position)
                 .arg(&width)
+                .arg(&cap)
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch kv store"))?;
@@ -416,6 +425,7 @@ impl CudaRuntime {
             )));
         }
         let width = u32_arg("kv_width", kv_width)?;
+        let cap = u32_arg("cache_capacity", context_size)?;
         let cfg = LaunchConfig {
             grid_dim: (ceil_div(width, 256), 1, 1),
             block_dim: (256, 1, 1),
@@ -430,6 +440,7 @@ impl CudaRuntime {
                 .arg(&value.slice)
                 .arg(&p_position.slice)
                 .arg(&width)
+                .arg(&cap)
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch kv_store_fp8_ptr"))?;
@@ -459,6 +470,7 @@ impl CudaRuntime {
         }
         let position = u32_arg("position", position)?;
         let width = u32_arg("kv_width", kv_width)?;
+        let cap = u32_arg("cache_capacity", context_size)?;
         let cfg = LaunchConfig {
             grid_dim: (ceil_div(width, 256), 1, 1),
             block_dim: (256, 1, 1),
@@ -473,6 +485,7 @@ impl CudaRuntime {
                 .arg(&value.slice)
                 .arg(&position)
                 .arg(&width)
+                .arg(&cap)
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch kv_store_fp8"))?;

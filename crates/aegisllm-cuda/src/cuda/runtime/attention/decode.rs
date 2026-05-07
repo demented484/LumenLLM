@@ -128,6 +128,13 @@ impl CudaRuntime {
         let split_k_u32 = u32_arg("split_k", DECODE_SPLIT_K)?;
         let max_chunk_len_u32 = u32_arg("max_chunk_len", DECODE_MAX_CHUNK_LEN)?;
         let window_size_u32 = u32_arg("window_size", window_size)?;
+        // Cache capacity (in tokens) is inferred from the key buffer size:
+        // sliding-window layers will pass a smaller cache, the kernel uses
+        // `slot = pos % cache_capacity` to index it. Global layers pass
+        // `cache_capacity == context_size`, which makes the wrap a no-op for
+        // any `pos < context_size`.
+        let cache_capacity = key_cache.len() / (num_kv_heads * head_dim);
+        let cache_capacity_u32 = u32_arg("cache_capacity", cache_capacity)?;
         let block_dim = CUDA_ATTENTION_BLOCK_DIM;
         // Shared memory layout: scores[max_chunk_len] + warp_partial[4] + vsum[4*head_dim].
         // = (DECODE_MAX_CHUNK_LEN + 4 + 4*head_dim) * 4 bytes.
@@ -153,6 +160,7 @@ impl CudaRuntime {
                 .arg(&split_k_u32)
                 .arg(&max_chunk_len_u32)
                 .arg(&window_size_u32)
+                .arg(&cache_capacity_u32)
                 .arg(&mut partial_acc.slice)
                 .arg(&mut partial_m.slice)
                 .arg(&mut partial_l.slice)
@@ -289,6 +297,8 @@ impl CudaRuntime {
         let split_k_u32      = u32_arg("split_k", DECODE_SPLIT_K)?;
         let max_chunk_len_u32 = u32_arg("max_chunk_len", DECODE_MAX_CHUNK_LEN)?;
         let window_size_u32  = u32_arg("window_size", window_size)?;
+        let cache_capacity = key_cache.len() / (num_kv_heads * head_dim);
+        let cache_capacity_u32 = u32_arg("cache_capacity", cache_capacity)?;
         let block_dim        = CUDA_ATTENTION_BLOCK_DIM;
         let split_shared_bytes =
             ((DECODE_MAX_CHUNK_LEN + 4 + 4 * head_dim) * std::mem::size_of::<f32>()) as u32;
@@ -310,6 +320,7 @@ impl CudaRuntime {
                 .arg(&split_k_u32)
                 .arg(&max_chunk_len_u32)
                 .arg(&window_size_u32)
+                .arg(&cache_capacity_u32)
                 .arg(&mut partial_acc.slice)
                 .arg(&mut partial_m.slice)
                 .arg(&mut partial_l.slice)

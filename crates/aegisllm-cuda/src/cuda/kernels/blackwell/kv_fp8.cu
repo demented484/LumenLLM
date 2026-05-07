@@ -21,12 +21,14 @@ extern "C" __global__ void aegis_kv_store_fp8_ptr(
     const float*         key,
     const float*         value,
     const unsigned int*  p_position,
-    const unsigned int   width
+    const unsigned int   width,
+    const unsigned int   cache_capacity
 ) {
     const unsigned int position = *p_position;
+    const unsigned int slot = (cache_capacity > 0u) ? (position % cache_capacity) : position;
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < width) {
-        const size_t offset = (size_t)position * width + idx;
+        const size_t offset = (size_t)slot * width + idx;
         key_cache[offset]   = float_to_fp8_e4m3_bits(key[idx]);
         value_cache[offset] = float_to_fp8_e4m3_bits(value[idx]);
     }
@@ -38,11 +40,13 @@ extern "C" __global__ void aegis_kv_store_fp8(
     const float*        key,
     const float*        value,
     const unsigned int  position,
-    const unsigned int  width
+    const unsigned int  width,
+    const unsigned int  cache_capacity
 ) {
+    const unsigned int slot = (cache_capacity > 0u) ? (position % cache_capacity) : position;
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < width) {
-        const size_t offset = (size_t)position * width + idx;
+        const size_t offset = (size_t)slot * width + idx;
         key_cache[offset]   = float_to_fp8_e4m3_bits(key[idx]);
         value_cache[offset] = float_to_fp8_e4m3_bits(value[idx]);
     }
@@ -322,6 +326,7 @@ extern "C" __global__ void aegis_attention_decode_ptr_split_fp8(
     const unsigned int split_k,
     const unsigned int max_chunk_len,
     const unsigned int window_size,
+    const unsigned int cache_capacity,  /* slot = pos % cache_capacity (0 = no wrap) */
     float* __restrict__ partial_acc,
     float* __restrict__ partial_m,
     float* __restrict__ partial_l
@@ -369,8 +374,9 @@ extern "C" __global__ void aegis_attention_decode_ptr_split_fp8(
         if (abs_pos < window_start) {
             score = -3.402823466e38f;
         } else {
+            const unsigned int slot = (cache_capacity > 0u) ? (abs_pos % cache_capacity) : abs_pos;
             const unsigned char* k =
-                key_cache + ((size_t)abs_pos * num_kv_heads + kv_head) * head_dim;
+                key_cache + ((size_t)slot * num_kv_heads + kv_head) * head_dim;
             float partial = 0.0f;
             for (unsigned int d = lane * 4u; d < head_dim; d += 128u) {
                 partial += q[d+0u] * fp8_e4m3_bits_to_float(k[d+0u]);
@@ -423,8 +429,10 @@ extern "C" __global__ void aegis_attention_decode_ptr_split_fp8(
     /* Phase 3: weighted V sum, 1 warp per position */
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     for (unsigned int pos = warp_id; pos < chunk_len; pos += 4u) {
+        const unsigned int abs_pos_v = chunk_start + pos;
+        const unsigned int slot_v = (cache_capacity > 0u) ? (abs_pos_v % cache_capacity) : abs_pos_v;
         const unsigned char* v =
-            value_cache + ((size_t)(chunk_start + pos) * num_kv_heads + kv_head) * head_dim;
+            value_cache + ((size_t)slot_v * num_kv_heads + kv_head) * head_dim;
         float w = scores[pos];
         for (unsigned int d = lane * 4u; d < head_dim; d += 128u) {
             acc[0] += w * fp8_e4m3_bits_to_float(v[d+0u]);

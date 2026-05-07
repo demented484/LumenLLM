@@ -24,6 +24,7 @@ extern "C" __global__ void aegis_attention_decode_ptr_split(
     const unsigned int split_k,
     const unsigned int max_chunk_len,
     const unsigned int window_size,     /* 0 = full causal; >0 = sliding window */
+    const unsigned int cache_capacity,  /* slot = pos % cache_capacity (0 = no wrap) */
     float* __restrict__ partial_acc,   /* [num_heads * split_k * head_dim] */
     float* __restrict__ partial_m,     /* [num_heads * split_k]            */
     float* __restrict__ partial_l      /* [num_heads * split_k]            */
@@ -77,7 +78,8 @@ extern "C" __global__ void aegis_attention_decode_ptr_split(
             /* Position is outside the sliding window — mask to -inf. */
             score = -3.402823466e38f;
         } else {
-            const unsigned short* k = key_cache + ((size_t)abs_pos * num_kv_heads + kv_head) * head_dim;
+            const unsigned int slot = (cache_capacity > 0u) ? (abs_pos % cache_capacity) : abs_pos;
+            const unsigned short* k = key_cache + ((size_t)slot * num_kv_heads + kv_head) * head_dim;
             float partial = 0.0f;
             for (unsigned int d = lane * 4u; d < head_dim; d += 128u) {
                 partial += q[d+0u] * f16_bits_to_float(k[d+0u]);
@@ -141,7 +143,9 @@ extern "C" __global__ void aegis_attention_decode_ptr_split(
     float acc[MAX_D_BLOCKS][4] = { {0.0f, 0.0f, 0.0f, 0.0f} };
     const unsigned int d_blocks = (head_dim + 127u) / 128u;
     for (unsigned int pos = warp_id; pos < chunk_len; pos += 4u) {
-        const unsigned short* v = value_cache + ((size_t)(chunk_start + pos) * num_kv_heads + kv_head) * head_dim;
+        const unsigned int abs_pos_v = chunk_start + pos;
+        const unsigned int slot_v = (cache_capacity > 0u) ? (abs_pos_v % cache_capacity) : abs_pos_v;
+        const unsigned short* v = value_cache + ((size_t)slot_v * num_kv_heads + kv_head) * head_dim;
         float w = scores[pos];
         for (unsigned int b = 0u; b < d_blocks; ++b) {
             const unsigned int d = b * 128u + lane * 4u;

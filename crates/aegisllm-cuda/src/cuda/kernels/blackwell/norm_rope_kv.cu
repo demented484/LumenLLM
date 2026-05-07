@@ -673,18 +673,25 @@ extern "C" __global__ void aegis_apply_rope_positions_batched_f16_out(
 }
 
 // Pointer-based variant for CUDA Graph replay: position is read from device memory.
+// `cache_capacity` lets sliding-window layers store into a ring buffer of size
+// `window_size` rather than allocating the full context. The slot in the cache
+// is `position % cache_capacity`. Pass `cache_capacity == context_size` (or any
+// value strictly greater than `position`) for the no-wrap (global-attention)
+// path — slot then equals position.
 extern "C" __global__ void aegis_kv_store_ptr(
     unsigned short* key_cache,
     unsigned short* value_cache,
     const float* key,
     const float* value,
     const unsigned int* p_position,
-    const unsigned int width
+    const unsigned int width,
+    const unsigned int cache_capacity
 ) {
     const unsigned int position = *p_position;
+    const unsigned int slot = (cache_capacity > 0u) ? (position % cache_capacity) : position;
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < width) {
-        const size_t offset = size_t(position) * width + idx;
+        const size_t offset = size_t(slot) * width + idx;
         key_cache[offset] = float_to_f16_bits(key[idx]);
         value_cache[offset] = float_to_f16_bits(value[idx]);
     }
@@ -696,11 +703,13 @@ extern "C" __global__ void aegis_kv_store(
     const float* key,
     const float* value,
     const unsigned int position,
-    const unsigned int width
+    const unsigned int width,
+    const unsigned int cache_capacity
 ) {
+    const unsigned int slot = (cache_capacity > 0u) ? (position % cache_capacity) : position;
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < width) {
-        const size_t offset = size_t(position) * width + idx;
+        const size_t offset = size_t(slot) * width + idx;
         key_cache[offset] = float_to_f16_bits(key[idx]);
         value_cache[offset] = float_to_f16_bits(value[idx]);
     }
