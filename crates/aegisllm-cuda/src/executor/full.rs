@@ -1061,15 +1061,15 @@ fn compute_host_arena_capacity(
 }
 
 fn cuda_prefill_chunk_size(config: CudaRuntimeConfig) -> usize {
-    // Default 1024: large enough that with Gemma-4 routing (top_k=8 over 128
-    // experts), the average per-expert batch is 1024*8/128 = 64, well above
-    // the WMMA NVFP4 GEMM kernel's gate (batch>=32). Smaller chunks (default
-    // 128) gave avg batch=8 which forces the scalar reference path. This
-    // value is a stop-gap until grouped MoE lands; once that ships, chunk
-    // size will only affect prefill latency, not throughput.
+    // Default 2048: matches llama.cpp's typical ubatch=2048. Halves H2D
+    // amortization vs chunk=1024 for routed-expert weight streaming. The
+    // hdim256 WMMA attention kernel handles the larger Q-tile range
+    // correctly (sliding-window ring-buffer KV cache transparently).
+    // Slightly slower than chunk=1024 on tiny prompts (≤1024 tokens)
+    // but wins at every realistic length.
     config
         .prefill_chunk_size
-        .unwrap_or(1024)
+        .unwrap_or(2048)
         .clamp(1, CUDA_PREFILL_CHUNK_MAX)
 }
 
