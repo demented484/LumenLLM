@@ -71,6 +71,22 @@ impl Executor {
                     artifact, graph, placement, &runtime, cuda,
                 )?),
             }),
+            "wgpu" => {
+                // WgpuExecutorProvider is a skeleton: from_artifact builds the
+                // wgpu context (probe adapter + load shaders), and
+                // forward_hidden / prefill_prompt return Unsupported. The
+                // runnable-gate above already prevents reaching this on a
+                // wgpu-only plan, so getting here implies a programming error.
+                let device = match placement.kv_cache.compute {
+                    ComputePlacement::Wgpu { device } => device,
+                    _ => 0,
+                };
+                Ok(Self {
+                    backend: Box::new(
+                        aegisllm_wgpu::WgpuExecutorProvider::from_artifact(artifact, device)?,
+                    ),
+                })
+            }
             other => Err(AegisError::Unsupported(format!(
                 "{other} executor plan is marked runnable but construction is not wired"
             ))),

@@ -1,7 +1,7 @@
 pub mod artifact;
 pub mod backend;
 pub mod cuda_config;
-pub mod cuda_types;
+pub mod backend_types;
 pub mod error;
 pub mod executor;
 pub mod generation;
@@ -19,7 +19,7 @@ pub use cuda_config::{
     CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, CUDA_PREFILL_VARLEN_MIN_CONTEXT,
     CudaPrefillAttentionKernel, CudaRuntimeConfig,
 };
-pub use cuda_types::CudaAttentionDType;
+pub use backend_types::AttentionDType;
 pub use error::{AegisError, Result};
 pub use generation::{GenerateOutput, GenerateRequest, SamplingConfig};
 pub use graph::{GraphRegion, GraphRegionKind, LayerMetadata, ModelGraph, RegionId, TensorRole};

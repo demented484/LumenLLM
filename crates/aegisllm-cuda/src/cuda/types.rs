@@ -56,7 +56,7 @@ pub enum CudaAttentionMode {
     Mixed = 3,
 }
 
-pub use aegisllm_base::cuda_types::CudaAttentionDType;
+pub use aegisllm_base::backend_types::AttentionDType;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -77,11 +77,11 @@ pub struct CudaAttentionParamsV1 {
     pub block_table_stride: u32,
     pub physical_slots: u32,
     pub softmax_scale: f32,
-    pub q_dtype: CudaAttentionDType,
-    pub k_dtype: CudaAttentionDType,
-    pub v_dtype: CudaAttentionDType,
-    pub output_dtype: CudaAttentionDType,
-    pub accum_dtype: CudaAttentionDType,
+    pub q_dtype: AttentionDType,
+    pub k_dtype: AttentionDType,
+    pub v_dtype: AttentionDType,
+    pub output_dtype: AttentionDType,
+    pub accum_dtype: AttentionDType,
     pub reserved0: u32,
     pub reserved1: u32,
     pub reserved2: u32,
@@ -419,7 +419,7 @@ impl DensePrefillMetadataProof {
 #[cfg(test)]
 mod tests {
     use super::{
-        CudaAttentionDType, CudaAttentionMode, CudaAttentionParamsV1, DensePrefillMetadataProof,
+        AttentionDType, CudaAttentionMode, CudaAttentionParamsV1, DensePrefillMetadataProof,
     };
 
     #[test]
@@ -429,14 +429,14 @@ mod tests {
         assert_eq!(CudaAttentionMode::Prefill as u32, 1);
         assert_eq!(CudaAttentionMode::Varlen as u32, 2);
         assert_eq!(CudaAttentionMode::Mixed as u32, 3);
-        assert_eq!(CudaAttentionDType::F32 as u32, 0);
-        assert_eq!(CudaAttentionDType::F16 as u32, 1);
-        assert_eq!(CudaAttentionDType::Bf16 as u32, 2);
-        assert_eq!(CudaAttentionDType::Fp8E4M3 as u32, 3);
-        assert_eq!(CudaAttentionDType::Fp8E5M2 as u32, 4);
-        assert_eq!(CudaAttentionDType::Fp4E2M1 as u32, 5);
-        assert_eq!(CudaAttentionDType::Int8 as u32, 6);
-        assert_eq!(CudaAttentionDType::Int4 as u32, 7);
+        assert_eq!(AttentionDType::F32 as u32, 0);
+        assert_eq!(AttentionDType::F16 as u32, 1);
+        assert_eq!(AttentionDType::Bf16 as u32, 2);
+        assert_eq!(AttentionDType::Fp8E4M3 as u32, 3);
+        assert_eq!(AttentionDType::Fp8E5M2 as u32, 4);
+        assert_eq!(AttentionDType::Fp4E2M1 as u32, 5);
+        assert_eq!(AttentionDType::Int8 as u32, 6);
+        assert_eq!(AttentionDType::Int4 as u32, 7);
         assert_eq!(CudaAttentionParamsV1::FLAG_CAUSAL, 1);
         assert_eq!(CudaAttentionParamsV1::FLAG_PAGED_KV, 2);
         assert_eq!(CudaAttentionParamsV1::FLAG_GQA, 4);

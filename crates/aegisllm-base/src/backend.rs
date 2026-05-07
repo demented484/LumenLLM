@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::hardware::{GpuArchitecture, HardwareInventory};
 use crate::planning::placement::ComputePlacement;
-use crate::cuda_types::CudaAttentionDType;
+use crate::backend_types::AttentionDType;
 use crate::tensor::quant::{QuantFormat, TensorCorePrecision};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -23,7 +23,7 @@ pub struct BackendDescriptor {
     pub supports_fp8: bool,
     pub supports_flash_attention: bool,
     pub supports_paged_attention: bool,
-    pub attention_dtypes: Vec<CudaAttentionDType>,
+    pub attention_dtypes: Vec<AttentionDType>,
     pub tensor_core_precisions: Vec<TensorCorePrecision>,
 }
 
@@ -48,7 +48,7 @@ impl BackendRegistry {
                 supports_fp8: false,
                 supports_flash_attention: false,
                 supports_paged_attention: false,
-                attention_dtypes: vec![CudaAttentionDType::F32],
+                attention_dtypes: vec![AttentionDType::F32],
                 tensor_core_precisions: Vec::new(),
             },
         );
@@ -87,7 +87,7 @@ impl BackendRegistry {
                     supports_fp8: false,
                     supports_flash_attention: false,
                     supports_paged_attention: false,
-                    attention_dtypes: vec![CudaAttentionDType::F32],
+                    attention_dtypes: vec![AttentionDType::F32],
                     tensor_core_precisions: vec![],
                 },
             );
@@ -120,7 +120,7 @@ impl BackendDescriptor {
             .is_some_and(|precision| self.supports_tensor_core_precision(precision))
     }
 
-    pub fn supports_attention_dtype(&self, dtype: CudaAttentionDType) -> bool {
+    pub fn supports_attention_dtype(&self, dtype: AttentionDType) -> bool {
         self.attention_dtypes.contains(&dtype)
     }
 }
@@ -162,58 +162,58 @@ fn gpu_tensor_core_precisions(architecture: GpuArchitecture) -> Vec<TensorCorePr
     }
 }
 
-fn cuda_attention_dtypes(architecture: GpuArchitecture) -> Vec<CudaAttentionDType> {
+fn cuda_attention_dtypes(architecture: GpuArchitecture) -> Vec<AttentionDType> {
     match architecture {
         GpuArchitecture::Blackwell => vec![
-            CudaAttentionDType::F32,
-            CudaAttentionDType::F16,
-            CudaAttentionDType::Bf16,
-            CudaAttentionDType::Fp8E4M3,
-            CudaAttentionDType::Fp8E5M2,
-            CudaAttentionDType::Fp4E2M1,
-            CudaAttentionDType::Int8,
-            CudaAttentionDType::Int4,
+            AttentionDType::F32,
+            AttentionDType::F16,
+            AttentionDType::Bf16,
+            AttentionDType::Fp8E4M3,
+            AttentionDType::Fp8E5M2,
+            AttentionDType::Fp4E2M1,
+            AttentionDType::Int8,
+            AttentionDType::Int4,
         ],
         GpuArchitecture::Hopper => vec![
-            CudaAttentionDType::F32,
-            CudaAttentionDType::F16,
-            CudaAttentionDType::Bf16,
-            CudaAttentionDType::Fp8E4M3,
-            CudaAttentionDType::Fp8E5M2,
-            CudaAttentionDType::Int8,
-            CudaAttentionDType::Int4,
+            AttentionDType::F32,
+            AttentionDType::F16,
+            AttentionDType::Bf16,
+            AttentionDType::Fp8E4M3,
+            AttentionDType::Fp8E5M2,
+            AttentionDType::Int8,
+            AttentionDType::Int4,
         ],
         GpuArchitecture::Ada | GpuArchitecture::Ampere => vec![
-            CudaAttentionDType::F32,
-            CudaAttentionDType::F16,
-            CudaAttentionDType::Bf16,
-            CudaAttentionDType::Int8,
-            CudaAttentionDType::Int4,
+            AttentionDType::F32,
+            AttentionDType::F16,
+            AttentionDType::Bf16,
+            AttentionDType::Int8,
+            AttentionDType::Int4,
         ],
-        GpuArchitecture::Unknown => vec![CudaAttentionDType::F32, CudaAttentionDType::F16],
+        GpuArchitecture::Unknown => vec![AttentionDType::F32, AttentionDType::F16],
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{cuda_attention_dtypes, BackendDescriptor, BackendKind};
-    use crate::cuda_types::CudaAttentionDType;
+    use crate::backend_types::AttentionDType;
     use crate::hardware::GpuArchitecture;
 
     #[test]
     fn attention_dtype_capabilities_are_not_fp4_only() {
         let blackwell = cuda_attention_dtypes(GpuArchitecture::Blackwell);
-        assert!(blackwell.contains(&CudaAttentionDType::F16));
-        assert!(blackwell.contains(&CudaAttentionDType::Bf16));
-        assert!(blackwell.contains(&CudaAttentionDType::Fp8E4M3));
-        assert!(blackwell.contains(&CudaAttentionDType::Fp4E2M1));
-        assert!(blackwell.contains(&CudaAttentionDType::Int4));
+        assert!(blackwell.contains(&AttentionDType::F16));
+        assert!(blackwell.contains(&AttentionDType::Bf16));
+        assert!(blackwell.contains(&AttentionDType::Fp8E4M3));
+        assert!(blackwell.contains(&AttentionDType::Fp4E2M1));
+        assert!(blackwell.contains(&AttentionDType::Int4));
 
         let ampere = cuda_attention_dtypes(GpuArchitecture::Ampere);
-        assert!(ampere.contains(&CudaAttentionDType::F16));
-        assert!(ampere.contains(&CudaAttentionDType::Bf16));
-        assert!(ampere.contains(&CudaAttentionDType::Int8));
-        assert!(!ampere.contains(&CudaAttentionDType::Fp4E2M1));
+        assert!(ampere.contains(&AttentionDType::F16));
+        assert!(ampere.contains(&AttentionDType::Bf16));
+        assert!(ampere.contains(&AttentionDType::Int8));
+        assert!(!ampere.contains(&AttentionDType::Fp4E2M1));
     }
 
     #[test]
@@ -226,10 +226,10 @@ mod tests {
             supports_fp8: false,
             supports_flash_attention: false,
             supports_paged_attention: false,
-            attention_dtypes: vec![CudaAttentionDType::F32],
+            attention_dtypes: vec![AttentionDType::F32],
             tensor_core_precisions: Vec::new(),
         };
-        assert!(backend.supports_attention_dtype(CudaAttentionDType::F32));
-        assert!(!backend.supports_attention_dtype(CudaAttentionDType::Fp4E2M1));
+        assert!(backend.supports_attention_dtype(AttentionDType::F32));
+        assert!(!backend.supports_attention_dtype(AttentionDType::Fp4E2M1));
     }
 }

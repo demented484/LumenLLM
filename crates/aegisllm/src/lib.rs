@@ -31,7 +31,7 @@ pub use aegisllm_base::executor::traits::{
     GenerationBackendPrimitives, GenerationState, ModelExecutorBackend,
 };
 pub use aegisllm_base::cuda_config::{CudaPrefillAttentionKernel, CudaRuntimeConfig};
-pub use aegisllm_base::cuda_types::CudaAttentionDType;
+pub use aegisllm_base::backend_types::AttentionDType;
 
 pub use aegisllm_cpu::{
     CpuNvfp4Linear, CpuReferenceExecutor, CpuRuntime, LinearMaterializationCache,
