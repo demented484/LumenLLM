@@ -235,6 +235,47 @@ impl CudaRuntime {
             .map_err(map_cuda_err("d2d u32 range"))
     }
 
+    /// Allocate `len` bytes of CUDA-pinned (page-locked) host memory bound
+    /// to this runtime's primary context. Used by grouped MoE bulk staging
+    /// for the bounce buffers.
+    pub fn alloc_pinned_u8(&self, len: usize) -> Result<cudarc::driver::PinnedHostSlice<u8>> {
+        unsafe { self.stream.context().alloc_pinned::<u8>(len) }
+            .map_err(map_cuda_err("alloc pinned u8"))
+    }
+
+    /// Copy from a pinned host byte slice into a u8 device buffer (full
+    /// length defined by `len`). Used by grouped MoE bulk staging to do
+    /// one big DMA transfer per projection instead of many small ones.
+    pub fn copy_pinned_u8_to_device(
+        &self,
+        src: &cudarc::driver::PinnedHostSlice<u8>,
+        len: usize,
+        dst: &mut DeviceBuffer<u8>,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if dst.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "copy_pinned_u8_to_device dst too small: have {} need {}",
+                dst.len(), len
+            )));
+        }
+        let src_full = src
+            .as_slice()
+            .map_err(map_cuda_err("pinned u8 as_slice"))?;
+        let src_slice = src_full.get(..len).ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "copy_pinned_u8_to_device src too small: have {} need {}",
+                src_full.len(), len
+            ))
+        })?;
+        let mut dst_view = dst.slice.slice_mut(0..len);
+        self.stream
+            .memcpy_htod(src_slice, &mut dst_view)
+            .map_err(map_cuda_err("h2d pinned u8"))
+    }
+
     /// Copy a host byte slice into a u8 device buffer at `dst_offset`.
     /// Used by grouped MoE bulk staging to concatenate per-expert weight
     /// bytes into a single contiguous VRAM buffer.

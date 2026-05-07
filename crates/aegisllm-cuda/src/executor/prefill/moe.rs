@@ -480,9 +480,11 @@ enum ExpertProjKind {
 }
 
 /// Stage one projection of all active experts into the bulk VRAM buffers.
-/// Records per-active-expert byte offsets into `bulk_packed` / `bulk_scales`
-/// and the f32 output_scale, then uploads them as device arrays for the
-/// grouped GEMM kernel to read.
+/// Each per-expert pair of memcpy_htod calls writes into a pre-allocated
+/// offset of the bulk buffer. Pinned bounce coalescing was tried and lost
+/// to per-expert because `as_mut_slice` synchronises on the bounce's prior
+/// DMA — that serialises across projections and wipes the overlap pool's
+/// gain. Per-expert via `memcpy_htod` keeps the existing pipeline behaviour.
 #[allow(clippy::too_many_arguments)]
 fn stage_active_experts_projection(
     runtime: &CudaRuntime,
@@ -495,12 +497,12 @@ fn stage_active_experts_projection(
     bulk_scales_offsets: &mut DeviceBuffer<u32>,
     bulk_output_scales: &mut DeviceBuffer<f32>,
 ) -> Result<()> {
-    let mut packed_off = 0u64;
-    let mut scales_off = 0u64;
     let mut packed_offsets_host: Vec<u32> = Vec::with_capacity(active_experts.len());
     let mut scales_offsets_host: Vec<u32> = Vec::with_capacity(active_experts.len());
     let mut output_scales_host: Vec<f32> = Vec::with_capacity(active_experts.len());
 
+    let mut packed_off: usize = 0;
+    let mut scales_off: usize = 0;
     for &expert_idx in active_experts {
         let expert = &experts[expert_idx];
         let proj = match projection {
@@ -513,17 +515,13 @@ fn stage_active_experts_projection(
             .ok_or_else(|| AegisError::InvalidPlan(format!(
                 "grouped MoE staging: expert `{}` is not host-resident", proj.name
             )))??;
-        packed_offsets_host.push(u32::try_from(packed_off).map_err(|_| {
-            AegisError::InvalidPlan("grouped MoE: packed offset > u32".into())
-        })?);
-        scales_offsets_host.push(u32::try_from(scales_off).map_err(|_| {
-            AegisError::InvalidPlan("grouped MoE: scales offset > u32".into())
-        })?);
+        packed_offsets_host.push(packed_off as u32);
+        scales_offsets_host.push(scales_off as u32);
         output_scales_host.push(proj.output_scale);
-        runtime.copy_host_u8_to_device_at_offset(packed_bytes, bulk_packed, packed_off as usize)?;
-        runtime.copy_host_u8_to_device_at_offset(scales_bytes, bulk_scales, scales_off as usize)?;
-        packed_off += packed_bytes.len() as u64;
-        scales_off += scales_bytes.len() as u64;
+        runtime.copy_host_u8_to_device_at_offset(packed_bytes, bulk_packed, packed_off)?;
+        runtime.copy_host_u8_to_device_at_offset(scales_bytes, bulk_scales, scales_off)?;
+        packed_off += packed_bytes.len();
+        scales_off += scales_bytes.len();
     }
 
     runtime.upload_u32_slice_to_device(&packed_offsets_host, bulk_packed_offsets)?;
