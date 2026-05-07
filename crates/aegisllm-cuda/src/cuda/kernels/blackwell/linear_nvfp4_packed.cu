@@ -401,6 +401,138 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_gemm_wmma_bf1
     }
 }
 
+// =============================================================================
+// Grouped MoE NVFP4 GEMM with BF16 WMMA inner (Phase B.2).
+//
+// Single-launch kernel that processes ALL active experts of one projection
+// (gate / up / down) in a single grid. Replaces the per-expert host loop +
+// per-expert kernel call pattern (30 expert × 3 launches = 90 launches per
+// layer with the per-expert path) with one launch per projection.
+//
+// Inputs:
+//   * `packed_base`         — base ptr to a contiguous VRAM buffer holding
+//                             ALL active experts' packed bytes.
+//   * `scales_base`         — same for the per-block scales.
+//   * `packed_offsets[ae]`  — byte offset into `packed_base` for the
+//                             ae-th active expert's weights.
+//   * `scales_offsets[ae]`  — same for scales.
+//   * `output_scales[ae]`   — per-expert FP32 output scale (was the
+//                             `output_scale` field on DeviceNvfp4Linear).
+//   * `expert_token_offsets[ae+1]`  — prefix sum over active experts:
+//                             tokens for expert ae live at
+//                             `permuted_input[token_offsets[ae] : token_offsets[ae+1]]`.
+//   * `permuted_input`      — `[total_tokens, cols]` activations sorted by
+//                             expert (built by `aegis_permute_gather_f32`).
+//   * `permuted_output`     — `[total_tokens, rows]` per-expert outputs
+//                             sorted in same order; later un-permuted by
+//                             `aegis_unpermute_scatter_add_f32`.
+//
+// Grid : (ceil(rows/16), max_tokens_per_expert/16, num_active_experts)
+// Block: 32 threads (one warp) — same WMMA tile design as the per-expert
+//        WMMA kernel above.
+//
+// Portability: same SM 7.5+ requirement as the per-expert WMMA kernel.
+// =============================================================================
+extern "C" __global__ void aegis_nvfp4_grouped_prequant_gemm_wmma_bf16(
+    const unsigned char* __restrict__ packed_base,
+    const unsigned char* __restrict__ scales_base,
+    const unsigned int*  __restrict__ packed_offsets,        // [num_active_experts]
+    const unsigned int*  __restrict__ scales_offsets,        // [num_active_experts]
+    const float*         __restrict__ output_scales,          // [num_active_experts]
+    const unsigned int*  __restrict__ expert_token_offsets,   // [num_active_experts + 1]
+    const float*         __restrict__ permuted_input,         // [total_tokens, cols]
+    const unsigned int rows,
+    const unsigned int cols,
+    float*               __restrict__ permuted_output         // [total_tokens, rows]
+) {
+    using namespace nvcuda;
+    constexpr int M = 16, N = 16, K = 16;
+
+    const unsigned int active_e = blockIdx.z;
+    const unsigned int tok_start = expert_token_offsets[active_e];
+    const unsigned int tok_end   = expert_token_offsets[active_e + 1];
+    const unsigned int tok_count = tok_end - tok_start;
+
+    const unsigned int tile_row = blockIdx.x * (unsigned int)M;
+    const unsigned int tile_col_in_expert = blockIdx.y * (unsigned int)N;
+
+    if (tile_row >= rows) return;
+    if (tile_col_in_expert >= tok_count) return;  // expert has no tokens for this Y-tile
+
+    const unsigned int tid = threadIdx.x;
+
+    const unsigned char* packed = packed_base + (size_t)packed_offsets[active_e];
+    const unsigned char* scales = scales_base + (size_t)scales_offsets[active_e];
+    const float output_scale = output_scales[active_e];
+
+    __shared__ __nv_bfloat16 sh_a[M * K];
+    __shared__ __nv_bfloat16 sh_b[K * N];
+    __shared__ float          sh_c[M * N];
+
+    wmma::fragment<wmma::matrix_a, M, N, K, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, M, N, K, __nv_bfloat16, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, M, N, K, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    const unsigned int packed_cols = cols / 2u;
+    const unsigned int scale_cols  = cols / 16u;
+
+    for (unsigned int k_tile = 0u; k_tile < cols; k_tile += (unsigned int)K) {
+        // Weight tile: same as per-expert WMMA kernel, but using per-expert
+        // packed/scales pointers.
+        for (unsigned int e = tid; e < (unsigned int)(M * K); e += 32u) {
+            const unsigned int m = e / (unsigned int)K;
+            const unsigned int k = e % (unsigned int)K;
+            const unsigned int row_g = tile_row + m;
+            const unsigned int col_g = k_tile + k;
+            float v = 0.0f;
+            if (row_g < rows && col_g < cols) {
+                const size_t packed_idx = (size_t)row_g * packed_cols + (size_t)(col_g / 2u);
+                const unsigned int byte = packed[packed_idx];
+                const unsigned int nibble = (col_g & 1u) ? (byte >> 4u) : (byte & 0x0Fu);
+                const size_t scale_idx = (size_t)row_g * scale_cols + (size_t)(col_g / 16u);
+                const float blk_scale = decode_ue4m3_half(scales[scale_idx]);
+                v = (float)decode_nvfp4_nibble(nibble) * blk_scale;
+            }
+            sh_a[m * (unsigned int)K + k] = __float2bfloat16(v);
+        }
+
+        // Input tile: read from this expert's slice of permuted_input.
+        // Global token index = tok_start + (tile_col_in_expert + n).
+        for (unsigned int e = tid; e < (unsigned int)(K * N); e += 32u) {
+            const unsigned int n = e / (unsigned int)K;
+            const unsigned int k = e % (unsigned int)K;
+            const unsigned int batch_in_e = tile_col_in_expert + n;
+            const unsigned int col_g      = k_tile + k;
+            float v = 0.0f;
+            if (batch_in_e < tok_count && col_g < cols) {
+                const unsigned int token_g = tok_start + batch_in_e;
+                v = permuted_input[(size_t)token_g * cols + col_g];
+            }
+            sh_b[n * (unsigned int)K + k] = __float2bfloat16(v);
+        }
+        __syncthreads();
+
+        wmma::load_matrix_sync(a_frag, sh_a, K);
+        wmma::load_matrix_sync(b_frag, sh_b, K);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        __syncthreads();
+    }
+
+    wmma::store_matrix_sync(sh_c, c_frag, N, wmma::mem_row_major);
+    for (unsigned int e = tid; e < (unsigned int)(M * N); e += 32u) {
+        const unsigned int m = e / (unsigned int)N;
+        const unsigned int n = e % (unsigned int)N;
+        const unsigned int row_g     = tile_row + m;
+        const unsigned int batch_in_e = tile_col_in_expert + n;
+        if (row_g < rows && batch_in_e < tok_count) {
+            const unsigned int token_g = tok_start + batch_in_e;
+            permuted_output[(size_t)token_g * rows + row_g] =
+                sh_c[m * (unsigned int)N + n] * output_scale;
+        }
+    }
+}
+
 extern "C" __global__ void aegis_nvfp4_linear_reference_batched(
     const unsigned char* packed,
     const unsigned char* scales,

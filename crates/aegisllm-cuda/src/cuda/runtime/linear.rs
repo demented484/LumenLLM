@@ -609,6 +609,73 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Grouped MoE NVFP4 GEMM (Phase B.2): single launch processes all
+    /// active experts of one projection. Replaces the per-expert dispatch
+    /// loop's inner kernel call.
+    ///
+    /// Inputs are concatenated VRAM buffers built by the caller:
+    ///   * `packed_base` / `scales_base` — contiguous bytes of all active
+    ///     experts' weights for this projection (gate / up / down).
+    ///   * `*_offsets` / `output_scales` / `expert_token_offsets` — per-active-
+    ///     expert metadata uploaded once per projection.
+    ///   * `permuted_input` — `[total_tokens, cols]` activations sorted by
+    ///     expert (built by `permute_gather_f32_device`).
+    ///   * `permuted_output` — written; later un-permuted by
+    ///     `unpermute_scatter_add_f32_device`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+        &self,
+        packed_base: &DeviceBuffer<u8>,
+        scales_base: &DeviceBuffer<u8>,
+        packed_offsets: &DeviceBuffer<u32>,
+        scales_offsets: &DeviceBuffer<u32>,
+        output_scales: &DeviceBuffer<f32>,
+        expert_token_offsets: &DeviceBuffer<u32>,
+        permuted_input: &DeviceBuffer<f32>,
+        rows: usize,
+        cols: usize,
+        max_tokens_per_expert: usize,
+        num_active_experts: usize,
+        permuted_output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if num_active_experts == 0 || max_tokens_per_expert == 0 {
+            return Ok(());
+        }
+        if rows % 16 != 0 || cols % 16 != 0 {
+            return Err(AegisError::InvalidPlan(format!(
+                "grouped wmma gemm requires rows%16==0 and cols%16==0, got rows={} cols={}",
+                rows, cols,
+            )));
+        }
+        let rows_u32 = u32_arg("rows", rows)?;
+        let cols_u32 = u32_arg("cols", cols)?;
+        let grid_x = (rows / 16) as u32;
+        let grid_y = ((max_tokens_per_expert + 15) / 16) as u32;
+        let grid_z = u32_arg("num_active_experts", num_active_experts)?;
+        let cfg = LaunchConfig {
+            grid_dim: (grid_x, grid_y, grid_z),
+            block_dim: (32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.nvfp4_grouped_prequant_gemm_wmma_bf16)
+                .arg(&packed_base.slice)
+                .arg(&scales_base.slice)
+                .arg(&packed_offsets.slice)
+                .arg(&scales_offsets.slice)
+                .arg(&output_scales.slice)
+                .arg(&expert_token_offsets.slice)
+                .arg(&permuted_input.slice)
+                .arg(&rows_u32)
+                .arg(&cols_u32)
+                .arg(&mut permuted_output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch grouped nvfp4 wmma gemm"))?;
+        Ok(())
+    }
+
     pub fn matvec_nvfp4_prequantized_batched_device(
         &self,
         linear: &DeviceNvfp4Linear,
