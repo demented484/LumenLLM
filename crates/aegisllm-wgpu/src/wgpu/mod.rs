@@ -6,8 +6,8 @@ mod state;
 mod weights;
 
 pub use weights::{
-    load_vanilla_llama_model, WgpuAttentionWeightsFull, WgpuLayerWeights, WgpuLinear,
-    WgpuMlpWeightsFull, WgpuModel, WgpuModelShape, WgpuMoeExpert, WgpuMoeWeights,
+    load_gemma4_model, load_vanilla_llama_model, WgpuAttentionWeightsFull, WgpuLayerWeights,
+    WgpuLinear, WgpuMlpWeightsFull, WgpuModel, WgpuModelShape, WgpuMoeExpert, WgpuMoeWeights,
 };
 
 pub use block::{

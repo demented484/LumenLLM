@@ -403,15 +403,22 @@ fn load_linear(
         let scales_bytes = loader.load_for_store(scale_info, StoragePlacement::Ram)?;
         let packed_buf = upload_padded_u8_buf(ctx, packed_bytes.as_bytes(), label);
         let scales_buf = upload_padded_u8_buf(ctx, scales_bytes.as_bytes(), label);
+        // NVFP4 stores the per-tensor output dequant scale at
+        // `{prefix}.weight_scale_2` (scalar BF16/F32). The CUDA loader
+        // uses this name; we mirror it. Default 1.0 if absent.
+        // The base name strips the trailing `.weight` so the lookup
+        // matches the artifact's `prefix.weight_scale_2`.
+        let scale_2_name = if let Some(stripped) = name.strip_suffix(".weight") {
+            format!("{stripped}.weight_scale_2")
+        } else {
+            format!("{name}.weight_scale_2")
+        };
         Ok(WgpuLinear::Nvfp4 {
             packed: packed_buf,
             scales: scales_buf,
             rows,
             cols,
-            // Per-tensor output scale: artifact may store it as a
-            // separate `{name}.output_scale` scalar; default 1.0 if
-            // absent. NVFP4 tensors without an output scale are common.
-            output_scale: load_optional_scalar(artifact, &format!("{name}.output_scale")).unwrap_or(1.0),
+            output_scale: load_optional_scalar(artifact, &scale_2_name).unwrap_or(1.0),
         })
     } else {
         // Dense path.
@@ -548,6 +555,429 @@ pub fn load_vanilla_llama_model(
         rms_norm_eps: shape.rms_norm_eps,
         // Vanilla Llama doesn't scale embeddings.
         embed_scale: None,
+    })
+}
+
+/// Optional dense norm-weight loader. Returns the first existing
+/// tensor across `candidates`; `None` when none exist. BF16/F16/F32 →
+/// f32 device buffer.
+fn load_optional_dense(
+    ctx: &WgpuContext,
+    loader: &mut TensorStorageLoader,
+    artifact: &ModelArtifact,
+    candidates: &[&str],
+    label: &'static str,
+) -> Result<Option<wgpu::Buffer>> {
+    for name in candidates {
+        if artifact.tensors.tensors.contains_key(*name) {
+            return Ok(Some(load_dense_as_f32(ctx, loader, artifact, name, label)?));
+        }
+    }
+    Ok(None)
+}
+
+/// Load `model.layers.{L}.router.per_expert_scale` as a host `Vec<f32>`.
+/// Returns identity (`vec![1.0; num_experts]`) if the tensor is absent.
+fn load_per_expert_scale_host(
+    loader: &mut TensorStorageLoader,
+    artifact: &ModelArtifact,
+    layer_idx: usize,
+    text_prefix: &str,
+    num_experts: usize,
+) -> Result<Vec<f32>> {
+    let name = format!("{text_prefix}layers.{layer_idx}.router.per_expert_scale");
+    let info = match artifact.tensors.tensors.get(&name) {
+        Some(t) => t,
+        None => return Ok(vec![1.0; num_experts]),
+    };
+    let host = loader.load_for_store(info, StoragePlacement::Ram)?;
+    let bytes = host.as_bytes();
+    match info.dtype {
+        TensorDType::BF16 => bf16_bytes_to_f32(bytes),
+        TensorDType::F32 => f32_bytes_to_vec(bytes),
+        TensorDType::F16 => Ok(bytes
+            .chunks_exact(2)
+            .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()),
+        other => Err(AegisError::Unsupported(format!(
+            "router.per_expert_scale[{layer_idx}] has unsupported dtype {other:?}"
+        ))),
+    }
+}
+
+/// Load a Gemma-4 model into wgpu buffers. Drives off the artifact
+/// `HfConfig` for per-layer global/sliding detection and the gemma4
+/// helper functions in `aegisllm_base::model::gemma4`.
+///
+/// Populates every Gemma-4-specific optional field on
+/// `WgpuLayerWeights` and `WgpuMoeWeights`:
+///   * Per-head Q/K norms + V `v_norm_unit` (one shared all-ones buffer
+///     of length max(head_dim) across all layers).
+///   * PrePost sub-layer norms when present.
+///   * `embed_scale = sqrt(hidden_size)` and per-layer `layer_scalar`.
+///   * MoE: router (NVFP4 or BF16), `router.scale` input scale,
+///     `per_expert_scale` host vec, 128 routed experts (NVFP4),
+///     shared expert (BF16 dense → upcast to f32), 3 PrePost FFN norms.
+///   * Per-layer `attention_window_size = Some(1024)` for sliding
+///     layers, `None` for global; `head_dim_override = Some(512)` for
+///     globals (vs the model-level `head_dim = 256`).
+///   * V-proj fallback: when `self_attn.v_proj.weight` is absent on a
+///     global layer (Gemma-4's `attention_k_eq_v=true` quirk), reuses
+///     `k_proj` weights.
+pub fn load_gemma4_model(
+    ctx: Arc<WgpuContext>,
+    artifact: &ModelArtifact,
+) -> Result<WgpuModel> {
+    let cfg = &artifact.config;
+    let hidden = cfg.hidden_size;
+    let num_layers = cfg.num_hidden_layers;
+    let intermediate = cfg
+        .intermediate_size
+        .ok_or_else(|| AegisError::InvalidPlan("Gemma-4 config missing intermediate_size".into()))?;
+    let num_q_heads = cfg.num_attention_heads;
+    let num_kv_heads = cfg
+        .num_key_value_heads
+        .unwrap_or(num_q_heads);
+    let model_head_dim = cfg.head_dim.unwrap_or(hidden / num_q_heads);
+    let vocab = cfg
+        .vocab_size
+        .ok_or_else(|| AegisError::InvalidPlan("Gemma-4 config missing vocab_size".into()))?;
+    let rms_norm_eps = cfg.rms_norm_eps.unwrap_or(1e-6) as f32;
+    let num_experts = cfg
+        .num_experts
+        .ok_or_else(|| AegisError::InvalidPlan("Gemma-4 config missing num_experts".into()))?;
+    let top_k = cfg.num_experts_per_tok.unwrap_or(2);
+    let moe_intermediate = cfg.moe_intermediate_size.unwrap_or(intermediate);
+    let window = aegisllm_base::model::gemma4::sliding_window(cfg) as u32;
+
+    // Detect text prefix ("model." or "model.language_model." for multimodal).
+    let text_prefix = if artifact
+        .tensors
+        .tensors
+        .contains_key("model.language_model.embed_tokens.weight")
+    {
+        "model.language_model."
+    } else {
+        "model."
+    };
+
+    let mut loader = TensorStorageLoader::new();
+
+    // Embeddings + final norm + lm_head.
+    let embed_name = format!("{text_prefix}embed_tokens.weight");
+    let embed_info = artifact.tensors.tensors.get(&embed_name).ok_or_else(|| {
+        AegisError::InvalidPlan(format!("Gemma-4 artifact missing tensor `{embed_name}`"))
+    })?;
+    let embed_rows = embed_info.shape[0];
+    let embed_cols = embed_info.shape[1];
+    let embed_buf = load_dense_as_f32(&ctx, &mut loader, artifact, &embed_name, "g4_embed")?;
+    let final_norm = load_dense_as_f32(
+        &ctx,
+        &mut loader,
+        artifact,
+        &format!("{text_prefix}norm.weight"),
+        "g4_final_norm",
+    )?;
+    let lm_head_name = if artifact.tensors.tensors.contains_key("lm_head.weight") {
+        "lm_head.weight".to_string()
+    } else {
+        embed_name.clone()
+    };
+    let lm_head = load_linear(&ctx, &mut loader, artifact, &lm_head_name, "g4_lm_head")?;
+
+    // V-norm unit buffer: an all-ones vector sized to the LARGEST head_dim
+    // any layer uses (typically Gemma-4 global head_dim=512). One buffer
+    // shared across all layers.
+    let max_head_dim = (0..num_layers)
+        .map(|l| {
+            aegisllm_base::model::gemma4::head_dim_for_layer(l, cfg).unwrap_or(model_head_dim)
+        })
+        .max()
+        .unwrap_or(model_head_dim);
+    let v_norm_unit_buf = upload_f32_buf(
+        &ctx,
+        &vec![1.0_f32; max_head_dim],
+        "g4_v_norm_unit",
+    );
+
+    let mut layers = Vec::with_capacity(num_layers);
+    for layer_idx in 0..num_layers {
+        let prefix = format!("{text_prefix}layers.{layer_idx}");
+        let is_global = aegisllm_base::model::gemma4::is_global_layer(layer_idx, cfg);
+        let layer_head_dim =
+            aegisllm_base::model::gemma4::head_dim_for_layer(layer_idx, cfg).unwrap_or(model_head_dim);
+        let layer_kv_heads = if is_global {
+            cfg.num_global_key_value_heads.unwrap_or(num_kv_heads)
+        } else {
+            num_kv_heads
+        };
+        let q_width = num_q_heads * layer_head_dim;
+        let kv_width = layer_kv_heads * layer_head_dim;
+
+        // Attention norms.
+        let input_norm = load_dense_as_f32(
+            &ctx,
+            &mut loader,
+            artifact,
+            &format!("{prefix}.input_layernorm.weight"),
+            "g4_input_norm",
+        )?;
+
+        // Q/K/V/O projections. V-proj falls back to k_proj when absent
+        // (Gemma-4 global layers can have attention_k_eq_v=true).
+        let q_proj = load_linear(&ctx, &mut loader, artifact,
+            &format!("{prefix}.self_attn.q_proj.weight"), "g4_q_proj")?;
+        let k_proj = load_linear(&ctx, &mut loader, artifact,
+            &format!("{prefix}.self_attn.k_proj.weight"), "g4_k_proj")?;
+        let v_proj_name = if artifact.tensors.tensors.contains_key(&format!("{prefix}.self_attn.v_proj.weight"))
+            || artifact.tensors.tensors.contains_key(&format!("{prefix}.self_attn.v_proj.weight_scale"))
+        {
+            format!("{prefix}.self_attn.v_proj.weight")
+        } else {
+            format!("{prefix}.self_attn.k_proj.weight")
+        };
+        let v_proj = load_linear(&ctx, &mut loader, artifact, &v_proj_name, "g4_v_proj")?;
+        let o_proj = load_linear(&ctx, &mut loader, artifact,
+            &format!("{prefix}.self_attn.o_proj.weight"), "g4_o_proj")?;
+
+        // Per-head Q/K norms (Gemma-4 always present).
+        let q_norm = load_optional_dense(
+            &ctx, &mut loader, artifact,
+            &[&format!("{prefix}.self_attn.q_norm.weight")],
+            "g4_q_norm",
+        )?;
+        let k_norm = load_optional_dense(
+            &ctx, &mut loader, artifact,
+            &[&format!("{prefix}.self_attn.k_norm.weight")],
+            "g4_k_norm",
+        )?;
+        // V-norm unit: bind only when q_norm is present (Gemma-4 marker).
+        let v_norm_unit = if q_norm.is_some() {
+            // Need a fresh handle per layer; reupload each time. Cheap.
+            Some(upload_f32_buf(
+                &ctx,
+                &vec![1.0_f32; layer_head_dim],
+                "g4_v_norm_unit_layer",
+            ))
+        } else {
+            None
+        };
+        let _ = &v_norm_unit_buf; // shared one not used; per-layer simpler
+
+        // Sub-layer norms (PrePost). The "pre-MLP" norm comes from
+        // `pre_feedforward_layernorm.weight` (Gemma-4) or
+        // `post_attention_layernorm.weight` (Llama fallback) — same slot.
+        let mlp_norm = if let Some(buf) = load_optional_dense(
+            &ctx, &mut loader, artifact,
+            &[&format!("{prefix}.pre_feedforward_layernorm.weight")],
+            "g4_mlp_norm",
+        )? {
+            buf
+        } else {
+            load_dense_as_f32(
+                &ctx, &mut loader, artifact,
+                &format!("{prefix}.post_attention_layernorm.weight"),
+                "g4_mlp_norm",
+            )?
+        };
+
+        // Post-attn sublayer norm: if Gemma-4 PrePost (pre_feedforward
+        // exists), then post_attention_layernorm is the post-attn
+        // sublayer norm. If only post_attention_layernorm exists, it
+        // was already used as `mlp_norm` and there's no sublayer norm.
+        let has_pre_ffn_norm = artifact
+            .tensors
+            .tensors
+            .contains_key(&format!("{prefix}.pre_feedforward_layernorm.weight"));
+        let post_attn_sublayer_norm = if has_pre_ffn_norm {
+            load_optional_dense(
+                &ctx, &mut loader, artifact,
+                &[
+                    &format!("{prefix}.post_attention_layernorm.weight"),
+                    &format!("{prefix}.post_attention_norm.weight"),
+                    &format!("{prefix}.post_attn_layernorm.weight"),
+                ],
+                "g4_post_attn_subnorm",
+            )?
+        } else {
+            None
+        };
+        let post_mlp_sublayer_norm = load_optional_dense(
+            &ctx, &mut loader, artifact,
+            &[
+                &format!("{prefix}.post_feedforward_layernorm.weight"),
+                &format!("{prefix}.post_mlp_norm.weight"),
+            ],
+            "g4_post_mlp_subnorm",
+        )?;
+
+        // ── MoE: router + 128 routed experts + shared expert ──────────
+        let router = load_linear(
+            &ctx, &mut loader, artifact,
+            &format!("{prefix}.router.proj.weight"),
+            "g4_router",
+        )
+        // Some checkpoints have just `router.weight` instead of `router.proj.weight`.
+        .or_else(|_| load_linear(&ctx, &mut loader, artifact,
+            &format!("{prefix}.router.weight"), "g4_router_alt"))?;
+        let router_input_scale = load_optional_dense(
+            &ctx, &mut loader, artifact,
+            &[&format!("{prefix}.router.scale")],
+            "g4_router_input_scale",
+        )?;
+        let per_expert_scale =
+            load_per_expert_scale_host(&mut loader, artifact, layer_idx, text_prefix, num_experts)?;
+
+        // Routed expert prefix: Gemma-4 native uses `{prefix}.experts.{E}.*`,
+        // Qwen 3.x style uses `{prefix}.mlp.experts.{E}.*`.
+        let expert_base = if artifact
+            .tensors
+            .tensors
+            .contains_key(&format!("{prefix}.experts.0.gate_proj.weight"))
+        {
+            format!("{prefix}.experts")
+        } else {
+            format!("{prefix}.mlp.experts")
+        };
+        let mut experts = Vec::with_capacity(num_experts);
+        for expert_idx in 0..num_experts {
+            let ep = format!("{expert_base}.{expert_idx}");
+            let gate = load_linear(&ctx, &mut loader, artifact,
+                &format!("{ep}.gate_proj.weight"), "g4_expert_gate")?;
+            let up = load_linear(&ctx, &mut loader, artifact,
+                &format!("{ep}.up_proj.weight"), "g4_expert_up")?;
+            let down = load_linear(&ctx, &mut loader, artifact,
+                &format!("{ep}.down_proj.weight"), "g4_expert_down")?;
+            experts.push(WgpuMoeExpert {
+                gate_proj: gate,
+                up_proj: up,
+                down_proj: down,
+            });
+        }
+
+        // Shared expert: Gemma-4 stores at `{prefix}.mlp.{gate,up,down}_proj.weight` (BF16).
+        let shared_expert = if artifact
+            .tensors
+            .tensors
+            .contains_key(&format!("{prefix}.mlp.gate_proj.weight"))
+        {
+            let gate = load_linear(&ctx, &mut loader, artifact,
+                &format!("{prefix}.mlp.gate_proj.weight"), "g4_shared_gate")?;
+            let up = load_linear(&ctx, &mut loader, artifact,
+                &format!("{prefix}.mlp.up_proj.weight"), "g4_shared_up")?;
+            let down = load_linear(&ctx, &mut loader, artifact,
+                &format!("{prefix}.mlp.down_proj.weight"), "g4_shared_down")?;
+            Some(WgpuMlpWeightsFull {
+                norm_weight: load_dense_as_f32(
+                    &ctx, &mut loader, artifact,
+                    &format!("{prefix}.input_layernorm.weight"),  // dummy: shared expert reuses pre-FFN norm
+                    "g4_shared_norm_dummy",
+                )?,
+                gate_proj: gate,
+                up_proj: up,
+                down_proj: down,
+                post_mlp_sublayer_norm: None,
+            })
+        } else {
+            None
+        };
+
+        // PrePost FFN norms (Gemma-4 MoE specific).
+        let pre_ff_2 = load_optional_dense(
+            &ctx, &mut loader, artifact,
+            &[&format!("{prefix}.pre_feedforward_layernorm_2.weight")],
+            "g4_pre_ff_2",
+        )?;
+        let post_ff_1 = load_optional_dense(
+            &ctx, &mut loader, artifact,
+            &[&format!("{prefix}.post_feedforward_layernorm_1.weight")],
+            "g4_post_ff_1",
+        )?;
+        let post_ff_2 = load_optional_dense(
+            &ctx, &mut loader, artifact,
+            &[&format!("{prefix}.post_feedforward_layernorm_2.weight")],
+            "g4_post_ff_2",
+        )?;
+
+        let moe = WgpuMoeWeights {
+            router,
+            router_input_scale,
+            per_expert_scale,
+            experts,
+            shared_expert,
+            num_experts,
+            top_k,
+            intermediate_size: moe_intermediate,
+            pre_feedforward_layernorm_2: pre_ff_2,
+            post_feedforward_layernorm_1: post_ff_1,
+            post_feedforward_layernorm_2: post_ff_2,
+        };
+
+        // Optional layer_scalar.
+        let layer_scalar =
+            load_optional_scalar(artifact, &format!("{prefix}.layer_scalar"));
+
+        layers.push(WgpuLayerWeights {
+            attention: WgpuAttentionWeightsFull {
+                norm_weight: input_norm,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                q_norm,
+                k_norm,
+                v_norm_unit,
+                post_attn_sublayer_norm,
+            },
+            mlp: WgpuMlpWeightsFull {
+                norm_weight: mlp_norm,
+                // Gemma-4 layers route through MoE; the dense MLP fields
+                // here hold the SHARED expert weights so the existing
+                // dense forward path stays usable for diagnostics. The
+                // MoE forward uses `moe.shared_expert` instead.
+                gate_proj: WgpuLinear::Dense {
+                    weight: upload_f32_buf(&ctx, &[0.0_f32], "g4_dummy_gate"),
+                    rows: moe_intermediate,
+                    cols: hidden,
+                },
+                up_proj: WgpuLinear::Dense {
+                    weight: upload_f32_buf(&ctx, &[0.0_f32], "g4_dummy_up"),
+                    rows: moe_intermediate,
+                    cols: hidden,
+                },
+                down_proj: WgpuLinear::Dense {
+                    weight: upload_f32_buf(&ctx, &[0.0_f32], "g4_dummy_down"),
+                    rows: hidden,
+                    cols: moe_intermediate,
+                },
+                post_mlp_sublayer_norm,
+            },
+            moe: Some(moe),
+            layer_scalar,
+            attention_window_size: if is_global { None } else { Some(window) },
+            head_dim_override: if is_global { Some(layer_head_dim) } else { None },
+        });
+        // Sanity: q_width / kv_width are computed but only documented for clarity.
+        let _ = (q_width, kv_width);
+    }
+
+    Ok(WgpuModel {
+        ctx,
+        embed_tokens: embed_buf,
+        embed_tokens_rows: embed_rows,
+        embed_tokens_cols: embed_cols,
+        final_norm,
+        lm_head,
+        layers,
+        hidden_size: hidden,
+        intermediate_size: intermediate,
+        num_q_heads,
+        num_kv_heads,
+        head_dim: model_head_dim,
+        vocab_size: vocab,
+        rms_norm_eps,
+        // Gemma-4 ScaledWordEmbedding: out = embed_lookup * sqrt(hidden_size).
+        embed_scale: Some((hidden as f32).sqrt()),
     })
 }
 

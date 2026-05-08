@@ -16,8 +16,8 @@ pub use wgpu::{
     // Layer block forward fns + activation enum.
     forward_attention_block_device, forward_dense_mlp_block_device, forward_layer_device,
     forward_moe_block_device, forward_token_device, Activation,
-    // Loader entry point.
-    load_vanilla_llama_model,
+    // Loader entry points.
+    load_gemma4_model, load_vanilla_llama_model,
     // Host-API primitive wrappers (for unit tests of individual kernels).
     decode_attention_gpu, dequant_nvfp4_gpu, embedding_gpu, matmul_f32_gpu, residual_add_gpu,
     rms_norm_gpu, rope_gpu, swiglu_gpu,
