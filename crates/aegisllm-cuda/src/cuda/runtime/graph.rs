@@ -13,8 +13,13 @@ impl CudaRuntime {
 
     /// Stop capturing and return the compiled CUDA Graph ready for replay.
     pub fn end_decode_graph_capture(&self) -> Result<Option<CudaGraph>> {
-        // 0 = no special instantiation flags
-        let flags = unsafe { std::mem::transmute::<u32, sys::CUgraphInstantiate_flags>(0u32) };
+        // `AUTO_FREE_ON_LAUNCH` only affects graphs containing memory-
+        // allocation nodes (`cuGraphAddMemAllocNode`). Our captures
+        // don't allocate, so this is effectively a no-op flag — but it
+        // gives us a real `CUgraphInstantiate_flags` variant to pass,
+        // avoiding the soundness hole of transmuting a literal 0u32 into
+        // a Rust `#[repr(u32)] enum` whose first variant is `1`.
+        let flags = sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
         self.stream
             .end_capture(flags)
             .map_err(map_cuda_err("end graph capture"))
@@ -96,19 +101,34 @@ pub(crate) fn enumerate_graph_nodes(graph: &CudaGraph) -> Result<Vec<GraphNode>>
     Ok(out)
 }
 
-/// Update a kernel node's parameters in an instantiated graph.
+/// Update a kernel node's parameters in the `CUgraphExec` instantiated
+/// from this `CudaGraph`. Mutating the source graph itself is not the
+/// CUDA Graphs flow — instead the `*Exec*SetParams` family lets you
+/// swap kernel/memcpy arguments on the *executable* between replays.
 ///
 /// Use to swap the device-pointer kernel arguments of a captured matvec/etc.
 /// kernel between replays — e.g. point a captured expert GEMM at a different
 /// expert's weights in VRAM staging without re-capturing the whole graph.
 ///
 /// Safety:
-///  * `params.kernelParams` (and any extras) must remain valid pointers for
-///    the duration of the call (the driver copies the param array internally,
-///    but the pointed-to *kernel* arg slots must outlive the call).
-///  * `node` must have been returned by [`enumerate_graph_nodes`] for `graph`.
+///  * `params.kernelParams` is a `void**` pointing at an array of pointers,
+///    each of which points at one kernel argument. The driver reads through
+///    this array and the pointed-to argument slots once, during this call
+///    — neither the array nor the slot pointees need to outlive the call.
+///    They DO need to be valid for the duration of the call.
+///  * `params.func` must be the same `CUfunction` (or one that's binary-
+///    compatible: same signature, register usage, shared-memory budget) as
+///    the kernel originally captured into `node`. Mismatches return
+///    `CUDA_ERROR_INVALID_VALUE` at instantiation, but some driver
+///    versions accept the mismatch and corrupt at replay time.
+///  * `params.gridDim` / `blockDim` may change between replays, but
+///    `sharedMemBytes` must not exceed what the original capture
+///    requested via `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)`.
+///  * `node` must have been returned by [`enumerate_graph_nodes`] for the
+///    graph that was instantiated into the exec held by `graph`. Passing
+///    a node from a different graph corrupts state.
 #[allow(dead_code)]
-pub(crate) unsafe fn set_kernel_node_params_in_graph(
+pub(crate) unsafe fn set_kernel_node_params_in_exec(
     graph: &CudaGraph,
     node: sys::CUgraphNode,
     params: &sys::CUDA_KERNEL_NODE_PARAMS,
@@ -126,11 +146,11 @@ pub(crate) unsafe fn set_kernel_node_params_in_graph(
 /// replays — e.g. point a captured expert weight upload at a different
 /// expert's row in pinned host memory without re-capturing.
 ///
-/// Safety: see [`set_kernel_node_params_in_graph`]. The memory pointed to by
+/// Safety: see [`set_kernel_node_params_in_exec`]. The memory pointed to by
 /// the `srcDevice`/`dstDevice` (or `srcHost`/`dstHost`) fields of `params`
 /// must outlive every replay that uses this node.
 #[allow(dead_code)]
-pub(crate) unsafe fn set_memcpy_node_params_in_graph(
+pub(crate) unsafe fn set_memcpy_node_params_in_exec(
     graph: &CudaGraph,
     ctx: &cudarc::driver::CudaContext,
     node: sys::CUgraphNode,
@@ -167,7 +187,7 @@ mod tests {
         stream
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_RELAXED)
             .expect("begin capture");
-        let flags = unsafe { std::mem::transmute::<u32, sys::CUgraphInstantiate_flags>(0u32) };
+        let flags = sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
         let graph = stream
             .end_capture(flags)
             .expect("end capture")
