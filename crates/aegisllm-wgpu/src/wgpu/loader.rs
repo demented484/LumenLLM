@@ -13,6 +13,8 @@ pub struct WgpuContext {
     pub(super) queue: wgpu::Queue,
     // Shaders that use the standard 4-binding layout: (storage, storage, storage rw, uniform).
     pub(super) rms_norm: KernelPipeline,
+    /// Per-row RMS norm — Gemma-4's per-head Q/K/V norms.
+    pub(super) rms_norm_batched: KernelPipeline,
     pub(super) swiglu: KernelPipeline,
     /// Gemma-4 uses GeGLU (tanh-approximation GELU) instead of SwiGLU.
     pub(super) geglu_tanh: KernelPipeline,
@@ -81,6 +83,12 @@ impl WgpuContext {
             &standard_4_layout,
             "rms_norm",
         );
+        let rms_norm_batched = build_kernel(
+            &device,
+            include_str!("shaders/rms_norm_batched.wgsl"),
+            &standard_4_layout,
+            "rms_norm_batched",
+        );
         let swiglu = build_kernel(
             &device,
             include_str!("shaders/swiglu.wgsl"),
@@ -136,6 +144,7 @@ impl WgpuContext {
             device,
             queue,
             rms_norm,
+            rms_norm_batched,
             swiglu,
             geglu_tanh,
             residual_add,

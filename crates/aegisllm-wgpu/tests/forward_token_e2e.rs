@@ -302,6 +302,9 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
                 k_proj: make_dense(&cl.k_proj, kv_width, s.h, "k_proj"),
                 v_proj: make_dense(&cl.v_proj, kv_width, s.h, "v_proj"),
                 o_proj: make_dense(&cl.o_proj, s.h, q_width, "o_proj"),
+                q_norm: None,
+                k_norm: None,
+                v_norm_unit: None,
             },
             mlp: WgpuMlpWeightsFull {
                 norm_weight: upload_f32_buf(&ctx, &cl.mlp_norm, "mlp_norm"),

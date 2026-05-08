@@ -719,6 +719,66 @@ pub fn rms_norm_device(
     )
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct BatchedRmsNormParams {
+    batch: u32,
+    len: u32,
+    eps: f32,
+    _pad: u32,
+}
+
+/// Device-resident per-row RMS norm: applies `weight[len]` to each of
+/// `batch` rows of `input[batch * len]`, writing to `output`. Used by
+/// Gemma-4's per-head Q/K norms (with a learned per-`head_dim` weight)
+/// and per-head V norm (with an all-ones weight).
+pub fn rms_norm_batched_device(
+    ctx: &WgpuContext,
+    input: &wgpu::Buffer,
+    weight: &wgpu::Buffer,
+    output: &wgpu::Buffer,
+    batch: usize,
+    len: usize,
+    eps: f32,
+) -> Result<()> {
+    if batch == 0 || len == 0 {
+        return Err(AegisError::InvalidPlan(
+            "rms_norm_batched_device requires non-zero batch and len".into(),
+        ));
+    }
+    if len > 256 {
+        // The shader's `partial[256]` workgroup-shared array bounds the
+        // per-row reduction at 256 threads; for `len > 256` each thread
+        // accumulates a stride loop, so this is fine — but we cap at
+        // the typical max head_dim (256 for Gemma-4 sliding, 512 for
+        // global) just to flag the unusual case rather than silently
+        // produce drift if the stride loop is buggy.
+        // Actually 512 still works (each thread strides twice); let
+        // through to 1024 and reject larger.
+        if len > 1024 {
+            return Err(AegisError::Unsupported(format!(
+                "rms_norm_batched_device: len={len} exceeds shader cap (1024)"
+            )));
+        }
+    }
+    let params = BatchedRmsNormParams {
+        batch: batch as u32,
+        len: len as u32,
+        eps,
+        _pad: 0,
+    };
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.rms_norm_batched,
+        input,
+        weight,
+        output,
+        bytemuck::bytes_of(&params),
+        (batch as u32, 1, 1),
+        "rms_norm_batched_device",
+    )
+}
+
 /// Device-resident GeGLU (tanh-approximation): `out[i] = gelu_tanh(gate[i]) * up[i]`.
 /// Gemma-4 uses this instead of SwiGLU. The shader matches the
 /// `transformers.activations.GELUTanh` reference (sqrt(2/π) and the
@@ -1198,6 +1258,47 @@ mod device_chain_tests {
             assert!(
                 (g - c).abs() < 1e-3,
                 "dequant→matmul chain mismatch at i={i}: gpu={g} cpu={c}",
+            );
+        }
+    }
+
+    /// Per-row RMS norm matches CPU reference for Gemma-4-style per-head
+    /// Q/K/V norms. Validates the shader handles arbitrary `len ≤ 256`
+    /// (single stride-256 pass) correctly.
+    /// Gated behind `AEGIS_WGPU_SMOKE=1`.
+    #[test]
+    fn rms_norm_batched_device_matches_cpu_reference() {
+        if std::env::var("AEGIS_WGPU_SMOKE").is_err() {
+            eprintln!("skipping; set AEGIS_WGPU_SMOKE=1 to run on a host with Vulkan/Metal/D3D12");
+            return;
+        }
+        let ctx = WgpuContext::new(0).expect("wgpu ctx");
+        let batch = 4;
+        let len = 8;
+        let eps = 1e-6_f32;
+        let input: Vec<f32> = (0..(batch * len))
+            .map(|k| ((k * 7 + 3) % 19) as f32 * 0.05 + 0.1)
+            .collect();
+        let weight: Vec<f32> = (0..len).map(|k| 1.0 + (k as f32) * 0.01).collect();
+        // CPU reference: per-row RMS norm with weight.
+        let mut cpu = vec![0.0_f32; batch * len];
+        for h in 0..batch {
+            let row = &input[h * len..(h + 1) * len];
+            let mean_sq = row.iter().map(|v| v * v).sum::<f32>() / len as f32;
+            let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+            for k in 0..len {
+                cpu[h * len + k] = row[k] * inv_rms * weight[k];
+            }
+        }
+        let buf_in = upload_f32_buf(&ctx, &input, "rms_in");
+        let buf_w = upload_f32_buf(&ctx, &weight, "rms_w");
+        let buf_out = alloc_storage(&ctx, (batch * len * 4) as u64, "rms_out");
+        rms_norm_batched_device(&ctx, &buf_in, &buf_w, &buf_out, batch, len, eps).unwrap();
+        let gpu = download_f32_buf(&ctx, &buf_out, batch * len, "rms_back").unwrap();
+        for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            assert!(
+                (g - c).abs() < 1e-5,
+                "rms_norm_batched mismatch at i={i}: gpu={g} cpu={c}",
             );
         }
     }

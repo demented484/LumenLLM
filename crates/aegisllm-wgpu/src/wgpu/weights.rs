@@ -102,6 +102,17 @@ pub struct WgpuAttentionWeightsFull {
     pub k_proj: WgpuLinear,
     pub v_proj: WgpuLinear,
     pub o_proj: WgpuLinear,
+    /// Gemma-4: per-head Q norm `[head_dim]` applied between Q proj and
+    /// RoPE. `None` for vanilla Llama (no Q norm).
+    pub q_norm: Option<wgpu::Buffer>,
+    /// Gemma-4: per-head K norm `[head_dim]` applied between K proj and
+    /// RoPE. `None` for vanilla Llama.
+    pub k_norm: Option<wgpu::Buffer>,
+    /// Gemma-4: when `q_norm` is present, V also gets a per-head RMS
+    /// norm with no learned weight (the shader binds an all-ones
+    /// vector of length `head_dim`). Buffer is allocated once per
+    /// model and reused across layers; `None` for vanilla Llama.
+    pub v_norm_unit: Option<wgpu::Buffer>,
 }
 
 impl std::fmt::Debug for WgpuAttentionWeightsFull {
@@ -408,6 +419,10 @@ pub fn load_vanilla_llama_model(
                 k_proj: k,
                 v_proj: v,
                 o_proj: o,
+                // Vanilla Llama has no per-head Q/K/V norms.
+                q_norm: None,
+                k_norm: None,
+                v_norm_unit: None,
             },
             mlp: WgpuMlpWeightsFull {
                 norm_weight: mlp_norm,

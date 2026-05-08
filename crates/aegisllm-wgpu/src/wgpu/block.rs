@@ -10,7 +10,7 @@ use aegisllm_base::error::{AegisError, Result};
 
 use super::forward::{
     decode_attention_device_strided, geglu_tanh_device, matmul_f32_device, residual_add_device,
-    rms_norm_device, rope_device, swiglu_device,
+    rms_norm_batched_device, rms_norm_device, rope_device, swiglu_device,
 };
 
 /// MLP activation function. Llama uses SwiGLU; Gemma-4 uses GeGLU
@@ -401,6 +401,77 @@ pub fn forward_layer_device(
         kv_width,
         h,
     )?;
+    // 4b. Gemma-4 per-head Q/K/V norms (between projection and RoPE).
+    // Vanilla Llama has no per-head norms — skip when not present.
+    if let Some(ref q_norm) = weights.attention.q_norm {
+        // Use post_normed as scratch (its f32[hidden] capacity is at
+        // least q_width since hidden_size >= num_q_heads * head_dim
+        // for both vanilla Llama and Gemma-4 sliding/global layouts).
+        rms_norm_batched_device(
+            ctx,
+            &model_state.attn_q,
+            q_norm,
+            &model_state.post_normed,
+            nq,
+            hd,
+            rms_norm_eps,
+        )?;
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("q_norm_writeback"),
+        });
+        enc.copy_buffer_to_buffer(
+            &model_state.post_normed,
+            0,
+            &model_state.attn_q,
+            0,
+            (nq * hd * 4) as u64,
+        );
+        ctx.queue.submit(std::iter::once(enc.finish()));
+    }
+    if let Some(ref k_norm) = weights.attention.k_norm {
+        rms_norm_batched_device(
+            ctx,
+            &model_state.attn_k_new,
+            k_norm,
+            &model_state.post_normed,
+            nkv,
+            hd,
+            rms_norm_eps,
+        )?;
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("k_norm_writeback"),
+        });
+        enc.copy_buffer_to_buffer(
+            &model_state.post_normed,
+            0,
+            &model_state.attn_k_new,
+            0,
+            (kv_width * 4) as u64,
+        );
+        ctx.queue.submit(std::iter::once(enc.finish()));
+    }
+    if let Some(ref v_unit) = weights.attention.v_norm_unit {
+        rms_norm_batched_device(
+            ctx,
+            &model_state.attn_v_new,
+            v_unit,
+            &model_state.post_normed,
+            nkv,
+            hd,
+            rms_norm_eps,
+        )?;
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("v_norm_writeback"),
+        });
+        enc.copy_buffer_to_buffer(
+            &model_state.post_normed,
+            0,
+            &model_state.attn_v_new,
+            0,
+            (kv_width * 4) as u64,
+        );
+        ctx.queue.submit(std::iter::once(enc.finish()));
+    }
     // 5. RoPE on Q and K (in place).
     rope_device(
         ctx,
