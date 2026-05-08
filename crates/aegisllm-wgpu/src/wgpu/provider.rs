@@ -82,7 +82,7 @@ impl GenerationBackendPrimitives for WgpuExecutorProvider {
     }
 
     fn new_sequence_state(&self) -> Result<Box<dyn GenerationState>> {
-        Ok(Box::new(WgpuLlamaState))
+        Ok(Box::new(WgpuLlamaState::default()))
     }
 
     fn forward_hidden(&self, _state: &mut dyn GenerationState, _token_id: usize) -> Result<()> {
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn wgpu_provider_returns_unsupported_for_forward() {
         let provider = WgpuExecutorProvider::new(0);
-        let mut state = WgpuLlamaState;
+        let mut state = WgpuLlamaState::default();
         let err = provider
             .forward_hidden(&mut state as &mut dyn GenerationState, 0)
             .unwrap_err();
