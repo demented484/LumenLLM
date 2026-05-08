@@ -297,6 +297,14 @@ impl CudaLlamaExecutor {
         sampling: &SamplingConfig,
     ) -> Result<usize> {
         let non_greedy = sampling.temperature > 0.0 && sampling.top_k != 1;
+        // Diagnostic: split decode time into "CPU issuing kernels" vs "CPU
+        // waiting for GPU after issuing". Toggle with `AEGIS_DECODE_TIMING=1`.
+        // This pins down whether decode tps is gated by Rust/cudarc launch
+        // overhead (T_cpu_issuing dominates) or by actual GPU compute
+        // (T_gpu_wait dominates).
+        let dec_timing =
+            std::env::var("AEGIS_DECODE_TIMING").ok().is_some_and(|v| !v.is_empty());
+        let t_step_start = if dec_timing { Some(std::time::Instant::now()) } else { None };
 
         if state.position >= self.kv_context_size {
             return Err(AegisError::InvalidPlan(format!(
@@ -381,23 +389,55 @@ impl CudaLlamaExecutor {
 
         state.position += 1;
 
+        // CPU has finished issuing all launches; the next download forces a
+        // stream sync and any time it spends waiting is GPU-side.
+        let t_cpu_done = t_step_start.map(|_| std::time::Instant::now());
+
         if non_greedy || self.lm_head_softcap.is_some() {
             // Download all logits and sample on CPU (also needed for soft-cap).
             let mut logits = self.runtime.download_f32(&state.logits)?;
             if let Some(cap) = self.lm_head_softcap {
                 aegisllm_base::executor::generation::apply_logit_softcap(&mut logits, cap);
             }
+            if let (Some(t0), Some(t_cpu)) = (t_step_start, t_cpu_done) {
+                report_decode_split(t0, t_cpu);
+            }
             return aegisllm_base::executor::generation::sample_next_token(&logits, sampling);
         }
 
         // Greedy (no soft-cap): download the argmax result (also synchronizes the stream).
         let token = self.runtime.download_u32(&state.sampled_token)?;
+        if let (Some(t0), Some(t_cpu)) = (t_step_start, t_cpu_done) {
+            report_decode_split(t0, t_cpu);
+        }
         token
             .first()
             .copied()
             .map(|token| token as usize)
             .ok_or_else(|| AegisError::InvalidPlan("CUDA decode argmax returned no token".into()))
     }
+}
+
+/// Print the CPU-issuing vs GPU-waiting split for one decode token.
+/// `t0` = function entry; `t_cpu_done` = right after all kernels are issued
+/// (state.position bumped, BEFORE any sync). The current time minus
+/// `t_cpu_done` is the time the CPU spent blocked waiting for the GPU to
+/// finish (download_* synchronously drains the stream), so it's a lower
+/// bound on extra GPU work past the CPU-issuing window.
+fn report_decode_split(t0: std::time::Instant, t_cpu_done: std::time::Instant) {
+    let total = t_cpu_done.elapsed() + (t_cpu_done - t0);
+    let cpu_issuing_ms = (t_cpu_done - t0).as_secs_f64() * 1000.0;
+    let gpu_wait_ms = t_cpu_done.elapsed().as_secs_f64() * 1000.0;
+    let total_ms = total.as_secs_f64() * 1000.0;
+    let pct = |x: f64| -> f64 { if total_ms > 0.0 { x / total_ms * 100.0 } else { 0.0 } };
+    eprintln!(
+        "[DECODE-TIMING] total={:>5.2}ms  cpu_issuing={:>5.2}ms ({:>4.1}%)  gpu_wait={:>5.2}ms ({:>4.1}%)",
+        total_ms,
+        cpu_issuing_ms,
+        pct(cpu_issuing_ms),
+        gpu_wait_ms,
+        pct(gpu_wait_ms),
+    );
 }
 
 impl CudaLayerBlockExecutor {
