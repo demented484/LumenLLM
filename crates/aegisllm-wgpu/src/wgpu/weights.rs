@@ -34,7 +34,7 @@ use std::sync::Arc;
 use aegisllm_base::artifact::ModelArtifact;
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::planning::placement::StoragePlacement;
-use aegisllm_base::tensor::core::{TensorDType, TensorInfo};
+use aegisllm_base::tensor::core::TensorDType;
 use aegisllm_base::tensor::storage::TensorStorageLoader;
 
 use super::forward::{upload_f32_buf, upload_padded_u8_buf};

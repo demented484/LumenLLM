@@ -9,9 +9,17 @@
 use aegisllm_base::error::{AegisError, Result};
 
 use super::forward::{
-    decode_attention_device_strided, matmul_f32_device, residual_add_device, rms_norm_device,
-    rope_device, swiglu_device,
+    decode_attention_device_strided, geglu_tanh_device, matmul_f32_device, residual_add_device,
+    rms_norm_device, rope_device, swiglu_device,
 };
+
+/// MLP activation function. Llama uses SwiGLU; Gemma-4 uses GeGLU
+/// (tanh-approximation GELU). Selected by the per-model forward path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    SwiGLU,
+    GeGluTanh,
+}
 use super::loader::WgpuContext;
 use super::state::{WgpuLlamaState, WgpuModelState};
 use super::weights::{WgpuLayerWeights, WgpuLinear, WgpuModel};
@@ -317,6 +325,7 @@ pub fn forward_layer_device(
     cos_table: &[f32],
     sin_table: &[f32],
     rms_norm_eps: f32,
+    activation: Activation,
 ) -> Result<()> {
     let h = model_state.hidden_size;
     let i = model_state.intermediate_size;
@@ -492,8 +501,15 @@ pub fn forward_layer_device(
         i,
         h,
     )?;
-    // 14. SwiGLU.
-    swiglu_device(ctx, &model_state.gate, &model_state.up, &model_state.swiglu_out, i)?;
+    // 14. Activation: SwiGLU (Llama) or GeGLU-tanh (Gemma-4).
+    match activation {
+        Activation::SwiGLU => {
+            swiglu_device(ctx, &model_state.gate, &model_state.up, &model_state.swiglu_out, i)?;
+        }
+        Activation::GeGluTanh => {
+            geglu_tanh_device(ctx, &model_state.gate, &model_state.up, &model_state.swiglu_out, i)?;
+        }
+    }
     // 15. down.
     matmul_f32_device(
         ctx,
@@ -542,6 +558,7 @@ pub fn forward_token_device<FCos, FSin>(
     cos_for_position: FCos,
     sin_for_position: FSin,
     rms_norm_eps: f32,
+    activation: Activation,
 ) -> Result<()>
 where
     FCos: Fn(usize, usize) -> Vec<f32>,
@@ -559,6 +576,7 @@ where
             &cos,
             &sin,
             rms_norm_eps,
+            activation,
         )?;
     }
     // Final norm + lm_head matmul → logits.

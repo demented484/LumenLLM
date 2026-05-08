@@ -14,6 +14,8 @@ pub struct WgpuContext {
     // Shaders that use the standard 4-binding layout: (storage, storage, storage rw, uniform).
     pub(super) rms_norm: KernelPipeline,
     pub(super) swiglu: KernelPipeline,
+    /// Gemma-4 uses GeGLU (tanh-approximation GELU) instead of SwiGLU.
+    pub(super) geglu_tanh: KernelPipeline,
     pub(super) residual_add: KernelPipeline,
     pub(super) embedding: KernelPipeline,
     // Matmul: same 4-binding layout but different uniform shape (m,n,k,_pad).
@@ -85,6 +87,12 @@ impl WgpuContext {
             &standard_4_layout,
             "swiglu",
         );
+        let geglu_tanh = build_kernel(
+            &device,
+            include_str!("shaders/geglu_tanh.wgsl"),
+            &standard_4_layout,
+            "geglu_tanh",
+        );
         let residual_add = build_kernel(
             &device,
             include_str!("shaders/residual_add.wgsl"),
@@ -129,6 +137,7 @@ impl WgpuContext {
             queue,
             rms_norm,
             swiglu,
+            geglu_tanh,
             residual_add,
             embedding,
             matmul,

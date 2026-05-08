@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use aegisllm_wgpu::{
-    forward_token_device, upload_f32_buf, WgpuAttentionWeightsFull, WgpuContext, WgpuLayerWeights,
-    WgpuLinear, WgpuMlpWeightsFull, WgpuModel, WgpuModelState,
+    forward_token_device, upload_f32_buf, Activation, WgpuAttentionWeightsFull, WgpuContext,
+    WgpuLayerWeights, WgpuLinear, WgpuMlpWeightsFull, WgpuModel, WgpuModelState,
 };
 
 /// Deterministic-random f32 vector.
@@ -370,6 +370,7 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
             cos_for,
             sin_for,
             s.eps,
+            Activation::SwiGLU,
         )
         .expect("forward_token");
 

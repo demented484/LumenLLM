@@ -719,6 +719,31 @@ pub fn rms_norm_device(
     )
 }
 
+/// Device-resident GeGLU (tanh-approximation): `out[i] = gelu_tanh(gate[i]) * up[i]`.
+/// Gemma-4 uses this instead of SwiGLU. The shader matches the
+/// `transformers.activations.GELUTanh` reference (sqrt(2/π) and the
+/// 0.044715 cubic coefficient).
+pub fn geglu_tanh_device(
+    ctx: &WgpuContext,
+    gate: &wgpu::Buffer,
+    up: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    len: usize,
+) -> Result<()> {
+    let params = LenParams { len: len as u32, _pad: 0 };
+    let groups = ((len + 63) / 64) as u32;
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.geglu_tanh,
+        gate,
+        up,
+        out,
+        bytemuck::bytes_of(&params),
+        (groups, 1, 1),
+        "geglu_tanh_device",
+    )
+}
+
 /// Device-resident SwiGLU: `out[i] = silu(gate[i]) * up[i]`.
 pub fn swiglu_device(
     ctx: &WgpuContext,
@@ -1173,6 +1198,46 @@ mod device_chain_tests {
             assert!(
                 (g - c).abs() < 1e-3,
                 "dequant→matmul chain mismatch at i={i}: gpu={g} cpu={c}",
+            );
+        }
+    }
+
+    /// GeGLU-tanh shader produces `gelu_tanh(gate) * up` matching CPU
+    /// reference. Used by Gemma-4's MLP / routed experts. Must agree
+    /// with `transformers.activations.GELUTanh` to ~1e-5.
+    /// Gated behind `AEGIS_WGPU_SMOKE=1`.
+    #[test]
+    fn geglu_tanh_device_matches_cpu_reference() {
+        if std::env::var("AEGIS_WGPU_SMOKE").is_err() {
+            eprintln!("skipping; set AEGIS_WGPU_SMOKE=1 to run on a host with Vulkan/Metal/D3D12");
+            return;
+        }
+        let ctx = WgpuContext::new(0).expect("wgpu ctx");
+        let len = 64;
+        let gate: Vec<f32> = (0..len).map(|i| ((i * 7 + 1) % 19) as f32 * 0.1 - 0.9).collect();
+        let up: Vec<f32> = (0..len).map(|i| ((i * 11 + 3) % 23) as f32 * 0.1 - 1.1).collect();
+        // CPU reference: gelu_tanh(g) * u.
+        let sqrt_2_over_pi = (2.0_f32 / std::f32::consts::PI).sqrt();
+        let coeff = 0.044715_f32;
+        let cpu: Vec<f32> = gate
+            .iter()
+            .zip(up.iter())
+            .map(|(g, u)| {
+                let inner = sqrt_2_over_pi * (g + coeff * g.powi(3));
+                let act = 0.5 * g * (1.0 + inner.tanh());
+                act * u
+            })
+            .collect();
+
+        let buf_gate = upload_f32_buf(&ctx, &gate, "gate");
+        let buf_up = upload_f32_buf(&ctx, &up, "up");
+        let buf_out = alloc_storage(&ctx, (len * 4) as u64, "geglu_out");
+        geglu_tanh_device(&ctx, &buf_gate, &buf_up, &buf_out, len).unwrap();
+        let gpu = download_f32_buf(&ctx, &buf_out, len, "geglu_readback").unwrap();
+        for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+            assert!(
+                (g - c).abs() < 1e-5,
+                "geglu mismatch at i={i}: gpu={g} cpu={c}",
             );
         }
     }

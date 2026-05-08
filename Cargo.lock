@@ -77,6 +77,7 @@ version = "0.2.0"
 dependencies = [
  "aegisllm-base",
  "bytemuck",
+ "half",
  "pollster",
  "serde",
  "tempfile",

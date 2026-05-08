@@ -12,7 +12,7 @@ pub use weights::{
 
 pub use block::{
     forward_attention_block_device, forward_dense_mlp_block_device, forward_layer_device,
-    forward_token_device, WgpuAttentionWeights, WgpuDenseMlpWeights,
+    forward_token_device, Activation, WgpuAttentionWeights, WgpuDenseMlpWeights,
 };
 pub use state::{WgpuLlamaState, WgpuModelState};
 
@@ -22,8 +22,8 @@ pub use forward::{
 };
 pub use forward::{
     alloc_storage, decode_attention_device, dequant_nvfp4_device, download_f32_buf,
-    embedding_device, matmul_f32_device, residual_add_device, rms_norm_device, rope_device,
-    swiglu_device, upload_f32_buf, upload_padded_u8_buf,
+    embedding_device, geglu_tanh_device, matmul_f32_device, residual_add_device,
+    rms_norm_device, rope_device, swiglu_device, upload_f32_buf, upload_padded_u8_buf,
 };
 pub use loader::WgpuContext;
 pub use provider::WgpuExecutorProvider;
