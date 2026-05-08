@@ -589,3 +589,299 @@ pub fn rope_gpu(
 
     readback_f32(&ctx.device, &staging_buf, byte_len, "rope")
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// Device-resident API.
+//
+// The host-input/host-output `*_gpu` functions above are unit-test friendly
+// but unsuitable for chained forward passes — every call uploads inputs,
+// dispatches, and reads back, so a 30-layer forward would round-trip
+// through PCIe ≈ thousands of times per token.
+//
+// The functions below operate on persistent `wgpu::Buffer`s. Callers
+// allocate input/output buffers once, then chain primitives without host
+// involvement. `download_f32_buf` performs the single readback at the end.
+//
+// Layout convention matches the host-API kernels: `_device` variants
+// dispatch the same shaders against the same 4-binding bind group layouts.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Allocate a storage buffer of `byte_len` bytes, with `STORAGE | COPY_SRC | COPY_DST`
+/// usage so it can serve as kernel I/O *and* as a memcpy source/destination
+/// for chaining or readback.
+pub fn alloc_storage(ctx: &WgpuContext, byte_len: u64, label: &'static str) -> wgpu::Buffer {
+    ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: byte_len.max(4),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// Upload an f32 slice into a fresh storage buffer. Use for one-time weight
+/// uploads that will be read repeatedly across forward calls.
+pub fn upload_f32_buf(ctx: &WgpuContext, data: &[f32], label: &'static str) -> wgpu::Buffer {
+    ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(data),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    })
+}
+
+/// Read back an f32 storage buffer to the host. Submits a copy-to-staging
+/// pass and blocks the calling thread on `device.poll(Maintain::Wait)`.
+pub fn download_f32_buf(
+    ctx: &WgpuContext,
+    buf: &wgpu::Buffer,
+    len: usize,
+    label: &'static str,
+) -> Result<Vec<f32>> {
+    let byte_len = (len * std::mem::size_of::<f32>()) as u64;
+    let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: byte_len,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some(label),
+    });
+    encoder.copy_buffer_to_buffer(buf, 0, &staging, 0, byte_len);
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+    readback_f32(&ctx.device, &staging, byte_len, label)
+}
+
+/// Dispatch a 4-binding kernel against three pre-existing storage buffers
+/// plus a fresh uniform buffer. Used by all `_device` primitives below.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_three_storage_device(
+    ctx: &WgpuContext,
+    pipe: &KernelPipeline,
+    in1: &wgpu::Buffer,
+    in2: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    uniform_bytes: &[u8],
+    workgroups: (u32, u32, u32),
+    label: &'static str,
+) -> Result<()> {
+    let uniform_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: uniform_bytes,
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout: &pipe.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: in1.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: in2.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2, resource: out.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3, resource: uniform_buf.as_entire_binding() },
+        ],
+    });
+    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some(label),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(label),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipe.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+    }
+    ctx.queue.submit(std::iter::once(encoder.finish()));
+    Ok(())
+}
+
+/// Device-resident RMS norm: `out[i] = input[i] / rms(input) * weight[i]`.
+/// All buffers must have `len * 4` bytes. The kernel runs a single workgroup
+/// of 256 threads — sufficient for hidden_size up to ≈16k.
+pub fn rms_norm_device(
+    ctx: &WgpuContext,
+    input: &wgpu::Buffer,
+    weight: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    len: usize,
+    eps: f32,
+) -> Result<()> {
+    let params = Params { len: len as u32, eps };
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.rms_norm,
+        input,
+        weight,
+        out,
+        bytemuck::bytes_of(&params),
+        (1, 1, 1),
+        "rms_norm_device",
+    )
+}
+
+/// Device-resident SwiGLU: `out[i] = silu(gate[i]) * up[i]`.
+pub fn swiglu_device(
+    ctx: &WgpuContext,
+    gate: &wgpu::Buffer,
+    up: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    len: usize,
+) -> Result<()> {
+    let params = LenParams { len: len as u32, _pad: 0 };
+    let groups = ((len + 63) / 64) as u32;
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.swiglu,
+        gate,
+        up,
+        out,
+        bytemuck::bytes_of(&params),
+        (groups, 1, 1),
+        "swiglu_device",
+    )
+}
+
+/// Device-resident residual add: `out[i] = a[i] + b[i]`.
+pub fn residual_add_device(
+    ctx: &WgpuContext,
+    a: &wgpu::Buffer,
+    b: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    len: usize,
+) -> Result<()> {
+    let params = LenParams { len: len as u32, _pad: 0 };
+    let groups = ((len + 63) / 64) as u32;
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.residual_add,
+        a,
+        b,
+        out,
+        bytemuck::bytes_of(&params),
+        (groups, 1, 1),
+        "residual_add_device",
+    )
+}
+
+/// Device-resident matmul: `C[M, N] = A[M, K] @ B^T[N, K]` (B stored row-major [N, K]).
+pub fn matmul_f32_device(
+    ctx: &WgpuContext,
+    a: &wgpu::Buffer,
+    b: &wgpu::Buffer,
+    c: &wgpu::Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let params = MatMulParams { m: m as u32, n: n as u32, k: k as u32, _pad: 0 };
+    let groups_x = ((m + 7) / 8) as u32;
+    let groups_y = ((n + 7) / 8) as u32;
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.matmul,
+        a,
+        b,
+        c,
+        bytemuck::bytes_of(&params),
+        (groups_x, groups_y, 1),
+        "matmul_f32_device",
+    )
+}
+
+#[cfg(test)]
+mod device_chain_tests {
+    use super::*;
+
+    /// Smoke test: chain rms_norm → matmul → swiglu (treating swiglu's two
+    /// inputs as `(matmul_out_first_half, matmul_out_second_half)`) without
+    /// any intermediate host readback. Verifies that output buffers from
+    /// one primitive bind cleanly as input buffers to the next.
+    ///
+    /// CPU reference checks the final swiglu output against expected values.
+    /// Gated by `AEGIS_WGPU_SMOKE=1`.
+    #[test]
+    fn rms_norm_then_matmul_then_swiglu_chains_without_host_roundtrip() {
+        if std::env::var("AEGIS_WGPU_SMOKE").is_err() {
+            eprintln!("skipping; set AEGIS_WGPU_SMOKE=1 to run on a host with Vulkan/Metal/D3D12");
+            return;
+        }
+        let ctx = WgpuContext::new(0).expect("wgpu ctx");
+
+        // Tiny shapes: hidden=8, intermediate=4 (so matmul output is 8-vec
+        // = gate||up halves of length 4 each for swiglu).
+        let hidden = 8;
+        let intermediate = 4;
+        let eps = 1e-6_f32;
+
+        // Inputs.
+        let x_host: Vec<f32> = (0..hidden).map(|i| (i + 1) as f32 * 0.5).collect();
+        let w_norm_host: Vec<f32> = (0..hidden).map(|_| 1.0_f32).collect();
+        // Matmul B is [N=intermediate*2, K=hidden], identity-ish so we can
+        // easily reason about the output.
+        let n = intermediate * 2;
+        let k = hidden;
+        let mut b_host = vec![0.0_f32; n * k];
+        for row in 0..n {
+            for col in 0..k {
+                b_host[row * k + col] = if row == col { 1.0 } else { 0.0 };
+            }
+        }
+
+        // Persistent buffers for the chain.
+        let buf_x = upload_f32_buf(&ctx, &x_host, "chain_x");
+        let buf_w = upload_f32_buf(&ctx, &w_norm_host, "chain_w");
+        let buf_b = upload_f32_buf(&ctx, &b_host, "chain_b");
+        let buf_normed = alloc_storage(&ctx, (hidden * 4) as u64, "chain_normed");
+        let buf_matmul = alloc_storage(&ctx, (1 * n * 4) as u64, "chain_matmul");
+        let buf_gate = alloc_storage(&ctx, (intermediate * 4) as u64, "chain_gate");
+        let buf_up = alloc_storage(&ctx, (intermediate * 4) as u64, "chain_up");
+        let buf_swiglu = alloc_storage(&ctx, (intermediate * 4) as u64, "chain_swiglu");
+
+        // Step 1: rms_norm(x, w) → normed.
+        rms_norm_device(&ctx, &buf_x, &buf_w, &buf_normed, hidden, eps).unwrap();
+
+        // Step 2: matmul(normed[1, K], B[N, K]) → matmul_out[1, N].
+        matmul_f32_device(&ctx, &buf_normed, &buf_b, &buf_matmul, 1, n, k).unwrap();
+
+        // Step 3: split matmul_out into (gate[0..4], up[4..8]) via two copies.
+        let mut split_enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("chain_split"),
+        });
+        split_enc.copy_buffer_to_buffer(&buf_matmul, 0, &buf_gate, 0, (intermediate * 4) as u64);
+        split_enc.copy_buffer_to_buffer(
+            &buf_matmul,
+            (intermediate * 4) as u64,
+            &buf_up,
+            0,
+            (intermediate * 4) as u64,
+        );
+        ctx.queue.submit(Some(split_enc.finish()));
+
+        // Step 4: swiglu(gate, up) → swiglu_out.
+        swiglu_device(&ctx, &buf_gate, &buf_up, &buf_swiglu, intermediate).unwrap();
+
+        // Single readback.
+        let result = download_f32_buf(&ctx, &buf_swiglu, intermediate, "chain_readback").unwrap();
+
+        // CPU reference: rms_norm with weight=1.0 → x / rms(x); matmul with
+        // identity-ish picks the first `n` lanes of normed (rest zero); then
+        // swiglu over (gate, up) = (normed[0..4], normed[4..8]).
+        let mean_sq: f32 = x_host.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv_rms = 1.0 / (mean_sq + eps).sqrt();
+        let normed_ref: Vec<f32> = x_host.iter().map(|v| v * inv_rms).collect();
+        let mut expected = vec![0.0_f32; intermediate];
+        for i in 0..intermediate {
+            let gate = normed_ref[i];
+            let up = normed_ref[i + intermediate];
+            let silu = gate / (1.0 + (-gate).exp());
+            expected[i] = silu * up;
+        }
+
+        for (i, (got, exp)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-4,
+                "chain mismatch at i={i}: got={got} exp={exp}",
+            );
+        }
+    }
+}
