@@ -95,6 +95,7 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) attention_prefill_dense_halfq_warp_tile_hdim128: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim256: CudaFunction,
+    pub(crate) attention_prefill_dense_halfq_wmma_hdim512: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_fa: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4_split: CudaFunction,
@@ -280,6 +281,22 @@ impl CudaKernelFunctions {
                 )
                 .map_err(|e| AegisError::Unsupported(format!(
                     "set max dynamic shared mem on hdim256 kernel: {e:?}"
+                )))?;
+                f
+            },
+            attention_prefill_dense_halfq_wmma_hdim512: {
+                let f = load(&module, "aegis_attention_prefill_dense_halfq_wmma_hdim512")?;
+                // hdim=512 needs ~83 KiB dynamic shared memory after
+                // dropping the tile_acc double-buffer (see the kernel's
+                // comment). 96 KiB is comfortably above that and sits
+                // within the sm_120 100 KiB per-block cap.
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on hdim512 kernel: {e:?}"
                 )))?;
                 f
             },
