@@ -168,6 +168,14 @@ impl CudaRuntime {
         num_attention_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        // Sliding-window cap on K iteration. 0 = full causal attention
+        // (Gemma-4 global + vanilla Llama). >0 (e.g. 1024 for Gemma-4
+        // sliding) clamps the K-tile loop to [max(0, q_pos - window + 1),
+        // q_pos]. THE fix for the long-context prefill scaling cliff:
+        // 25 of 30 Gemma-4 layers use sliding=1024, so at seq=32k they
+        // should iterate 1024 keys/query rather than 32k. Without this,
+        // sliding layers do O(seq²) work that should be O(seq × window).
+        window_size: u32,
         output: &mut DeviceBuffer<f32>,
         dense_metadata: DensePrefillMetadataProof,
     ) -> Result<()> {
@@ -242,6 +250,7 @@ impl CudaRuntime {
                 num_attention_heads,
                 num_kv_heads,
                 head_dim,
+                window_size,
                 output,
             );
         }
@@ -386,6 +395,7 @@ impl CudaRuntime {
                     num_attention_heads,
                     num_kv_heads,
                     head_dim,
+                    window_size,
                     output,
                 )
             } else {
@@ -718,6 +728,7 @@ impl CudaRuntime {
         num_attention_heads: usize,
         num_kv_heads: usize,
         head_dim: usize,
+        window_size: u32,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let kernel = match head_dim {
@@ -808,6 +819,7 @@ impl CudaRuntime {
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
                 .arg(&cache_capacity_u32)
+                .arg(&window_size)
                 .arg(&mut output.slice)
                 .launch(cfg)
         }

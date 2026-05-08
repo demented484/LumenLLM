@@ -603,6 +603,10 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_warp_tile_hdim128
 // HDIM ∈ {128, 256} today; HDIM=512 (Gemma-4 global layers) falls back
 // to the slow paged path until shared-memory + thread-block budget for
 // 32-warp blocks is sized in.
+// `window_size = 0` means full causal attention (no sliding-window
+// clamp). `window_size > 0` (Gemma-4 sliding layers: 1024) clamps the
+// K-tile loop to `[max(0, q_pos - window + 1), q_pos]`. For long
+// contexts on sliding layers this turns O(seq²) into O(seq * window).
 template<unsigned int HDIM>
 __device__ __forceinline__ void aegis_attention_prefill_dense_halfq_wmma_impl(
     const unsigned short* __restrict__ key_cache,
@@ -615,6 +619,7 @@ __device__ __forceinline__ void aegis_attention_prefill_dense_halfq_wmma_impl(
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
     const unsigned int cache_capacity,
+    const unsigned int window_size,
     float* __restrict__ output
 ) {
     static_assert(HDIM % 16u == 0u, "HDIM must be a multiple of WMMA tile size 16");
@@ -638,6 +643,17 @@ __device__ __forceinline__ void aegis_attention_prefill_dense_halfq_wmma_impl(
     if (block_max_visible == 0u) {
         return;
     }
+    // Sliding-window lower bound for the earliest query in this block
+    // (global_q = global_q_base). Earliest visible K position is
+    // `q_pos - window + 1`. Round down to a k_tile boundary so the
+    // K-loop still aligns with WMMA tile cadence.
+    // window_size == 0 means full attention (no clamp).
+    const unsigned int block_min_visible_raw = (window_size > 0u
+        && start_position + global_q_base + 1u > window_size)
+        ? (start_position + global_q_base + 1u - window_size)
+        : 0u;
+    const unsigned int block_min_tile_start =
+        (block_min_visible_raw / k_tile) * k_tile;
 
     extern __shared__ __align__(16) unsigned char smem[];
     unsigned short* q_shared = reinterpret_cast<unsigned short*>(smem);
@@ -671,7 +687,7 @@ __device__ __forceinline__ void aegis_attention_prefill_dense_halfq_wmma_impl(
     __syncthreads();
 
     const uint4 zero_vec = make_uint4(0u, 0u, 0u, 0u);
-    for (unsigned int tile_start = 0u; tile_start < block_max_visible; tile_start += k_tile) {
+    for (unsigned int tile_start = block_min_tile_start; tile_start < block_max_visible; tile_start += k_tile) {
         const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
         constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
         constexpr unsigned int kv_vecs = k_tile * hdim / halfs_per_vec;
@@ -722,10 +738,12 @@ __device__ __forceinline__ void aegis_attention_prefill_dense_halfq_wmma_impl(
             const unsigned int visible_len = valid_q
                 ? min(context_len, start_position + global_q + 1u)
                 : 0u;
+            const unsigned int row_min_visible = (window_size > 0u && start_position + global_q + 1u > window_size)
+                ? (start_position + global_q + 1u - window_size) : 0u;
             const float old_m = scalars[row * 3u + 0u];
             const float old_l = scalars[row * 3u + 1u];
             const unsigned int pos = tile_start + lane;
-            float score = (valid_q && lane < tile_count && pos < visible_len)
+            float score = (valid_q && lane < tile_count && pos < visible_len && pos >= row_min_visible)
                 ? scores[row * k_tile + lane] * scale
                 : -3.402823466e38f;
             const float tile_m = aegis_warp_reduce_max(score);
@@ -807,11 +825,12 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128(
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
     const unsigned int cache_capacity,
+    const unsigned int window_size,
     float* __restrict__ output
 ) {
     aegis_attention_prefill_dense_halfq_wmma_impl<128u>(
         key_cache, value_cache, query, start_position, total_q, context_len,
-        num_attention_heads, num_kv_heads, head_dim, cache_capacity, output
+        num_attention_heads, num_kv_heads, head_dim, cache_capacity, window_size, output
     );
 }
 
@@ -826,11 +845,12 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim256(
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
     const unsigned int cache_capacity,
+    const unsigned int window_size,
     float* __restrict__ output
 ) {
     aegis_attention_prefill_dense_halfq_wmma_impl<256u>(
         key_cache, value_cache, query, start_position, total_q, context_len,
-        num_attention_heads, num_kv_heads, head_dim, cache_capacity, output
+        num_attention_heads, num_kv_heads, head_dim, cache_capacity, window_size, output
     );
 }
 

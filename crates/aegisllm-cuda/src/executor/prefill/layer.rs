@@ -444,6 +444,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.num_attention_heads,
             layer.layer_num_kv_heads,
             layer.layer_head_dim,
+            layer.window_size as u32,
             &mut prefill.qkv,
             params.dense_metadata,
         )?;
@@ -522,6 +523,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.num_attention_heads,
             layer.layer_num_kv_heads,
             layer.layer_head_dim,
+            layer.window_size as u32,
             &mut prefill.qkv,
             params.dense_metadata,
         )?;
