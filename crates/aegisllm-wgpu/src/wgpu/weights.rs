@@ -113,6 +113,10 @@ pub struct WgpuAttentionWeightsFull {
     /// vector of length `head_dim`). Buffer is allocated once per
     /// model and reused across layers; `None` for vanilla Llama.
     pub v_norm_unit: Option<wgpu::Buffer>,
+    /// Gemma-4 PrePost: full-RMS-norm `[hidden_size]` applied to
+    /// the attention block output BEFORE adding to the residual.
+    /// `None` for vanilla Llama.
+    pub post_attn_sublayer_norm: Option<wgpu::Buffer>,
 }
 
 impl std::fmt::Debug for WgpuAttentionWeightsFull {
@@ -129,6 +133,10 @@ pub struct WgpuMlpWeightsFull {
     pub gate_proj: WgpuLinear,
     pub up_proj: WgpuLinear,
     pub down_proj: WgpuLinear,
+    /// Gemma-4 PrePost: full-RMS-norm `[hidden_size]` applied to the
+    /// MLP block output BEFORE adding to the residual. `None` for
+    /// vanilla Llama.
+    pub post_mlp_sublayer_norm: Option<wgpu::Buffer>,
 }
 
 impl std::fmt::Debug for WgpuMlpWeightsFull {
@@ -425,16 +433,18 @@ pub fn load_vanilla_llama_model(
                 k_proj: k,
                 v_proj: v,
                 o_proj: o,
-                // Vanilla Llama has no per-head Q/K/V norms.
+                // Vanilla Llama has no per-head Q/K/V norms or sub-layer norms.
                 q_norm: None,
                 k_norm: None,
                 v_norm_unit: None,
+                post_attn_sublayer_norm: None,
             },
             mlp: WgpuMlpWeightsFull {
                 norm_weight: mlp_norm,
                 gate_proj: gate,
                 up_proj: up,
                 down_proj: down,
+                post_mlp_sublayer_norm: None,
             },
             layer_scalar: None,
         });

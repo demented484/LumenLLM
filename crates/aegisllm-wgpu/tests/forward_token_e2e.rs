@@ -305,12 +305,14 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
                 q_norm: None,
                 k_norm: None,
                 v_norm_unit: None,
+                post_attn_sublayer_norm: None,
             },
             mlp: WgpuMlpWeightsFull {
                 norm_weight: upload_f32_buf(&ctx, &cl.mlp_norm, "mlp_norm"),
                 gate_proj: make_dense(&cl.gate_proj, s.inter, s.h, "gate_proj"),
                 up_proj: make_dense(&cl.up_proj, s.inter, s.h, "up_proj"),
                 down_proj: make_dense(&cl.down_proj, s.h, s.inter, "down_proj"),
+                post_mlp_sublayer_norm: None,
             },
             layer_scalar: None,
         })

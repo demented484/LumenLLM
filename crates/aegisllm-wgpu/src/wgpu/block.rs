@@ -532,6 +532,30 @@ pub fn forward_layer_device(
         h,
         q_width,
     )?;
+    // 9b. Gemma-4 PrePost: post-attention sub-layer norm BEFORE the
+    // residual add. Normalises `mlp_out` (= attention block output)
+    // with a learned hidden_size weight, writes back into `mlp_out`.
+    if let Some(ref post_attn_norm) = weights.attention.post_attn_sublayer_norm {
+        rms_norm_device(
+            ctx,
+            &model_state.mlp_out,
+            post_attn_norm,
+            &model_state.post_normed,
+            h,
+            rms_norm_eps,
+        )?;
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("post_attn_sublayer_norm_writeback"),
+        });
+        enc.copy_buffer_to_buffer(
+            &model_state.post_normed,
+            0,
+            &model_state.mlp_out,
+            0,
+            (h * 4) as u64,
+        );
+        ctx.queue.submit(std::iter::once(enc.finish()));
+    }
     // 10. residual += attn_o (route through post_normed).
     residual_add_device(
         ctx,
@@ -600,6 +624,28 @@ pub fn forward_layer_device(
         h,
         i,
     )?;
+    // 15b. Gemma-4 PrePost: post-MLP sub-layer norm BEFORE residual add.
+    if let Some(ref post_mlp_norm) = weights.mlp.post_mlp_sublayer_norm {
+        rms_norm_device(
+            ctx,
+            &model_state.mlp_out,
+            post_mlp_norm,
+            &model_state.post_normed,
+            h,
+            rms_norm_eps,
+        )?;
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("post_mlp_sublayer_norm_writeback"),
+        });
+        enc.copy_buffer_to_buffer(
+            &model_state.post_normed,
+            0,
+            &model_state.mlp_out,
+            0,
+            (h * 4) as u64,
+        );
+        ctx.queue.submit(std::iter::once(enc.finish()));
+    }
     // 16. residual += mlp_out.
     residual_add_device(
         ctx,
