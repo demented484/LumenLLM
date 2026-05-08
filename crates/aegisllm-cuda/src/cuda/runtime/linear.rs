@@ -660,6 +660,47 @@ impl CudaRuntime {
         // odd rows for forward-compatibility with future dim choices, and
         // also covers the small-batch decode path that calls this.
         let t32_disabled = std::env::var("AEGIS_NVFP4_GROUPED_T32_DISABLE").is_ok();
+        // Phase B.4 Round 4 OPT-IN: 64×64 output-tile (8 warps, 4×2 grid)
+        // variant. Eligibility is stricter than t32 (rows%64==0 AND
+        // max_tokens_per_expert>=64). Default-on after A/B benched
+        // +9-13% across 9.6k/19k/38.4k seq lengths. quality-smoke shows
+        // 1-token drift in long Russian output (text remains coherent),
+        // similar to other accepted kernels in this hot path. Opt-out
+        // via AEGIS_NVFP4_GROUPED_T32_BIG_DISABLE=1.
+        let big_disabled = std::env::var("AEGIS_NVFP4_GROUPED_T32_BIG_DISABLE").is_ok();
+        let use_big = !big_disabled
+            && !t32_disabled
+            && rows % 64 == 0
+            && max_tokens_per_expert >= 64;
+        if use_big {
+            let grid_x = (rows / 64) as u32;
+            let grid_y = ((max_tokens_per_expert + 63) / 64) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_x, grid_y, grid_z),
+                block_dim: (256, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(
+                        &self.kernels.nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big,
+                    )
+                    .arg(&packed_base.slice)
+                    .arg(&scales_base.slice)
+                    .arg(&packed_offsets.slice)
+                    .arg(&scales_offsets.slice)
+                    .arg(&output_scales.slice)
+                    .arg(&expert_token_offsets.slice)
+                    .arg(&permuted_input.slice)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&mut permuted_output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch grouped nvfp4 wmma gemm t32 big"))?;
+            return Ok(());
+        }
+
         let use_t32 = !t32_disabled
             && rows % 32 == 0
             && max_tokens_per_expert >= 16;

@@ -814,9 +814,23 @@ impl CudaRuntime {
                 .ok()
                 .as_deref()
                 != Some("1");
+        // Round 3 attention pipeline: cp.async double-buffered K/V loads on
+        // the hdim=512 regacc kernel. Default-OFF until measured. Opt-in via
+        // `AEGIS_ATTN_PIPELINE_ENABLE=1`. Only meaningful when the regacc
+        // path is also active (the pipeline kernel is a numerical-twin of
+        // the regacc kernel; the dispatcher upgrades the kernel pointer
+        // and shared-mem layout, nothing else changes for the caller).
+        let use_hdim512_regacc_pipeline = use_hdim512_regacc
+            && std::env::var("AEGIS_ATTN_PIPELINE_ENABLE")
+                .ok()
+                .as_deref()
+                == Some("1");
         let kernel = match head_dim {
             128 => &self.kernels.attention_prefill_dense_halfq_wmma_hdim128,
             256 => &self.kernels.attention_prefill_dense_halfq_wmma_hdim256,
+            512 if use_hdim512_regacc_pipeline => {
+                &self.kernels.attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline
+            }
             512 if use_hdim512_regacc => {
                 &self.kernels.attention_prefill_dense_halfq_wmma_hdim512_regacc
             }
@@ -863,8 +877,12 @@ impl CudaRuntime {
                 "dense wmma attention heads must be divisible by kv heads".into(),
             ));
         }
+        // Round-3 pipeline path doubles the K and V tile shared region (one
+        // pair for the active iter, one pair for the cp.async-prefetched
+        // next iter). 4 * k_tile * head_dim halfs total instead of 2.
+        let kv_tile_count = if use_hdim512_regacc_pipeline { 4 } else { 2 };
         let half_values = DENSE_WMMA_Q_BLOCK * head_dim
-            + 2 * k_tile * head_dim
+            + kv_tile_count * k_tile * head_dim
             + DENSE_WMMA_Q_BLOCK * k_tile;
         // float region: scores[q_block * k_tile] + (optional) acc[q_block * head_dim]
         //   + (optional) tile_acc[q_block * head_dim] + scalars[q_block * 3]
@@ -872,9 +890,18 @@ impl CudaRuntime {
         // entirely (lives in WMMA fragments per warp) and reuses k_shared
         // as a per-warp 1 KiB rescale scratch (16 warps * 1 KiB = 16 KiB
         // ≤ k_shared = 16 KiB).
+        // The pipeline variant cannot reuse k_shared (it holds prefetched
+        // K[k+1]) so it allocates a dedicated 16 warps * 256 = 4096-float
+        // (16 KiB) acc_scratch region.
+        let pipeline_acc_scratch = if use_hdim512_regacc_pipeline {
+            16 /* warps */ * 16 * 16
+        } else {
+            0
+        };
         let float_values = DENSE_WMMA_Q_BLOCK * k_tile
             + if has_acc_buffer { DENSE_WMMA_Q_BLOCK * head_dim } else { 0 }
             + if has_tile_acc { DENSE_WMMA_Q_BLOCK * head_dim } else { 0 }
+            + pipeline_acc_scratch
             + DENSE_WMMA_Q_BLOCK * 3;
         // Block size = (head_dim/16) * 32 — one warp per output 16-col
         // slice for the P*V WMMA stage. hdim128 → 256, hdim256 → 512,
@@ -896,12 +923,14 @@ impl CudaRuntime {
             block_dim: (block_threads, 1, 1),
             // hdim=256 exceeds the default 48 KiB shared-mem cap; the
             // function has been opted into 96 KiB at load time
-            // (functions.rs). Use the higher cap.
+            // (functions.rs). Use the higher cap. The Round-3 cp.async
+            // pipeline variant pushes the budget to ~98 KiB and is opted
+            // into 100 KiB at load time.
             shared_mem_bytes: super::validate_dynamic_shared_bytes_with_cap(
                 "prefill_dense_halfq_wmma",
                 half_values * std::mem::size_of::<u16>()
                     + float_values * std::mem::size_of::<f32>(),
-                96 * 1024,
+                if use_hdim512_regacc_pipeline { 100 * 1024 } else { 96 * 1024 },
             )?,
         };
         let start_position = u32_arg("start_position", start_position)?;

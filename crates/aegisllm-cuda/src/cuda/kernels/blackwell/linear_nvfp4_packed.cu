@@ -682,6 +682,194 @@ extern "C" __global__ void aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32(
 }
 
 // =============================================================================
+// Grouped MoE NVFP4 GEMM with BF16 WMMA inner — 64×64 output tile (8 warps).
+// Phase B.4 Round 4.
+//
+// Larger-tile sibling of `aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32`.
+// Computes a 64-row × 64-col output region per block. Block has 8 warps
+// (256 threads) arranged in a 4 (row) × 2 (col) grid; each warp owns a
+// 16-row × 32-col strip of the output tile = 2 horizontally-adjacent 16×16
+// WMMA sub-tiles → 8 × 2 = 16 c_frags total, exactly covering 64×64 / 256 = 16
+// 16×16 sub-tiles.
+//
+// Per K-iter, each warp loads ONE 16×16 a_frag (its row strip of A) and TWO
+// 16×16 b_frags (its two col sub-tiles), then issues two mma.sync ops sharing
+// the a_frag. This raises arithmetic per shared load relative to t32:
+//   * t32: 1 a_frag + 1 b_frag → 1 mma per warp; A shared loads / mma = 1
+//   * t32_big: 1 a_frag + 2 b_frags → 2 mmas per warp; A shared loads / mma = 0.5
+//
+// Bit-exactness vs. the t32 (and 16×16) kernel:
+//   * Each output element (row_g, batch_g) is owned by exactly one warp.
+//   * That warp issues `mma.sync(c, a_warp, b_warp, c)` once per K-iter where
+//     `a_warp` is the same 16×16 of A[row_g..row_g+16, k_tile..k_tile+16] that
+//     the t32 kernel uses for the same output element, and `b_warp` is the
+//     same 16×16 of B[batch_g..batch_g+16, k_tile..k_tile+16]. Per-element f32
+//     accumulator order is identical because mma.sync semantics are
+//     element-wise sums; the only thing that differs is which warp/block
+//     computes which output element. Cooperative shmem loads dequant exactly
+//     the same NVFP4 nibble × ue4m3 scale and apply the same
+//     __float2bfloat16 cast per element.
+//
+// Eligibility: rows%64==0 AND max_tokens_per_expert>=64. Outside that, the
+// dispatcher falls back to the t32 (32×32) path. For Gemma-4-26B-A4B routed
+// experts the per-expert weight rows are multiples of 64 (704 = 11×64,
+// 2048 = 32×64); the M-tile boundary check is still kept inside the load
+// loops in case future configs land odd row counts.
+//
+// Grid : (ceil(rows/64), ceil(max_tokens_per_active/64), num_active_experts)
+// Block: 256 threads (8 warps) in 4 (row-warps) × 2 (col-warps) layout.
+// Shared: 64×16 BF16 sh_a (2 KiB) + 64×16 BF16 sh_b (2 KiB) +
+//         64×64 f32 sh_c (16 KiB) = ~20 KiB. Well under sm_120's 100 KiB cap.
+// Registers per warp: 2 c_frags (8 f32 each = 16 regs) + 1 a_frag (8 bf16
+//   packed = 4 regs) + 2 b_frags (8 bf16 packed = 4 regs each) ≈ 28 acc regs.
+//   Plus loop-local f32/i32 ≈ 70-90 regs/thread total (verify with ptxas -v).
+// =============================================================================
+extern "C" __global__ void aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big(
+    const unsigned char* __restrict__ packed_base,
+    const unsigned char* __restrict__ scales_base,
+    const unsigned int*  __restrict__ packed_offsets,        // [num_active_experts]
+    const unsigned int*  __restrict__ scales_offsets,        // [num_active_experts]
+    const float*         __restrict__ output_scales,          // [num_active_experts]
+    const unsigned int*  __restrict__ expert_token_offsets,   // [num_active_experts + 1]
+    const float*         __restrict__ permuted_input,         // [total_tokens, cols]
+    const unsigned int rows,
+    const unsigned int cols,
+    float*               __restrict__ permuted_output         // [total_tokens, rows]
+) {
+    using namespace nvcuda;
+    constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
+    constexpr int TILE_M = 64, TILE_N = 64;          // block output tile
+    constexpr unsigned int WARPS_M = 4u;             // row-warps
+    constexpr unsigned int WARPS_N = 2u;             // col-warps
+    constexpr unsigned int WARPS_PER_BLOCK = WARPS_M * WARPS_N;  // 8
+    constexpr unsigned int N_FRAGS_PER_WARP = 2u;    // each warp owns 2 col sub-tiles
+    constexpr unsigned int BLOCK_THREADS = WARPS_PER_BLOCK * 32u;  // 256
+
+    const unsigned int active_e = blockIdx.z;
+    const unsigned int tok_start = expert_token_offsets[active_e];
+    const unsigned int tok_end   = expert_token_offsets[active_e + 1];
+    const unsigned int tok_count = tok_end - tok_start;
+
+    const unsigned int tile_row = blockIdx.x * (unsigned int)TILE_M;
+    const unsigned int tile_col_in_expert = blockIdx.y * (unsigned int)TILE_N;
+
+    if (tile_row >= rows) return;
+    if (tile_col_in_expert >= tok_count) return;
+
+    const unsigned int tid     = threadIdx.x;        // 0..255
+    const unsigned int warp_id = tid >> 5;            // 0..7
+    // 4×2 warp grid in (M, N): warp_row ∈ [0..4), warp_col ∈ [0..2).
+    const unsigned int warp_row = warp_id >> 1;       // 0..3 — owns rows [warp_row*16, +16)
+    const unsigned int warp_col = warp_id & 1u;       // 0..1 — owns cols [warp_col*32, +32) = two 16-col sub-tiles
+
+    const unsigned char* packed = packed_base + (size_t)packed_offsets[active_e];
+    const unsigned char* scales = scales_base + (size_t)scales_offsets[active_e];
+    const float output_scale = output_scales[active_e];
+
+    __shared__ __nv_bfloat16 sh_a[TILE_M * WMMA_K];   // [TILE_M rows, WMMA_K cols] row-major
+    __shared__ __nv_bfloat16 sh_b[TILE_N * WMMA_K];   // [TILE_N cols, WMMA_K] col-major: sh_b[n*K + k]
+    __shared__ float          sh_c[TILE_M * TILE_N];  // [TILE_M rows, TILE_N cols] row-major
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> b_frag[N_FRAGS_PER_WARP];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag[N_FRAGS_PER_WARP];
+    #pragma unroll
+    for (unsigned int j = 0u; j < N_FRAGS_PER_WARP; ++j) {
+        wmma::fill_fragment(c_frag[j], 0.0f);
+    }
+
+    const unsigned int packed_cols = cols / 2u;
+    const unsigned int scale_cols  = cols / 16u;
+
+    constexpr unsigned int A_ELEMS = (unsigned)(TILE_M * WMMA_K);  // 1024
+    constexpr unsigned int B_ELEMS = (unsigned)(TILE_N * WMMA_K);  // 1024
+
+    for (unsigned int k_tile = 0u; k_tile < cols; k_tile += (unsigned int)WMMA_K) {
+        // Load 64×16 weight tile (TILE_M rows × WMMA_K cols), row-major.
+        // 1024 elements / 256 threads = 4 elements per thread.
+        // Per-element dequant order matches the t32 kernel exactly: same
+        // (row_g, col_g) → same byte/nibble/blk_scale → same f32 → same bf16.
+        for (unsigned int e = tid; e < A_ELEMS; e += BLOCK_THREADS) {
+            const unsigned int m = e / (unsigned int)WMMA_K;
+            const unsigned int k = e % (unsigned int)WMMA_K;
+            const unsigned int row_g = tile_row + m;
+            const unsigned int col_g = k_tile + k;
+            float v = 0.0f;
+            if (row_g < rows && col_g < cols) {
+                const size_t packed_idx = (size_t)row_g * packed_cols + (size_t)(col_g / 2u);
+                const unsigned int byte = packed[packed_idx];
+                const unsigned int nibble = (col_g & 1u) ? (byte >> 4u) : (byte & 0x0Fu);
+                const size_t scale_idx = (size_t)row_g * scale_cols + (size_t)(col_g / 16u);
+                const float blk_scale = decode_ue4m3_half(scales[scale_idx]);
+                v = (float)decode_nvfp4_nibble(nibble) * blk_scale;
+            }
+            sh_a[m * (unsigned int)WMMA_K + k] = __float2bfloat16(v);
+        }
+
+        // Load 64×16 input tile (TILE_N batch entries × WMMA_K cols), col-major:
+        // sh_b[n*K + k] = input[batch=n, col=k]. Same per-element f32→bf16
+        // conversion as the t32 kernel.
+        for (unsigned int e = tid; e < B_ELEMS; e += BLOCK_THREADS) {
+            const unsigned int n = e / (unsigned int)WMMA_K;
+            const unsigned int k = e % (unsigned int)WMMA_K;
+            const unsigned int batch_in_e = tile_col_in_expert + n;
+            const unsigned int col_g      = k_tile + k;
+            float v = 0.0f;
+            if (batch_in_e < tok_count && col_g < cols) {
+                const unsigned int token_g = tok_start + batch_in_e;
+                v = permuted_input[(size_t)token_g * cols + col_g];
+            }
+            sh_b[n * (unsigned int)WMMA_K + k] = __float2bfloat16(v);
+        }
+        __syncthreads();
+
+        // Each warp loads its 1 a_frag (row strip) and 2 b_frags (col sub-tiles),
+        // then issues 2 mma.sync ops. The a_frag is reused across both mmas.
+        const __nv_bfloat16* a_base = sh_a + (warp_row * (unsigned int)WMMA_M) * (unsigned int)WMMA_K;
+        wmma::load_matrix_sync(a_frag, a_base, WMMA_K);
+        #pragma unroll
+        for (unsigned int j = 0u; j < N_FRAGS_PER_WARP; ++j) {
+            // Sub-tile column index inside the block tile:
+            //   warp_col=0 → sub-tile cols 0..16, 16..32   (j=0,1)
+            //   warp_col=1 → sub-tile cols 32..48, 48..64  (j=0,1)
+            const unsigned int sub_col = warp_col * N_FRAGS_PER_WARP + j;  // 0..3
+            const __nv_bfloat16* b_base = sh_b + (sub_col * (unsigned int)WMMA_N) * (unsigned int)WMMA_K;
+            wmma::load_matrix_sync(b_frag[j], b_base, WMMA_K);
+            wmma::mma_sync(c_frag[j], a_frag, b_frag[j], c_frag[j]);
+        }
+        __syncthreads();
+    }
+
+    // Store each warp's 2 c_frags into sh_c at their respective sub-tile positions.
+    // Row strip: rows [warp_row*16, +16). Col strip: cols [warp_col*32, +32),
+    // split into two 16-col sub-tiles selected by `j`.
+    #pragma unroll
+    for (unsigned int j = 0u; j < N_FRAGS_PER_WARP; ++j) {
+        const unsigned int sub_col = warp_col * N_FRAGS_PER_WARP + j;
+        float* c_base = sh_c
+            + (warp_row * (unsigned int)WMMA_M) * (unsigned int)TILE_N
+            + (sub_col  * (unsigned int)WMMA_N);
+        wmma::store_matrix_sync(c_base, c_frag[j], TILE_N, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    // Cooperative strided write of 64×64 fp32 staging buffer to global with
+    // output-scale and boundary masking. 4096 elements / 256 threads = 16/thread.
+    constexpr unsigned int C_ELEMS = (unsigned)(TILE_M * TILE_N);  // 4096
+    for (unsigned int e = tid; e < C_ELEMS; e += BLOCK_THREADS) {
+        const unsigned int m = e / (unsigned int)TILE_N;
+        const unsigned int n = e % (unsigned int)TILE_N;
+        const unsigned int row_g     = tile_row + m;
+        const unsigned int batch_in_e = tile_col_in_expert + n;
+        if (row_g < rows && batch_in_e < tok_count) {
+            const unsigned int token_g = tok_start + batch_in_e;
+            permuted_output[(size_t)token_g * rows + row_g] =
+                sh_c[m * (unsigned int)TILE_N + n] * output_scale;
+        }
+    }
+}
+
+// =============================================================================
 // Grouped MoE NVFP4 GEMM with BF16 WMMA inner — t32 + cp.async pipelined B —
 // Phase B.4 Round 3.
 //

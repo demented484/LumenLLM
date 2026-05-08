@@ -42,6 +42,10 @@ pub(crate) struct CudaKernelFunctions {
     // ── MoE/NVFP4 cp.async pipelined entry (Phase B.4 Round 3). Opt-in via
     //    AEGIS_NVFP4_GROUPED_T32_PIPELINE=1. ──
     pub(crate) nvfp4_grouped_prequant_gemm_wmma_bf16_t32_pipeline: CudaFunction,
+    // ── MoE/NVFP4 64×64 output-tile entry (Phase B.4 Round 4). Opt-in via
+    //    AEGIS_NVFP4_GROUPED_T32_BIG_ENABLE=1. 8 warps, 4×2 warp grid, 2 c_frags
+    //    per warp. Eligibility: rows%64==0 AND max_tokens_per_expert>=64. ──
+    pub(crate) nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big: CudaFunction,
     pub(crate) nvfp4_quantize_input: CudaFunction,
     pub(crate) nvfp4_quantize_input_batched: CudaFunction,
     pub(crate) bf16_matvec: CudaFunction,
@@ -104,6 +108,10 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) attention_prefill_dense_halfq_wmma_hdim256: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim512: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim512_regacc: CudaFunction,
+    // ===== Round 3 attention pipeline (cp.async K/V double-buffer) =====
+    // Numerical-twin of `..._hdim512_regacc`; opt-in via env var.
+    pub(crate) attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline: CudaFunction,
+    // ===================================================================
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_fa: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4_split: CudaFunction,
@@ -209,6 +217,11 @@ impl CudaKernelFunctions {
             nvfp4_grouped_prequant_gemm_wmma_bf16_t32_pipeline: load(
                 &module,
                 "aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_pipeline",
+            )?,
+            // ── MoE/NVFP4 64×64 output-tile entry (Phase B.4 Round 4). ──
+            nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big: load(
+                &module,
+                "aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big",
             )?,
             nvfp4_quantize_input: load(&module, "aegis_nvfp4_quantize_input")?,
             nvfp4_quantize_input_batched: load(&module, "aegis_nvfp4_quantize_input_batched")?,
@@ -368,6 +381,31 @@ impl CudaKernelFunctions {
                 )))?;
                 f
             },
+            // ===== Round 3 attention pipeline (cp.async K/V double-buffer) =====
+            attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline: {
+                let f = load(
+                    &module,
+                    "aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline",
+                )?;
+                // cp.async-pipelined twin: doubles K and V tile shared-mem
+                // (32 KiB extra) and adds a dedicated 16 KiB acc_scratch
+                // (since k_shared no longer overlays acc). Total ~98 KiB,
+                // within sm_120's 100 KiB max-dynamic-shared cap.
+                // sm_120 rejects 100 KiB cap (CUDA_ERROR_INVALID_VALUE); the
+                // actual per-block opt-in dynamic shared limit on consumer
+                // Blackwell appears below 100 KiB. Drop to 96 KiB. The
+                // pipeline kernel's claimed 98 KiB usage exceeds 96 KiB so
+                // the launch itself will fail at opt-in time; until that's
+                // resolved the registration succeeds (binary still works for
+                // the default non-pipeline path).
+                let _ = f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                );
+                f
+            },
+            // ===================================================================
             attention_prefill_dense_halfq_wmma_hdim128_fa: load(
                 &module,
                 "aegis_attention_prefill_dense_halfq_wmma_hdim128_fa",
