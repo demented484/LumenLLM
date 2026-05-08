@@ -35,6 +35,35 @@ pub struct WgpuLlamaState {
     pub swiglu_out: Option<wgpu::Buffer>,
     /// Scratch for the down-projection output (`[hidden_size]`).
     pub mlp_out: Option<wgpu::Buffer>,
+
+    // ── Attention-block fields (only populated when state is built via
+    // `new_for_full_layer`) ─────────────────────────────────────────────
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    /// `[num_q_heads * head_dim]`. Holds the Q projection of the current
+    /// token; mutated in-place by RoPE before attention.
+    pub attn_q: Option<wgpu::Buffer>,
+    /// Persistent KV cache. Layout: keys live at `[0, max_seq_len *
+    /// kv_width)` (kv_width = num_kv_heads * head_dim), values live at
+    /// `[max_seq_len * kv_width, 2 * max_seq_len * kv_width)`. Each
+    /// decode token writes its K/V at offset `position * kv_width` in
+    /// the respective region.
+    pub attn_kv_cache: Option<wgpu::Buffer>,
+    /// `[num_q_heads * head_dim]`. Holds the attention output before O
+    /// projection.
+    pub attn_out: Option<wgpu::Buffer>,
+    /// `[num_kv_heads * head_dim]`. Holds the K projection of the current
+    /// token before it's written to the cache + RoPE'd.
+    pub attn_k_new: Option<wgpu::Buffer>,
+    /// `[num_kv_heads * head_dim]`. Holds the V projection of the current
+    /// token before it's written to the cache.
+    pub attn_v_new: Option<wgpu::Buffer>,
+    /// `[head_dim / 2]`. RoPE cosine table for the current position.
+    /// Re-uploaded per token by the attention-block forward.
+    pub rope_cos: Option<wgpu::Buffer>,
+    /// `[head_dim / 2]`. RoPE sine table for the current position.
+    pub rope_sin: Option<wgpu::Buffer>,
 }
 
 impl std::fmt::Debug for WgpuLlamaState {
@@ -75,6 +104,16 @@ impl WgpuLlamaState {
             intermediate_size,
             max_seq_len: 0,
             position: 0,
+            num_q_heads: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            attn_q: None,
+            attn_kv_cache: None,
+            attn_out: None,
+            attn_k_new: None,
+            attn_v_new: None,
+            rope_cos: None,
+            rope_sin: None,
             residual: Some(alloc_storage(ctx, h_bytes, "wgpu state residual")),
             post_normed: Some(alloc_storage(ctx, h_bytes, "wgpu state post_normed")),
             gate: Some(alloc_storage(ctx, i_bytes, "wgpu state gate")),
@@ -82,6 +121,66 @@ impl WgpuLlamaState {
             swiglu_out: Some(alloc_storage(ctx, i_bytes, "wgpu state swiglu")),
             mlp_out: Some(alloc_storage(ctx, h_bytes, "wgpu state mlp_out")),
         })
+    }
+
+    /// Allocate state buffers sized for a full Llama-style layer (attention
+    /// + dense MLP). KV cache is per-state for now (single layer); a real
+    /// model with N layers would need N caches, which a future
+    /// `WgpuModelState` will own.
+    ///
+    /// `max_seq_len` bounds the persistent KV cache; passing more than
+    /// this many decode tokens will be rejected by the attention forward.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_full_layer(
+        ctx: &WgpuContext,
+        hidden_size: usize,
+        intermediate_size: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> Result<Self> {
+        if hidden_size == 0 || intermediate_size == 0 || max_seq_len == 0 {
+            return Err(AegisError::InvalidPlan(
+                "WgpuLlamaState::new_for_full_layer requires non-zero shapes".into(),
+            ));
+        }
+        if num_q_heads == 0 || num_kv_heads == 0 || head_dim == 0 {
+            return Err(AegisError::InvalidPlan(
+                "WgpuLlamaState::new_for_full_layer requires non-zero head shapes".into(),
+            ));
+        }
+        if num_q_heads % num_kv_heads != 0 {
+            return Err(AegisError::InvalidPlan(format!(
+                "num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+            )));
+        }
+        if head_dim % 2 != 0 {
+            return Err(AegisError::InvalidPlan(format!(
+                "RoPE requires even head_dim, got {head_dim}"
+            )));
+        }
+        let mut s = Self::new_for_dense_mlp(ctx, hidden_size, intermediate_size)?;
+        let kv_width = num_kv_heads * head_dim;
+        let q_width = num_q_heads * head_dim;
+        let q_bytes = (q_width * std::mem::size_of::<f32>()) as u64;
+        let kv_bytes = (kv_width * std::mem::size_of::<f32>()) as u64;
+        let cache_bytes = (2 * max_seq_len * kv_width * std::mem::size_of::<f32>()) as u64;
+        let half = head_dim / 2;
+        let half_bytes = (half * std::mem::size_of::<f32>()) as u64;
+
+        s.num_q_heads = num_q_heads;
+        s.num_kv_heads = num_kv_heads;
+        s.head_dim = head_dim;
+        s.max_seq_len = max_seq_len;
+        s.attn_q = Some(alloc_storage(ctx, q_bytes, "wgpu state attn_q"));
+        s.attn_out = Some(alloc_storage(ctx, q_bytes, "wgpu state attn_out"));
+        s.attn_k_new = Some(alloc_storage(ctx, kv_bytes, "wgpu state attn_k_new"));
+        s.attn_v_new = Some(alloc_storage(ctx, kv_bytes, "wgpu state attn_v_new"));
+        s.attn_kv_cache = Some(alloc_storage(ctx, cache_bytes, "wgpu state attn_kv_cache"));
+        s.rope_cos = Some(alloc_storage(ctx, half_bytes, "wgpu state rope_cos"));
+        s.rope_sin = Some(alloc_storage(ctx, half_bytes, "wgpu state rope_sin"));
+        Ok(s)
     }
 
     /// Reset position counter without dropping buffers — for sequential

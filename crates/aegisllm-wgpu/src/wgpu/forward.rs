@@ -862,13 +862,19 @@ pub fn dequant_nvfp4_device(
 /// Device-resident decode attention (single-token / M=1).
 ///
 /// `q`: `[num_q_heads * head_dim]` storage buffer.
-/// `kv`: `[2 * seq_len * num_kv_heads * head_dim]` storage buffer holding
-///   keys followed by values (caller arranges this layout — matches the
-///   `kv_offset_v = seq_len * num_kv_heads * head_dim` field in the
-///   uniform). Use a layer-owned KV cache that you write Q-projected keys
-///   and values into at offset `position`, then call this with the cache
-///   sliced to length `seq_len = position + 1`.
+/// `kv`: storage buffer holding keys then values. Two supported layouts:
+///   * **packed** (caller builds a fresh buffer per call): keys at offset
+///     `0`, values at offset `seq_len * kv_width`. Total size
+///     `2 * seq_len * kv_width`.
+///   * **strided** (persistent cache): keys at offset `0` running up to
+///     `max_seq_len * kv_width`, values at a caller-chosen fixed offset
+///     `v_offset_floats` (typically `max_seq_len * kv_width`). The cache
+///     slot for position `p` is `keys[p * kv_width]` and
+///     `values[v_offset_floats + p * kv_width]`.
 /// `out`: `[num_q_heads * head_dim]` storage buffer.
+///
+/// `seq_len` is how many positions the kernel reads (= `position + 1` for
+/// causal decode). Pass `v_offset_floats = None` for the packed layout.
 ///
 /// Constraints: `head_dim ≤ 256`, `num_q_heads % num_kv_heads == 0`.
 pub fn decode_attention_device(
@@ -881,6 +887,24 @@ pub fn decode_attention_device(
     head_dim: usize,
     seq_len: usize,
 ) -> Result<()> {
+    decode_attention_device_strided(ctx, q, kv, out, num_q_heads, num_kv_heads, head_dim, seq_len, None)
+}
+
+/// Strided-cache variant of [`decode_attention_device`]. See its doc for
+/// layout details. Pass `v_offset_floats = Some(offset)` when the kv
+/// buffer is a persistent cache where keys live at `[0, max_seq_len *
+/// kv_width)` and values start at the given fixed offset.
+pub fn decode_attention_device_strided(
+    ctx: &WgpuContext,
+    q: &wgpu::Buffer,
+    kv: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    v_offset_floats: Option<usize>,
+) -> Result<()> {
     if num_q_heads % num_kv_heads != 0 {
         return Err(AegisError::InvalidPlan(format!(
             "decode_attention: num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
@@ -892,7 +916,7 @@ pub fn decode_attention_device(
         )));
     }
     let kv_width = num_kv_heads * head_dim;
-    let kv_offset_v = (seq_len * kv_width) as u32;
+    let kv_offset_v = v_offset_floats.unwrap_or(seq_len * kv_width) as u32;
     let params = DecodeAttentionParams {
         num_q_heads: num_q_heads as u32,
         num_kv_heads: num_kv_heads as u32,

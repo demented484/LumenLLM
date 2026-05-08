@@ -4,7 +4,10 @@ mod loader;
 mod provider;
 mod state;
 
-pub use block::{forward_dense_mlp_block_device, WgpuDenseMlpWeights};
+pub use block::{
+    forward_attention_block_device, forward_dense_mlp_block_device, WgpuAttentionWeights,
+    WgpuDenseMlpWeights,
+};
 
 pub use forward::{
     decode_attention_gpu, dequant_nvfp4_gpu, embedding_gpu, matmul_f32_gpu, residual_add_gpu,
