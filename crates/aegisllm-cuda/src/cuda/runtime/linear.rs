@@ -664,6 +664,16 @@ impl CudaRuntime {
             && rows % 32 == 0
             && max_tokens_per_expert >= 16;
         if use_t32 {
+            // Phase B.4 Round 3 OPT-IN: cp.async pipelined B-tile variant.
+            // Routes to the same launch shape; only the kernel symbol changes.
+            // Numerically bit-identical to the standalone t32 kernel — only
+            // the staging path for the input tile differs (cp.async raw f32
+            // bytes → shared, then cast f32→bf16 via the same per-element
+            // __float2bfloat16 op).
+            // Default-off: parent A/Bs to confirm a perf win before flipping
+            // (Round 2 dual-kernel was default-on and regressed -5%).
+            let pipeline_enabled =
+                std::env::var("AEGIS_NVFP4_GROUPED_T32_PIPELINE").is_ok();
             let grid_x = (rows / 32) as u32;
             let grid_y = ((max_tokens_per_expert + 31) / 32) as u32;
             let cfg = LaunchConfig {
@@ -671,9 +681,14 @@ impl CudaRuntime {
                 block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             };
+            let kernel = if pipeline_enabled {
+                &self.kernels.nvfp4_grouped_prequant_gemm_wmma_bf16_t32_pipeline
+            } else {
+                &self.kernels.nvfp4_grouped_prequant_gemm_wmma_bf16_t32
+            };
             unsafe {
                 self.stream
-                    .launch_builder(&self.kernels.nvfp4_grouped_prequant_gemm_wmma_bf16_t32)
+                    .launch_builder(kernel)
                     .arg(&packed_base.slice)
                     .arg(&scales_base.slice)
                     .arg(&packed_offsets.slice)
@@ -686,7 +701,11 @@ impl CudaRuntime {
                     .arg(&mut permuted_output.slice)
                     .launch(cfg)
             }
-            .map_err(map_cuda_err("launch grouped nvfp4 wmma gemm t32"))?;
+            .map_err(map_cuda_err(if pipeline_enabled {
+                "launch grouped nvfp4 wmma gemm t32 pipeline"
+            } else {
+                "launch grouped nvfp4 wmma gemm t32"
+            }))?;
             return Ok(());
         }
 

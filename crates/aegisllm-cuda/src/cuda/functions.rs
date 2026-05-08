@@ -39,6 +39,9 @@ pub(crate) struct CudaKernelFunctions {
     // ── MoE/NVFP4 fused entries (Phase B.4 Round 2; do not reorder, attention
     //    work is appended below). ──
     pub(crate) nvfp4_grouped_prequant_gemm_wmma_bf16_t32_dual: CudaFunction,
+    // ── MoE/NVFP4 cp.async pipelined entry (Phase B.4 Round 3). Opt-in via
+    //    AEGIS_NVFP4_GROUPED_T32_PIPELINE=1. ──
+    pub(crate) nvfp4_grouped_prequant_gemm_wmma_bf16_t32_pipeline: CudaFunction,
     pub(crate) nvfp4_quantize_input: CudaFunction,
     pub(crate) nvfp4_quantize_input_batched: CudaFunction,
     pub(crate) bf16_matvec: CudaFunction,
@@ -201,6 +204,11 @@ impl CudaKernelFunctions {
             nvfp4_grouped_prequant_gemm_wmma_bf16_t32_dual: load(
                 &module,
                 "aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_dual",
+            )?,
+            // ── MoE/NVFP4 cp.async pipelined entry (Phase B.4 Round 3). ──
+            nvfp4_grouped_prequant_gemm_wmma_bf16_t32_pipeline: load(
+                &module,
+                "aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_pipeline",
             )?,
             nvfp4_quantize_input: load(&module, "aegis_nvfp4_quantize_input")?,
             nvfp4_quantize_input_batched: load(&module, "aegis_nvfp4_quantize_input_batched")?,
