@@ -225,6 +225,20 @@ pub struct WgpuModelState {
     pub rope_cos: wgpu::Buffer,         // [head_dim / 2]
     pub rope_sin: wgpu::Buffer,         // [head_dim / 2]
 
+    // ── MoE scratch (allocated even for non-MoE models; sizes are
+    //     small relative to KV cache so the fixed cost is fine) ──────────
+    /// `[max_num_experts]` router logits / scaled routing weights buffer.
+    /// Sized to handle Gemma-4's 128 experts. Reused across MoE layers.
+    pub router_logits: wgpu::Buffer,
+    /// `[hidden_size]` accumulator for the routed-expert sum.
+    pub moe_acc: wgpu::Buffer,
+    /// `[hidden_size]` scratch for the shared-expert stream output.
+    pub shared_expert_out: wgpu::Buffer,
+    /// `[hidden_size]` scratch for the routed-expert input (when the
+    /// model uses a separate `pre_feedforward_layernorm_2` for the
+    /// routed stream, distinct from the shared-expert input).
+    pub moe_expert_input: wgpu::Buffer,
+
     // ── Per-layer KV caches ───────────────────────────────────────────────
     /// `kv_caches[L]` is layer L's persistent cache: keys at
     /// `[0, max_seq_len * kv_width)`, values at
@@ -324,6 +338,13 @@ impl WgpuModelState {
             swiglu_out: alloc_storage(ctx, i_bytes, "model state swiglu"),
             rope_cos: alloc_storage(ctx, half_bytes, "model state rope_cos"),
             rope_sin: alloc_storage(ctx, half_bytes, "model state rope_sin"),
+            // MoE: fixed-size router-logits buffer for up to 256 experts;
+            // covers Gemma-4 (128) and any plausible future model. The
+            // host-side download pulls `num_experts` elements per layer.
+            router_logits: alloc_storage(ctx, (256 * 4) as u64, "model state router_logits"),
+            moe_acc: alloc_storage(ctx, h_bytes, "model state moe_acc"),
+            shared_expert_out: alloc_storage(ctx, h_bytes, "model state shared_expert_out"),
+            moe_expert_input: alloc_storage(ctx, h_bytes, "model state moe_expert_input"),
             kv_caches,
             final_normed: alloc_storage(ctx, h_bytes, "model state final_normed"),
             logits: alloc_storage(ctx, v_bytes, "model state logits"),

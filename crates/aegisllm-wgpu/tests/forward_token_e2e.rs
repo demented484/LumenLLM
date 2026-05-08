@@ -314,6 +314,7 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
                 down_proj: make_dense(&cl.down_proj, s.h, s.inter, "down_proj"),
                 post_mlp_sublayer_norm: None,
             },
+            moe: None,
             layer_scalar: None,
             attention_window_size: None,
             head_dim_override: None,

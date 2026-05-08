@@ -11,10 +11,11 @@ pub use wgpu::{
     WgpuModelState,
     // Layer / model weight types.
     WgpuAttentionWeightsFull, WgpuDenseMlpWeights, WgpuLayerWeights, WgpuLinear,
-    WgpuMlpWeightsFull, WgpuModel, WgpuModelShape, WgpuAttentionWeights,
+    WgpuMlpWeightsFull, WgpuModel, WgpuModelShape, WgpuAttentionWeights, WgpuMoeExpert,
+    WgpuMoeWeights,
     // Layer block forward fns + activation enum.
     forward_attention_block_device, forward_dense_mlp_block_device, forward_layer_device,
-    forward_token_device, Activation,
+    forward_moe_block_device, forward_token_device, Activation,
     // Loader entry point.
     load_vanilla_llama_model,
     // Host-API primitive wrappers (for unit tests of individual kernels).

@@ -125,6 +125,71 @@ impl std::fmt::Debug for WgpuAttentionWeightsFull {
     }
 }
 
+/// One routed-expert weight bundle. Gemma-4 has 128 of these per
+/// MoE layer; top-k=2 means each token activates 2.
+pub struct WgpuMoeExpert {
+    pub gate_proj: WgpuLinear,
+    pub up_proj: WgpuLinear,
+    pub down_proj: WgpuLinear,
+}
+
+impl std::fmt::Debug for WgpuMoeExpert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WgpuMoeExpert").finish_non_exhaustive()
+    }
+}
+
+/// Mixture-of-Experts weights for one Gemma-4 transformer layer.
+///
+/// Gemma-4 every layer is MoE (no dense-only layers). The router projects
+/// the post-norm input to `num_experts` logits, top-k indices are selected
+/// (currently on host — future: GPU softmax+topk shader). Each token
+/// activates `top_k` routed experts plus an always-active shared expert.
+pub struct WgpuMoeWeights {
+    /// `[num_experts, hidden_size]` router projection. Maps the router
+    /// input to per-expert logits.
+    pub router: WgpuLinear,
+    /// Optional `[hidden_size]` element-wise scale applied to the
+    /// router input BEFORE projection. Gemma-4 sets this; vanilla MoE
+    /// architectures may leave it `None`.
+    pub router_input_scale: Option<wgpu::Buffer>,
+    /// Host-side `[num_experts]` calibration scale applied to the
+    /// top-k routing weights AFTER softmax (`top_k_w[i] *=
+    /// per_expert_scale[indices[i]]`). Gemma-4-specific. The host-side
+    /// representation is a Vec because top-k indexing happens on host.
+    pub per_expert_scale: Vec<f32>,
+    /// All routed experts. Length must equal `num_experts`.
+    pub experts: Vec<WgpuMoeExpert>,
+    /// Always-active shared expert (Gemma-4 has one). Run unconditionally
+    /// alongside the routed experts and combined into the layer output.
+    pub shared_expert: Option<WgpuMlpWeightsFull>,
+    pub num_experts: usize,
+    pub top_k: usize,
+    pub intermediate_size: usize,
+    /// Gemma-4: pre-norm applied to the residual specifically for the
+    /// routed-expert stream's input (separate from the shared expert's
+    /// input). When `None`, the routed experts reuse the same pre-FFN
+    /// normed input as the shared expert.
+    pub pre_feedforward_layernorm_2: Option<wgpu::Buffer>,
+    /// Gemma-4: post-norm on the shared-expert stream output before
+    /// combining with routed experts.
+    pub post_feedforward_layernorm_1: Option<wgpu::Buffer>,
+    /// Gemma-4: post-norm on the routed-expert stream output before
+    /// combining with the shared stream.
+    pub post_feedforward_layernorm_2: Option<wgpu::Buffer>,
+}
+
+impl std::fmt::Debug for WgpuMoeWeights {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WgpuMoeWeights")
+            .field("num_experts", &self.num_experts)
+            .field("top_k", &self.top_k)
+            .field("intermediate_size", &self.intermediate_size)
+            .field("has_shared_expert", &self.shared_expert.is_some())
+            .finish()
+    }
+}
+
 /// Per-layer dense MLP weights (gate/up/down + post-attn norm).
 /// MoE layers will use a different struct that holds router + per-expert
 /// weights; this is the simple path.
@@ -149,6 +214,11 @@ impl std::fmt::Debug for WgpuMlpWeightsFull {
 pub struct WgpuLayerWeights {
     pub attention: WgpuAttentionWeightsFull,
     pub mlp: WgpuMlpWeightsFull,
+    /// When present, this layer is MoE: `mlp` holds the shared-expert
+    /// fields (or is unused if Gemma-4 routes the shared expert through
+    /// `WgpuMoeWeights::shared_expert` instead) and `moe` carries the
+    /// router + routed experts. `None` for vanilla Llama.
+    pub moe: Option<WgpuMoeWeights>,
     /// Gemma-4: per-layer multiplicative scalar applied after the MLP
     /// block's residual add. `None` for vanilla Llama.
     pub layer_scalar: Option<f32>,
@@ -454,6 +524,7 @@ pub fn load_vanilla_llama_model(
                 down_proj: down,
                 post_mlp_sublayer_norm: None,
             },
+            moe: None,
             layer_scalar: None,
             attention_window_size: None,
             head_dim_override: None,

@@ -7,12 +7,13 @@ mod weights;
 
 pub use weights::{
     load_vanilla_llama_model, WgpuAttentionWeightsFull, WgpuLayerWeights, WgpuLinear,
-    WgpuMlpWeightsFull, WgpuModel, WgpuModelShape,
+    WgpuMlpWeightsFull, WgpuModel, WgpuModelShape, WgpuMoeExpert, WgpuMoeWeights,
 };
 
 pub use block::{
     forward_attention_block_device, forward_dense_mlp_block_device, forward_layer_device,
-    forward_token_device, Activation, WgpuAttentionWeights, WgpuDenseMlpWeights,
+    forward_moe_block_device, forward_token_device, Activation, WgpuAttentionWeights,
+    WgpuDenseMlpWeights,
 };
 pub use state::{WgpuLlamaState, WgpuModelState};
 
