@@ -189,3 +189,148 @@ impl WgpuLlamaState {
         self.position = 0;
     }
 }
+
+/// Multi-layer decode state for a whole model. Owns the shared
+/// per-layer scratch (residual, norms, QKV scratch, MLP scratch) plus
+/// one persistent KV cache per layer plus the final-stage outputs
+/// (final-norm scratch + logits buffer).
+///
+/// The forward orchestration (`forward_layer_device` in `block.rs`)
+/// reads the layer-specific KV cache by index and uses the shared
+/// scratch in-place across all N layers — kernels are sequenced on the
+/// wgpu queue, so no cross-layer aliasing concerns.
+pub struct WgpuModelState {
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub vocab_size: usize,
+    pub max_seq_len: usize,
+    /// Decode token counter (0-indexed). Bumped by the caller after a
+    /// layer-block forward sequence completes.
+    pub position: usize,
+
+    // ── Shared activations / scratch (re-used per layer) ──────────────────
+    pub residual: wgpu::Buffer,         // [hidden_size]
+    pub post_normed: wgpu::Buffer,      // [hidden_size]
+    pub mlp_out: wgpu::Buffer,          // [hidden_size]
+    pub attn_q: wgpu::Buffer,           // [num_q_heads * head_dim]
+    pub attn_k_new: wgpu::Buffer,       // [num_kv_heads * head_dim]
+    pub attn_v_new: wgpu::Buffer,       // [num_kv_heads * head_dim]
+    pub attn_out: wgpu::Buffer,         // [num_q_heads * head_dim]
+    pub gate: wgpu::Buffer,             // [intermediate_size]
+    pub up: wgpu::Buffer,               // [intermediate_size]
+    pub swiglu_out: wgpu::Buffer,       // [intermediate_size]
+    pub rope_cos: wgpu::Buffer,         // [head_dim / 2]
+    pub rope_sin: wgpu::Buffer,         // [head_dim / 2]
+
+    // ── Per-layer KV caches ───────────────────────────────────────────────
+    /// `kv_caches[L]` is layer L's persistent cache: keys at
+    /// `[0, max_seq_len * kv_width)`, values at
+    /// `[max_seq_len * kv_width, 2 * max_seq_len * kv_width)`,
+    /// kv_width = num_kv_heads * head_dim.
+    pub kv_caches: Vec<wgpu::Buffer>,
+
+    // ── Final-stage outputs ──────────────────────────────────────────────
+    pub final_normed: wgpu::Buffer,     // [hidden_size]
+    pub logits: wgpu::Buffer,           // [vocab_size]
+}
+
+impl std::fmt::Debug for WgpuModelState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WgpuModelState")
+            .field("hidden_size", &self.hidden_size)
+            .field("intermediate_size", &self.intermediate_size)
+            .field("num_q_heads", &self.num_q_heads)
+            .field("num_kv_heads", &self.num_kv_heads)
+            .field("head_dim", &self.head_dim)
+            .field("vocab_size", &self.vocab_size)
+            .field("max_seq_len", &self.max_seq_len)
+            .field("position", &self.position)
+            .field("num_layer_caches", &self.kv_caches.len())
+            .finish()
+    }
+}
+
+impl WgpuModelState {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        ctx: &WgpuContext,
+        num_layers: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        vocab_size: usize,
+        max_seq_len: usize,
+    ) -> Result<Self> {
+        if num_layers == 0
+            || hidden_size == 0
+            || intermediate_size == 0
+            || num_q_heads == 0
+            || num_kv_heads == 0
+            || head_dim == 0
+            || vocab_size == 0
+            || max_seq_len == 0
+        {
+            return Err(AegisError::InvalidPlan(
+                "WgpuModelState requires all shapes to be non-zero".into(),
+            ));
+        }
+        if num_q_heads % num_kv_heads != 0 {
+            return Err(AegisError::InvalidPlan(format!(
+                "num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+            )));
+        }
+        if head_dim % 2 != 0 {
+            return Err(AegisError::InvalidPlan(format!(
+                "RoPE requires even head_dim, got {head_dim}"
+            )));
+        }
+        let h_bytes = (hidden_size * 4) as u64;
+        let i_bytes = (intermediate_size * 4) as u64;
+        let q_bytes = (num_q_heads * head_dim * 4) as u64;
+        let kv_width = num_kv_heads * head_dim;
+        let kv_bytes = (kv_width * 4) as u64;
+        let cache_bytes = (2 * max_seq_len * kv_width * 4) as u64;
+        let half = head_dim / 2;
+        let half_bytes = (half * 4) as u64;
+        let v_bytes = (vocab_size * 4) as u64;
+
+        let kv_caches = (0..num_layers)
+            .map(|_| alloc_storage(ctx, cache_bytes, "model state kv_cache"))
+            .collect::<Vec<_>>();
+
+        Ok(Self {
+            hidden_size,
+            intermediate_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            vocab_size,
+            max_seq_len,
+            position: 0,
+            residual: alloc_storage(ctx, h_bytes, "model state residual"),
+            post_normed: alloc_storage(ctx, h_bytes, "model state post_normed"),
+            mlp_out: alloc_storage(ctx, h_bytes, "model state mlp_out"),
+            attn_q: alloc_storage(ctx, q_bytes, "model state attn_q"),
+            attn_k_new: alloc_storage(ctx, kv_bytes, "model state attn_k_new"),
+            attn_v_new: alloc_storage(ctx, kv_bytes, "model state attn_v_new"),
+            attn_out: alloc_storage(ctx, q_bytes, "model state attn_out"),
+            gate: alloc_storage(ctx, i_bytes, "model state gate"),
+            up: alloc_storage(ctx, i_bytes, "model state up"),
+            swiglu_out: alloc_storage(ctx, i_bytes, "model state swiglu"),
+            rope_cos: alloc_storage(ctx, half_bytes, "model state rope_cos"),
+            rope_sin: alloc_storage(ctx, half_bytes, "model state rope_sin"),
+            kv_caches,
+            final_normed: alloc_storage(ctx, h_bytes, "model state final_normed"),
+            logits: alloc_storage(ctx, v_bytes, "model state logits"),
+        })
+    }
+
+    pub fn reset_position(&mut self) {
+        self.position = 0;
+    }
+}

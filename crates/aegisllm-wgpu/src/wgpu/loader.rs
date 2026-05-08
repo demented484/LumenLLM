@@ -37,6 +37,21 @@ pub(super) struct KernelPipeline {
 }
 
 impl WgpuContext {
+    /// Accessor for the underlying `wgpu::Device`. Public so integration
+    /// tests and downstream callers can build their own command encoders
+    /// against the same device the primitives use.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// Accessor for the underlying `wgpu::Queue`. Public for the same
+    /// reason as [`WgpuContext::device`] — letting callers submit
+    /// command buffers and write to buffers built from primitives'
+    /// output.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
     pub fn new(device_index: usize) -> Result<Self> {
         let instance = wgpu::Instance::default();
         let adapters: Vec<wgpu::Adapter> =

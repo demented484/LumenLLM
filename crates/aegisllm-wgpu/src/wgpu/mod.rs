@@ -11,9 +11,10 @@ pub use weights::{
 };
 
 pub use block::{
-    forward_attention_block_device, forward_dense_mlp_block_device, WgpuAttentionWeights,
-    WgpuDenseMlpWeights,
+    forward_attention_block_device, forward_dense_mlp_block_device, forward_layer_device,
+    forward_token_device, WgpuAttentionWeights, WgpuDenseMlpWeights,
 };
+pub use state::{WgpuLlamaState, WgpuModelState};
 
 pub use forward::{
     decode_attention_gpu, dequant_nvfp4_gpu, embedding_gpu, matmul_f32_gpu, residual_add_gpu,
@@ -26,4 +27,3 @@ pub use forward::{
 };
 pub use loader::WgpuContext;
 pub use provider::WgpuExecutorProvider;
-pub use state::WgpuLlamaState;

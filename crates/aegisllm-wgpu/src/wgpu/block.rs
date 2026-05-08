@@ -13,7 +13,8 @@ use super::forward::{
     rope_device, swiglu_device,
 };
 use super::loader::WgpuContext;
-use super::state::WgpuLlamaState;
+use super::state::{WgpuLlamaState, WgpuModelState};
+use super::weights::{WgpuLayerWeights, WgpuLinear, WgpuModel};
 
 /// Weights for one dense (non-MoE) Llama-style MLP block, in device memory.
 ///
@@ -254,6 +255,331 @@ pub fn forward_attention_block_device(
     });
     wb.copy_buffer_to_buffer(post_normed, 0, residual, 0, (hidden * 4) as u64);
     ctx.queue.submit(std::iter::once(wb.finish()));
+    Ok(())
+}
+
+/// Resolve a `WgpuLinear` into a borrowable `&wgpu::Buffer` of f32
+/// weights ready to feed into `matmul_f32_device`. For `Dense`, returns
+/// the underlying buffer directly. `Nvfp4` is **not yet supported** in
+/// this synchronous path — it will be wired once the on-device dequant
+/// scratch lifetime is sorted; today the loader path only emits Dense
+/// for the synthetic-Llama tests.
+fn dense_weight_buf(linear: &WgpuLinear) -> Result<&wgpu::Buffer> {
+    match linear {
+        WgpuLinear::Dense { weight, .. } => Ok(weight),
+        WgpuLinear::Nvfp4 { .. } => Err(AegisError::Unsupported(
+            "wgpu forward_layer_device: NVFP4 weights not yet wired into the f32 matmul path; \
+             dequant-and-cache is the next step"
+                .into(),
+        )),
+    }
+}
+
+/// Run one full Llama-style transformer layer (attention block + dense
+/// MLP block) on the wgpu backend, end-to-end on persistent buffers.
+///
+/// `model_state.residual` carries the activation across blocks; the
+/// function reads + updates it in place. `layer_idx` selects this
+/// layer's persistent KV cache from `model_state.kv_caches`.
+///
+/// `cos_table` / `sin_table` are precomputed for the current decode
+/// position and uploaded into `model_state.rope_cos` / `rope_sin` at
+/// the start of the attention block.
+///
+/// The pipeline mirrors the reference vanilla-Llama decoder block:
+///   ATTENTION:
+///     1. post_normed = rms_norm(residual, attn_norm)
+///     2. q = matmul(post_normed, q_proj^T)
+///     3. k_new = matmul(post_normed, k_proj^T)
+///     4. v_new = matmul(post_normed, v_proj^T)
+///     5. rope(q), rope(k_new) in place
+///     6. write k_new → cache.keys[position]
+///     7. write v_new → cache.values[position]
+///     8. attn_out = decode_attention(q, cache, seq_len = position + 1)
+///     9. mlp_out = matmul(attn_out, o_proj^T)
+///     10. residual = residual + mlp_out
+///   MLP:
+///     11. post_normed = rms_norm(residual, mlp_norm)
+///     12. gate = matmul(post_normed, gate_proj^T)
+///     13. up = matmul(post_normed, up_proj^T)
+///     14. swiglu_out = silu(gate) * up
+///     15. mlp_out = matmul(swiglu_out, down_proj^T)
+///     16. residual = residual + mlp_out
+///
+/// Position is *not* advanced — the caller bumps `model_state.position`
+/// once per generation step (after running all layers).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_layer_device(
+    ctx: &WgpuContext,
+    model_state: &mut WgpuModelState,
+    weights: &WgpuLayerWeights,
+    layer_idx: usize,
+    cos_table: &[f32],
+    sin_table: &[f32],
+    rms_norm_eps: f32,
+) -> Result<()> {
+    let h = model_state.hidden_size;
+    let i = model_state.intermediate_size;
+    let nq = model_state.num_q_heads;
+    let nkv = model_state.num_kv_heads;
+    let hd = model_state.head_dim;
+    let max_seq = model_state.max_seq_len;
+    let position = model_state.position;
+    let q_width = nq * hd;
+    let kv_width = nkv * hd;
+    let half = hd / 2;
+
+    if layer_idx >= model_state.kv_caches.len() {
+        return Err(AegisError::InvalidPlan(format!(
+            "layer_idx {layer_idx} out of range (have {} kv_caches)",
+            model_state.kv_caches.len()
+        )));
+    }
+    if position >= max_seq {
+        return Err(AegisError::InvalidPlan(format!(
+            "decode position {position} ≥ max_seq_len {max_seq} — KV cache is full"
+        )));
+    }
+    if cos_table.len() != half || sin_table.len() != half {
+        return Err(AegisError::InvalidPlan(format!(
+            "cos/sin table size mismatch: cos={} sin={} expected={half}",
+            cos_table.len(),
+            sin_table.len(),
+        )));
+    }
+
+    let kv_cache = &model_state.kv_caches[layer_idx];
+
+    // Upload RoPE tables for this position.
+    ctx.queue.write_buffer(&model_state.rope_cos, 0, bytemuck::cast_slice(cos_table));
+    ctx.queue.write_buffer(&model_state.rope_sin, 0, bytemuck::cast_slice(sin_table));
+
+    // ── ATTENTION BLOCK ───────────────────────────────────────────────────
+    // 1. pre-attention norm.
+    rms_norm_device(
+        ctx,
+        &model_state.residual,
+        &weights.attention.norm_weight,
+        &model_state.post_normed,
+        h,
+        rms_norm_eps,
+    )?;
+    // 2-4. QKV projections.
+    matmul_f32_device(
+        ctx,
+        &model_state.post_normed,
+        dense_weight_buf(&weights.attention.q_proj)?,
+        &model_state.attn_q,
+        1,
+        q_width,
+        h,
+    )?;
+    matmul_f32_device(
+        ctx,
+        &model_state.post_normed,
+        dense_weight_buf(&weights.attention.k_proj)?,
+        &model_state.attn_k_new,
+        1,
+        kv_width,
+        h,
+    )?;
+    matmul_f32_device(
+        ctx,
+        &model_state.post_normed,
+        dense_weight_buf(&weights.attention.v_proj)?,
+        &model_state.attn_v_new,
+        1,
+        kv_width,
+        h,
+    )?;
+    // 5. RoPE on Q and K (in place).
+    rope_device(
+        ctx,
+        &model_state.attn_q,
+        &model_state.rope_cos,
+        &model_state.rope_sin,
+        nq,
+        hd,
+    )?;
+    rope_device(
+        ctx,
+        &model_state.attn_k_new,
+        &model_state.rope_cos,
+        &model_state.rope_sin,
+        nkv,
+        hd,
+    )?;
+    // 6-7. KV cache writes (per-layer cache, slot `position`).
+    let bytes_per_slot = (kv_width * 4) as u64;
+    let k_offset_bytes = (position * kv_width * 4) as u64;
+    let v_offset_bytes = ((max_seq + position) * kv_width * 4) as u64;
+    let mut enc_kv = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("layer_kv_cache_write"),
+    });
+    enc_kv.copy_buffer_to_buffer(&model_state.attn_k_new, 0, kv_cache, k_offset_bytes, bytes_per_slot);
+    enc_kv.copy_buffer_to_buffer(&model_state.attn_v_new, 0, kv_cache, v_offset_bytes, bytes_per_slot);
+    ctx.queue.submit(std::iter::once(enc_kv.finish()));
+    // 8. Attention.
+    let seq_len = position + 1;
+    let v_offset_floats = max_seq * kv_width;
+    decode_attention_device_strided(
+        ctx,
+        &model_state.attn_q,
+        kv_cache,
+        &model_state.attn_out,
+        nq,
+        nkv,
+        hd,
+        seq_len,
+        Some(v_offset_floats),
+    )?;
+    // 9. O projection.
+    matmul_f32_device(
+        ctx,
+        &model_state.attn_out,
+        dense_weight_buf(&weights.attention.o_proj)?,
+        &model_state.mlp_out,
+        1,
+        h,
+        q_width,
+    )?;
+    // 10. residual += attn_o (route through post_normed).
+    residual_add_device(
+        ctx,
+        &model_state.residual,
+        &model_state.mlp_out,
+        &model_state.post_normed,
+        h,
+    )?;
+    let mut enc_wb = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("attn_residual_writeback"),
+    });
+    enc_wb.copy_buffer_to_buffer(
+        &model_state.post_normed,
+        0,
+        &model_state.residual,
+        0,
+        (h * 4) as u64,
+    );
+    ctx.queue.submit(std::iter::once(enc_wb.finish()));
+
+    // ── MLP BLOCK ────────────────────────────────────────────────────────
+    // 11. pre-MLP norm.
+    rms_norm_device(
+        ctx,
+        &model_state.residual,
+        &weights.mlp.norm_weight,
+        &model_state.post_normed,
+        h,
+        rms_norm_eps,
+    )?;
+    // 12-13. gate / up.
+    matmul_f32_device(
+        ctx,
+        &model_state.post_normed,
+        dense_weight_buf(&weights.mlp.gate_proj)?,
+        &model_state.gate,
+        1,
+        i,
+        h,
+    )?;
+    matmul_f32_device(
+        ctx,
+        &model_state.post_normed,
+        dense_weight_buf(&weights.mlp.up_proj)?,
+        &model_state.up,
+        1,
+        i,
+        h,
+    )?;
+    // 14. SwiGLU.
+    swiglu_device(ctx, &model_state.gate, &model_state.up, &model_state.swiglu_out, i)?;
+    // 15. down.
+    matmul_f32_device(
+        ctx,
+        &model_state.swiglu_out,
+        dense_weight_buf(&weights.mlp.down_proj)?,
+        &model_state.mlp_out,
+        1,
+        h,
+        i,
+    )?;
+    // 16. residual += mlp_out.
+    residual_add_device(
+        ctx,
+        &model_state.residual,
+        &model_state.mlp_out,
+        &model_state.post_normed,
+        h,
+    )?;
+    let mut enc_mlp_wb = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("mlp_residual_writeback"),
+    });
+    enc_mlp_wb.copy_buffer_to_buffer(
+        &model_state.post_normed,
+        0,
+        &model_state.residual,
+        0,
+        (h * 4) as u64,
+    );
+    ctx.queue.submit(std::iter::once(enc_mlp_wb.finish()));
+
+    Ok(())
+}
+
+/// Run all layers of `model` for one decode token. After this returns,
+/// `model_state.logits` holds the per-token logits ready for argmax /
+/// softmax sampling, and `model_state.position` has been incremented.
+///
+/// `cos_for_position(p, half_dim) -> Vec<f32>` and `sin_for_position`
+/// are the user-supplied RoPE table generators (theta-base depends on
+/// model architecture so it lives on the caller side).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_token_device<FCos, FSin>(
+    ctx: &WgpuContext,
+    model: &WgpuModel,
+    model_state: &mut WgpuModelState,
+    cos_for_position: FCos,
+    sin_for_position: FSin,
+    rms_norm_eps: f32,
+) -> Result<()>
+where
+    FCos: Fn(usize, usize) -> Vec<f32>,
+    FSin: Fn(usize, usize) -> Vec<f32>,
+{
+    let half = model.head_dim / 2;
+    let cos = cos_for_position(model_state.position, half);
+    let sin = sin_for_position(model_state.position, half);
+    for (layer_idx, layer_weights) in model.layers.iter().enumerate() {
+        forward_layer_device(
+            ctx,
+            model_state,
+            layer_weights,
+            layer_idx,
+            &cos,
+            &sin,
+            rms_norm_eps,
+        )?;
+    }
+    // Final norm + lm_head matmul → logits.
+    rms_norm_device(
+        ctx,
+        &model_state.residual,
+        &model.final_norm,
+        &model_state.final_normed,
+        model.hidden_size,
+        rms_norm_eps,
+    )?;
+    matmul_f32_device(
+        ctx,
+        &model_state.final_normed,
+        dense_weight_buf(&model.lm_head)?,
+        &model_state.logits,
+        1,
+        model.vocab_size,
+        model.hidden_size,
+    )?;
+    model_state.position += 1;
     Ok(())
 }
 
