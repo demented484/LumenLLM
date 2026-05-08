@@ -365,6 +365,12 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
     let sin_for = |pos: usize, half: usize| -> Vec<f32> {
         (0..half).map(|i| (pos as f32 * theta[i]).sin()).collect()
     };
+    // Per-layer RoPE generator (this synthetic test uses the same
+    // theta for every layer; Gemma-4 paths give globals a different
+    // theta).
+    let rope_for_layer = |pos: usize, _layer: usize, half: usize| -> (Vec<f32>, Vec<f32>) {
+        (cos_for(pos, half), sin_for(pos, half))
+    };
 
     // CPU-side mirror state.
     let mut cpu_keys: Vec<Vec<f32>> = (0..s.num_layers)
@@ -388,8 +394,7 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
             &ctx,
             &model,
             &mut state,
-            cos_for,
-            sin_for,
+            rope_for_layer,
             s.eps,
             Activation::SwiGLU,
         )

@@ -953,28 +953,33 @@ pub fn forward_layer_device(
 /// are the user-supplied RoPE table generators (theta-base depends on
 /// model architecture so it lives on the caller side).
 #[allow(clippy::too_many_arguments)]
-pub fn forward_token_device<FCos, FSin>(
+pub fn forward_token_device<FRope>(
     ctx: &WgpuContext,
     model: &WgpuModel,
     model_state: &mut WgpuModelState,
-    cos_for_position: FCos,
-    sin_for_position: FSin,
+    rope_for_layer: FRope,
     rms_norm_eps: f32,
     activation: Activation,
 ) -> Result<()>
 where
-    FCos: Fn(usize, usize) -> Vec<f32>,
-    FSin: Fn(usize, usize) -> Vec<f32>,
+    // (position, layer_idx, half_dim) → (cos, sin) for that layer's
+    // RoPE. Gemma-4 globals use a different rope_theta than sliding
+    // layers (sliding=10k, global=1M), so the table is computed per-
+    // layer rather than once per token. Callers that don't need
+    // per-layer theta just ignore the layer_idx argument.
+    FRope: Fn(usize, usize, usize) -> (Vec<f32>, Vec<f32>),
 {
-    let half = model.head_dim / 2;
-    let cos = cos_for_position(model_state.position, half);
-    let sin = sin_for_position(model_state.position, half);
     // Gemma-4: scale embeddings (which the caller has just written into
     // model_state.residual) by sqrt(hidden_size). No-op for vanilla Llama.
     if let Some(scale) = model.embed_scale {
         scale_f32_device(ctx, &model_state.residual, model.hidden_size, scale)?;
     }
+    let position = model_state.position;
     for (layer_idx, layer_weights) in model.layers.iter().enumerate() {
+        let layer_head_dim = layer_weights
+            .head_dim_override
+            .unwrap_or(model.head_dim);
+        let (cos, sin) = rope_for_layer(position, layer_idx, layer_head_dim / 2);
         forward_layer_device(
             ctx,
             model_state,
