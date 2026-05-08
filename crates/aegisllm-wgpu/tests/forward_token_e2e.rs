@@ -340,7 +340,18 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
 
     // ── Build model state ─────────────────────────────────────────────
     let mut state = WgpuModelState::new(
-        &ctx, s.num_layers, s.h, s.inter, s.nq, s.nkv, s.hd, s.vocab, s.max_seq,
+        &ctx,
+        s.num_layers,
+        s.h,
+        s.inter,
+        s.nq,
+        s.nkv,
+        s.hd,
+        s.vocab,
+        s.max_seq,
+        // No NVFP4 weights in this synthetic test — pass 0 so the
+        // dequant scratch is just a 1-element placeholder.
+        0,
     )
     .expect("state");
 

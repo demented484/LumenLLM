@@ -238,6 +238,12 @@ pub struct WgpuModelState {
     /// model uses a separate `pre_feedforward_layernorm_2` for the
     /// routed stream, distinct from the shared-expert input).
     pub moe_expert_input: wgpu::Buffer,
+    /// Reusable scratch for on-the-fly NVFP4 dequantisation. Sized to
+    /// the largest expected weight matrix (`max_weight_elements *
+    /// 4 bytes`). One matmul at a time consumes this — the queue
+    /// ordering between dequant and the matmul that reads it is
+    /// guaranteed by submitting both on the same queue in order.
+    pub nvfp4_dequant_scratch: wgpu::Buffer,
 
     // ── Per-layer KV caches ───────────────────────────────────────────────
     /// `kv_caches[L]` is layer L's persistent cache: keys at
@@ -268,6 +274,14 @@ impl std::fmt::Debug for WgpuModelState {
 }
 
 impl WgpuModelState {
+    /// Allocate state for a model. `max_dequant_elements` sizes the
+    /// reusable on-the-fly NVFP4 dequant scratch buffer — pass the
+    /// largest weight-matrix element count this model will ever
+    /// dequant, or `0` if the model is fully Dense (the scratch is
+    /// allocated as 1 f32 in that case so it's effectively a no-op).
+    /// For Gemma-4-26B-A4B, the largest matrix is one routed expert's
+    /// `gate_proj` / `up_proj` / `down_proj` = 14336 × 4096 = 58 720 256
+    /// elements (~235 MiB).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &WgpuContext,
@@ -279,6 +293,7 @@ impl WgpuModelState {
         head_dim: usize,
         vocab_size: usize,
         max_seq_len: usize,
+        max_dequant_elements: usize,
     ) -> Result<Self> {
         if num_layers == 0
             || hidden_size == 0
@@ -345,6 +360,11 @@ impl WgpuModelState {
             moe_acc: alloc_storage(ctx, h_bytes, "model state moe_acc"),
             shared_expert_out: alloc_storage(ctx, h_bytes, "model state shared_expert_out"),
             moe_expert_input: alloc_storage(ctx, h_bytes, "model state moe_expert_input"),
+            nvfp4_dequant_scratch: alloc_storage(
+                ctx,
+                (max_dequant_elements.max(1) * 4) as u64,
+                "model state nvfp4_dequant_scratch",
+            ),
             kv_caches,
             final_normed: alloc_storage(ctx, h_bytes, "model state final_normed"),
             logits: alloc_storage(ctx, v_bytes, "model state logits"),

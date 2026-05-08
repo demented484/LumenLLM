@@ -9,9 +9,9 @@
 use aegisllm_base::error::{AegisError, Result};
 
 use super::forward::{
-    decode_attention_device_full, decode_attention_device_strided, geglu_tanh_device,
-    matmul_f32_device, residual_add_device, rms_norm_batched_device, rms_norm_device, rope_device,
-    scale_f32_device, swiglu_device,
+    decode_attention_device_full, decode_attention_device_strided, dequant_nvfp4_device,
+    geglu_tanh_device, matmul_f32_device, residual_add_device, rms_norm_batched_device,
+    rms_norm_device, rope_device, scale_f32_device, swiglu_device,
 };
 
 /// MLP activation function. Llama uses SwiGLU; Gemma-4 uses GeGLU
@@ -285,8 +285,8 @@ fn run_dense_mlp_into(
     intermediate: usize,
     hidden: usize,
 ) -> Result<()> {
-    matmul_f32_device(ctx, post_normed, dense_weight_buf(gate_proj)?, &model_state.gate, 1, intermediate, hidden)?;
-    matmul_f32_device(ctx, post_normed, dense_weight_buf(up_proj)?, &model_state.up, 1, intermediate, hidden)?;
+    matmul_with_optional_dequant(ctx, model_state, post_normed, gate_proj, &model_state.gate, 1, intermediate, hidden)?;
+    matmul_with_optional_dequant(ctx, model_state, post_normed, up_proj, &model_state.up, 1, intermediate, hidden)?;
     match activation {
         Activation::SwiGLU => {
             swiglu_device(ctx, &model_state.gate, &model_state.up, &model_state.swiglu_out, intermediate)?;
@@ -295,7 +295,7 @@ fn run_dense_mlp_into(
             geglu_tanh_device(ctx, &model_state.gate, &model_state.up, &model_state.swiglu_out, intermediate)?;
         }
     }
-    matmul_f32_device(ctx, &model_state.swiglu_out, dense_weight_buf(down_proj)?, out_hidden_size, 1, hidden, intermediate)?;
+    matmul_with_optional_dequant(ctx, model_state, &model_state.swiglu_out, down_proj, out_hidden_size, 1, hidden, intermediate)?;
     Ok(())
 }
 
@@ -335,10 +335,11 @@ pub fn forward_moe_block_device(
     let router_input = pre_ffn_normed;
 
     // Router projection: matmul(router_input, router.weight^T) → logits.
-    matmul_f32_device(
+    matmul_with_optional_dequant(
         ctx,
+        model_state,
         router_input,
-        dense_weight_buf(&moe.router)?,
+        &moe.router,
         &model_state.router_logits,
         1,
         moe.num_experts,
@@ -493,18 +494,52 @@ pub fn forward_moe_block_device(
     Ok(())
 }
 
-/// Resolve a `WgpuLinear` into a borrowable `&wgpu::Buffer` of f32
-/// weights ready to feed into `matmul_f32_device`. For `Dense`, returns
-/// the underlying buffer directly. `Nvfp4` is **not yet supported** in
-/// this synchronous path — it will be wired once the on-device dequant
-/// scratch lifetime is sorted; today the loader path only emits Dense
-/// for the synthetic-Llama tests.
+/// Run a `[1, n] = [1, k] @ [n, k]^T` matmul where the weight may be
+/// either `Dense` (used directly) or `Nvfp4` (dequantised on-the-fly
+/// into `model_state.nvfp4_dequant_scratch` first). Pairs the dequant
+/// + matmul atomically so the scratch lifetime is guaranteed to stay
+/// valid across the matmul read; subsequent calls then reuse the
+/// scratch for their own dequant.
+#[allow(clippy::too_many_arguments)]
+fn matmul_with_optional_dequant(
+    ctx: &WgpuContext,
+    model_state: &WgpuModelState,
+    input: &wgpu::Buffer,
+    linear: &WgpuLinear,
+    output: &wgpu::Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let weight_buf = match linear {
+        WgpuLinear::Dense { weight, .. } => weight,
+        WgpuLinear::Nvfp4 { packed, scales, rows, cols, output_scale } => {
+            dequant_nvfp4_device(
+                ctx,
+                packed,
+                scales,
+                &model_state.nvfp4_dequant_scratch,
+                *rows,
+                *cols,
+                *output_scale,
+            )?;
+            &model_state.nvfp4_dequant_scratch
+        }
+    };
+    matmul_f32_device(ctx, input, weight_buf, output, m, n, k)
+}
+
+/// Compatibility shim used in matmul sites that don't have
+/// `&WgpuModelState` in scope (e.g. final `lm_head`). Dense passes
+/// through; NVFP4 errors with a clear message. The lm_head matmul
+/// site has been refactored to use `matmul_with_optional_dequant` —
+/// this helper is kept as a fallback for any leftover callers.
 fn dense_weight_buf(linear: &WgpuLinear) -> Result<&wgpu::Buffer> {
     match linear {
         WgpuLinear::Dense { weight, .. } => Ok(weight),
         WgpuLinear::Nvfp4 { .. } => Err(AegisError::Unsupported(
-            "wgpu forward_layer_device: NVFP4 weights not yet wired into the f32 matmul path; \
-             dequant-and-cache is the next step"
+            "wgpu: this matmul site doesn't have model_state access for NVFP4 dequant; \
+             refactor the call site to use matmul_with_optional_dequant"
                 .into(),
         )),
     }
@@ -600,29 +635,32 @@ pub fn forward_layer_device(
         h,
         rms_norm_eps,
     )?;
-    // 2-4. QKV projections.
-    matmul_f32_device(
+    // 2-4. QKV projections (NVFP4-aware: dequants on-the-fly when needed).
+    matmul_with_optional_dequant(
         ctx,
+        model_state,
         &model_state.post_normed,
-        dense_weight_buf(&weights.attention.q_proj)?,
+        &weights.attention.q_proj,
         &model_state.attn_q,
         1,
         q_width,
         h,
     )?;
-    matmul_f32_device(
+    matmul_with_optional_dequant(
         ctx,
+        model_state,
         &model_state.post_normed,
-        dense_weight_buf(&weights.attention.k_proj)?,
+        &weights.attention.k_proj,
         &model_state.attn_k_new,
         1,
         kv_width,
         h,
     )?;
-    matmul_f32_device(
+    matmul_with_optional_dequant(
         ctx,
+        model_state,
         &model_state.post_normed,
-        dense_weight_buf(&weights.attention.v_proj)?,
+        &weights.attention.v_proj,
         &model_state.attn_v_new,
         1,
         kv_width,
@@ -752,10 +790,11 @@ pub fn forward_layer_device(
         window,
     )?;
     // 9. O projection.
-    matmul_f32_device(
+    matmul_with_optional_dequant(
         ctx,
+        model_state,
         &model_state.attn_out,
-        dense_weight_buf(&weights.attention.o_proj)?,
+        &weights.attention.o_proj,
         &model_state.mlp_out,
         1,
         h,
@@ -815,20 +854,22 @@ pub fn forward_layer_device(
         h,
         rms_norm_eps,
     )?;
-    // 12-13. gate / up.
-    matmul_f32_device(
+    // 12-13. gate / up (NVFP4-aware via matmul_with_optional_dequant).
+    matmul_with_optional_dequant(
         ctx,
+        model_state,
         &model_state.post_normed,
-        dense_weight_buf(&weights.mlp.gate_proj)?,
+        &weights.mlp.gate_proj,
         &model_state.gate,
         1,
         i,
         h,
     )?;
-    matmul_f32_device(
+    matmul_with_optional_dequant(
         ctx,
+        model_state,
         &model_state.post_normed,
-        dense_weight_buf(&weights.mlp.up_proj)?,
+        &weights.mlp.up_proj,
         &model_state.up,
         1,
         i,
@@ -844,10 +885,11 @@ pub fn forward_layer_device(
         }
     }
     // 15. down.
-    matmul_f32_device(
+    matmul_with_optional_dequant(
         ctx,
+        model_state,
         &model_state.swiglu_out,
-        dense_weight_buf(&weights.mlp.down_proj)?,
+        &weights.mlp.down_proj,
         &model_state.mlp_out,
         1,
         h,
@@ -953,10 +995,11 @@ where
         model.hidden_size,
         rms_norm_eps,
     )?;
-    matmul_f32_device(
+    matmul_with_optional_dequant(
         ctx,
+        model_state,
         &model_state.final_normed,
-        dense_weight_buf(&model.lm_head)?,
+        &model.lm_head,
         &model_state.logits,
         1,
         model.vocab_size,
