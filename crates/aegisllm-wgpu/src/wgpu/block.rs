@@ -10,7 +10,7 @@ use aegisllm_base::error::{AegisError, Result};
 
 use super::forward::{
     decode_attention_device_strided, geglu_tanh_device, matmul_f32_device, residual_add_device,
-    rms_norm_batched_device, rms_norm_device, rope_device, swiglu_device,
+    rms_norm_batched_device, rms_norm_device, rope_device, scale_f32_device, swiglu_device,
 };
 
 /// MLP activation function. Llama uses SwiGLU; Gemma-4 uses GeGLU
@@ -489,6 +489,15 @@ pub fn forward_layer_device(
         nkv,
         hd,
     )?;
+    // 5b. Gemma-4: post-RoPE Q scale-by-sqrt(d). Gemma-4 attention uses
+    // scaling=1.0 in the softmax; our `decode_attention` shader bakes in
+    // 1/sqrt(d). Multiplying Q by sqrt(d) cancels the kernel's scale so
+    // the effective Q·K^T is unscaled. Triggered by q_norm being present
+    // (which is Gemma-4's marker tensor — vanilla Llama has neither).
+    if weights.attention.q_norm.is_some() {
+        let sqrt_d = (hd as f32).sqrt();
+        scale_f32_device(ctx, &model_state.attn_q, nq * hd, sqrt_d)?;
+    }
     // 6-7. KV cache writes (per-layer cache, slot `position`).
     let bytes_per_slot = (kv_width * 4) as u64;
     let k_offset_bytes = (position * kv_width * 4) as u64;
@@ -611,6 +620,11 @@ pub fn forward_layer_device(
     );
     ctx.queue.submit(std::iter::once(enc_mlp_wb.finish()));
 
+    // Gemma-4: per-layer scalar multiply on the layer output.
+    if let Some(scalar) = weights.layer_scalar {
+        scale_f32_device(ctx, &model_state.residual, h, scalar)?;
+    }
+
     Ok(())
 }
 
@@ -638,6 +652,11 @@ where
     let half = model.head_dim / 2;
     let cos = cos_for_position(model_state.position, half);
     let sin = sin_for_position(model_state.position, half);
+    // Gemma-4: scale embeddings (which the caller has just written into
+    // model_state.residual) by sqrt(hidden_size). No-op for vanilla Llama.
+    if let Some(scale) = model.embed_scale {
+        scale_f32_device(ctx, &model_state.residual, model.hidden_size, scale)?;
+    }
     for (layer_idx, layer_weights) in model.layers.iter().enumerate() {
         forward_layer_device(
             ctx,

@@ -312,6 +312,7 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
                 up_proj: make_dense(&cl.up_proj, s.inter, s.h, "up_proj"),
                 down_proj: make_dense(&cl.down_proj, s.h, s.inter, "down_proj"),
             },
+            layer_scalar: None,
         })
         .collect();
     let model = WgpuModel {
@@ -329,6 +330,7 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
         head_dim: s.hd,
         vocab_size: s.vocab,
         rms_norm_eps: s.eps,
+        embed_scale: None,
     };
 
     // ── Build model state ─────────────────────────────────────────────

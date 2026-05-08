@@ -15,6 +15,9 @@ pub struct WgpuContext {
     pub(super) rms_norm: KernelPipeline,
     /// Per-row RMS norm — Gemma-4's per-head Q/K/V norms.
     pub(super) rms_norm_batched: KernelPipeline,
+    /// In-place scalar multiply — Gemma-4's embed_scale, layer_scalar,
+    /// and post-RoPE Q scale.
+    pub(super) scale_f32: KernelPipeline,
     pub(super) swiglu: KernelPipeline,
     /// Gemma-4 uses GeGLU (tanh-approximation GELU) instead of SwiGLU.
     pub(super) geglu_tanh: KernelPipeline,
@@ -89,6 +92,12 @@ impl WgpuContext {
             &standard_4_layout,
             "rms_norm_batched",
         );
+        let scale_f32 = build_kernel(
+            &device,
+            include_str!("shaders/scale_f32.wgsl"),
+            &standard_4_layout,
+            "scale_f32",
+        );
         let swiglu = build_kernel(
             &device,
             include_str!("shaders/swiglu.wgsl"),
@@ -145,6 +154,7 @@ impl WgpuContext {
             queue,
             rms_norm,
             rms_norm_batched,
+            scale_f32,
             swiglu,
             geglu_tanh,
             residual_add,

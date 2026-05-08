@@ -728,6 +728,44 @@ struct BatchedRmsNormParams {
     _pad: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct ScaleF32Params {
+    len: u32,
+    scale: f32,
+}
+
+/// In-place element-wise scalar multiply: `data[i] *= scale`. Used for
+/// Gemma-4's `embed_scale` (after embedding lookup), per-layer
+/// `layer_scalar`, and the post-RoPE Q scaling that cancels the
+/// 1/sqrt(d) softmax scale our attention kernel applies (Gemma-4 uses
+/// scaling=1.0).
+pub fn scale_f32_device(
+    ctx: &WgpuContext,
+    data: &wgpu::Buffer,
+    len: usize,
+    scale: f32,
+) -> Result<()> {
+    let params = ScaleF32Params {
+        len: len as u32,
+        scale,
+    };
+    let groups = ((len + 63) / 64) as u32;
+    // The shader uses bindings 0/1 as ignored read-only inputs and
+    // binding 2 as the in-place data — match this with the standard
+    // dispatcher by passing `data` as the "out" slot.
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.scale_f32,
+        data, // bound at binding 0 (ignored by shader)
+        data, // bound at binding 1 (ignored by shader)
+        data, // bound at binding 2 (mutated)
+        bytemuck::bytes_of(&params),
+        (groups, 1, 1),
+        "scale_f32_device",
+    )
+}
+
 /// Device-resident per-row RMS norm: applies `weight[len]` to each of
 /// `batch` rows of `input[batch * len]`, writing to `output`. Used by
 /// Gemma-4's per-head Q/K norms (with a learned per-`head_dim` weight)

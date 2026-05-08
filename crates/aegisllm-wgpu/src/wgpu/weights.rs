@@ -141,6 +141,9 @@ impl std::fmt::Debug for WgpuMlpWeightsFull {
 pub struct WgpuLayerWeights {
     pub attention: WgpuAttentionWeightsFull,
     pub mlp: WgpuMlpWeightsFull,
+    /// Gemma-4: per-layer multiplicative scalar applied after the MLP
+    /// block's residual add. `None` for vanilla Llama.
+    pub layer_scalar: Option<f32>,
 }
 
 impl std::fmt::Debug for WgpuLayerWeights {
@@ -168,6 +171,9 @@ pub struct WgpuModel {
     pub head_dim: usize,
     pub vocab_size: usize,
     pub rms_norm_eps: f32,
+    /// Gemma-4: scalar multiplier applied to embeddings after lookup
+    /// (`sqrt(hidden_size)` for Gemma-4). `None` for vanilla Llama.
+    pub embed_scale: Option<f32>,
 }
 
 impl std::fmt::Debug for WgpuModel {
@@ -430,6 +436,7 @@ pub fn load_vanilla_llama_model(
                 up_proj: up,
                 down_proj: down,
             },
+            layer_scalar: None,
         });
     }
 
@@ -448,6 +455,8 @@ pub fn load_vanilla_llama_model(
         head_dim: shape.head_dim,
         vocab_size: shape.vocab_size,
         rms_norm_eps: shape.rms_norm_eps,
+        // Vanilla Llama doesn't scale embeddings.
+        embed_scale: None,
     })
 }
 
