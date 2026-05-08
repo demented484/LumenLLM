@@ -777,9 +777,24 @@ impl CudaRuntime {
         window_size: u32,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
+        // Round-2 optimisation: the register-resident-accumulator variant
+        // of the hdim=512 kernel uses 512 threads/block (16 warps) instead
+        // of 1024 (32 warps), keeping the per-row WMMA accumulator in
+        // register fragments rather than `acc[16][512]` shared memory.
+        // Shared-mem drops from ~82 KiB to ~50 KiB, lifting block-per-SM
+        // residency from 1 → 2 on sm_120. Opt-out via
+        // `AEGIS_HDIM512_REG_ACC_DISABLE=1`.
+        let use_hdim512_regacc = head_dim == 512
+            && std::env::var("AEGIS_HDIM512_REG_ACC_DISABLE")
+                .ok()
+                .as_deref()
+                != Some("1");
         let kernel = match head_dim {
             128 => &self.kernels.attention_prefill_dense_halfq_wmma_hdim128,
             256 => &self.kernels.attention_prefill_dense_halfq_wmma_hdim256,
+            512 if use_hdim512_regacc => {
+                &self.kernels.attention_prefill_dense_halfq_wmma_hdim512_regacc
+            }
             512 => &self.kernels.attention_prefill_dense_halfq_wmma_hdim512,
             other => return Err(AegisError::Unsupported(format!(
                 "dense wmma prefill attention requires head_dim ∈ {{128, 256, 512}}; got {other}",
@@ -789,7 +804,10 @@ impl CudaRuntime {
         // double-buffer; both choices are forced by the sm_120 100 KiB
         // shared-mem cap. See the kernel comment for the layout details.
         let k_tile = if head_dim == 512 { 16 } else { DENSE_WMMA_K_TILE };
+        // The baseline hdim=512 kernel keeps `acc` (and no tile_acc) in
+        // shmem; the register-resident-acc variant drops `acc` entirely.
         let has_tile_acc = head_dim != 512;
+        let has_acc_buffer = !(head_dim == 512 && use_hdim512_regacc);
         let q_width = checked_len("dense wmma q width", num_attention_heads, head_dim)?;
         let q_tokens = checked_len("dense wmma q tokens", batch, q_width)?;
         let kv_width = checked_len("dense wmma kv width", num_kv_heads, head_dim)?;
@@ -823,17 +841,27 @@ impl CudaRuntime {
         let half_values = DENSE_WMMA_Q_BLOCK * head_dim
             + 2 * k_tile * head_dim
             + DENSE_WMMA_Q_BLOCK * k_tile;
-        // float region: scores[q_block * k_tile] + acc[q_block * head_dim]
+        // float region: scores[q_block * k_tile] + (optional) acc[q_block * head_dim]
         //   + (optional) tile_acc[q_block * head_dim] + scalars[q_block * 3]
+        // The hdim=512 register-resident-acc variant drops the acc buffer
+        // entirely (lives in WMMA fragments per warp) and reuses k_shared
+        // as a per-warp 1 KiB rescale scratch (16 warps * 1 KiB = 16 KiB
+        // ≤ k_shared = 16 KiB).
         let float_values = DENSE_WMMA_Q_BLOCK * k_tile
-            + DENSE_WMMA_Q_BLOCK * head_dim
+            + if has_acc_buffer { DENSE_WMMA_Q_BLOCK * head_dim } else { 0 }
             + if has_tile_acc { DENSE_WMMA_Q_BLOCK * head_dim } else { 0 }
             + DENSE_WMMA_Q_BLOCK * 3;
         // Block size = (head_dim/16) * 32 — one warp per output 16-col
         // slice for the P*V WMMA stage. hdim128 → 256, hdim256 → 512,
         // hdim512 → 1024 (sm_120 max threads-per-block).
+        // The register-resident-acc variant halves to 16 warps (512
+        // threads); each warp owns 2 column slices.
         let output_warps = (head_dim / 16) as u32;
-        let block_threads = output_warps * 32;
+        let block_threads = if head_dim == 512 && use_hdim512_regacc {
+            16 * 32
+        } else {
+            output_warps * 32
+        };
         let cfg = LaunchConfig {
             grid_dim: (
                 u32_arg("num_attention_heads", num_attention_heads)?,
