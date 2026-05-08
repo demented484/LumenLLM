@@ -133,6 +133,16 @@ pub(super) fn dense_wmma_q32_enabled() -> bool {
     std::env::var_os("AEGISLLM_CUDA_EXPERIMENTAL_PERSISTENT_ATTENTION").is_some()
 }
 
+// Opt-out for the default-on Q_BLOCK=32 sliding-window prefill kernel.
+// When unset (the default) the dispatcher routes hdim=128 sliding
+// layers (window>0) with batch >= DENSE_WMMA_Q32_BLOCK to the larger-Q
+// kernel for better K/V tile reuse. Set `AEGIS_HDIM128_Q32_DISABLE=1`
+// to fall back to the Q_BLOCK=16 baseline (e.g. for A/B benching or
+// numerical bisection).
+pub(super) fn dense_wmma_hdim128_q32_window_disabled() -> bool {
+    std::env::var_os("AEGIS_HDIM128_Q32_DISABLE").is_some()
+}
+
 pub(super) fn dense_wmma_legacy_enabled() -> bool {
     std::env::var_os("AEGISLLM_CUDA_LEGACY_WMMA_ATTENTION").is_some()
 }

@@ -2230,6 +2230,24 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim128_cluster2(
     cluster.sync();
 }
 
+// Q_BLOCK=32 variant of the hdim=128 dense WMMA prefill kernel.
+//
+// Identical online-softmax/WMMA structure to the generic
+// `aegis_attention_prefill_dense_halfq_wmma_impl<128>` template
+// (Q_BLOCK=16) but doubles the Q tile so each K/V tile load is
+// amortised over twice as many query rows. For sliding-window layers
+// (Gemma-4: 25/30 layers, window=1024) where the K-iteration count is
+// bounded to `window/k_tile = 32` regardless of seq length, this halves
+// the K/V shared-memory load traffic and the Q*K WMMA tile count grows
+// from 2 to 4 (two 16x16 score sub-tiles per warp).
+//
+// `window_size = 0` means full causal attention. `window_size > 0`
+// applies the same `block_min_tile_start` + per-row `row_min_visible`
+// clamp as the generic template (commit 016a485) so sliding-layer
+// behaviour matches the Q_BLOCK=16 reference bit-for-bit per output
+// element: same K positions scanned in the same tile order, same
+// online-softmax math per row, same hdim/k_tile WMMA accumulator
+// reduction order.
 extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_q32(
     const unsigned short* __restrict__ key_cache,
     const unsigned short* __restrict__ value_cache,
@@ -2241,6 +2259,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_q32(
     const unsigned int num_kv_heads,
     const unsigned int head_dim,
     const unsigned int cache_capacity,
+    const unsigned int window_size,
     float* __restrict__ output
 ) {
     constexpr unsigned int hdim = 128u;
@@ -2262,6 +2281,18 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_q32(
     if (block_max_visible == 0u) {
         return;
     }
+    // Sliding-window lower bound on the K-tile loop. Earliest visible K
+    // position for the earliest query in this block (global_q =
+    // global_q_base) is `start_position + global_q_base + 1 -
+    // window_size`. Round down to a k_tile boundary so we still hit
+    // tile_start cadence and per-row mask drops the residual.
+    // window_size == 0 means full causal (no clamp).
+    const unsigned int block_min_visible_raw = (window_size > 0u
+        && start_position + global_q_base + 1u > window_size)
+        ? (start_position + global_q_base + 1u - window_size)
+        : 0u;
+    const unsigned int block_min_tile_start =
+        (block_min_visible_raw / k_tile) * k_tile;
 
     extern __shared__ __align__(16) unsigned char smem[];
     unsigned short* q_shared = reinterpret_cast<unsigned short*>(smem);
@@ -2294,7 +2325,7 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_q32(
     }
     __syncthreads();
 
-    for (unsigned int tile_start = 0u; tile_start < block_max_visible; tile_start += k_tile) {
+    for (unsigned int tile_start = block_min_tile_start; tile_start < block_max_visible; tile_start += k_tile) {
         const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
         for (unsigned int idx = tid; idx < k_tile * hdim; idx += blockDim.x) {
             const unsigned int col = idx / hdim;
@@ -2337,10 +2368,16 @@ extern "C" __global__ void aegis_attention_prefill_dense_halfq_wmma_hdim128_q32(
             const unsigned int visible_len = valid_q
                 ? min(context_len, start_position + global_q + 1u)
                 : 0u;
+            // Sliding-window per-row lower bound. Mirrors the generic
+            // template's `row_min_visible` clamp so q_block=32 numerics
+            // match q_block=16 bit-for-bit on sliding layers. When
+            // window_size==0 this is 0 and the mask reduces to causal.
+            const unsigned int row_min_visible = (window_size > 0u && start_position + global_q + 1u > window_size)
+                ? (start_position + global_q + 1u - window_size) : 0u;
             const float old_m = scalars[row * 3u + 0u];
             const float old_l = scalars[row * 3u + 1u];
             const unsigned int pos = tile_start + lane;
-            float score = (valid_q && lane < tile_count && pos < visible_len)
+            float score = (valid_q && lane < tile_count && pos < visible_len && pos >= row_min_visible)
                 ? scores[row * k_tile + lane] * scale
                 : -3.402823466e38f;
             const float tile_m = aegis_warp_reduce_max(score);

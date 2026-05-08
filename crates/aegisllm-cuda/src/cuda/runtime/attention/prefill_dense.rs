@@ -399,6 +399,30 @@ impl CudaRuntime {
                     num_kv_heads,
                     output,
                 )
+            } else if !dense_wmma_hdim128_q32_window_disabled()
+                && window_size > 0
+                && batch >= DENSE_WMMA_Q32_BLOCK
+            {
+                // Sliding-window layers (Gemma-4: 25/30 layers, window=1024).
+                // The Q_BLOCK=32 kernel halves K/V tile load traffic
+                // because each loaded K/V tile is amortised across 32
+                // query rows instead of 16. Per-element output matches
+                // the Q_BLOCK=16 path bit-for-bit (same K positions,
+                // same hdim/k_tile WMMA accumulator order, same online
+                // softmax math, same window mask). Opt-out via
+                // `AEGIS_HDIM128_Q32_DISABLE=1`.
+                self.attention_prefill_dense_halfq_wmma_hdim128_q32_device(
+                    key_cache,
+                    value_cache,
+                    query_half,
+                    start_position,
+                    batch,
+                    dense_metadata.context_len(),
+                    num_attention_heads,
+                    num_kv_heads,
+                    window_size,
+                    output,
+                )
             } else if dense_wmma_q32_enabled() && dense_metadata.context_len() >= 1024 {
                 self.attention_prefill_dense_halfq_wmma_hdim128_q32_device(
                     key_cache,
@@ -409,6 +433,7 @@ impl CudaRuntime {
                     dense_metadata.context_len(),
                     num_attention_heads,
                     num_kv_heads,
+                    window_size,
                     output,
                 )
             } else if num_attention_heads / num_kv_heads >= DENSE_WMMA_GQA4_HEADS {
@@ -1421,6 +1446,7 @@ impl CudaRuntime {
         context_len: usize,
         num_attention_heads: usize,
         num_kv_heads: usize,
+        window_size: u32,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
         let head_dim = 128usize;
@@ -1492,6 +1518,7 @@ impl CudaRuntime {
                 .arg(&num_kv_heads)
                 .arg(&head_dim)
                 .arg(&cache_capacity_u32)
+                .arg(&window_size)
                 .arg(&mut output.slice)
                 .launch(LaunchConfig {
                     grid_dim: (
