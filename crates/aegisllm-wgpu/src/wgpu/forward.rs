@@ -51,7 +51,9 @@ struct DecodeAttentionParams {
     head_dim: u32,
     seq_len: u32,
     kv_offset_v: u32,
-    _pad0: u32,
+    /// Sliding-window cap: 0 = full attention, N = mask positions
+    /// older than `seq_len - N`.
+    window_size: u32,
     _pad1: u32,
     _pad2: u32,
 }
@@ -410,9 +412,9 @@ pub fn decode_attention_gpu(
             "decode_attention: num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
         )));
     }
-    if head_dim > 256 {
+    if head_dim > 512 {
         return Err(AegisError::Unsupported(format!(
-            "decode_attention WGSL kernel hard-codes max head_dim=256, got {head_dim}"
+            "decode_attention WGSL kernel hard-codes max head_dim=512, got {head_dim}"
         )));
     }
     let q_len = num_q_heads * head_dim;
@@ -440,7 +442,9 @@ pub fn decode_attention_gpu(
         head_dim: head_dim as u32,
         seq_len: seq_len as u32,
         kv_offset_v: kv_len as u32,
-        _pad0: 0, _pad1: 0, _pad2: 0,
+        window_size: 0,
+        _pad1: 0,
+        _pad2: 0,
     };
     let byte_len = (q_len * std::mem::size_of::<f32>()) as u64;
 
@@ -1028,14 +1032,35 @@ pub fn decode_attention_device_strided(
     seq_len: usize,
     v_offset_floats: Option<usize>,
 ) -> Result<()> {
+    decode_attention_device_full(
+        ctx, q, kv, out, num_q_heads, num_kv_heads, head_dim, seq_len, v_offset_floats, 0,
+    )
+}
+
+/// Full-featured attention dispatch that exposes the sliding-window
+/// cap. `window_size = 0` is equivalent to `_strided` (full attention).
+/// Gemma-4 sliding layers pass `window_size = 1024`.
+#[allow(clippy::too_many_arguments)]
+pub fn decode_attention_device_full(
+    ctx: &WgpuContext,
+    q: &wgpu::Buffer,
+    kv: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    v_offset_floats: Option<usize>,
+    window_size: u32,
+) -> Result<()> {
     if num_q_heads % num_kv_heads != 0 {
         return Err(AegisError::InvalidPlan(format!(
             "decode_attention: num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
         )));
     }
-    if head_dim > 256 {
+    if head_dim > 512 {
         return Err(AegisError::Unsupported(format!(
-            "decode_attention WGSL kernel hard-codes max head_dim=256, got {head_dim}"
+            "decode_attention WGSL kernel hard-codes max head_dim=512, got {head_dim}"
         )));
     }
     let kv_width = num_kv_heads * head_dim;
@@ -1046,7 +1071,7 @@ pub fn decode_attention_device_strided(
         head_dim: head_dim as u32,
         seq_len: seq_len as u32,
         kv_offset_v,
-        _pad0: 0,
+        window_size,
         _pad1: 0,
         _pad2: 0,
     };

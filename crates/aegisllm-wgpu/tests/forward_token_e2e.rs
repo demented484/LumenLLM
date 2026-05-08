@@ -315,6 +315,8 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
                 post_mlp_sublayer_norm: None,
             },
             layer_scalar: None,
+            attention_window_size: None,
+            head_dim_override: None,
         })
         .collect();
     let model = WgpuModel {

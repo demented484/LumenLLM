@@ -152,6 +152,14 @@ pub struct WgpuLayerWeights {
     /// Gemma-4: per-layer multiplicative scalar applied after the MLP
     /// block's residual add. `None` for vanilla Llama.
     pub layer_scalar: Option<f32>,
+    /// Gemma-4 sliding-window layers cap attention to the most recent
+    /// `window_size` positions. `None` means full causal attention
+    /// (Gemma-4 global layers and vanilla Llama).
+    pub attention_window_size: Option<u32>,
+    /// Gemma-4 global layers may use a different head_dim (512) than
+    /// the model's "default" sliding head_dim (256). When `Some`,
+    /// overrides the model-level head_dim for THIS layer's attention.
+    pub head_dim_override: Option<usize>,
 }
 
 impl std::fmt::Debug for WgpuLayerWeights {
@@ -447,6 +455,8 @@ pub fn load_vanilla_llama_model(
                 post_mlp_sublayer_norm: None,
             },
             layer_scalar: None,
+            attention_window_size: None,
+            head_dim_override: None,
         });
     }
 

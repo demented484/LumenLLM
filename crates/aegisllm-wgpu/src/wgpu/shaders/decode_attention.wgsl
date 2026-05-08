@@ -22,7 +22,10 @@ struct Params {
     head_dim     : u32,
     seq_len      : u32,
     kv_offset_v  : u32,  // float index where the V section starts in `kv` (== seq_len * num_kv_heads * head_dim)
-    _pad0        : u32,
+    // Sliding window: when non-zero, only K/V positions in
+    // `[seq_len - window_size, seq_len)` are attended; older positions
+    // contribute zero. Vanilla full attention sets this to 0.
+    window_size  : u32,
     _pad1        : u32,
     _pad2        : u32,
 }
@@ -45,14 +48,25 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>) {
     // Inv-INFINITY surrogate that's safe across all backends.
     var max_score: f32 = -3.4e38;
     var sum: f32 = 0.0;
-    // Local accumulator. Bounded by head_dim ≤ 256 in target models.
-    var acc: array<f32, 256>;
+    // Local accumulator. Bounded by head_dim ≤ 512 (Gemma-4 global layers
+    // use head_dim=512; sliding layers use 256).
+    var acc: array<f32, 512>;
     for (var i: u32 = 0u; i < head_dim; i = i + 1u) {
         acc[i] = 0.0;
     }
 
+    // Sliding-window starting position. When `window_size == 0`, attend
+    // to all positions; otherwise mask out positions older than
+    // `seq_len - window_size`.
+    var window_start: u32 = 0u;
+    if (params.window_size != 0u) {
+        if (params.seq_len > params.window_size) {
+            window_start = params.seq_len - params.window_size;
+        }
+    }
+
     let q_base = q_head * head_dim;
-    for (var pos: u32 = 0u; pos < params.seq_len; pos = pos + 1u) {
+    for (var pos: u32 = window_start; pos < params.seq_len; pos = pos + 1u) {
         let k_base = pos * kv_width + kv_head * head_dim;
         // dot(q[q_head], k[pos, kv_head])
         var dot: f32 = 0.0;

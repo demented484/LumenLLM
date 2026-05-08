@@ -21,10 +21,11 @@ pub use forward::{
     rms_norm_gpu, rope_gpu, swiglu_gpu,
 };
 pub use forward::{
-    alloc_storage, decode_attention_device, dequant_nvfp4_device, download_f32_buf,
-    embedding_device, geglu_tanh_device, matmul_f32_device, residual_add_device,
-    rms_norm_batched_device, rms_norm_device, rope_device, scale_f32_device, swiglu_device,
-    upload_f32_buf, upload_padded_u8_buf,
+    alloc_storage, decode_attention_device, decode_attention_device_full,
+    decode_attention_device_strided, dequant_nvfp4_device, download_f32_buf, embedding_device,
+    geglu_tanh_device, matmul_f32_device, residual_add_device, rms_norm_batched_device,
+    rms_norm_device, rope_device, scale_f32_device, swiglu_device, upload_f32_buf,
+    upload_padded_u8_buf,
 };
 pub use loader::WgpuContext;
 pub use provider::WgpuExecutorProvider;

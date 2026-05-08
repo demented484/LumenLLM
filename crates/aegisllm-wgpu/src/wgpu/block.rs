@@ -9,8 +9,9 @@
 use aegisllm_base::error::{AegisError, Result};
 
 use super::forward::{
-    decode_attention_device_strided, geglu_tanh_device, matmul_f32_device, residual_add_device,
-    rms_norm_batched_device, rms_norm_device, rope_device, scale_f32_device, swiglu_device,
+    decode_attention_device_full, decode_attention_device_strided, geglu_tanh_device,
+    matmul_f32_device, residual_add_device, rms_norm_batched_device, rms_norm_device, rope_device,
+    scale_f32_device, swiglu_device,
 };
 
 /// MLP activation function. Llama uses SwiGLU; Gemma-4 uses GeGLU
@@ -508,10 +509,11 @@ pub fn forward_layer_device(
     enc_kv.copy_buffer_to_buffer(&model_state.attn_k_new, 0, kv_cache, k_offset_bytes, bytes_per_slot);
     enc_kv.copy_buffer_to_buffer(&model_state.attn_v_new, 0, kv_cache, v_offset_bytes, bytes_per_slot);
     ctx.queue.submit(std::iter::once(enc_kv.finish()));
-    // 8. Attention.
+    // 8. Attention. Sliding-window cap (Gemma-4 sliding layers) when present.
     let seq_len = position + 1;
     let v_offset_floats = max_seq * kv_width;
-    decode_attention_device_strided(
+    let window = weights.attention_window_size.unwrap_or(0);
+    decode_attention_device_full(
         ctx,
         &model_state.attn_q,
         kv_cache,
@@ -521,6 +523,7 @@ pub fn forward_layer_device(
         hd,
         seq_len,
         Some(v_offset_floats),
+        window,
     )?;
     // 9. O projection.
     matmul_f32_device(
