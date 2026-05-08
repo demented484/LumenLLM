@@ -216,6 +216,45 @@ impl CudaRuntime {
         let legacy_shared_bytes = (dense_metadata.context_len()
             + CUDA_ATTENTION_BLOCK_DIM as usize)
             * std::mem::size_of::<f32>();
+        // hdim=512 path (Gemma-4 global-attention layers, 5 of 30 in the
+        // 26B model). Bespoke kernel with K_TILE=16 and no tile_acc
+        // double-buffer to fit the sm_120 shared-mem cap. Routes here
+        // instead of the slow paged-varlen kernel; same templated
+        // dispatcher entry as 128/256.
+        if matches!(
+            self.config.prefill_attention,
+            CudaPrefillAttentionKernel::Auto
+                | CudaPrefillAttentionKernel::AegisVarlen
+                | CudaPrefillAttentionKernel::WarpFlash
+        ) && head_dim == 512
+            && batch >= DENSE_WARP_TILE_Q_BLOCK
+        {
+            let q_len = checked_len(
+                "dense wmma hdim512 query half width",
+                batch,
+                checked_len(
+                    "dense wmma hdim512 q width",
+                    num_attention_heads,
+                    head_dim,
+                )?,
+            )?;
+            if !query_half_ready {
+                self.f32_to_f16_device(query, q_len, query_half)?;
+            }
+            return self.attention_prefill_dense_halfq_wmma_hdim_device(
+                key_cache,
+                value_cache,
+                query_half,
+                start_position,
+                batch,
+                dense_metadata.context_len(),
+                num_attention_heads,
+                num_kv_heads,
+                head_dim,
+                window_size,
+                output,
+            );
+        }
         // hdim=256 path (Gemma-4 sliding layers): the parametric WMMA
         // kernel handles it via the templated impl. Other hdim≠128 paths
         // still fall through to the slow paged kernel until we add their
@@ -712,10 +751,17 @@ impl CudaRuntime {
     }
 
     /// Dense WMMA prefill attention with parametric head_dim.
-    /// Selects the kernel instantiation by `head_dim` (currently 128 / 256;
-    /// 512 is not yet templated and falls back to the slow paged path
-    /// upstream). Block size scales as `(head_dim/16) * 32` threads so the
-    /// output P*V WMMA distributes one 16-column slice per warp.
+    /// Selects the kernel instantiation by `head_dim`:
+    ///   * 128 / 256: shared `aegis_attention_prefill_dense_halfq_wmma_impl`
+    ///     (Q_BLOCK=16, K_TILE=32, classic flash-attention-style with
+    ///     `tile_acc` double-buffer).
+    ///   * 512: bespoke `aegis_attention_prefill_dense_halfq_wmma_hdim512`
+    ///     kernel — same algorithm but K_TILE=16 and no `tile_acc`
+    ///     double-buffer (rescale-then-accumulate fused into the WMMA
+    ///     fragment) so it fits the sm_120 100 KiB shared-mem cap.
+    /// Block size scales as `(head_dim/16) * 32` threads so the
+    /// output P*V WMMA distributes one 16-column slice per warp:
+    /// hdim128 → 256 threads, hdim256 → 512 threads, hdim512 → 1024.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn attention_prefill_dense_halfq_wmma_hdim_device(
         &self,
@@ -734,10 +780,16 @@ impl CudaRuntime {
         let kernel = match head_dim {
             128 => &self.kernels.attention_prefill_dense_halfq_wmma_hdim128,
             256 => &self.kernels.attention_prefill_dense_halfq_wmma_hdim256,
+            512 => &self.kernels.attention_prefill_dense_halfq_wmma_hdim512,
             other => return Err(AegisError::Unsupported(format!(
-                "dense wmma prefill attention requires head_dim ∈ {{128, 256}}; got {other}",
+                "dense wmma prefill attention requires head_dim ∈ {{128, 256, 512}}; got {other}",
             ))),
         };
+        // hdim=512 uses K_TILE=16 (instead of 32) and drops the tile_acc
+        // double-buffer; both choices are forced by the sm_120 100 KiB
+        // shared-mem cap. See the kernel comment for the layout details.
+        let k_tile = if head_dim == 512 { 16 } else { DENSE_WMMA_K_TILE };
+        let has_tile_acc = head_dim != 512;
         let q_width = checked_len("dense wmma q width", num_attention_heads, head_dim)?;
         let q_tokens = checked_len("dense wmma q tokens", batch, q_width)?;
         let kv_width = checked_len("dense wmma kv width", num_kv_heads, head_dim)?;
@@ -769,14 +821,17 @@ impl CudaRuntime {
             ));
         }
         let half_values = DENSE_WMMA_Q_BLOCK * head_dim
-            + 2 * DENSE_WMMA_K_TILE * head_dim
-            + DENSE_WMMA_Q_BLOCK * DENSE_WMMA_K_TILE;
-        let float_values = DENSE_WMMA_Q_BLOCK * DENSE_WMMA_K_TILE
+            + 2 * k_tile * head_dim
+            + DENSE_WMMA_Q_BLOCK * k_tile;
+        // float region: scores[q_block * k_tile] + acc[q_block * head_dim]
+        //   + (optional) tile_acc[q_block * head_dim] + scalars[q_block * 3]
+        let float_values = DENSE_WMMA_Q_BLOCK * k_tile
             + DENSE_WMMA_Q_BLOCK * head_dim
-            + DENSE_WMMA_Q_BLOCK * head_dim
+            + if has_tile_acc { DENSE_WMMA_Q_BLOCK * head_dim } else { 0 }
             + DENSE_WMMA_Q_BLOCK * 3;
         // Block size = (head_dim/16) * 32 — one warp per output 16-col
-        // slice for the P*V WMMA stage. hdim128 → 256, hdim256 → 512.
+        // slice for the P*V WMMA stage. hdim128 → 256, hdim256 → 512,
+        // hdim512 → 1024 (sm_120 max threads-per-block).
         let output_warps = (head_dim / 16) as u32;
         let block_threads = output_warps * 32;
         let cfg = LaunchConfig {
