@@ -788,6 +788,109 @@ pub fn matmul_f32_device(
     )
 }
 
+/// Upload an arbitrary byte slice into a fresh `STORAGE` buffer, padding to
+/// u32 alignment so WGSL `array<u32>` reads are safe regardless of length.
+///
+/// Used by NVFP4 weight upload paths: the packed-nibble and UE4M3-half
+/// scale arrays come from artifact tensors as raw `u8` slices, but the
+/// dequant shader binds them as `array<u32>`.
+pub fn upload_padded_u8_buf(
+    ctx: &WgpuContext,
+    bytes: &[u8],
+    label: &'static str,
+) -> wgpu::Buffer {
+    let pad = (4 - bytes.len() % 4) % 4;
+    if pad == 0 {
+        return ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+    }
+    let mut padded = Vec::with_capacity(bytes.len() + pad);
+    padded.extend_from_slice(bytes);
+    padded.extend(std::iter::repeat(0u8).take(pad));
+    ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: &padded,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+    })
+}
+
+/// Device-resident NVFP4 dequant: `out[rows, cols]` ← (packed nibbles, UE4M3 scales).
+///
+/// `packed` and `scales` must already be u32-padded `STORAGE` buffers
+/// (use [`upload_padded_u8_buf`]). `out` is `f32 [rows * cols]` and must be
+/// `STORAGE`. `output_scale` is the per-tensor multiplier (`1.0` for NVFP4
+/// tensors without one).
+///
+/// `cols` must be a multiple of 16 (NVFP4 block size).
+pub fn dequant_nvfp4_device(
+    ctx: &WgpuContext,
+    packed: &wgpu::Buffer,
+    scales: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    rows: usize,
+    cols: usize,
+    output_scale: f32,
+) -> Result<()> {
+    if cols % 16 != 0 {
+        return Err(AegisError::InvalidPlan(format!(
+            "dequant_nvfp4_device: cols ({cols}) must be a multiple of 16",
+        )));
+    }
+    let params = DequantParams {
+        rows: rows as u32,
+        cols: cols as u32,
+        output_scale_bits: output_scale.to_bits(),
+        _pad: 0,
+    };
+    let out_len = rows * cols;
+    let groups = ((out_len + 63) / 64) as u32;
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.dequant_nvfp4,
+        packed,
+        scales,
+        out,
+        bytemuck::bytes_of(&params),
+        (groups, 1, 1),
+        "dequant_nvfp4_device",
+    )
+}
+
+/// Device-resident embedding lookup: `out[hidden]` ← `embed_table[token_id, :]`.
+///
+/// `embed_table` is the full `STORAGE` buffer of shape `[vocab, hidden]`
+/// stored row-major. `out` is `f32[hidden]`. The `_unused` buffer is bound
+/// at slot 1 because the standard 4-binding layout requires three storage
+/// buffers; the embedding shader ignores it (the host API used a 1-element
+/// dummy upload for the same reason).
+pub fn embedding_device(
+    ctx: &WgpuContext,
+    embed_table: &wgpu::Buffer,
+    unused: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    token_id: u32,
+    hidden_size: usize,
+) -> Result<()> {
+    let params = EmbeddingParams {
+        token_id,
+        hidden_size: hidden_size as u32,
+    };
+    let groups = ((hidden_size + 63) / 64) as u32;
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.embedding,
+        embed_table,
+        unused,
+        out,
+        bytemuck::bytes_of(&params),
+        (groups, 1, 1),
+        "embedding_device",
+    )
+}
+
 #[cfg(test)]
 mod device_chain_tests {
     use super::*;
@@ -883,5 +986,125 @@ mod device_chain_tests {
                 "chain mismatch at i={i}: got={got} exp={exp}",
             );
         }
+    }
+
+    /// Chain test: NVFP4 dequant → matmul, single readback at end. Validates
+    /// that quantized weight bytes can drive a matmul without leaving the GPU.
+    /// This is the on-device weight-format-conversion path that NVFP4 model
+    /// loaders will use.
+    ///
+    /// Gated behind `AEGIS_WGPU_SMOKE=1`.
+    #[test]
+    fn dequant_nvfp4_then_matmul_chains_without_host_roundtrip() {
+        if std::env::var("AEGIS_WGPU_SMOKE").is_err() {
+            eprintln!("skipping; set AEGIS_WGPU_SMOKE=1 to run on a host with Vulkan/Metal/D3D12");
+            return;
+        }
+        let ctx = WgpuContext::new(0).expect("wgpu ctx");
+
+        // Tiny shapes: weight `[rows=4, cols=16]`, input `[1, K=16]`. NVFP4
+        // requires cols % 16 == 0; the smallest legal shape is one block.
+        let rows = 4usize;
+        let cols = 16usize;
+
+        // Build random NVFP4 packed bytes + scales. NVFP4 nibble values are
+        // in [0, 15]; UE4M3 scales we set to a known constant per block so
+        // dequantization is predictable.
+        let packed_len = rows * cols / 2;
+        let scales_len = rows * cols / 16; // = rows
+        let mut packed = vec![0u8; packed_len];
+        for (i, b) in packed.iter_mut().enumerate() {
+            // Each byte holds two NVFP4 nibbles. Pick small, varied codes.
+            let lo = ((i * 5 + 1) % 16) as u8;
+            let hi = ((i * 7 + 3) % 16) as u8;
+            *b = (hi << 4) | lo;
+        }
+        // UE4M3 byte 0x38 = exponent=7 (bias-7 → 0), mantissa=0 → magnitude
+        // 1.0; *0.5 (NVFP4 tail factor) → effective scale 0.5. One byte per
+        // block; same for every block here.
+        let scales = vec![0x38u8; scales_len];
+        let output_scale = 1.0_f32;
+
+        // CPU reference: dequant first, then matmul.
+        let cpu_weight = cpu_dequant_nvfp4(&packed, &scales, rows, cols, output_scale);
+        let input_host: Vec<f32> = (0..cols).map(|k| ((k as f32) - 7.5) * 0.1).collect();
+        let mut cpu_out = vec![0.0_f32; rows];
+        for r in 0..rows {
+            let mut acc = 0.0_f32;
+            for c in 0..cols {
+                acc += input_host[c] * cpu_weight[r * cols + c];
+            }
+            cpu_out[r] = acc;
+        }
+
+        // GPU run: upload packed/scales, allocate dequant output + matmul
+        // output, run dequant_device + matmul_device, single readback.
+        let buf_packed = upload_padded_u8_buf(&ctx, &packed, "test_packed");
+        let buf_scales = upload_padded_u8_buf(&ctx, &scales, "test_scales");
+        let buf_input = upload_f32_buf(&ctx, &input_host, "test_input");
+        let buf_weight = alloc_storage(&ctx, (rows * cols * 4) as u64, "test_weight");
+        let buf_out = alloc_storage(&ctx, (rows * 4) as u64, "test_out");
+
+        dequant_nvfp4_device(&ctx, &buf_packed, &buf_scales, &buf_weight, rows, cols, output_scale)
+            .unwrap();
+        matmul_f32_device(&ctx, &buf_input, &buf_weight, &buf_out, 1, rows, cols).unwrap();
+
+        let gpu_out = download_f32_buf(&ctx, &buf_out, rows, "test_readback").unwrap();
+        for (i, (g, c)) in gpu_out.iter().zip(cpu_out.iter()).enumerate() {
+            assert!(
+                (g - c).abs() < 1e-3,
+                "dequant→matmul chain mismatch at i={i}: gpu={g} cpu={c}",
+            );
+        }
+    }
+
+    fn cpu_dequant_nvfp4(
+        packed: &[u8],
+        scales: &[u8],
+        rows: usize,
+        cols: usize,
+        output_scale: f32,
+    ) -> Vec<f32> {
+        // Nibble → signed integer table (matches the WGSL
+        // `decode_nvfp4_nibble`; the NVFP4 0.5× tail factor lives inside
+        // `decode_ue4m3_half` instead, so the int table here MUST stay
+        // integer-valued — folding 0.5 in here would double-apply it).
+        let nvfp4: [f32; 16] = [
+            0.0,  1.0,  2.0,  3.0,  4.0,  6.0,  8.0,  12.0,
+            -0.0, -1.0, -2.0, -3.0, -4.0, -6.0, -8.0, -12.0,
+        ];
+        let mut out = vec![0.0_f32; rows * cols];
+        let block = 16;
+        for r in 0..rows {
+            for blk in 0..(cols / block) {
+                let scale_byte = scales[r * (cols / block) + blk] as u32;
+                // Decode UE4M3 half (matches `decode_ue4m3_half` in the WGSL):
+                // bit-7 sign ignored here, exponent biased -7, mantissa /8.
+                let masked = scale_byte & 0x7F;
+                let scale = if masked == 0 || masked == 0x7F {
+                    0.0
+                } else {
+                    let exp = ((masked >> 3) & 0x0F) as i32;
+                    let mant = (masked & 0x07) as f32;
+                    let raw = if exp == 0 {
+                        mant * (1.0 / 512.0)
+                    } else {
+                        (1.0 + mant * 0.125) * 2f32.powi(exp - 7)
+                    };
+                    raw * 0.5
+                };
+                for k in 0..block {
+                    let col = blk * block + k;
+                    let byte_idx = (r * cols + col) / 2;
+                    let nib = if (col & 1) == 0 {
+                        packed[byte_idx] & 0x0F
+                    } else {
+                        packed[byte_idx] >> 4
+                    };
+                    out[r * cols + col] = nvfp4[nib as usize] * scale * output_scale;
+                }
+            }
+        }
+        out
     }
 }

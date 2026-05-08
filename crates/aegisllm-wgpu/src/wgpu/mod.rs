@@ -11,8 +11,8 @@ pub use forward::{
     rms_norm_gpu, rope_gpu, swiglu_gpu,
 };
 pub use forward::{
-    alloc_storage, download_f32_buf, matmul_f32_device, residual_add_device, rms_norm_device,
-    swiglu_device, upload_f32_buf,
+    alloc_storage, dequant_nvfp4_device, download_f32_buf, embedding_device, matmul_f32_device,
+    residual_add_device, rms_norm_device, swiglu_device, upload_f32_buf, upload_padded_u8_buf,
 };
 pub use loader::WgpuContext;
 pub use provider::WgpuExecutorProvider;
