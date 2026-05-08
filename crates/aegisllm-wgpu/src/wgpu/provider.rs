@@ -223,20 +223,29 @@ impl GenerationBackendPrimitives for WgpuExecutorProvider {
                 "token_id {token_id} ≥ vocab {}", model.embed_tokens_rows
             )));
         }
-        // Read the row from the embedding buffer? No — the embedding
-        // is on the device. The cheapest correct path: dispatch the
-        // existing `embedding_device` shader. Done below.
-        super::forward::embedding_device(
-            &model.ctx,
+        // Embedding lookup: row `token_id` of embed_tokens →
+        // state.residual. We use a buffer-to-buffer copy instead of
+        // dispatching `embedding_device` because Vulkan caps storage-
+        // buffer BINDING size at 2 GiB even when the underlying buffer
+        // is larger. Real models (Gemma-4-26B has 262K vocab × 2816
+        // hidden = 2.95 GiB embedding) exceed this cap if bound whole.
+        // copy_buffer_to_buffer has no binding-size limit.
+        let row_bytes = (model.hidden_size * std::mem::size_of::<f32>()) as u64;
+        let src_offset = (token_id as u64) * row_bytes;
+        let mut enc = model
+            .ctx
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("wgpu_provider_embed_lookup"),
+            });
+        enc.copy_buffer_to_buffer(
             &model.embed_tokens,
-            // Bind dummy at slot 1 (shader ignores it). Reuse residual
-            // as the dummy since it's already bound for output anyway —
-            // wgpu accepts the same buffer at multiple slots.
+            src_offset,
             &st.residual,
-            &st.residual,
-            token_id as u32,
-            model.hidden_size,
-        )?;
+            0,
+            row_bytes,
+        );
+        model.ctx.queue().submit(std::iter::once(enc.finish()));
         let rope_fn = rope_for_layer_factory(self.rope_theta);
         forward_token_device(
             &model.ctx,

@@ -624,12 +624,37 @@ pub fn alloc_storage(ctx: &WgpuContext, byte_len: u64, label: &'static str) -> w
 
 /// Upload an f32 slice into a fresh storage buffer. Use for one-time weight
 /// uploads that will be read repeatedly across forward calls.
+///
+/// Uses `queue.write_buffer` (bounded staging belt, recycled per submit)
+/// rather than `create_buffer_init` (mapped_at_creation that pins host
+/// memory until the buffer is dropped) — critical for loading multi-GB
+/// model weights without OOM-ing the host. After every upload we issue
+/// a tiny no-op submit to flush the staging belt and let the driver
+/// release the temporary host backing.
 pub fn upload_f32_buf(ctx: &WgpuContext, data: &[f32], label: &'static str) -> wgpu::Buffer {
-    ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let byte_len = (data.len() * std::mem::size_of::<f32>()) as u64;
+    let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        contents: bytemuck::cast_slice(data),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-    })
+        size: byte_len.max(4),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !data.is_empty() {
+        ctx.queue.write_buffer(&buffer, 0, bytemuck::cast_slice(data));
+    }
+    flush_staging(ctx, label);
+    buffer
+}
+
+/// Flush queue.write_buffer's staging belt and wait for the upload to
+/// complete. Without this the staging-belt allocations remain pinned in
+/// host memory until the next "real" submit; for multi-GB model loads
+/// that's enough to OOM a 32 GiB host.
+fn flush_staging(ctx: &WgpuContext, _label: &'static str) {
+    ctx.queue.submit(std::iter::empty::<wgpu::CommandBuffer>());
+    ctx.device.poll(wgpu::Maintain::Wait);
 }
 
 /// Read back an f32 storage buffer to the host. Submits a copy-to-staging
@@ -755,19 +780,33 @@ pub fn scale_f32_device(
         scale,
     };
     let groups = ((len + 63) / 64) as u32;
-    // The shader uses bindings 0/1 as ignored read-only inputs and
-    // binding 2 as the in-place data — match this with the standard
-    // dispatcher by passing `data` as the "out" slot.
-    dispatch_three_storage_device(
-        ctx,
-        &ctx.scale_f32,
-        data, // bound at binding 0 (ignored by shader)
-        data, // bound at binding 1 (ignored by shader)
-        data, // bound at binding 2 (mutated)
-        bytemuck::bytes_of(&params),
-        (groups, 1, 1),
-        "scale_f32_device",
-    )
+    let uniform_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("scale_f32_uniform"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("scale_f32_bg"),
+        layout: &ctx.scale_f32.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: data.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: uniform_buf.as_entire_binding() },
+        ],
+    });
+    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("scale_f32_enc"),
+    });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("scale_f32_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&ctx.scale_f32.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(groups, 1, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc.finish()));
+    Ok(())
 }
 
 /// Device-resident per-row RMS norm: applies `weight[len]` to each of
@@ -891,7 +930,70 @@ pub fn residual_add_device(
 }
 
 /// Device-resident matmul: `C[M, N] = A[M, K] @ B^T[N, K]` (B stored row-major [N, K]).
+///
+/// Auto-tiles along the N dimension when binding the full B buffer
+/// would exceed Vulkan's `max_storage_buffer_binding_size` (typically
+/// 2 GiB on RTX 5070 Ti, even when `max_buffer_size` is much larger).
+/// Required for large lm_head / tied-embedding matmuls.
 pub fn matmul_f32_device(
+    ctx: &WgpuContext,
+    a: &wgpu::Buffer,
+    b: &wgpu::Buffer,
+    c: &wgpu::Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let max_bind = ctx.device.limits().max_storage_buffer_binding_size as u64;
+    let b_bytes = (n as u64) * (k as u64) * 4;
+    let c_bytes = (m as u64) * (n as u64) * 4;
+    if b_bytes <= max_bind && c_bytes <= max_bind {
+        return matmul_f32_device_untiled(ctx, a, b, c, m, n, k);
+    }
+    // Tile along N. Each tile reads `tile_n` rows of B and writes
+    // `tile_n` columns of C. For the lm_head case (M=1), C tiling is
+    // also along N, so the same `tile_n` works.
+    //
+    // Tile size: largest power of 2 such that
+    //   tile_n * k * 4 ≤ max_bind  AND  m * tile_n * 4 ≤ max_bind.
+    // We also align tile_n to keep the byte-offset 256-aligned (the
+    // wgpu min_storage_buffer_offset_alignment): tile_n * k * 4 must
+    // be 256-aligned, so tile_n must be a multiple of 256 / (k*4 mod 256).
+    let max_tile_b = (max_bind / (k as u64 * 4)) as usize;
+    let max_tile_c = if m == 0 { n } else { (max_bind / (m as u64 * 4)) as usize };
+    let mut tile_n = max_tile_b.min(max_tile_c).min(n);
+    // Round down to a multiple of 256-aligned step.
+    let row_bytes = k * 4;
+    let alignment = 256usize;
+    if row_bytes > 0 {
+        let step = if alignment % (row_bytes.max(1)) == 0 {
+            alignment / row_bytes.max(1)
+        } else {
+            // row_bytes ≥ 256 — every row already alignment-aligned.
+            1
+        };
+        if step > 1 {
+            tile_n = (tile_n / step) * step;
+        }
+    }
+    if tile_n == 0 {
+        return Err(AegisError::Unsupported(format!(
+            "matmul tile size collapsed to zero: m={m} n={n} k={k} max_bind={max_bind}"
+        )));
+    }
+    let mut start = 0;
+    while start < n {
+        let this_n = (n - start).min(tile_n);
+        // Run on a partial range of B and C using bind-group offsets.
+        run_matmul_partial(ctx, a, b, c, m, this_n, k, start, n)?;
+        start += this_n;
+    }
+    Ok(())
+}
+
+/// Untiled matmul: bind whole B, whole C. Caller has already
+/// verified the binding-size limits accommodate this.
+fn matmul_f32_device_untiled(
     ctx: &WgpuContext,
     a: &wgpu::Buffer,
     b: &wgpu::Buffer,
@@ -915,6 +1017,80 @@ pub fn matmul_f32_device(
     )
 }
 
+/// Run a matmul where B and C are bound with byte offsets so only
+/// `[start_n, start_n + this_n)` rows of B and columns of C are
+/// visible to the shader. The shader sees `n = this_n`, so its
+/// indexing into B and C is local to the bound range.
+#[allow(clippy::too_many_arguments)]
+fn run_matmul_partial(
+    ctx: &WgpuContext,
+    a: &wgpu::Buffer,
+    b: &wgpu::Buffer,
+    c: &wgpu::Buffer,
+    m: usize,
+    this_n: usize,
+    k: usize,
+    start_n: usize,
+    full_n: usize,
+) -> Result<()> {
+    let _ = full_n; // documents the caller's invariant; unused locally
+    let params = MatMulParams {
+        m: m as u32,
+        n: this_n as u32,
+        k: k as u32,
+        _pad: 0,
+    };
+    let uniform_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("matmul_partial_uniform"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let b_offset = (start_n * k * std::mem::size_of::<f32>()) as u64;
+    let b_size = (this_n * k * std::mem::size_of::<f32>()) as u64;
+    let c_offset = (start_n * std::mem::size_of::<f32>()) as u64; // m=1 implicit; for m>1 caller must accept that c is laid as N-major
+    let c_size = (m * this_n * std::mem::size_of::<f32>()) as u64;
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("matmul_partial_bg"),
+        layout: &ctx.matmul.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: b,
+                    offset: b_offset,
+                    size: std::num::NonZeroU64::new(b_size),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: c,
+                    offset: c_offset,
+                    size: std::num::NonZeroU64::new(c_size),
+                }),
+            },
+            wgpu::BindGroupEntry { binding: 3, resource: uniform_buf.as_entire_binding() },
+        ],
+    });
+    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("matmul_partial_enc"),
+    });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("matmul_partial_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&ctx.matmul.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        let groups_x = ((m + 7) / 8) as u32;
+        let groups_y = ((this_n + 7) / 8) as u32;
+        pass.dispatch_workgroups(groups_x, groups_y, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc.finish()));
+    Ok(())
+}
+
 /// Upload an arbitrary byte slice into a fresh `STORAGE` buffer, padding to
 /// u32 alignment so WGSL `array<u32>` reads are safe regardless of length.
 ///
@@ -927,21 +1103,39 @@ pub fn upload_padded_u8_buf(
     label: &'static str,
 ) -> wgpu::Buffer {
     let pad = (4 - bytes.len() % 4) % 4;
-    if pad == 0 {
-        return ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(label),
-            contents: bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-    }
-    let mut padded = Vec::with_capacity(bytes.len() + pad);
-    padded.extend_from_slice(bytes);
-    padded.extend(std::iter::repeat(0u8).take(pad));
-    ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+    let total_bytes = bytes.len() + pad;
+    let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        contents: &padded,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-    })
+        size: total_bytes.max(4) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !bytes.is_empty() {
+        // queue.write_buffer requires the write size to be a multiple of
+        // 4. Fast path: input is already aligned, write directly. Slow
+        // path (rare): pad in a small temporary buffer, write that.
+        if pad == 0 {
+            ctx.queue.write_buffer(&buffer, 0, bytes);
+        } else {
+            // Write the aligned prefix directly, then a single tiny
+            // padded block for the tail. This keeps the host-side
+            // temporary at exactly `pad` bytes (≤ 3) instead of
+            // duplicating the entire input.
+            let aligned_len = bytes.len() & !3;
+            if aligned_len > 0 {
+                ctx.queue.write_buffer(&buffer, 0, &bytes[..aligned_len]);
+            }
+            let mut tail = [0u8; 4];
+            for (i, &b) in bytes[aligned_len..].iter().enumerate() {
+                tail[i] = b;
+            }
+            ctx.queue.write_buffer(&buffer, aligned_len as u64, &tail);
+        }
+    }
+    flush_staging(ctx, label);
+    buffer
 }
 
 /// Device-resident NVFP4 dequant: `out[rows, cols]` ← (packed nibbles, UE4M3 scales).

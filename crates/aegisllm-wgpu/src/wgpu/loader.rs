@@ -67,11 +67,26 @@ impl WgpuContext {
             AegisError::Unsupported("no wgpu adapter available".into())
         })?;
 
+        // Bump buffer-size + storage-buffer-binding limits to handle
+        // large model weights (Gemma-4-26B's embedding table is ~2.95 GiB,
+        // routed expert weights ~5 MiB each but vocab is the gating
+        // factor). The downlevel default of 256 MiB max buffer would
+        // reject the embedding buffer; we ask for whatever the adapter
+        // supports up to ~8 GiB.
+        let adapter_limits = adapter.limits();
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        required_limits.max_buffer_size = adapter_limits.max_buffer_size;
+        required_limits.max_storage_buffer_binding_size =
+            adapter_limits.max_storage_buffer_binding_size;
+        required_limits.max_storage_buffers_per_shader_stage = adapter_limits
+            .max_storage_buffers_per_shader_stage
+            .max(required_limits.max_storage_buffers_per_shader_stage);
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("aegis-wgpu"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::default(),
             },
             None,
@@ -92,10 +107,40 @@ impl WgpuContext {
             &standard_4_layout,
             "rms_norm_batched",
         );
+        // scale_f32 uses a custom 2-binding layout (rw storage + uniform)
+        // because the shader writes in place; the standard 4-binding
+        // dispatcher would bind the data buffer at both a read-only and
+        // a read-write slot, which wgpu's validation layer rejects as
+        // conflicting usage.
+        let scale_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scale_f32_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
         let scale_f32 = build_kernel(
             &device,
             include_str!("shaders/scale_f32.wgsl"),
-            &standard_4_layout,
+            &scale_layout,
             "scale_f32",
         );
         let swiglu = build_kernel(

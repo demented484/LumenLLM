@@ -336,6 +336,7 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
         vocab_size: s.vocab,
         rms_norm_eps: s.eps,
         embed_scale: None,
+        lm_head_tied: false,
     };
 
     // ── Build model state ─────────────────────────────────────────────

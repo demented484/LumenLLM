@@ -1000,16 +1000,31 @@ where
         model.hidden_size,
         rms_norm_eps,
     )?;
-    matmul_with_optional_dequant(
-        ctx,
-        model_state,
-        &model_state.final_normed,
-        &model.lm_head,
-        &model_state.logits,
-        1,
-        model.vocab_size,
-        model.hidden_size,
-    )?;
+    if model.lm_head_tied {
+        // Tied embeddings: lm_head reuses the embedding table directly.
+        // matmul_f32_device auto-tiles when the embedding buffer
+        // exceeds the storage-buffer binding limit (2 GiB on Vulkan).
+        matmul_f32_device(
+            ctx,
+            &model_state.final_normed,
+            &model.embed_tokens,
+            &model_state.logits,
+            1,
+            model.vocab_size,
+            model.hidden_size,
+        )?;
+    } else {
+        matmul_with_optional_dequant(
+            ctx,
+            model_state,
+            &model_state.final_normed,
+            &model.lm_head,
+            &model_state.logits,
+            1,
+            model.vocab_size,
+            model.hidden_size,
+        )?;
+    }
     model_state.position += 1;
     Ok(())
 }

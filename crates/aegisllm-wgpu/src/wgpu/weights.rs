@@ -260,6 +260,12 @@ pub struct WgpuModel {
     /// Gemma-4: scalar multiplier applied to embeddings after lookup
     /// (`sqrt(hidden_size)` for Gemma-4). `None` for vanilla Llama.
     pub embed_scale: Option<f32>,
+    /// True when `lm_head.weight` is absent and the lm_head matmul
+    /// should reuse the embedding table directly (tie_word_embeddings).
+    /// Saves N GiB of VRAM for large vocab models. When `true`,
+    /// `lm_head` is a placeholder and the forward path uses
+    /// `embed_tokens` for the final matmul.
+    pub lm_head_tied: bool,
 }
 
 impl std::fmt::Debug for WgpuModel {
@@ -555,6 +561,7 @@ pub fn load_vanilla_llama_model(
         rms_norm_eps: shape.rms_norm_eps,
         // Vanilla Llama doesn't scale embeddings.
         embed_scale: None,
+        lm_head_tied: false,
     })
 }
 
@@ -670,7 +677,26 @@ pub fn load_gemma4_model(
     })?;
     let embed_rows = embed_info.shape[0];
     let embed_cols = embed_info.shape[1];
+    if std::env::var("AEGIS_WGPU_TRACE").is_ok() {
+        eprintln!(
+            "[g4-loader] cfg: hidden={} inter={} num_q={} num_kv={} head_dim={} vocab={} \
+             num_layers={} num_experts={} top_k={} text_prefix={}",
+            hidden, intermediate, num_q_heads, num_kv_heads, model_head_dim, vocab,
+            num_layers, num_experts, top_k, text_prefix
+        );
+        eprintln!(
+            "[g4-loader] embed tensor `{embed_name}` shape={:?} bytes={}",
+            embed_info.shape,
+            embed_info.data_len_bytes()
+        );
+    }
     let embed_buf = load_dense_as_f32(&ctx, &mut loader, artifact, &embed_name, "g4_embed")?;
+    if std::env::var("AEGIS_WGPU_TRACE").is_ok() {
+        eprintln!(
+            "[g4-loader] embed buffer size after upload = {} bytes",
+            embed_buf.size()
+        );
+    }
     let final_norm = load_dense_as_f32(
         &ctx,
         &mut loader,
@@ -678,12 +704,23 @@ pub fn load_gemma4_model(
         &format!("{text_prefix}norm.weight"),
         "g4_final_norm",
     )?;
-    let lm_head_name = if artifact.tensors.tensors.contains_key("lm_head.weight") {
-        "lm_head.weight".to_string()
+    let lm_head_present = artifact.tensors.tensors.contains_key("lm_head.weight");
+    let (lm_head, lm_head_tied) = if lm_head_present {
+        (load_linear(&ctx, &mut loader, artifact, "lm_head.weight", "g4_lm_head")?, false)
     } else {
-        embed_name.clone()
+        // Tied: lm_head reuses the embedding table at forward time.
+        // Construct a placeholder Dense linear pointing at a tiny dummy
+        // buffer (forward path checks `lm_head_tied` before reading
+        // this). Prevents allocating a 2.95 GiB duplicate of embed.
+        (
+            WgpuLinear::Dense {
+                weight: upload_f32_buf(&ctx, &[0.0_f32], "g4_lm_head_tied_placeholder"),
+                rows: embed_rows,
+                cols: embed_cols,
+            },
+            true,
+        )
     };
-    let lm_head = load_linear(&ctx, &mut loader, artifact, &lm_head_name, "g4_lm_head")?;
 
     // V-norm unit buffer: an all-ones vector sized to the LARGEST head_dim
     // any layer uses (typically Gemma-4 global head_dim=512). One buffer
@@ -978,6 +1015,7 @@ pub fn load_gemma4_model(
         rms_norm_eps,
         // Gemma-4 ScaledWordEmbedding: out = embed_lookup * sqrt(hidden_size).
         embed_scale: Some((hidden as f32).sqrt()),
+        lm_head_tied,
     })
 }
 
