@@ -870,6 +870,278 @@ extern "C" __global__ void aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big(
 }
 
 // =============================================================================
+// Grouped MoE NVFP4 GEMM with BF16 WMMA inner — 64×64 tile + cp.async pipelined
+// B — Phase B.4 Round 5.
+//
+// Numerical-twin of `aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big`.
+// Mirrors the cp.async pipelining strategy already used by
+// `_t32_pipeline` (Round 3), but applied to the 64×64 / 8-warp output-tile
+// kernel from Round 4. Pipelines ONLY the input tile (B); the NVFP4 weight
+// dequant path is left synchronous (its dequant is the longer per-iter
+// critical path; reordering it could perturb numerics).
+//
+// Per-K-iter:
+//   * Synchronous A: dequant 64×16 NVFP4 weight tile → bf16 in `sh_a` (same
+//     code as the synchronous BIG kernel, byte-for-byte).
+//   * cp.async B[k+1] (if any) into the next double-buffer slot, commit, then
+//     `cp.async.wait_group<1>` so B[k] is ready while B[k+1] is in flight.
+//   * Cast f32 → bf16 from the staging double-buffer slot for buf_cur into
+//     `sh_b` (per-element __float2bfloat16 — same op the synchronous BIG
+//     kernel applies to its global-loaded f32, so the resulting bf16 is
+//     bit-identical at the per-element level).
+//   * 8-warp / 4×2 / 2-c_frag mma sequence (identical to the BIG kernel).
+//
+// Tile/launch shape:
+//   * Grid : (ceil(rows/64), ceil(max_tokens_per_active/64), num_active_experts)
+//   * Block: 256 threads (8 warps) — same as BIG.
+//   * Eligibility: rows%64==0 AND max_tokens_per_expert>=64 (matches BIG).
+//
+// cp.async layout (B-tile is 64 rows × 16 cols × 4 bytes = 4096 bytes):
+//   * 256 threads × 16-byte chunk per thread → 4096 bytes / iter — full
+//     bandwidth utilization, no thread idle.
+//   * n_load       = tid / 4   (0..63)
+//   * k_chunk_load = tid % 4   (0..3)
+//   * k_start_load = k_chunk * 4 → {0,4,8,12}
+//   * Each thread issues exactly one cp.async.ca.shared.global of 16 bytes
+//     per (k_tile, buffer) pair.
+//
+// Shared memory budget:
+//   * sh_a (bf16):     64 * 16 * 2 = 2 KiB
+//   * sh_b (bf16):     64 * 16 * 2 = 2 KiB
+//   * sh_c (f32):     64 * 64 * 4 = 16 KiB
+//   * sh_b_raw (f32): 2 * 64 * 16 * 4 = 8 KiB  (double-buffer)
+//   * Total ≈ 28 KiB. Well under sm_120's 100 KiB cap. Static shared, so no
+//     `cudaFuncSetAttribute` needed.
+//
+// Numerical correctness vs. synchronous BIG:
+//   * cp.async copies raw f32 bytes from `permuted_input` to `sh_b_raw` —
+//     identical f32 values to what the synchronous load reads.
+//   * The cast to bf16 happens via the same per-element `__float2bfloat16`
+//     op as the synchronous BIG kernel uses on its global-loaded f32, so
+//     `sh_b` bytes match bit-for-bit.
+//   * `mma.sync` operand pairing per K-iter is identical → c_frag is
+//     bit-identical to the synchronous BIG kernel at every iter.
+//
+// Requires sm_80+ for cp.async (Blackwell sm_120 supported).
+// =============================================================================
+extern "C" __global__ void aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big_pipeline(
+    const unsigned char* __restrict__ packed_base,
+    const unsigned char* __restrict__ scales_base,
+    const unsigned int*  __restrict__ packed_offsets,        // [num_active_experts]
+    const unsigned int*  __restrict__ scales_offsets,        // [num_active_experts]
+    const float*         __restrict__ output_scales,          // [num_active_experts]
+    const unsigned int*  __restrict__ expert_token_offsets,   // [num_active_experts + 1]
+    const float*         __restrict__ permuted_input,         // [total_tokens, cols]
+    const unsigned int rows,
+    const unsigned int cols,
+    float*               __restrict__ permuted_output         // [total_tokens, rows]
+) {
+    using namespace nvcuda;
+    constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
+    constexpr int TILE_M = 64, TILE_N = 64;          // block output tile
+    constexpr unsigned int WARPS_M = 4u;             // row-warps
+    constexpr unsigned int WARPS_N = 2u;             // col-warps
+    constexpr unsigned int WARPS_PER_BLOCK = WARPS_M * WARPS_N;  // 8
+    constexpr unsigned int N_FRAGS_PER_WARP = 2u;
+    constexpr unsigned int BLOCK_THREADS = WARPS_PER_BLOCK * 32u;  // 256
+
+    const unsigned int active_e = blockIdx.z;
+    const unsigned int tok_start = expert_token_offsets[active_e];
+    const unsigned int tok_end   = expert_token_offsets[active_e + 1];
+    const unsigned int tok_count = tok_end - tok_start;
+
+    const unsigned int tile_row = blockIdx.x * (unsigned int)TILE_M;
+    const unsigned int tile_col_in_expert = blockIdx.y * (unsigned int)TILE_N;
+
+    if (tile_row >= rows) return;
+    if (tile_col_in_expert >= tok_count) return;
+
+    const unsigned int tid     = threadIdx.x;        // 0..255
+    const unsigned int warp_id = tid >> 5;            // 0..7
+    const unsigned int warp_row = warp_id >> 1;       // 0..3
+    const unsigned int warp_col = warp_id & 1u;       // 0..1
+
+    const unsigned char* packed = packed_base + (size_t)packed_offsets[active_e];
+    const unsigned char* scales = scales_base + (size_t)scales_offsets[active_e];
+    const float output_scale = output_scales[active_e];
+
+    __shared__ __nv_bfloat16 sh_a[TILE_M * WMMA_K];   // 2 KiB
+    __shared__ __nv_bfloat16 sh_b[TILE_N * WMMA_K];   // 2 KiB
+    __shared__ float          sh_c[TILE_M * TILE_N];  // 16 KiB
+    // Double-buffered f32 staging for the input tile, populated via cp.async.
+    __shared__ float          sh_b_raw[2][TILE_N * WMMA_K];  // 8 KiB
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> b_frag[N_FRAGS_PER_WARP];
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag[N_FRAGS_PER_WARP];
+    #pragma unroll
+    for (unsigned int j = 0u; j < N_FRAGS_PER_WARP; ++j) {
+        wmma::fill_fragment(c_frag[j], 0.0f);
+    }
+
+    const unsigned int packed_cols = cols / 2u;
+    const unsigned int scale_cols  = cols / 16u;
+
+    constexpr unsigned int A_ELEMS = (unsigned)(TILE_M * WMMA_K);  // 1024
+    constexpr unsigned int B_ELEMS = (unsigned)(TILE_N * WMMA_K);  // 1024
+
+    // cp.async chunking: 256 threads × 16B = 4096B = full B-tile.
+    //   chunk_id = tid (0..255)
+    //   n_load   = tid / 4   (0..63)
+    //   k_chunk  = tid % 4   (0..3) → k_start = k_chunk * 4 ∈ {0,4,8,12}
+    const unsigned int n_load       = tid >> 2;
+    const unsigned int k_chunk_load = tid & 3u;
+    const unsigned int k_start_load = k_chunk_load * 4u;
+
+#if __CUDA_ARCH__ >= 800
+    auto issue_b_prefetch = [&] (unsigned int k_tile_arg, unsigned int buf_idx) {
+        const unsigned int batch_in_e = tile_col_in_expert + n_load;
+        float* dst = &sh_b_raw[buf_idx][n_load * (unsigned int)WMMA_K + k_start_load];
+        unsigned int dst_smem;
+        asm volatile("{ .reg .u64 smem64;\n\t"
+                     "  cvta.to.shared.u64 smem64, %1;\n\t"
+                     "  cvt.u32.u64 %0, smem64; }\n"
+                     : "=r"(dst_smem) : "l"((const void*)dst));
+        if (batch_in_e < tok_count) {
+            const unsigned int token_g = tok_start + batch_in_e;
+            const unsigned int col_g   = k_tile_arg + k_start_load;
+            const float* src = permuted_input + (size_t)token_g * cols + col_g;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                         :: "r"(dst_smem), "l"(src));
+        } else {
+            // OOB row: src_size=0 → zero-fills shared without dereferencing.
+            const float* src = permuted_input;
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16, 0;\n"
+                         :: "r"(dst_smem), "l"(src));
+        }
+    };
+
+    auto cp_async_commit = [] () {
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    auto cp_async_wait_lt1 = [] () {
+        asm volatile("cp.async.wait_group 1;\n" ::);
+    };
+    auto cp_async_wait_lt0 = [] () {
+        asm volatile("cp.async.wait_group 0;\n" ::);
+    };
+#endif
+
+    const unsigned int N_KITERS = cols / (unsigned int)WMMA_K;
+
+#if __CUDA_ARCH__ >= 800
+    // Prologue: issue B[0] prefetch into buffer 0, commit as group 0.
+    if (N_KITERS > 0u) {
+        issue_b_prefetch(0u, 0u);
+        cp_async_commit();
+    }
+#endif
+
+    for (unsigned int k_idx = 0u; k_idx < N_KITERS; ++k_idx) {
+        const unsigned int k_tile  = k_idx * (unsigned int)WMMA_K;
+        const unsigned int buf_cur = k_idx & 1u;
+        const unsigned int buf_nxt = buf_cur ^ 1u;
+
+        // ------ A weight tile (synchronous, identical to BIG kernel). ------
+        // 1024 elements / 256 threads = 4 elements per thread.
+        for (unsigned int e = tid; e < A_ELEMS; e += BLOCK_THREADS) {
+            const unsigned int m = e / (unsigned int)WMMA_K;
+            const unsigned int k = e % (unsigned int)WMMA_K;
+            const unsigned int row_g = tile_row + m;
+            const unsigned int col_g = k_tile + k;
+            float v = 0.0f;
+            if (row_g < rows && col_g < cols) {
+                const size_t packed_idx = (size_t)row_g * packed_cols + (size_t)(col_g / 2u);
+                const unsigned int byte = packed[packed_idx];
+                const unsigned int nibble = (col_g & 1u) ? (byte >> 4u) : (byte & 0x0Fu);
+                const size_t scale_idx = (size_t)row_g * scale_cols + (size_t)(col_g / 16u);
+                const float blk_scale = decode_ue4m3_half(scales[scale_idx]);
+                v = (float)decode_nvfp4_nibble(nibble) * blk_scale;
+            }
+            sh_a[m * (unsigned int)WMMA_K + k] = __float2bfloat16(v);
+        }
+
+#if __CUDA_ARCH__ >= 800
+        // Issue B[k+1] prefetch into the next buffer (if it exists), then
+        // commit. After this we have either 1 or 2 outstanding cp.async groups.
+        if (k_idx + 1u < N_KITERS) {
+            issue_b_prefetch((k_idx + 1u) * (unsigned int)WMMA_K, buf_nxt);
+            cp_async_commit();
+            // 2 outstanding groups; wait until ≤1 remain → B[k] is ready.
+            cp_async_wait_lt1();
+        } else {
+            // 1 outstanding group (B[k] only); wait until 0 remain.
+            cp_async_wait_lt0();
+        }
+        __syncthreads();
+
+        // Cast f32 → bf16 from the staging buffer into the bf16 sh_b that
+        // wmma::load_matrix_sync reads. Per-element __float2bfloat16 — same
+        // operation as the BIG kernel uses on its global-loaded f32, so the
+        // resulting bf16 is bit-identical.
+        // 1024 elems / 256 threads = 4 elems/thread.
+        for (unsigned int e = tid; e < B_ELEMS; e += BLOCK_THREADS) {
+            sh_b[e] = __float2bfloat16(sh_b_raw[buf_cur][e]);
+        }
+        __syncthreads();
+#else
+        // Fallback for pre-sm_80: synchronous load of B (matches BIG exactly).
+        for (unsigned int e = tid; e < B_ELEMS; e += BLOCK_THREADS) {
+            const unsigned int n = e / (unsigned int)WMMA_K;
+            const unsigned int k = e % (unsigned int)WMMA_K;
+            const unsigned int batch_in_e = tile_col_in_expert + n;
+            const unsigned int col_g      = k_tile + k;
+            float v = 0.0f;
+            if (batch_in_e < tok_count && col_g < cols) {
+                const unsigned int token_g = tok_start + batch_in_e;
+                v = permuted_input[(size_t)token_g * cols + col_g];
+            }
+            sh_b[n * (unsigned int)WMMA_K + k] = __float2bfloat16(v);
+        }
+        __syncthreads();
+#endif
+
+        // ------ WMMA mma_sync (identical to BIG kernel). ------
+        const __nv_bfloat16* a_base = sh_a + (warp_row * (unsigned int)WMMA_M) * (unsigned int)WMMA_K;
+        wmma::load_matrix_sync(a_frag, a_base, WMMA_K);
+        #pragma unroll
+        for (unsigned int j = 0u; j < N_FRAGS_PER_WARP; ++j) {
+            const unsigned int sub_col = warp_col * N_FRAGS_PER_WARP + j;
+            const __nv_bfloat16* b_base = sh_b + (sub_col * (unsigned int)WMMA_N) * (unsigned int)WMMA_K;
+            wmma::load_matrix_sync(b_frag[j], b_base, WMMA_K);
+            wmma::mma_sync(c_frag[j], a_frag, b_frag[j], c_frag[j]);
+        }
+        __syncthreads();
+    }
+
+    // Store each warp's 2 c_frags into sh_c at their respective sub-tile positions.
+    #pragma unroll
+    for (unsigned int j = 0u; j < N_FRAGS_PER_WARP; ++j) {
+        const unsigned int sub_col = warp_col * N_FRAGS_PER_WARP + j;
+        float* c_base = sh_c
+            + (warp_row * (unsigned int)WMMA_M) * (unsigned int)TILE_N
+            + (sub_col  * (unsigned int)WMMA_N);
+        wmma::store_matrix_sync(c_base, c_frag[j], TILE_N, wmma::mem_row_major);
+    }
+    __syncthreads();
+
+    // Cooperative strided write of 64×64 fp32 staging buffer to global with
+    // output-scale and boundary masking. 4096 elems / 256 threads = 16/thread.
+    constexpr unsigned int C_ELEMS = (unsigned)(TILE_M * TILE_N);
+    for (unsigned int e = tid; e < C_ELEMS; e += BLOCK_THREADS) {
+        const unsigned int m = e / (unsigned int)TILE_N;
+        const unsigned int n = e % (unsigned int)TILE_N;
+        const unsigned int row_g     = tile_row + m;
+        const unsigned int batch_in_e = tile_col_in_expert + n;
+        if (row_g < rows && batch_in_e < tok_count) {
+            const unsigned int token_g = tok_start + batch_in_e;
+            permuted_output[(size_t)token_g * rows + row_g] =
+                sh_c[m * (unsigned int)TILE_N + n] * output_scale;
+        }
+    }
+}
+
+// =============================================================================
 // Grouped MoE NVFP4 GEMM with BF16 WMMA inner — t32 + cp.async pipelined B —
 // Phase B.4 Round 3.
 //

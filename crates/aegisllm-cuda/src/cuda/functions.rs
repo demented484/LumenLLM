@@ -46,6 +46,10 @@ pub(crate) struct CudaKernelFunctions {
     //    AEGIS_NVFP4_GROUPED_T32_BIG_ENABLE=1. 8 warps, 4×2 warp grid, 2 c_frags
     //    per warp. Eligibility: rows%64==0 AND max_tokens_per_expert>=64. ──
     pub(crate) nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big: CudaFunction,
+    // ── MoE/NVFP4 64×64 output-tile + cp.async pipelined B (Phase B.4 Round 5).
+    //    Opt-in via AEGIS_NVFP4_GROUPED_T32_BIG_PIPELINE=1. Same eligibility
+    //    as `_t32_big`; pipelines B-tile load via cp.async double-buffer. ──
+    pub(crate) nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big_pipeline: CudaFunction,
     pub(crate) nvfp4_quantize_input: CudaFunction,
     pub(crate) nvfp4_quantize_input_batched: CudaFunction,
     pub(crate) bf16_matvec: CudaFunction,
@@ -222,6 +226,11 @@ impl CudaKernelFunctions {
             nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big: load(
                 &module,
                 "aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big",
+            )?,
+            // ── MoE/NVFP4 64×64 output-tile + cp.async B-pipeline (Phase B.4 Round 5). ──
+            nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big_pipeline: load(
+                &module,
+                "aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big_pipeline",
             )?,
             nvfp4_quantize_input: load(&module, "aegis_nvfp4_quantize_input")?,
             nvfp4_quantize_input_batched: load(&module, "aegis_nvfp4_quantize_input_batched")?,

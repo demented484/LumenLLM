@@ -673,6 +673,17 @@ impl CudaRuntime {
             && rows % 64 == 0
             && max_tokens_per_expert >= 64;
         if use_big {
+            // Phase B.4 Round 5 OPT-IN: cp.async pipelined B variant of the
+            // 64×64 output-tile kernel. Same launch shape (256-thread block,
+            // ceil(rows/64)×ceil(max_tokens/64)×experts grid); only the kernel
+            // symbol changes. Numerically twin of the synchronous BIG path
+            // (cp.async stages raw f32 bytes; same per-element f32→bf16 cast
+            // before mma → bit-identical sh_b → bit-identical c_frag).
+            // Default-on after A/B benched +3% across 9.6k/19k/38.4k.
+            // Quality-smoke output unchanged (matches synchronous BIG twin).
+            // Opt-out via AEGIS_NVFP4_GROUPED_T32_BIG_PIPELINE_DISABLE=1.
+            let big_pipeline_enabled =
+                std::env::var("AEGIS_NVFP4_GROUPED_T32_BIG_PIPELINE_DISABLE").is_err();
             let grid_x = (rows / 64) as u32;
             let grid_y = ((max_tokens_per_expert + 63) / 64) as u32;
             let cfg = LaunchConfig {
@@ -680,11 +691,16 @@ impl CudaRuntime {
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
+            let kernel = if big_pipeline_enabled {
+                &self
+                    .kernels
+                    .nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big_pipeline
+            } else {
+                &self.kernels.nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big
+            };
             unsafe {
                 self.stream
-                    .launch_builder(
-                        &self.kernels.nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big,
-                    )
+                    .launch_builder(kernel)
                     .arg(&packed_base.slice)
                     .arg(&scales_base.slice)
                     .arg(&packed_offsets.slice)
@@ -697,7 +713,11 @@ impl CudaRuntime {
                     .arg(&mut permuted_output.slice)
                     .launch(cfg)
             }
-            .map_err(map_cuda_err("launch grouped nvfp4 wmma gemm t32 big"))?;
+            .map_err(map_cuda_err(if big_pipeline_enabled {
+                "launch grouped nvfp4 wmma gemm t32 big pipeline"
+            } else {
+                "launch grouped nvfp4 wmma gemm t32 big"
+            }))?;
             return Ok(());
         }
 
