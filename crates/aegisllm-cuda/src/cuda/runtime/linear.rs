@@ -716,6 +716,120 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Phase B.4 Round 2: fused gate+up grouped NVFP4 GEMM. Dispatches one
+    /// kernel that computes BOTH gate and up projections sharing the input
+    /// tile, halving kernel launches and in-kernel input-tile global loads.
+    /// Eligibility: same as the t32 path (rows%32==0, max_tokens_per_expert
+    /// >= 16). Falls back to two sequential standalone calls when ineligible
+    /// or when AEGIS_NVFP4_GROUPED_DUAL_DISABLE=1.
+    ///
+    /// Numerical correctness: each warp's f32 accumulator is bit-identical to
+    /// the standalone t32 path — same mma.sync operands per K-iter, same
+    /// per-element BF16 cast order, identical accumulation order. Verify
+    /// with AEGIS_NVFP4_GROUPED_DUAL_DISABLE=1 to A/B against the unfused
+    /// path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_nvfp4_grouped_prequant_wmma_bf16_dual_device(
+        &self,
+        packed_base_gate: &DeviceBuffer<u8>,
+        scales_base_gate: &DeviceBuffer<u8>,
+        packed_offsets_gate: &DeviceBuffer<u32>,
+        scales_offsets_gate: &DeviceBuffer<u32>,
+        output_scales_gate: &DeviceBuffer<f32>,
+        packed_base_up: &DeviceBuffer<u8>,
+        scales_base_up: &DeviceBuffer<u8>,
+        packed_offsets_up: &DeviceBuffer<u32>,
+        scales_offsets_up: &DeviceBuffer<u32>,
+        output_scales_up: &DeviceBuffer<f32>,
+        expert_token_offsets: &DeviceBuffer<u32>,
+        permuted_input: &DeviceBuffer<f32>,
+        rows: usize,
+        cols: usize,
+        max_tokens_per_expert: usize,
+        num_active_experts: usize,
+        permuted_output_gate: &mut DeviceBuffer<f32>,
+        permuted_output_up: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if num_active_experts == 0 || max_tokens_per_expert == 0 {
+            return Ok(());
+        }
+        if rows % 16 != 0 || cols % 16 != 0 {
+            return Err(AegisError::InvalidPlan(format!(
+                "grouped wmma gemm dual requires rows%16==0 and cols%16==0, got rows={} cols={}",
+                rows, cols,
+            )));
+        }
+        let rows_u32 = u32_arg("rows", rows)?;
+        let cols_u32 = u32_arg("cols", cols)?;
+        let grid_z = u32_arg("num_active_experts", num_active_experts)?;
+
+        // Eligibility for the fused 32x32-output-tile dual kernel: rows%32==0
+        // and max_tokens_per_expert>=16 (matching the t32 path). Fall back
+        // to two standalone calls otherwise.
+        //
+        // OPT-IN (AEGIS_NVFP4_GROUPED_DUAL_ENABLE=1): empirically the fused
+        // kernel regressed prefill ~5% at 9.6k tokens because (a) shared-mem
+        // doubles to ~11 KiB lowering occupancy and (b) fusing serialises
+        // gate/up dispatches that previously overlapped via H2D streaming.
+        // Kept in-tree opt-in for future tuning (cp.async pipelining or
+        // smaller shmem footprint may flip the win).
+        let dual_enabled = std::env::var("AEGIS_NVFP4_GROUPED_DUAL_ENABLE").is_ok();
+        let dual_eligible = dual_enabled
+            && rows % 32 == 0
+            && max_tokens_per_expert >= 16
+            && std::env::var("AEGIS_NVFP4_GROUPED_T32_DISABLE").is_err();
+        if dual_eligible {
+            let grid_x = (rows / 32) as u32;
+            let grid_y = ((max_tokens_per_expert + 31) / 32) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_x, grid_y, grid_z),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_grouped_prequant_gemm_wmma_bf16_t32_dual)
+                    .arg(&packed_base_gate.slice)
+                    .arg(&scales_base_gate.slice)
+                    .arg(&packed_offsets_gate.slice)
+                    .arg(&scales_offsets_gate.slice)
+                    .arg(&output_scales_gate.slice)
+                    .arg(&packed_base_up.slice)
+                    .arg(&scales_base_up.slice)
+                    .arg(&packed_offsets_up.slice)
+                    .arg(&scales_offsets_up.slice)
+                    .arg(&output_scales_up.slice)
+                    .arg(&expert_token_offsets.slice)
+                    .arg(&permuted_input.slice)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&mut permuted_output_gate.slice)
+                    .arg(&mut permuted_output_up.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch grouped nvfp4 wmma gemm t32 dual"))?;
+            return Ok(());
+        }
+
+        // Fallback: two sequential standalone calls. Each call goes through
+        // the standard dispatcher and picks t32 or 16x16 per its own rules.
+        self.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+            packed_base_gate, scales_base_gate,
+            packed_offsets_gate, scales_offsets_gate, output_scales_gate,
+            expert_token_offsets, permuted_input,
+            rows, cols, max_tokens_per_expert, num_active_experts,
+            permuted_output_gate,
+        )?;
+        self.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+            packed_base_up, scales_base_up,
+            packed_offsets_up, scales_offsets_up, output_scales_up,
+            expert_token_offsets, permuted_input,
+            rows, cols, max_tokens_per_expert, num_active_experts,
+            permuted_output_up,
+        )?;
+        Ok(())
+    }
+
     pub fn matvec_nvfp4_prequantized_batched_device(
         &self,
         linear: &DeviceNvfp4Linear,

@@ -629,32 +629,58 @@ fn forward_moe_grouped_routed_experts(
         &mut moe_scratch.bulk_slots[2].bulk_output_scales,
     )?;
 
-    // ── Gate projection (input: permuted_input → output: permuted_intermediate) ──
-    runtime.compute_wait_event(&gate_event)?;
-    {
-        let slot = &moe_scratch.bulk_slots[0];
-        runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
-            &slot.bulk_packed, &slot.bulk_scales,
-            &slot.bulk_packed_offsets, &slot.bulk_scales_offsets,
-            &slot.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+    // ── Phase B.4 Round 2: fused gate+up grouped GEMM (opt-in via
+    //   AEGIS_NVFP4_GROUPED_DUAL_ENABLE=1). Default-off: empirical bench
+    //   regressed -5% at 9.6k because (a) shared-mem doubles → lower
+    //   occupancy, and (b) fusing waits for both H2Ds before launch,
+    //   killing the gate_GEMM || up_H2D overlap. Kept in-tree for future
+    //   tuning (cp.async + smaller shmem may flip the win). ──
+    let dual_enabled = std::env::var("AEGIS_NVFP4_GROUPED_DUAL_ENABLE").is_ok();
+    if dual_enabled {
+        runtime.compute_wait_event(&gate_event)?;
+        runtime.compute_wait_event(&up_event)?;
+        let (slots_lo, slots_hi) = moe_scratch.bulk_slots.split_at(1);
+        let slot_gate = &slots_lo[0];
+        let slot_up   = &slots_hi[0];
+        runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_dual_device(
+            &slot_gate.bulk_packed, &slot_gate.bulk_scales,
+            &slot_gate.bulk_packed_offsets, &slot_gate.bulk_scales_offsets,
+            &slot_gate.bulk_output_scales,
+            &slot_up.bulk_packed, &slot_up.bulk_scales,
+            &slot_up.bulk_packed_offsets, &slot_up.bulk_scales_offsets,
+            &slot_up.bulk_output_scales,
+            &moe_scratch.bulk_token_offsets,
             &moe_scratch.permuted_input,
             exp_intermediate, exp_cols_in, max_tokens_per_active, num_active,
             &mut moe_scratch.permuted_intermediate,
-        )?;
-    }
-
-    // ── Up projection (input: permuted_input → output: permuted_swiglu) ──
-    runtime.compute_wait_event(&up_event)?;
-    {
-        let slot = &moe_scratch.bulk_slots[1];
-        runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
-            &slot.bulk_packed, &slot.bulk_scales,
-            &slot.bulk_packed_offsets, &slot.bulk_scales_offsets,
-            &slot.bulk_output_scales, &moe_scratch.bulk_token_offsets,
-            &moe_scratch.permuted_input,
-            exp_intermediate, exp_cols_in, max_tokens_per_active, num_active,
             &mut moe_scratch.permuted_swiglu,
         )?;
+    } else {
+        // Default: gate first, then up. up_H2D overlaps gate_GEMM.
+        runtime.compute_wait_event(&gate_event)?;
+        {
+            let slot = &moe_scratch.bulk_slots[0];
+            runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+                &slot.bulk_packed, &slot.bulk_scales,
+                &slot.bulk_packed_offsets, &slot.bulk_scales_offsets,
+                &slot.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+                &moe_scratch.permuted_input,
+                exp_intermediate, exp_cols_in, max_tokens_per_active, num_active,
+                &mut moe_scratch.permuted_intermediate,
+            )?;
+        }
+        runtime.compute_wait_event(&up_event)?;
+        {
+            let slot = &moe_scratch.bulk_slots[1];
+            runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+                &slot.bulk_packed, &slot.bulk_scales,
+                &slot.bulk_packed_offsets, &slot.bulk_scales_offsets,
+                &slot.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+                &moe_scratch.permuted_input,
+                exp_intermediate, exp_cols_in, max_tokens_per_active, num_active,
+                &mut moe_scratch.permuted_swiglu,
+            )?;
+        }
     }
 
     // GeGLU (Gemma 4): permuted_swiglu = geglu_tanh(permuted_intermediate, permuted_swiglu).
