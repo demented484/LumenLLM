@@ -25,12 +25,21 @@ pub struct WgpuContext {
     pub(super) embedding: KernelPipeline,
     // Matmul: same 4-binding layout but different uniform shape (m,n,k,_pad).
     pub(super) matmul: KernelPipeline,
+    /// Matmul with BF16-packed weights (slot 1 = `array<u32>` instead
+    /// of `array<f32>`). Decodes BF16 inline; avoids the need to
+    /// dequant the entire weight matrix to f32 scratch first.
+    pub(super) matmul_bf16: KernelPipeline,
     /// NVFP4 → f32 dequantization (`shaders/dequant_nvfp4.wgsl`). Bridges
     /// quantized weight buffers (Gemma-4 routed experts, attention proj
     /// in NVFP4 source) to the f32-only matmul kernel. Same 4-binding
     /// layout as everyone else: packed (ro), scales (ro), output (rw),
     /// uniform.
     pub(super) dequant_nvfp4: KernelPipeline,
+    /// BF16 → f32 dequant. Each u32 holds 2 packed bf16 values;
+    /// output is `f32[len]`. Used for the embed_tokens / lm_head /
+    /// shared-MLP / norm weight paths so we don't need to upcast to
+    /// f32 at load time (saves ~50% VRAM for those tensors).
+    pub(super) dequant_bf16: KernelPipeline,
     // RoPE: storage rw + 2 storage read + uniform.
     pub(super) rope: KernelPipeline,
     // Decode attention: storage rw (out) + 2 storage read (q, kv) + uniform.
@@ -167,11 +176,23 @@ impl WgpuContext {
             &standard_4_layout,
             "matmul",
         );
+        let matmul_bf16 = build_kernel(
+            &device,
+            include_str!("shaders/matmul_bf16.wgsl"),
+            &standard_4_layout,
+            "matmul_bf16",
+        );
         let dequant_nvfp4 = build_kernel(
             &device,
             include_str!("shaders/dequant_nvfp4.wgsl"),
             &standard_4_layout,
             "dequant_nvfp4",
+        );
+        let dequant_bf16 = build_kernel(
+            &device,
+            include_str!("shaders/dequant_bf16.wgsl"),
+            &standard_4_layout,
+            "dequant_bf16",
         );
         let embedding = build_kernel(
             &device,
@@ -205,7 +226,9 @@ impl WgpuContext {
             residual_add,
             embedding,
             matmul,
+            matmul_bf16,
             dequant_nvfp4,
+            dequant_bf16,
             rope,
             decode_attention,
         })

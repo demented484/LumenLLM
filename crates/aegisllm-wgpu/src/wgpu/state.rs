@@ -238,12 +238,19 @@ pub struct WgpuModelState {
     /// model uses a separate `pre_feedforward_layernorm_2` for the
     /// routed stream, distinct from the shared-expert input).
     pub moe_expert_input: wgpu::Buffer,
-    /// Reusable scratch for on-the-fly NVFP4 dequantisation. Sized to
-    /// the largest expected weight matrix (`max_weight_elements *
-    /// 4 bytes`). One matmul at a time consumes this — the queue
-    /// ordering between dequant and the matmul that reads it is
-    /// guaranteed by submitting both on the same queue in order.
+    /// Reusable scratch for on-the-fly NVFP4 / BF16 dequantisation.
+    /// Sized to the largest expected weight matrix
+    /// (`max_weight_elements * 4 bytes`). One matmul at a time
+    /// consumes this — the queue ordering between dequant and the
+    /// matmul that reads it is guaranteed by submitting both on the
+    /// same queue in order.
     pub nvfp4_dequant_scratch: wgpu::Buffer,
+    /// Tiny scratch for BF16-packed embedding-row lookup:
+    /// `hidden_size` BF16 values stored as `(hidden_size+1)/2 * 4`
+    /// bytes of u32. Used when the embedding table is
+    /// `WgpuLinear::Bf16Packed` and the provider's `forward_hidden`
+    /// needs to fetch one row.
+    pub embed_row_packed_bf16: wgpu::Buffer,
 
     // ── Per-layer KV caches ───────────────────────────────────────────────
     /// `kv_caches[L]` is layer L's persistent cache: keys at
@@ -274,14 +281,16 @@ impl std::fmt::Debug for WgpuModelState {
 }
 
 impl WgpuModelState {
-    /// Allocate state for a model. `max_dequant_elements` sizes the
-    /// reusable on-the-fly NVFP4 dequant scratch buffer — pass the
-    /// largest weight-matrix element count this model will ever
-    /// dequant, or `0` if the model is fully Dense (the scratch is
-    /// allocated as 1 f32 in that case so it's effectively a no-op).
-    /// For Gemma-4-26B-A4B, the largest matrix is one routed expert's
-    /// `gate_proj` / `up_proj` / `down_proj` = 14336 × 4096 = 58 720 256
-    /// elements (~235 MiB).
+    /// Allocate state for a model. The `max_*` parameters bound the
+    /// per-layer heterogeneity Gemma-4 introduces: global attention
+    /// layers use a different `head_dim` (512 vs 256) and
+    /// `num_kv_heads` (2 vs 8) than sliding layers, so the per-token
+    /// scratch + per-layer KV caches must be sized for the LARGEST
+    /// of any layer.
+    ///
+    /// `max_dequant_elements` sizes the reusable on-the-fly NVFP4 /
+    /// BF16 dequant scratch — pass the largest weight-matrix element
+    /// count, or 0 for a fully Dense model (allocates a 1-f32 stub).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &WgpuContext,
@@ -294,6 +303,43 @@ impl WgpuModelState {
         vocab_size: usize,
         max_seq_len: usize,
         max_dequant_elements: usize,
+    ) -> Result<Self> {
+        Self::new_with_layer_max(
+            ctx,
+            num_layers,
+            hidden_size,
+            intermediate_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            vocab_size,
+            max_seq_len,
+            max_dequant_elements,
+            num_q_heads * head_dim,
+            num_kv_heads * head_dim,
+            head_dim,
+        )
+    }
+
+    /// Variant accepting explicit per-layer maxes. Use when layers
+    /// are heterogeneous (Gemma-4): pass `max_q_width`, `max_kv_width`,
+    /// `max_head_dim` = the largest of any layer's value, so all
+    /// scratch buffers fit every layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_layer_max(
+        ctx: &WgpuContext,
+        num_layers: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        vocab_size: usize,
+        max_seq_len: usize,
+        max_dequant_elements: usize,
+        max_q_width: usize,
+        max_kv_width: usize,
+        max_head_dim: usize,
     ) -> Result<Self> {
         if num_layers == 0
             || hidden_size == 0
@@ -320,13 +366,21 @@ impl WgpuModelState {
         }
         let h_bytes = (hidden_size * 4) as u64;
         let i_bytes = (intermediate_size * 4) as u64;
-        let q_bytes = (num_q_heads * head_dim * 4) as u64;
-        let kv_width = num_kv_heads * head_dim;
-        let kv_bytes = (kv_width * 4) as u64;
-        let cache_bytes = (2 * max_seq_len * kv_width * 4) as u64;
-        let half = head_dim / 2;
-        let half_bytes = (half * 4) as u64;
+        let q_bytes = (max_q_width * 4) as u64;
+        let kv_width = num_kv_heads * head_dim; // model-default, used for per-layer-cache sizing
+        let kv_bytes = (max_kv_width * 4) as u64;
+        // KV cache sized for the largest per-layer kv_width. Layers
+        // with a smaller kv_width waste some of the cache but read/
+        // write only the bytes they need.
+        let cache_bytes = (2 * max_seq_len * max_kv_width * 4) as u64;
+        let half_bytes = (max_head_dim / 2 * 4) as u64;
         let v_bytes = (vocab_size * 4) as u64;
+        // post_normed doubles as the q/k/v norm writeback scratch in
+        // the Gemma-4 attention forward — must hold the LARGEST of
+        // any layer's hidden_size, q_width, kv_width.
+        let post_normed_bytes =
+            (hidden_size.max(max_q_width).max(max_kv_width) * 4) as u64;
+        let _ = kv_width; // currently unused beyond documentation
 
         let kv_caches = (0..num_layers)
             .map(|_| alloc_storage(ctx, cache_bytes, "model state kv_cache"))
@@ -342,7 +396,7 @@ impl WgpuModelState {
             max_seq_len,
             position: 0,
             residual: alloc_storage(ctx, h_bytes, "model state residual"),
-            post_normed: alloc_storage(ctx, h_bytes, "model state post_normed"),
+            post_normed: alloc_storage(ctx, post_normed_bytes, "model state post_normed"),
             mlp_out: alloc_storage(ctx, h_bytes, "model state mlp_out"),
             attn_q: alloc_storage(ctx, q_bytes, "model state attn_q"),
             attn_k_new: alloc_storage(ctx, kv_bytes, "model state attn_k_new"),
@@ -364,6 +418,11 @@ impl WgpuModelState {
                 ctx,
                 (max_dequant_elements.max(1) * 4) as u64,
                 "model state nvfp4_dequant_scratch",
+            ),
+            embed_row_packed_bf16: alloc_storage(
+                ctx,
+                ((hidden_size.div_ceil(2)) * 4) as u64,
+                "model state embed_row_packed_bf16",
             ),
             kv_caches,
             final_normed: alloc_storage(ctx, h_bytes, "model state final_normed"),

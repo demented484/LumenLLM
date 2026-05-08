@@ -279,7 +279,11 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
 
     // ── Build wgpu model directly from the same weights ──────────────
     let ctx = Arc::new(WgpuContext::new(0).expect("wgpu ctx"));
-    let embed_buf = upload_f32_buf(&ctx, &embed, "embed");
+    let embed_buf = WgpuLinear::Dense {
+        weight: upload_f32_buf(&ctx, &embed, "embed"),
+        rows: s.vocab,
+        cols: s.h,
+    };
     let final_norm_buf = upload_f32_buf(&ctx, &final_norm_w, "final_norm");
     let lm_head_buf = WgpuLinear::Dense {
         weight: upload_f32_buf(&ctx, &lm_head, "lm_head"),
@@ -318,6 +322,7 @@ fn forward_token_matches_cpu_reference_two_tokens_two_layers() {
             layer_scalar: None,
             attention_window_size: None,
             head_dim_override: None,
+            num_kv_heads_override: None,
         })
         .collect();
     let model = WgpuModel {

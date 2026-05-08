@@ -37,14 +37,24 @@ use aegisllm_base::planning::placement::StoragePlacement;
 use aegisllm_base::tensor::core::TensorDType;
 use aegisllm_base::tensor::storage::TensorStorageLoader;
 
-use super::forward::{upload_f32_buf, upload_padded_u8_buf};
+use super::forward::{upload_bf16_packed_buf, upload_f32_buf, upload_padded_u8_buf};
 use super::loader::WgpuContext;
 
-/// A linear weight matrix uploaded to the device. Either dense f32 (BF16
-/// or F32 source upcast at load time) or NVFP4 packed.
+/// A linear weight matrix uploaded to the device. Either dense f32,
+/// BF16 stored as packed `array<u32>` (decoded on the fly via
+/// `dequant_bf16_device`), or NVFP4 packed.
 pub enum WgpuLinear {
     /// f32 row-major `[rows, cols]`.
     Dense {
+        weight: wgpu::Buffer,
+        rows: usize,
+        cols: usize,
+    },
+    /// BF16 packed: each u32 holds 2 BF16 values. Total buffer size =
+    /// `(rows * cols + 1) / 2 * 4` bytes. Saves ~50 % VRAM vs `Dense`
+    /// when the source weight is BF16 — required to fit Gemma-4-26B
+    /// shared-MLP / embedding tensors in 16 GiB VRAM.
+    Bf16Packed {
         weight: wgpu::Buffer,
         rows: usize,
         cols: usize,
@@ -69,6 +79,11 @@ impl std::fmt::Debug for WgpuLinear {
                 .field("rows", rows)
                 .field("cols", cols)
                 .finish(),
+            Self::Bf16Packed { rows, cols, .. } => f
+                .debug_struct("WgpuLinear::Bf16Packed")
+                .field("rows", rows)
+                .field("cols", cols)
+                .finish(),
             Self::Nvfp4 { rows, cols, output_scale, .. } => f
                 .debug_struct("WgpuLinear::Nvfp4")
                 .field("rows", rows)
@@ -82,12 +97,16 @@ impl std::fmt::Debug for WgpuLinear {
 impl WgpuLinear {
     pub fn rows(&self) -> usize {
         match self {
-            Self::Dense { rows, .. } | Self::Nvfp4 { rows, .. } => *rows,
+            Self::Dense { rows, .. }
+            | Self::Bf16Packed { rows, .. }
+            | Self::Nvfp4 { rows, .. } => *rows,
         }
     }
     pub fn cols(&self) -> usize {
         match self {
-            Self::Dense { cols, .. } | Self::Nvfp4 { cols, .. } => *cols,
+            Self::Dense { cols, .. }
+            | Self::Bf16Packed { cols, .. }
+            | Self::Nvfp4 { cols, .. } => *cols,
         }
     }
 }
@@ -230,6 +249,10 @@ pub struct WgpuLayerWeights {
     /// the model's "default" sliding head_dim (256). When `Some`,
     /// overrides the model-level head_dim for THIS layer's attention.
     pub head_dim_override: Option<usize>,
+    /// Gemma-4 global layers use a different num_kv_heads (2) than
+    /// the model's default sliding count (8). When `Some`, overrides
+    /// `model.num_kv_heads` for this layer.
+    pub num_kv_heads_override: Option<usize>,
 }
 
 impl std::fmt::Debug for WgpuLayerWeights {
@@ -242,7 +265,11 @@ impl std::fmt::Debug for WgpuLayerWeights {
 /// layer N-1 at index N-1.
 pub struct WgpuModel {
     pub ctx: Arc<WgpuContext>,
-    pub embed_tokens: wgpu::Buffer,
+    /// Token embedding table. `WgpuLinear::Dense` (f32) for vanilla
+    /// loads; `WgpuLinear::Bf16Packed` for Gemma-4 (saves ~50 % VRAM
+    /// on the 2.95 GiB → 1.48 GiB embedding). The provider's row
+    /// lookup dispatches the right path based on the variant.
+    pub embed_tokens: WgpuLinear,
     pub embed_tokens_rows: usize,
     pub embed_tokens_cols: usize,
     pub final_norm: wgpu::Buffer,
@@ -427,7 +454,10 @@ fn load_linear(
             output_scale: load_optional_scalar(artifact, &scale_2_name).unwrap_or(1.0),
         })
     } else {
-        // Dense path.
+        // Dense path. For BF16 source: store packed (each u32 = 2 bf16
+        // values) and dequant on the fly during matmul. Saves ~50 % VRAM.
+        // For F32 / F16 source: upload as f32 (small enough that the
+        // packing complexity isn't worth it).
         if weight_info.shape.len() != 2 {
             return Err(AegisError::InvalidPlan(format!(
                 "dense linear weight `{name}` must be 2-D, got shape {:?}",
@@ -436,8 +466,14 @@ fn load_linear(
         }
         let rows = weight_info.shape[0];
         let cols = weight_info.shape[1];
-        let buf = load_dense_as_f32(ctx, loader, artifact, name, label)?;
-        Ok(WgpuLinear::Dense { weight: buf, rows, cols })
+        if weight_info.dtype == TensorDType::BF16 {
+            let host = loader.load_for_store(weight_info, StoragePlacement::Ram)?;
+            let buf = upload_bf16_packed_buf(ctx, host.as_bytes(), label)?;
+            Ok(WgpuLinear::Bf16Packed { weight: buf, rows, cols })
+        } else {
+            let buf = load_dense_as_f32(ctx, loader, artifact, name, label)?;
+            Ok(WgpuLinear::Dense { weight: buf, rows, cols })
+        }
     }
 }
 
@@ -478,7 +514,7 @@ pub fn load_vanilla_llama_model(
     })?;
     let embed_rows = embed_info.shape[0];
     let embed_cols = embed_info.shape[1];
-    let embed_buf = load_dense_as_f32(&ctx, &mut loader, artifact, embed_name, "embed_tokens")?;
+    let embed_linear = load_linear(&ctx, &mut loader, artifact, embed_name, "embed_tokens")?;
 
     let final_norm =
         load_dense_as_f32(&ctx, &mut loader, artifact, "model.norm.weight", "final_norm")?;
@@ -541,12 +577,13 @@ pub fn load_vanilla_llama_model(
             layer_scalar: None,
             attention_window_size: None,
             head_dim_override: None,
+            num_kv_heads_override: None,
         });
     }
 
     Ok(WgpuModel {
         ctx,
-        embed_tokens: embed_buf,
+        embed_tokens: embed_linear,
         embed_tokens_rows: embed_rows,
         embed_tokens_cols: embed_cols,
         final_norm,
@@ -690,11 +727,13 @@ pub fn load_gemma4_model(
             embed_info.data_len_bytes()
         );
     }
-    let embed_buf = load_dense_as_f32(&ctx, &mut loader, artifact, &embed_name, "g4_embed")?;
+    // Load embed_tokens via `load_linear` so BF16 source ends up
+    // stored as Bf16Packed (saves ~50 % VRAM vs f32 upcast).
+    let embed_linear = load_linear(&ctx, &mut loader, artifact, &embed_name, "g4_embed")?;
     if std::env::var("AEGIS_WGPU_TRACE").is_ok() {
         eprintln!(
-            "[g4-loader] embed buffer size after upload = {} bytes",
-            embed_buf.size()
+            "[g4-loader] embed loaded as {:?}",
+            embed_linear,
         );
     }
     let final_norm = load_dense_as_f32(
@@ -993,6 +1032,11 @@ pub fn load_gemma4_model(
             layer_scalar,
             attention_window_size: if is_global { None } else { Some(window) },
             head_dim_override: if is_global { Some(layer_head_dim) } else { None },
+            num_kv_heads_override: if is_global {
+                Some(layer_kv_heads)
+            } else {
+                None
+            },
         });
         // Sanity: q_width / kv_width are computed but only documented for clarity.
         let _ = (q_width, kv_width);
@@ -1000,7 +1044,7 @@ pub fn load_gemma4_model(
 
     Ok(WgpuModel {
         ctx,
-        embed_tokens: embed_buf,
+        embed_tokens: embed_linear,
         embed_tokens_rows: embed_rows,
         embed_tokens_cols: embed_cols,
         final_norm,

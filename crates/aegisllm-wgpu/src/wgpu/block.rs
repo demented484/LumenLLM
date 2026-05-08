@@ -9,9 +9,10 @@
 use aegisllm_base::error::{AegisError, Result};
 
 use super::forward::{
-    decode_attention_device_full, decode_attention_device_strided, dequant_nvfp4_device,
-    geglu_tanh_device, matmul_f32_device, residual_add_device, rms_norm_batched_device,
-    rms_norm_device, rope_device, scale_f32_device, swiglu_device,
+    decode_attention_device_full, decode_attention_device_strided, dequant_bf16_device,
+    dequant_nvfp4_device, geglu_tanh_device, matmul_bf16_device, matmul_f32_device,
+    residual_add_device, rms_norm_batched_device, rms_norm_device, rope_device,
+    scale_f32_device, swiglu_device,
 };
 
 /// MLP activation function. Llama uses SwiGLU; Gemma-4 uses GeGLU
@@ -511,8 +512,14 @@ fn matmul_with_optional_dequant(
     n: usize,
     k: usize,
 ) -> Result<()> {
-    let weight_buf = match linear {
-        WgpuLinear::Dense { weight, .. } => weight,
+    match linear {
+        WgpuLinear::Dense { weight, .. } => matmul_f32_device(ctx, input, weight, output, m, n, k),
+        WgpuLinear::Bf16Packed { weight, .. } => {
+            // Direct BF16 matmul: shader decodes bf16 → f32 in the
+            // inner loop. Saves a 2.95 GiB scratch dequant for tied
+            // lm_head and ~1 GiB for shared MLP.
+            matmul_bf16_device(ctx, input, weight, output, m, n, k)
+        }
         WgpuLinear::Nvfp4 { packed, scales, rows, cols, output_scale } => {
             dequant_nvfp4_device(
                 ctx,
@@ -523,10 +530,9 @@ fn matmul_with_optional_dequant(
                 *cols,
                 *output_scale,
             )?;
-            &model_state.nvfp4_dequant_scratch
+            matmul_f32_device(ctx, input, &model_state.nvfp4_dequant_scratch, output, m, n, k)
         }
-    };
-    matmul_f32_device(ctx, input, weight_buf, output, m, n, k)
+    }
 }
 
 /// Compatibility shim used in matmul sites that don't have
@@ -537,8 +543,8 @@ fn matmul_with_optional_dequant(
 fn dense_weight_buf(linear: &WgpuLinear) -> Result<&wgpu::Buffer> {
     match linear {
         WgpuLinear::Dense { weight, .. } => Ok(weight),
-        WgpuLinear::Nvfp4 { .. } => Err(AegisError::Unsupported(
-            "wgpu: this matmul site doesn't have model_state access for NVFP4 dequant; \
+        WgpuLinear::Bf16Packed { .. } | WgpuLinear::Nvfp4 { .. } => Err(AegisError::Unsupported(
+            "wgpu: this matmul site doesn't have model_state access for non-Dense weights; \
              refactor the call site to use matmul_with_optional_dequant"
                 .into(),
         )),
@@ -592,8 +598,11 @@ pub fn forward_layer_device(
     let h = model_state.hidden_size;
     let i = model_state.intermediate_size;
     let nq = model_state.num_q_heads;
-    let nkv = model_state.num_kv_heads;
-    let hd = model_state.head_dim;
+    // Per-layer overrides for Gemma-4 global attention layers: head_dim
+    // = 512 (vs 256 sliding), num_kv_heads = 2 (vs 8 sliding). All
+    // other layers use the model defaults.
+    let hd = weights.head_dim_override.unwrap_or(model_state.head_dim);
+    let nkv = weights.num_kv_heads_override.unwrap_or(model_state.num_kv_heads);
     let max_seq = model_state.max_seq_len;
     let position = model_state.position;
     let q_width = nq * hd;
@@ -1000,31 +1009,21 @@ where
         model.hidden_size,
         rms_norm_eps,
     )?;
-    if model.lm_head_tied {
-        // Tied embeddings: lm_head reuses the embedding table directly.
-        // matmul_f32_device auto-tiles when the embedding buffer
-        // exceeds the storage-buffer binding limit (2 GiB on Vulkan).
-        matmul_f32_device(
-            ctx,
-            &model_state.final_normed,
-            &model.embed_tokens,
-            &model_state.logits,
-            1,
-            model.vocab_size,
-            model.hidden_size,
-        )?;
+    let lm_head_linear = if model.lm_head_tied {
+        &model.embed_tokens
     } else {
-        matmul_with_optional_dequant(
-            ctx,
-            model_state,
-            &model_state.final_normed,
-            &model.lm_head,
-            &model_state.logits,
-            1,
-            model.vocab_size,
-            model.hidden_size,
-        )?;
-    }
+        &model.lm_head
+    };
+    matmul_with_optional_dequant(
+        ctx,
+        model_state,
+        &model_state.final_normed,
+        lm_head_linear,
+        &model_state.logits,
+        1,
+        model.vocab_size,
+        model.hidden_size,
+    )?;
     model_state.position += 1;
     Ok(())
 }

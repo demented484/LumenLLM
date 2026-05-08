@@ -3,7 +3,9 @@ use std::sync::Arc;
 use super::block::{forward_token_device, Activation};
 use super::loader::WgpuContext;
 use super::state::{WgpuLlamaState, WgpuModelState};
-use super::weights::{load_gemma4_model, load_vanilla_llama_model, WgpuModel, WgpuModelShape};
+use super::weights::{
+    load_gemma4_model, load_vanilla_llama_model, WgpuLinear, WgpuModel, WgpuModelShape,
+};
 use aegisllm_base::artifact::ModelArtifact;
 use aegisllm_base::backend::BackendKind;
 use aegisllm_base::error::{AegisError, Result};
@@ -184,13 +186,26 @@ impl GenerationBackendPrimitives for WgpuExecutorProvider {
 
     fn new_sequence_state(&self) -> Result<Box<dyn GenerationState>> {
         let model = self.model.as_ref().ok_or_else(|| self.not_initialized())?;
-        // Largest weight matrix size — Gemma-4 routed-expert
-        // gate/up/down is `intermediate_size × hidden_size` (for the
-        // largest matrix). We size the dequant scratch to that bound.
+        // Largest dequant scratch needed by any matmul. Gemma-4's
+        // routed expert gate/up/down is `moe_intermediate × hidden`
+        // ≈ 1.98 M elements; shared MLP gate/up is `intermediate ×
+        // hidden` ≈ 5.95 M elements. Take the larger.
         let max_dequant = model
             .intermediate_size
             .saturating_mul(model.hidden_size);
-        let state = WgpuModelState::new(
+        // Per-layer max widths for Gemma-4 heterogeneity (global
+        // layers use head_dim=512 / num_kv_heads=2 vs sliding 256/8).
+        let mut max_q_width = model.num_q_heads * model.head_dim;
+        let mut max_kv_width = model.num_kv_heads * model.head_dim;
+        let mut max_head_dim = model.head_dim;
+        for layer in &model.layers {
+            let hd = layer.head_dim_override.unwrap_or(model.head_dim);
+            let nkv = layer.num_kv_heads_override.unwrap_or(model.num_kv_heads);
+            max_q_width = max_q_width.max(model.num_q_heads * hd);
+            max_kv_width = max_kv_width.max(nkv * hd);
+            max_head_dim = max_head_dim.max(hd);
+        }
+        let state = WgpuModelState::new_with_layer_max(
             &model.ctx,
             model.layers.len(),
             model.hidden_size,
@@ -201,6 +216,9 @@ impl GenerationBackendPrimitives for WgpuExecutorProvider {
             model.vocab_size,
             self.max_seq_len.max(1),
             max_dequant,
+            max_q_width,
+            max_kv_width,
+            max_head_dim,
         )?;
         Ok(Box::new(state))
     }
@@ -224,28 +242,71 @@ impl GenerationBackendPrimitives for WgpuExecutorProvider {
             )));
         }
         // Embedding lookup: row `token_id` of embed_tokens →
-        // state.residual. We use a buffer-to-buffer copy instead of
-        // dispatching `embedding_device` because Vulkan caps storage-
-        // buffer BINDING size at 2 GiB even when the underlying buffer
-        // is larger. Real models (Gemma-4-26B has 262K vocab × 2816
-        // hidden = 2.95 GiB embedding) exceed this cap if bound whole.
-        // copy_buffer_to_buffer has no binding-size limit.
-        let row_bytes = (model.hidden_size * std::mem::size_of::<f32>()) as u64;
-        let src_offset = (token_id as u64) * row_bytes;
-        let mut enc = model
-            .ctx
-            .device()
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("wgpu_provider_embed_lookup"),
-            });
-        enc.copy_buffer_to_buffer(
-            &model.embed_tokens,
-            src_offset,
-            &st.residual,
-            0,
-            row_bytes,
-        );
-        model.ctx.queue().submit(std::iter::once(enc.finish()));
+        // state.residual. Two paths depending on storage format:
+        //   * Dense (f32): single copy_buffer_to_buffer of `hidden * 4`
+        //     bytes. Bypass Vulkan's 2 GiB binding cap.
+        //   * Bf16Packed: copy `hidden * 2` BF16 bytes from packed
+        //     buffer to a small bf16 row scratch, then dispatch
+        //     `dequant_bf16_device` to expand bf16 → f32 into residual.
+        match &model.embed_tokens {
+            WgpuLinear::Dense { weight, .. } => {
+                let row_bytes = (model.hidden_size * std::mem::size_of::<f32>()) as u64;
+                let src_offset = (token_id as u64) * row_bytes;
+                let mut enc = model
+                    .ctx
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("wgpu_provider_embed_lookup_dense"),
+                    });
+                enc.copy_buffer_to_buffer(weight, src_offset, &st.residual, 0, row_bytes);
+                model.ctx.queue().submit(std::iter::once(enc.finish()));
+            }
+            WgpuLinear::Bf16Packed { weight, .. } => {
+                // Each BF16 row is `hidden * 2` bytes. token_id-th row
+                // starts at `token_id * hidden * 2` bytes from the
+                // packed buffer's start. Both offsets are 4-byte
+                // aligned as long as hidden is even (always true).
+                let row_bytes_bf16 = (model.hidden_size * 2) as u64;
+                let src_offset = (token_id as u64) * row_bytes_bf16;
+                if std::env::var("AEGIS_WGPU_TRACE").is_ok() {
+                    eprintln!(
+                        "[provider] embed lookup token={} hidden={} row_bf16_bytes={} src_off={} src_buf={} dst_buf={} resid_buf={}",
+                        token_id,
+                        model.hidden_size,
+                        row_bytes_bf16,
+                        src_offset,
+                        weight.size(),
+                        st.embed_row_packed_bf16.size(),
+                        st.residual.size(),
+                    );
+                }
+                let mut enc = model
+                    .ctx
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("wgpu_provider_embed_lookup_bf16"),
+                    });
+                enc.copy_buffer_to_buffer(
+                    weight,
+                    src_offset,
+                    &st.embed_row_packed_bf16,
+                    0,
+                    row_bytes_bf16,
+                );
+                model.ctx.queue().submit(std::iter::once(enc.finish()));
+                super::forward::dequant_bf16_device(
+                    &model.ctx,
+                    &st.embed_row_packed_bf16,
+                    &st.residual,
+                    model.hidden_size,
+                )?;
+            }
+            WgpuLinear::Nvfp4 { .. } => {
+                return Err(AegisError::Unsupported(
+                    "wgpu provider: NVFP4 embed_tokens not supported".into(),
+                ));
+            }
+        }
         let rope_fn = rope_for_layer_factory(self.rope_theta);
         forward_token_device(
             &model.ctx,

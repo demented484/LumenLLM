@@ -163,8 +163,16 @@ fn validate_memory_budget(memory: &MemoryPlan) -> Result<()> {
         .iter()
         .find(|warning| warning.contains("allocation exceeds usable budget"));
     if let Some(warning) = exceeded {
+        if std::env::var("AEGIS_BYPASS_BUDGET_GATE").is_ok() {
+            eprintln!(
+                "[aegis] memory budget gate bypassed: {warning} (AEGIS_BYPASS_BUDGET_GATE=1)"
+            );
+            return Ok(());
+        }
         return Err(AegisError::InvalidPlan(format!(
-            "memory budget gate failed: {warning}"
+            "memory budget gate failed: {warning} \
+             (set AEGIS_BYPASS_BUDGET_GATE=1 to override; useful for wgpu where \
+             ram-stored weights actually upload to GPU and don't stay resident in host)"
         )));
     }
     Ok(())

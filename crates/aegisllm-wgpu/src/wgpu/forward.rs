@@ -991,6 +991,153 @@ pub fn matmul_f32_device(
     Ok(())
 }
 
+/// Matmul with BF16-packed weights:
+/// `C[M,N] = A[M,K] @ B^T[N,K]` where B is `array<u32>` packing 2
+/// BF16 values per word. Avoids dequanting B to f32 scratch first —
+/// critical for tied lm_head where B is the full embedding table
+/// (would need a 2.95 GiB scratch on Gemma-4-26B).
+pub fn matmul_bf16_device(
+    ctx: &WgpuContext,
+    a: &wgpu::Buffer,
+    b_packed: &wgpu::Buffer,
+    c: &wgpu::Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let max_bind = ctx.device.limits().max_storage_buffer_binding_size as u64;
+    let b_bytes = ((n as u64) * (k as u64) * 2 + 3) & !3; // bf16 → 2 bytes/elt, padded to u32
+    let c_bytes = (m as u64) * (n as u64) * 4;
+    if b_bytes <= max_bind && c_bytes <= max_bind {
+        return matmul_bf16_device_untiled(ctx, a, b_packed, c, m, n, k);
+    }
+    // Tile along N. Each tile reads `tile_n` rows of B (bf16) and
+    // writes `tile_n` columns of C. Bf16 row stride = `k * 2` bytes;
+    // tile_n must satisfy tile_n * k * 2 ≤ max_bind AND m * tile_n * 4
+    // ≤ max_bind. Offsets for B (bf16) must be 4-byte aligned (u32);
+    // for C (f32) must be 4-byte aligned (always true).
+    let max_tile_b = (max_bind / (k as u64 * 2)) as usize;
+    let max_tile_c = if m == 0 { n } else { (max_bind / (m as u64 * 4)) as usize };
+    let mut tile_n = max_tile_b.min(max_tile_c).min(n);
+    // For BF16 alignment: tile_n * k * 2 must be 4-aligned. Since k
+    // is even (head_dim, intermediate, etc. always even), tile_n * k
+    // * 2 % 4 == 0 always. For 256-byte alignment of bind offsets:
+    let row_bytes = k * 2;
+    if row_bytes > 0 {
+        let step = if 256 % row_bytes.max(1) == 0 {
+            256 / row_bytes.max(1)
+        } else {
+            1
+        };
+        if step > 1 {
+            tile_n = (tile_n / step) * step;
+        }
+    }
+    if tile_n == 0 {
+        return Err(AegisError::Unsupported(format!(
+            "matmul_bf16 tile size collapsed: m={m} n={n} k={k} max_bind={max_bind}"
+        )));
+    }
+    let mut start = 0;
+    while start < n {
+        let this_n = (n - start).min(tile_n);
+        run_matmul_bf16_partial(ctx, a, b_packed, c, m, this_n, k, start)?;
+        start += this_n;
+    }
+    Ok(())
+}
+
+fn matmul_bf16_device_untiled(
+    ctx: &WgpuContext,
+    a: &wgpu::Buffer,
+    b_packed: &wgpu::Buffer,
+    c: &wgpu::Buffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let params = MatMulParams { m: m as u32, n: n as u32, k: k as u32, _pad: 0 };
+    let groups_x = ((m + 7) / 8) as u32;
+    let groups_y = ((n + 7) / 8) as u32;
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.matmul_bf16,
+        a,
+        b_packed,
+        c,
+        bytemuck::bytes_of(&params),
+        (groups_x, groups_y, 1),
+        "matmul_bf16_device",
+    )
+}
+
+fn run_matmul_bf16_partial(
+    ctx: &WgpuContext,
+    a: &wgpu::Buffer,
+    b_packed: &wgpu::Buffer,
+    c: &wgpu::Buffer,
+    m: usize,
+    this_n: usize,
+    k: usize,
+    start_n: usize,
+) -> Result<()> {
+    let params = MatMulParams {
+        m: m as u32,
+        n: this_n as u32,
+        k: k as u32,
+        _pad: 0,
+    };
+    let uniform_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("matmul_bf16_partial_uniform"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let b_offset = (start_n * k * 2) as u64;
+    let b_size = (this_n * k * 2) as u64;
+    let c_offset = (start_n * 4) as u64; // for m=1 (decode), c laid out as N-major
+    let c_size = (m * this_n * 4) as u64;
+    let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("matmul_bf16_partial_bg"),
+        layout: &ctx.matmul_bf16.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: a.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: b_packed,
+                    offset: b_offset,
+                    size: std::num::NonZeroU64::new(b_size),
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: c,
+                    offset: c_offset,
+                    size: std::num::NonZeroU64::new(c_size),
+                }),
+            },
+            wgpu::BindGroupEntry { binding: 3, resource: uniform_buf.as_entire_binding() },
+        ],
+    });
+    let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("matmul_bf16_partial_enc"),
+    });
+    {
+        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("matmul_bf16_partial_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&ctx.matmul_bf16.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        let groups_x = ((m + 7) / 8) as u32;
+        let groups_y = ((this_n + 7) / 8) as u32;
+        pass.dispatch_workgroups(groups_x, groups_y, 1);
+    }
+    ctx.queue.submit(std::iter::once(enc.finish()));
+    Ok(())
+}
+
 /// Untiled matmul: bind whole B, whole C. Caller has already
 /// verified the binding-size limits accommodate this.
 fn matmul_f32_device_untiled(
@@ -1136,6 +1283,87 @@ pub fn upload_padded_u8_buf(
     }
     flush_staging(ctx, label);
     buffer
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct LenOnlyParams {
+    len: u32,
+    _pad: u32,
+}
+
+/// Device-resident BF16 → f32 dequant. `packed` is a `STORAGE` buffer of
+/// `(len+1)/2` u32 words holding 2 bf16 values each (lo bits = even index,
+/// hi bits = odd). `out` is `f32[len]`. Saves ~50 % VRAM for BF16 weight
+/// matrices vs. upcasting to f32 at load time.
+pub fn dequant_bf16_device(
+    ctx: &WgpuContext,
+    packed: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    len: usize,
+) -> Result<()> {
+    let params = LenOnlyParams { len: len as u32, _pad: 0 };
+    let groups = ((len + 63) / 64) as u32;
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.dequant_bf16,
+        packed,
+        // Slot 1 unused by shader; bind something. Reuse `out` as a
+        // dummy — wgpu accepts the same buffer at multiple slots
+        // when the binding usage is read-only at slot 1.
+        // BUT — the shader declares slot 1 as read, slot 2 as
+        // read_write, and a single buffer can't be bound as both.
+        // Pass `packed` again at slot 1 (it's read-only) — fine.
+        packed,
+        out,
+        bytemuck::bytes_of(&params),
+        (groups, 1, 1),
+        "dequant_bf16_device",
+    )
+}
+
+/// Upload a BF16 byte slice as a u32-packed wgpu storage buffer (each
+/// u32 holds 2 BF16 values). The byte length must be a multiple of 2.
+/// Total buffer size = ceil(byte_len / 4) bytes (rounded up to a u32
+/// boundary). Used by the loader to keep BF16 weights at native
+/// 16-bit storage instead of upcasting to f32.
+pub fn upload_bf16_packed_buf(
+    ctx: &WgpuContext,
+    bf16_bytes: &[u8],
+    label: &'static str,
+) -> Result<wgpu::Buffer> {
+    if bf16_bytes.len() % 2 != 0 {
+        return Err(AegisError::InvalidPlan(format!(
+            "upload_bf16_packed_buf: byte length {} is not a multiple of 2",
+            bf16_bytes.len()
+        )));
+    }
+    // Pad to u32 alignment (4 bytes).
+    let pad = (4 - bf16_bytes.len() % 4) % 4;
+    let total_bytes = bf16_bytes.len() + pad;
+    let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: total_bytes.max(4) as u64,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_SRC
+            | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !bf16_bytes.is_empty() {
+        let aligned_len = bf16_bytes.len() & !3;
+        if aligned_len > 0 {
+            ctx.queue.write_buffer(&buffer, 0, &bf16_bytes[..aligned_len]);
+        }
+        if aligned_len < bf16_bytes.len() {
+            let mut tail = [0u8; 4];
+            for (i, &b) in bf16_bytes[aligned_len..].iter().enumerate() {
+                tail[i] = b;
+            }
+            ctx.queue.write_buffer(&buffer, aligned_len as u64, &tail);
+        }
+    }
+    flush_staging(ctx, label);
+    Ok(buffer)
 }
 
 /// Device-resident NVFP4 dequant: `out[rows, cols]` ← (packed nibbles, UE4M3 scales).
