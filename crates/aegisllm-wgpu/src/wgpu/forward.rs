@@ -859,6 +859,101 @@ pub fn dequant_nvfp4_device(
     )
 }
 
+/// Device-resident decode attention (single-token / M=1).
+///
+/// `q`: `[num_q_heads * head_dim]` storage buffer.
+/// `kv`: `[2 * seq_len * num_kv_heads * head_dim]` storage buffer holding
+///   keys followed by values (caller arranges this layout — matches the
+///   `kv_offset_v = seq_len * num_kv_heads * head_dim` field in the
+///   uniform). Use a layer-owned KV cache that you write Q-projected keys
+///   and values into at offset `position`, then call this with the cache
+///   sliced to length `seq_len = position + 1`.
+/// `out`: `[num_q_heads * head_dim]` storage buffer.
+///
+/// Constraints: `head_dim ≤ 256`, `num_q_heads % num_kv_heads == 0`.
+pub fn decode_attention_device(
+    ctx: &WgpuContext,
+    q: &wgpu::Buffer,
+    kv: &wgpu::Buffer,
+    out: &wgpu::Buffer,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+) -> Result<()> {
+    if num_q_heads % num_kv_heads != 0 {
+        return Err(AegisError::InvalidPlan(format!(
+            "decode_attention: num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})"
+        )));
+    }
+    if head_dim > 256 {
+        return Err(AegisError::Unsupported(format!(
+            "decode_attention WGSL kernel hard-codes max head_dim=256, got {head_dim}"
+        )));
+    }
+    let kv_width = num_kv_heads * head_dim;
+    let kv_offset_v = (seq_len * kv_width) as u32;
+    let params = DecodeAttentionParams {
+        num_q_heads: num_q_heads as u32,
+        num_kv_heads: num_kv_heads as u32,
+        head_dim: head_dim as u32,
+        seq_len: seq_len as u32,
+        kv_offset_v,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+    // The decode_attention pipeline binds (rw out, ro q, ro kv, uniform).
+    // Order our helper's (in1, in2, out, uniform) → (out, q, kv, uniform) —
+    // semantic naming is misleading but the helper just shovels buffers
+    // into bind slots 0/1/2/3 in order.
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.decode_attention,
+        out,
+        q,
+        kv,
+        bytemuck::bytes_of(&params),
+        (num_q_heads as u32, 1, 1),
+        "decode_attention_device",
+    )
+}
+
+/// Device-resident RoPE (in-place rotation on `values`).
+///
+/// `values`: `[num_heads * head_dim]` storage buffer (rotated in place
+///   — bind it as both input and output via the same handle).
+/// `cos_table`, `sin_table`: `[half_dim]` precomputed for the current position.
+pub fn rope_device(
+    ctx: &WgpuContext,
+    values: &wgpu::Buffer,
+    cos_table: &wgpu::Buffer,
+    sin_table: &wgpu::Buffer,
+    num_heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let half_dim = head_dim / 2;
+    let params = RopeParams {
+        num_heads: num_heads as u32,
+        head_dim: head_dim as u32,
+        half_dim: half_dim as u32,
+        _pad: 0,
+    };
+    let groups_x = ((half_dim + 63) / 64) as u32;
+    let groups_y = num_heads as u32;
+    // RoPE pipeline binds (rw values, ro cos, ro sin, uniform).
+    dispatch_three_storage_device(
+        ctx,
+        &ctx.rope,
+        values,
+        cos_table,
+        sin_table,
+        bytemuck::bytes_of(&params),
+        (groups_x, groups_y, 1),
+        "rope_device",
+    )
+}
+
 /// Device-resident embedding lookup: `out[hidden]` ← `embed_table[token_id, :]`.
 ///
 /// `embed_table` is the full `STORAGE` buffer of shape `[vocab, hidden]`
@@ -1054,6 +1149,106 @@ mod device_chain_tests {
             assert!(
                 (g - c).abs() < 1e-3,
                 "dequant→matmul chain mismatch at i={i}: gpu={g} cpu={c}",
+            );
+        }
+    }
+
+    /// Validates `rope_device` and `decode_attention_device` produce the
+    /// same output as their host-API counterparts (`rope_gpu` /
+    /// `decode_attention_gpu`) on identical inputs. This is the cheapest
+    /// path to confirming the device-resident attention primitives — the
+    /// host-API results are already covered by the broader
+    /// `wgpu_dequant_nvfp4`/test bench, so we anchor against them.
+    ///
+    /// Gated behind `AEGIS_WGPU_SMOKE=1`.
+    #[test]
+    fn rope_and_decode_attention_device_match_host_api() {
+        if std::env::var("AEGIS_WGPU_SMOKE").is_err() {
+            eprintln!("skipping; set AEGIS_WGPU_SMOKE=1 to run on a host with Vulkan/Metal/D3D12");
+            return;
+        }
+        let ctx = WgpuContext::new(0).expect("wgpu ctx");
+
+        // ── RoPE: small head dim that's a multiple of 2.
+        let num_heads = 2;
+        let head_dim = 8;
+        let half = head_dim / 2;
+        let values_host: Vec<f32> = (0..(num_heads * head_dim))
+            .map(|k| ((k * 13 + 1) % 23) as f32 * 0.1 - 0.5)
+            .collect();
+        let cos_host: Vec<f32> = (0..half).map(|k| (k as f32 * 0.3).cos()).collect();
+        let sin_host: Vec<f32> = (0..half).map(|k| (k as f32 * 0.3).sin()).collect();
+
+        let host_rope = rope_gpu(&ctx, &values_host, &cos_host, &sin_host, num_heads, head_dim)
+            .expect("rope_gpu");
+
+        let buf_values = upload_f32_buf(&ctx, &values_host, "rope_values");
+        let buf_cos = upload_f32_buf(&ctx, &cos_host, "rope_cos");
+        let buf_sin = upload_f32_buf(&ctx, &sin_host, "rope_sin");
+        rope_device(&ctx, &buf_values, &buf_cos, &buf_sin, num_heads, head_dim).unwrap();
+        let dev_rope = download_f32_buf(&ctx, &buf_values, num_heads * head_dim, "rope_dev")
+            .expect("readback rope");
+        for (k, (h, d)) in host_rope.iter().zip(dev_rope.iter()).enumerate() {
+            assert!(
+                (h - d).abs() < 1e-5,
+                "rope device vs host mismatch at k={k}: host={h} device={d}",
+            );
+        }
+
+        // ── decode_attention: GQA with num_q_heads = 2 * num_kv_heads.
+        let num_q_heads = 4;
+        let num_kv_heads = 2;
+        let head_dim_attn = 8;
+        let seq_len = 3;
+        let q_host: Vec<f32> = (0..(num_q_heads * head_dim_attn))
+            .map(|k| ((k * 7 + 2) % 17) as f32 * 0.05 - 0.4)
+            .collect();
+        let kv_width = num_kv_heads * head_dim_attn;
+        let keys_host: Vec<f32> = (0..(seq_len * kv_width))
+            .map(|k| ((k * 11 + 4) % 19) as f32 * 0.05 - 0.45)
+            .collect();
+        let values_attn_host: Vec<f32> = (0..(seq_len * kv_width))
+            .map(|k| ((k * 13 + 6) % 21) as f32 * 0.05 - 0.5)
+            .collect();
+
+        let host_attn = decode_attention_gpu(
+            &ctx,
+            &q_host,
+            &keys_host,
+            &values_attn_host,
+            num_q_heads,
+            num_kv_heads,
+            head_dim_attn,
+            seq_len,
+        )
+        .expect("decode_attention_gpu");
+
+        // Device path: callers concatenate keys + values into one buffer.
+        let mut kv_concat = Vec::with_capacity(2 * seq_len * kv_width);
+        kv_concat.extend_from_slice(&keys_host);
+        kv_concat.extend_from_slice(&values_attn_host);
+        let buf_q = upload_f32_buf(&ctx, &q_host, "attn_q");
+        let buf_kv = upload_f32_buf(&ctx, &kv_concat, "attn_kv");
+        let buf_attn_out =
+            alloc_storage(&ctx, (num_q_heads * head_dim_attn * 4) as u64, "attn_out");
+        decode_attention_device(
+            &ctx,
+            &buf_q,
+            &buf_kv,
+            &buf_attn_out,
+            num_q_heads,
+            num_kv_heads,
+            head_dim_attn,
+            seq_len,
+        )
+        .unwrap();
+        let dev_attn =
+            download_f32_buf(&ctx, &buf_attn_out, num_q_heads * head_dim_attn, "attn_readback")
+                .unwrap();
+        for (k, (h, d)) in host_attn.iter().zip(dev_attn.iter()).enumerate() {
+            assert!(
+                (h - d).abs() < 1e-5,
+                "decode_attention device vs host mismatch at k={k}: host={h} device={d}",
             );
         }
     }
