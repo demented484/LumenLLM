@@ -3,6 +3,12 @@ mod forward;
 mod loader;
 mod provider;
 mod state;
+mod weights;
+
+pub use weights::{
+    load_vanilla_llama_model, WgpuAttentionWeightsFull, WgpuLayerWeights, WgpuLinear,
+    WgpuMlpWeightsFull, WgpuModel, WgpuModelShape,
+};
 
 pub use block::{
     forward_attention_block_device, forward_dense_mlp_block_device, WgpuAttentionWeights,
