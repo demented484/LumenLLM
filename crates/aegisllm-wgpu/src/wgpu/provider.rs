@@ -52,15 +52,21 @@ pub struct WgpuExecutorProvider {
     /// `None` until `from_artifact` succeeds; once present, forward
     /// methods call into it.
     model: Option<Arc<WgpuModel>>,
-    /// Per-layer-uniform `rope_theta` (Llama / Gemma-4 sliding). For
-    /// Gemma-4 we should plumb a per-layer-class theta (sliding=10k vs
-    /// global=1M); for now we use one value and tolerate a small
-    /// numerical mismatch on the 5 global layers. Replacing this with
-    /// `[Vec<f32>; 2]` keyed by (sliding, global) is the next step.
+    /// Default rope_theta (used by vanilla Llama and Gemma-4 sliding
+    /// layers). Gemma-4 global layers use `rope_theta_global` instead.
     rope_theta: f32,
+    /// Gemma-4 globals: rope_theta=1M (vs sliding=10k). When `None`,
+    /// falls back to `rope_theta` for all layers (Llama path).
+    rope_theta_global: Option<f32>,
+    /// Layer indices that use `rope_theta_global`. For Gemma-4 this is
+    /// the every-Nth-layer pattern; computed once at provider construction.
+    global_layers: Vec<bool>,
     activation: Activation,
     max_seq_len: usize,
     kind: Option<ModelKind>,
+    /// Gemma-4 final logit soft-cap: `logits = cap * tanh(logits / cap)`
+    /// applied to lm_head output before sampling. `None` for vanilla Llama.
+    lm_head_softcap: Option<f32>,
 }
 
 impl WgpuExecutorProvider {
@@ -71,9 +77,12 @@ impl WgpuExecutorProvider {
             text: None,
             model: None,
             rope_theta: 10000.0,
+            rope_theta_global: None,
+            global_layers: Vec::new(),
             activation: Activation::SwiGLU,
             max_seq_len: 0,
             kind: None,
+            lm_head_softcap: None,
         }
     }
 
@@ -130,10 +139,17 @@ impl WgpuExecutorProvider {
             ModelKind::Gemma4 => Activation::GeGluTanh,
             ModelKind::VanillaLlama => Activation::SwiGLU,
         };
-        let rope_theta = artifact
-            .config
-            .rope_theta
-            .unwrap_or(10000.0) as f32;
+        let cfg = &artifact.config;
+        let rope_theta = cfg.rope_theta_sliding.or(cfg.rope_theta).unwrap_or(10000.0) as f32;
+        let rope_theta_global = cfg.rope_theta_global.map(|v| v as f32);
+        // Precompute per-layer global-vs-sliding flag (Gemma-4 only;
+        // empty for vanilla Llama).
+        let global_layers: Vec<bool> = match kind {
+            ModelKind::Gemma4 => (0..cfg.num_hidden_layers)
+                .map(|l| aegisllm_base::model::gemma4::is_global_layer(l, cfg))
+                .collect(),
+            ModelKind::VanillaLlama => Vec::new(),
+        };
         let max_seq_len = artifact
             .config
             .max_position_embeddings
@@ -141,23 +157,40 @@ impl WgpuExecutorProvider {
             // Cap at a sane bound — full max_position_embeddings can be
             // 1M+ for Gemma-4, which would allocate enormous KV caches.
             .min(8192);
+        let lm_head_softcap = cfg.final_logit_softcapping.map(|v| v as f32).filter(|v| *v > 0.0);
         Ok(Self {
             device: device_index,
             limitations: vec![],
             text: Some(TextProcessor::from_artifact(artifact)?),
             model: Some(Arc::new(model)),
             rope_theta,
+            rope_theta_global,
+            global_layers,
             activation,
             max_seq_len,
             kind: Some(kind),
+            lm_head_softcap,
         })
     }
 }
 
-fn rope_for_layer_factory(rope_theta: f32) -> impl Fn(usize, usize, usize) -> (Vec<f32>, Vec<f32>) {
-    move |position, _layer_idx, half_dim| {
+/// Build a per-layer RoPE table generator. For Gemma-4: layers in
+/// `global_layers[layer_idx]==true` use `rope_theta_global`, the rest
+/// use `rope_theta`. For vanilla Llama: `global_layers` is empty so
+/// every layer uses `rope_theta`.
+fn rope_for_layer_factory(
+    rope_theta: f32,
+    rope_theta_global: Option<f32>,
+    global_layers: Vec<bool>,
+) -> impl Fn(usize, usize, usize) -> (Vec<f32>, Vec<f32>) {
+    move |position, layer_idx, half_dim| {
+        let theta = if global_layers.get(layer_idx).copied().unwrap_or(false) {
+            rope_theta_global.unwrap_or(rope_theta)
+        } else {
+            rope_theta
+        };
         let inv = (0..half_dim)
-            .map(|i| rope_theta.powf(-2.0 * i as f32 / (2 * half_dim) as f32))
+            .map(|i| theta.powf(-2.0 * i as f32 / (2 * half_dim) as f32))
             .collect::<Vec<_>>();
         let cos = inv.iter().map(|t| (position as f32 * t).cos()).collect();
         let sin = inv.iter().map(|t| (position as f32 * t).sin()).collect();
@@ -307,7 +340,11 @@ impl GenerationBackendPrimitives for WgpuExecutorProvider {
                 ));
             }
         }
-        let rope_fn = rope_for_layer_factory(self.rope_theta);
+        let rope_fn = rope_for_layer_factory(
+            self.rope_theta,
+            self.rope_theta_global,
+            self.global_layers.clone(),
+        );
         forward_token_device(
             &model.ctx,
             model,
@@ -332,12 +369,17 @@ impl GenerationBackendPrimitives for WgpuExecutorProvider {
             .ok_or_else(|| AegisError::InvalidPlan(
                 "wgpu forward_logits: state is not a WgpuModelState".into(),
             ))?;
-        super::forward::download_f32_buf(
+        let mut logits = super::forward::download_f32_buf(
             &model.ctx,
             &st.logits,
             model.vocab_size,
             "wgpu_provider_logits",
-        )
+        )?;
+        // Gemma-4 final logit soft-cap: `cap * tanh(logits / cap)`.
+        if let Some(cap) = self.lm_head_softcap {
+            aegisllm_base::executor::generation::apply_logit_softcap(&mut logits, cap);
+        }
+        Ok(logits)
     }
 
     fn prefill_prompt(
