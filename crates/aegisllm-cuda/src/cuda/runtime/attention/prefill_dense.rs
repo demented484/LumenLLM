@@ -877,10 +877,13 @@ impl CudaRuntime {
                 "dense wmma attention heads must be divisible by kv heads".into(),
             ));
         }
-        // Round-3 pipeline path doubles the K and V tile shared region (one
-        // pair for the active iter, one pair for the cp.async-prefetched
-        // next iter). 4 * k_tile * head_dim halfs total instead of 2.
-        let kv_tile_count = if use_hdim512_regacc_pipeline { 4 } else { 2 };
+        // Round-3 pipeline path doubles ONLY the K tile shared region (one
+        // for the active iter, one for the cp.async-prefetched next iter);
+        // V stays single-buffered and is loaded synchronously. So we have
+        // 3 * k_tile * head_dim halfs total (2 K + 1 V) instead of the
+        // synchronous twin's 2 (1 K + 1 V). Pipelining V too would blow the
+        // 96 KiB sm_120 opt-in dynamic-shared cap.
+        let kv_tile_count = if use_hdim512_regacc_pipeline { 3 } else { 2 };
         let half_values = DENSE_WMMA_Q_BLOCK * head_dim
             + kv_tile_count * k_tile * head_dim
             + DENSE_WMMA_Q_BLOCK * k_tile;
@@ -924,13 +927,13 @@ impl CudaRuntime {
             // hdim=256 exceeds the default 48 KiB shared-mem cap; the
             // function has been opted into 96 KiB at load time
             // (functions.rs). Use the higher cap. The Round-3 cp.async
-            // pipeline variant pushes the budget to ~98 KiB and is opted
-            // into 100 KiB at load time.
+            // K-only pipeline variant lands at ~82 KiB and shares the same
+            // 96 KiB cap as the synchronous twin.
             shared_mem_bytes: super::validate_dynamic_shared_bytes_with_cap(
                 "prefill_dense_halfq_wmma",
                 half_values * std::mem::size_of::<u16>()
                     + float_values * std::mem::size_of::<f32>(),
-                if use_hdim512_regacc_pipeline { 100 * 1024 } else { 96 * 1024 },
+                96 * 1024,
             )?,
         };
         let start_position = u32_arg("start_position", start_position)?;

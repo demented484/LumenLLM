@@ -390,28 +390,27 @@ impl CudaKernelFunctions {
                 )))?;
                 f
             },
-            // ===== Round 3 attention pipeline (cp.async K/V double-buffer) =====
+            // ===== Round 3 attention pipeline (cp.async K-only double-buffer) =====
             attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline: {
                 let f = load(
                     &module,
                     "aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline",
                 )?;
-                // cp.async-pipelined twin: doubles K and V tile shared-mem
-                // (32 KiB extra) and adds a dedicated 16 KiB acc_scratch
-                // (since k_shared no longer overlays acc). Total ~98 KiB,
-                // within sm_120's 100 KiB max-dynamic-shared cap.
-                // sm_120 rejects 100 KiB cap (CUDA_ERROR_INVALID_VALUE); the
-                // actual per-block opt-in dynamic shared limit on consumer
-                // Blackwell appears below 100 KiB. Drop to 96 KiB. The
-                // pipeline kernel's claimed 98 KiB usage exceeds 96 KiB so
-                // the launch itself will fail at opt-in time; until that's
-                // resolved the registration succeeds (binary still works for
-                // the default non-pipeline path).
-                let _ = f.set_attribute(
+                // cp.async-pipelined K-only twin: doubles K tile shared-mem
+                // (16 KiB extra) and adds a dedicated 16 KiB acc_scratch
+                // (since k_shared no longer overlays acc). V stays single-
+                // buffered and synchronous. Total ~82 KiB, within sm_120's
+                // 96 KiB opt-in dynamic-shared cap. Pipelining V too would
+                // push us back over the cap (see kernel comment). The 96 KiB
+                // cap is the empirically-safe ceiling on consumer Blackwell.
+                f.set_attribute(
                     cudarc::driver::sys::CUfunction_attribute_enum
                         ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     96 * 1024,
-                );
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on hdim512_regacc_pipeline kernel: {e:?}"
+                )))?;
                 f
             },
             // ===================================================================

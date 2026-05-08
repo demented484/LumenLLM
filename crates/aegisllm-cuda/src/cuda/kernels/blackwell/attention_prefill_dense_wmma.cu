@@ -1378,58 +1378,70 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc(
 }
 
 // =============================================================================
-// HDIM=512 register-resident-accumulator + cp.async pipelined K/V variant —
+// HDIM=512 register-resident-accumulator + cp.async pipelined K-only variant —
 // Round 3 attention pipelining.
 //
 // Drop-in numerical-twin of `aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc`.
-// The only difference is HOW the K and V tiles are staged from `key_cache`
-// and `value_cache` into shared memory:
+// The only difference is HOW the K tile is staged from `key_cache` into
+// shared memory:
 //   * Synchronous twin:   global → shared (vectorised uint4 load) per K-iter,
 //                         then __syncthreads(), then Q*K / softmax / P*V.
-//   * This pipeline:      cp.async.ca.shared.global into a DOUBLE-BUFFERED
-//                         pair of K/V slots, with two outstanding cp.async
-//                         groups so iter (k+1)'s K and V loads are in-flight
-//                         while iter (k)'s Q*K, softmax, and P*V execute.
+//   * This pipeline:      K is loaded via cp.async.ca.shared.global into a
+//                         DOUBLE-BUFFERED pair of K slots, with one outstanding
+//                         cp.async group so iter (k+1)'s K load is in-flight
+//                         while iter (k)'s Q*K runs (Q*K is the bottleneck of
+//                         the K critical path because softmax depends on it).
 //
-// Pipelining strategy (mirrors `aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_pipeline`):
-//   * Two K slots `k_shared[2][k_tile*hdim]` and two V slots `v_shared[2][k_tile*hdim]`.
-//     Each slot is k_tile=16 × hdim=512 × 2B = 16 KiB. 4 slots = 64 KiB.
-//   * Per K-iter we issue ONE cp.async commit_group covering K+V for the next
-//     iter into the next buffer. The PREVIOUS commit_group (for the current
-//     iter's K+V) is already in flight from the prior iter (or prologue).
-//   * `cp.async.wait_group<1>` keeps the current iter's data ready while the
-//     next iter's load runs in the background.
-//   * Bit-identical to the synchronous twin: cp.async copies bf16 BYTES that
-//     the synchronous path was loading via uint4 reads. No precision change.
-//   * OOB rows (`pos >= context_len` etc.) are zero-filled by issuing
-//     `cp.async.ca.shared.global ..., 16, 0;` (src_size=0 → SMEM zero-fill),
-//     matching the synchronous path's `valid_k ? *src : zero_vec` clamp.
+// Why K-only and not K+V (Option 1 of the round-3 follow-up):
+//   * sm_120 (RTX 5070 Ti, Blackwell consumer) opt-in dynamic shared cap is
+//     below 100 KiB — empirically 96 KiB is the safe ceiling. Pipelining BOTH
+//     K and V (4 staged buffers × 16 KiB = 64 KiB of K/V alone) blows the cap.
+//   * V is consumed late in the iter (after Q*K + softmax + rescale, in the
+//     P*V WMMA), so a synchronous global→shared V load issued just after
+//     the cp.async-K-wait runs in parallel with Q*K and softmax. The V load
+//     is finished long before P*V touches v_shared.
+//   * K dominates the latency-hiding win because Q*K is the FIRST compute
+//     stage and the entire iter is gated on K being resident.
 //
-// Per-warp rescale scratch reuse: just like the synchronous twin, the rescale
-// step needs 16 KiB of warp-private scratch. We CANNOT overlay k_shared (it
-// holds prefetched K[k+1] while we compute on K[k]). Instead we add a
-// dedicated `acc_scratch[16 warps * 16 * 16]` = 16 KiB region.
+// Pipelining strategy (mirrors `aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_pipeline`,
+//   restricted to the K side):
+//   * Two K slots `k_shared[2][k_tile*hdim]`. Each slot is
+//     k_tile=16 × hdim=512 × 2B = 16 KiB. 2 slots = 32 KiB.
+//   * Single V slot `v_shared[k_tile*hdim]` = 16 KiB, loaded synchronously
+//     each iter via uint4.
+//   * Per K-iter we issue ONE cp.async commit_group for iter (k+1)'s K into
+//     the next K buffer. `cp.async.wait_group<1>` keeps the current iter's K
+//     ready while the next iter's K load runs in the background.
+//   * Bit-identical K bytes vs. the synchronous twin's uint4 read.
+//   * OOB rows (`pos >= context_len` etc.) for K use cp.async src_size=0
+//     zero-fill; OOB rows for V use the same `valid_k ? *src : zero_vec`
+//     clamp the synchronous twin uses.
+//
+// Per-warp rescale scratch: 16 KiB of warp-private scratch is needed during
+// the alpha rescale step. We CANNOT overlay k_shared (it holds prefetched
+// K[k+1] while we compute on K[k]). v_shared is alive during P*V. q_shared
+// is alive across the whole loop. So a dedicated `acc_scratch[16 warps *
+// 16 * 16]` = 16 KiB region is added.
 //
 // Shared-memory budget:
 //   q_shared           16 KiB
 //   k_shared[2]        32 KiB
-//   v_shared[2]        32 KiB
-//   acc_scratch        16 KiB    (NEW — cannot reuse k_shared anymore)
+//   v_shared[1]        16 KiB    (single buffer, synchronous load)
+//   acc_scratch        16 KiB
 //   scores              1 KiB
 //   scalars + weights ~700 B
-//   total            ~97.7 KiB → packed into 100 KiB sm_120 cap via
-//                                cudaFuncSetAttribute(MAX_DYNAMIC_SHARED, 100K).
+//   total            ~81.7 KiB → fits comfortably in the 96 KiB sm_120 cap.
 //
-// Block-per-SM residency: shared-mem footprint pushes us back to 1 block / SM
-// (vs 2 blocks for the synchronous twin). The win must come from compute
-// overlap with cp.async-issued global loads. If profiling shows this regresses
-// for short contexts, the dispatcher gates this kernel behind
-// `AEGIS_ATTN_PIPELINE_ENABLE=1` and only enables it for long contexts.
+// Block-per-SM residency: shared-mem footprint at ~82 KiB still keeps us at
+// 1 block / SM on the 100 KiB sm_120 SM (synchronous twin at ~50 KiB gets
+// 2 blocks). The win comes from cp.async-issued K load overlap with the
+// previous iter's P*V and the current iter's V load + Q*K issue.
 //
 // Numerical correctness vs. the synchronous twin:
 //   * cp.async copies bf16 bytes — same byte stream the uint4 load reads.
-//   * OOB rows: synchronous path stores `zero_vec` (16 zero bytes); cp.async
+//   * OOB K rows: synchronous path stores `zero_vec` (16 zero bytes); cp.async
 //     with src_size=0 zero-fills 16 destination bytes. Identical.
+//   * V load is identical to the synchronous twin (same uint4 + zero_vec).
 //   * Q*K, softmax, P*V, alpha rescale — all unchanged.
 //   * `acc_frag[]` accumulation order is identical → bit-identical output.
 // =============================================================================
@@ -1480,9 +1492,9 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline(
 
     extern __shared__ __align__(16) unsigned char smem[];
     unsigned short* q_shared      = reinterpret_cast<unsigned short*>(smem);
-    unsigned short* k_shared_buf  = q_shared + q_block * hdim;            // 2 * k_tile * hdim
-    unsigned short* v_shared_buf  = k_shared_buf + 2u * k_tile * hdim;    // 2 * k_tile * hdim
-    float*          acc_scratch   = reinterpret_cast<float*>(v_shared_buf + 2u * k_tile * hdim);
+    unsigned short* k_shared_buf  = q_shared + q_block * hdim;            // 2 * k_tile * hdim (cp.async double-buffered)
+    unsigned short* v_shared      = k_shared_buf + 2u * k_tile * hdim;    // 1 * k_tile * hdim (synchronous)
+    float*          acc_scratch   = reinterpret_cast<float*>(v_shared + k_tile * hdim);
     constexpr unsigned int acc_scratch_per_warp = 16u * 16u; // 256 floats per warp
     float*          scores        = acc_scratch + warps_per_block * acc_scratch_per_warp;
     float*          scalars       = scores + q_block * k_tile;
@@ -1518,9 +1530,9 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline(
 #endif
 
     // -------------------------------------------------------------------------
-    // cp.async helpers + per-iter K/V tile prefetch.
+    // cp.async helpers + per-iter K-tile prefetch (V is loaded synchronously).
     //
-    // Each K (or V) tile is k_tile=16 rows × hdim=512 halfs = 8192 halfs = 16 KiB.
+    // Each K tile is k_tile=16 rows × hdim=512 halfs = 8192 halfs = 16 KiB.
     // We map each thread to one 16-byte (8-half) chunk: 512 threads × 16B = 8 KiB.
     // That covers HALF of the tile per pass; we issue TWO 16-byte cp.async ops
     // per thread per tile (chunks 0 and 1). Together: 1024 chunks × 16B = 16 KiB
@@ -1560,22 +1572,24 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline(
         asm volatile("cp.async.wait_group 0;\n" ::);
     };
 
-    // Issue K[tile_start] and V[tile_start] prefetch into k_shared_buf[buf_idx]
-    // and v_shared_buf[buf_idx]. Caller commits the cp.async group separately.
+    // Issue K[tile_start] prefetch into k_shared_buf[buf_idx]. Caller commits
+    // the cp.async group separately. V is NOT prefetched here — it is loaded
+    // synchronously inside the main loop after the K wait (V is consumed late
+    // in the iter, after Q*K + softmax + rescale, so a synchronous load that
+    // overlaps with Q*K via SM scoreboarding is enough).
     //
-    // Bit-identical to the synchronous twin's tile-load: zero-fill any row
-    // where `col >= tile_count` (where tile_count = min(k_tile,
+    // Bit-identical to the synchronous twin's tile-load for K: zero-fill any
+    // row where `col >= tile_count` (where tile_count = min(k_tile,
     // block_max_visible - tile_start_arg)). For valid rows we issue a 16-byte
     // cp.async whose source matches the synchronous twin's uint4 read of
-    // `key_cache + kv_offset` / `value_cache + kv_offset`.
-    auto issue_kv_prefetch = [&] (unsigned int tile_start_arg, unsigned int buf_idx) {
+    // `key_cache + kv_offset`.
+    auto issue_k_prefetch = [&] (unsigned int tile_start_arg, unsigned int buf_idx) {
         constexpr unsigned int halfs_per_chunk = 8u; // 16 bytes
         constexpr unsigned int chunks_per_row  = hdim / halfs_per_chunk;     // 64
         constexpr unsigned int chunks_per_tile = k_tile * chunks_per_row;    // 1024
         constexpr unsigned int passes          = chunks_per_tile / 512u;     // 2
         const unsigned int tile_count_arg = min(k_tile, block_max_visible - tile_start_arg);
         unsigned short* k_buf = k_shared_buf + buf_idx * (k_tile * hdim);
-        unsigned short* v_buf = v_shared_buf + buf_idx * (k_tile * hdim);
         #pragma unroll
         for (unsigned int p = 0u; p < passes; ++p) {
             const unsigned int chunk      = p * 512u + tid;
@@ -1587,13 +1601,10 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline(
                 ? (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + half_off
                 : (size_t)half_off;
             unsigned int k_dst_smem = cvt_smem(&k_buf[row * hdim + half_off]);
-            unsigned int v_dst_smem = cvt_smem(&v_buf[row * hdim + half_off]);
             if (valid) {
-                cp_async_16(k_dst_smem, key_cache   + kv_offset);
-                cp_async_16(v_dst_smem, value_cache + kv_offset);
+                cp_async_16(k_dst_smem, key_cache + kv_offset);
             } else {
                 cp_async_zero_16(k_dst_smem);
-                cp_async_zero_16(v_dst_smem);
             }
         }
     };
@@ -1605,38 +1616,61 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline(
         : 0u;
 
 #if __CUDA_ARCH__ >= 800
-    // Prologue: issue prefetch for tile 0 into buffer 0, commit as group 0.
+    // Prologue: issue K prefetch for tile 0 into buffer 0, commit as group 0.
     if (n_kiters > 0u) {
-        issue_kv_prefetch(block_min_tile_start, 0u);
+        issue_k_prefetch(block_min_tile_start, 0u);
         cp_async_commit();
     }
 #endif
     __syncthreads(); // ensure scalars/q_shared init visible before loop
 
+    const uint4 zero_vec = make_uint4(0u, 0u, 0u, 0u);
     for (unsigned int it = 0u; it < n_kiters; ++it) {
         const unsigned int tile_start = block_min_tile_start + it * k_tile;
         const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
         const unsigned int buf_cur = it & 1u;
         const unsigned int buf_nxt = buf_cur ^ 1u;
         unsigned short* k_shared = k_shared_buf + buf_cur * (k_tile * hdim);
-        unsigned short* v_shared = v_shared_buf + buf_cur * (k_tile * hdim);
 
 #if __CUDA_ARCH__ >= 800
-        // Issue the next iter's prefetch, then wait until ≤1 group remains
-        // (i.e., the current iter's data is ready).
+        // Issue the next iter's K prefetch, then wait until ≤1 group remains
+        // (i.e., the current iter's K data is ready).
         if (it + 1u < n_kiters) {
-            issue_kv_prefetch(block_min_tile_start + (it + 1u) * k_tile, buf_nxt);
+            issue_k_prefetch(block_min_tile_start + (it + 1u) * k_tile, buf_nxt);
             cp_async_commit();
             cp_async_wait_lt1();
         } else {
             cp_async_wait_lt0();
+        }
+
+        // Synchronous V load for the current iter. Bit-identical to the
+        // synchronous twin's V uint4 path. Issued AFTER the K cp.async wait
+        // so the K group is already in flight; the V load runs in parallel
+        // with the next iter's K cp.async DMA via the SM's load/store unit.
+        // V is consumed late (P*V), so by the time we touch v_shared the
+        // load is comfortably visible after the post-Q*K sync.
+        {
+            constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
+            constexpr unsigned int v_vecs = k_tile * hdim / halfs_per_vec;
+            uint4* v_shared_vec = reinterpret_cast<uint4*>(v_shared);
+            for (unsigned int vec = tid; vec < v_vecs; vec += blockDim.x) {
+                const unsigned int idx = vec * halfs_per_vec;
+                const unsigned int col = idx / hdim;
+                const unsigned int dim = idx - col * hdim;
+                const unsigned int pos = tile_start + col;
+                const bool valid_k = col < tile_count;
+                const size_t kv_offset =
+                    (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
+                v_shared_vec[vec] = valid_k
+                    ? *reinterpret_cast<const uint4*>(value_cache + kv_offset)
+                    : zero_vec;
+            }
         }
         __syncthreads();
 #else
         // Pre-sm_80 fallback: synchronous load (matches the twin exactly).
         constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
         constexpr unsigned int kv_vecs = k_tile * hdim / halfs_per_vec;
-        const uint4 zero_vec = make_uint4(0u, 0u, 0u, 0u);
         uint4* k_shared_vec = reinterpret_cast<uint4*>(k_shared);
         uint4* v_shared_vec = reinterpret_cast<uint4*>(v_shared);
         for (unsigned int vec = tid; vec < kv_vecs; vec += blockDim.x) {
@@ -1655,6 +1689,7 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline(
                 : zero_vec;
         }
         __syncthreads();
+        (void)buf_nxt; // unused on pre-sm_80
 #endif
 
 #if __CUDA_ARCH__ >= 800
