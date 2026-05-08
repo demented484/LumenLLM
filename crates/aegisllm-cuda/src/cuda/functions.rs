@@ -35,6 +35,7 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) nvfp4_prequant_batched_gemm: CudaFunction,
     pub(crate) nvfp4_prequant_batched_gemm_wmma_bf16: CudaFunction,
     pub(crate) nvfp4_grouped_prequant_gemm_wmma_bf16: CudaFunction,
+    pub(crate) nvfp4_grouped_prequant_gemm_wmma_bf16_t32: CudaFunction,
     pub(crate) nvfp4_quantize_input: CudaFunction,
     pub(crate) nvfp4_quantize_input_batched: CudaFunction,
     pub(crate) bf16_matvec: CudaFunction,
@@ -186,6 +187,10 @@ impl CudaKernelFunctions {
             nvfp4_grouped_prequant_gemm_wmma_bf16: load(
                 &module,
                 "aegis_nvfp4_grouped_prequant_gemm_wmma_bf16",
+            )?,
+            nvfp4_grouped_prequant_gemm_wmma_bf16_t32: load(
+                &module,
+                "aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32",
             )?,
             nvfp4_quantize_input: load(&module, "aegis_nvfp4_quantize_input")?,
             nvfp4_quantize_input_batched: load(&module, "aegis_nvfp4_quantize_input_batched")?,

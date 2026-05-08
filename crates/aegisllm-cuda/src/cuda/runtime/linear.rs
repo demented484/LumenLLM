@@ -649,9 +649,49 @@ impl CudaRuntime {
         }
         let rows_u32 = u32_arg("rows", rows)?;
         let cols_u32 = u32_arg("cols", cols)?;
+        let grid_z = u32_arg("num_active_experts", num_active_experts)?;
+
+        // Prefer the 32x32-output-tile (4-warp) kernel: same FP4 dequant
+        // semantics, identical per-element WMMA accumulation order, but
+        // amortizes shared-memory loads across 4 mma.sync calls per K-iter
+        // and raises tensor-core utilization. Eligibility: rows is a
+        // multiple of 32 (ensures each block's M-tile is fully populated for
+        // the 16x16+16x16 sub-tile pair). The 16x16 fallback kernel handles
+        // odd rows for forward-compatibility with future dim choices, and
+        // also covers the small-batch decode path that calls this.
+        let t32_disabled = std::env::var("AEGIS_NVFP4_GROUPED_T32_DISABLE").is_ok();
+        let use_t32 = !t32_disabled
+            && rows % 32 == 0
+            && max_tokens_per_expert >= 16;
+        if use_t32 {
+            let grid_x = (rows / 32) as u32;
+            let grid_y = ((max_tokens_per_expert + 31) / 32) as u32;
+            let cfg = LaunchConfig {
+                grid_dim: (grid_x, grid_y, grid_z),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_grouped_prequant_gemm_wmma_bf16_t32)
+                    .arg(&packed_base.slice)
+                    .arg(&scales_base.slice)
+                    .arg(&packed_offsets.slice)
+                    .arg(&scales_offsets.slice)
+                    .arg(&output_scales.slice)
+                    .arg(&expert_token_offsets.slice)
+                    .arg(&permuted_input.slice)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&mut permuted_output.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch grouped nvfp4 wmma gemm t32"))?;
+            return Ok(());
+        }
+
         let grid_x = (rows / 16) as u32;
         let grid_y = ((max_tokens_per_expert + 15) / 16) as u32;
-        let grid_z = u32_arg("num_active_experts", num_active_experts)?;
         let cfg = LaunchConfig {
             grid_dim: (grid_x, grid_y, grid_z),
             block_dim: (32, 1, 1),
