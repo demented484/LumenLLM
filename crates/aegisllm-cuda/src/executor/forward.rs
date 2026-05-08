@@ -332,14 +332,23 @@ impl CudaLlamaExecutor {
             &mut state.decode_seq_len,
         )?;
 
-        if let Some(ref graph) = state.decode_graph {
+        // The decode graph captures the split-decode kernel's shared-mem
+        // allocation, which is sized for chunk_len ≤ DECODE_MAX_CHUNK_LEN
+        // (= CUDA_GRAPH_ATTN_MAX_SEQ_LEN / DECODE_SPLIT_K). Replaying the
+        // captured graph at seq_len > CUDA_GRAPH_ATTN_MAX_SEQ_LEN would
+        // overflow `scores[chunk_len]` past the captured shared
+        // allocation. Fall back to the eager path (which sizes shared mem
+        // from the live seq_len) when we exceed the captured envelope.
+        let can_replay = seq_len <= CUDA_GRAPH_ATTN_MAX_SEQ_LEN;
+        if let (true, Some(ref graph)) = (can_replay, state.decode_graph.as_ref()) {
             // Hot path: replay the previously captured graph (32 layers + norm + lm_head + argmax).
             // For non-greedy we'll download logits from state.logits; the argmax is a no-op for us.
             self.runtime.replay_decode_graph(&graph.0)?;
         } else {
             let can_capture = seq_len <= CUDA_GRAPH_ATTN_MAX_SEQ_LEN
                 && !self.has_staged_layers
-                && !self.has_staged_kv;
+                && !self.has_staged_kv
+                && state.decode_graph.is_none();
             if can_capture {
                 self.runtime.begin_decode_graph_capture()?;
             }

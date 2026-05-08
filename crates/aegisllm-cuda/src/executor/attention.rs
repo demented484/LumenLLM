@@ -216,6 +216,7 @@ pub(super) fn forward_attention_device(
             num_kv_heads,
             head_dim,
             layer.window_size,
+            _seq_len,
             &mut scratch.attn_split_acc,
             &mut scratch.attn_split_m,
             &mut scratch.attn_split_l,
@@ -234,6 +235,7 @@ pub(super) fn forward_attention_device(
                 runtime.attention_decode_split_ptr_device(
                     keys, values, &scratch.q, p_seq_len, num_attention_heads, num_kv_heads,
                     head_dim, layer.window_size,
+                    _seq_len,
                     &mut scratch.attn_split_acc,
                     &mut scratch.attn_split_m,
                     &mut scratch.attn_split_l,
@@ -247,6 +249,7 @@ pub(super) fn forward_attention_device(
                 runtime.attention_decode_split_ptr_fp8_device(
                     keys, values, &scratch.q, p_seq_len, num_attention_heads, num_kv_heads,
                     head_dim, layer.window_size,
+                    _seq_len,
                     &mut scratch.attn_split_acc,
                     &mut scratch.attn_split_m,
                     &mut scratch.attn_split_l,

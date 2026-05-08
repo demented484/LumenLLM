@@ -80,6 +80,19 @@ impl CudaRuntime {
     ///   2. combine: grid (heads, 1), no shared mem
     ///
     /// `partial_acc/m/l` must be pre-allocated in CudaScratch (see state.rs).
+    ///
+    /// `seq_len_hint` is the host-known seq_len (kv_position + 1) for the
+    /// current decode step. The kernel re-reads the authoritative value from
+    /// `*p_seq_len` at runtime; the hint is used solely to size the dynamic
+    /// shared memory allocation, which must hold `scores[chunk_len]` where
+    /// `chunk_len = ceil(seq_len / DECODE_SPLIT_K)`. For seq_len ≤
+    /// `CUDA_GRAPH_ATTN_MAX_SEQ_LEN` the captured-graph hot path uses the
+    /// fixed `DECODE_MAX_CHUNK_LEN` allocation; for longer seqs (eager
+    /// path only — graph capture is skipped above 8k) we widen shared mem
+    /// to fit. Without this fix, decode at seq_len > 8k overruns the
+    /// fixed 512-slot `scores` array into adjacent shared memory and
+    /// (above ~16k) past the dynamic-shared allocation entirely, surfacing
+    /// as `CUDA_ERROR_ILLEGAL_ADDRESS` on the next kernel launch.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_decode_split_ptr_device(
         &self,
@@ -91,6 +104,7 @@ impl CudaRuntime {
         num_kv_heads: usize,
         head_dim: usize,
         window_size: usize,
+        seq_len_hint: usize,
         partial_acc: &mut DeviceBuffer<f32>,
         partial_m: &mut DeviceBuffer<f32>,
         partial_l: &mut DeviceBuffer<f32>,
@@ -126,7 +140,15 @@ impl CudaRuntime {
         let num_kv_heads_u32 = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim_u32 = u32_arg("head_dim", head_dim)?;
         let split_k_u32 = u32_arg("split_k", DECODE_SPLIT_K)?;
-        let max_chunk_len_u32 = u32_arg("max_chunk_len", DECODE_MAX_CHUNK_LEN)?;
+        // For the captured-graph hot path (seq_len ≤ CUDA_GRAPH_ATTN_MAX_SEQ_LEN),
+        // chunk_len ≤ DECODE_MAX_CHUNK_LEN and we use the fixed allocation.
+        // For longer seqs we widen `max_chunk_len` to fit the actual chunk size
+        // so `scores[pos]` writes stay in-bounds. The kernel uses this both as
+        // the shared-mem layout offset for warp_partial/vsum AND as the
+        // implicit upper bound on `pos`.
+        let chunk_len_for_seq = seq_len_hint.div_ceil(DECODE_SPLIT_K).max(1);
+        let effective_max_chunk_len = DECODE_MAX_CHUNK_LEN.max(chunk_len_for_seq);
+        let max_chunk_len_u32 = u32_arg("max_chunk_len", effective_max_chunk_len)?;
         let window_size_u32 = u32_arg("window_size", window_size)?;
         // Cache capacity (in tokens) is inferred from the key buffer size:
         // sliding-window layers will pass a smaller cache, the kernel uses
@@ -136,12 +158,17 @@ impl CudaRuntime {
         let cache_capacity = key_cache.len() / (num_kv_heads * head_dim);
         let cache_capacity_u32 = u32_arg("cache_capacity", cache_capacity)?;
         let block_dim = CUDA_ATTENTION_BLOCK_DIM;
-        // Shared memory layout: scores[max_chunk_len] + warp_partial[4] + vsum[4*head_dim].
-        // = (DECODE_MAX_CHUNK_LEN + 4 + 4*head_dim) * 4 bytes.
-        // With DECODE_SPLIT_K=32, head_dim=128: (256+4+512)*4 = 3072 bytes.
-        let split_shared_bytes =
-            (DECODE_MAX_CHUNK_LEN + 4 + 4 * head_dim) * std::mem::size_of::<f32>();
-        let split_shared_bytes = split_shared_bytes as u32;
+        // Shared memory layout: scores[effective_max_chunk_len] +
+        // warp_partial[4] + vsum[4*head_dim], all f32.
+        // Capped at the kernel's MAX_DYNAMIC_SHARED_SIZE_BYTES opt-in
+        // (96 KiB) at load time.
+        let split_shared_bytes_usize =
+            (effective_max_chunk_len + 4 + 4 * head_dim) * std::mem::size_of::<f32>();
+        let split_shared_bytes = super::validate_dynamic_shared_bytes_with_cap(
+            "attention_decode_ptr_split",
+            split_shared_bytes_usize,
+            96 * 1024,
+        )?;
         let split_cfg = LaunchConfig {
             grid_dim: (num_heads_u32, split_k_u32, 1),
             block_dim: (block_dim, 1, 1),
@@ -254,6 +281,10 @@ impl CudaRuntime {
 
     /// FP8 KV FlashDecoding split-K for CUDA Graph.  The combine pass is
     /// shared with the F16 path (it never reads the KV cache).
+    ///
+    /// `seq_len_hint`: see `attention_decode_split_ptr_device` — used solely
+    /// to size dynamic shared memory for `scores[chunk_len]`. Required for
+    /// correct execution above `CUDA_GRAPH_ATTN_MAX_SEQ_LEN`.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_decode_split_ptr_fp8_device(
         &self,
@@ -265,6 +296,7 @@ impl CudaRuntime {
         num_kv_heads: usize,
         head_dim: usize,
         window_size: usize,
+        seq_len_hint: usize,
         partial_acc: &mut DeviceBuffer<f32>,
         partial_m: &mut DeviceBuffer<f32>,
         partial_l: &mut DeviceBuffer<f32>,
@@ -295,13 +327,22 @@ impl CudaRuntime {
         let num_kv_heads_u32 = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim_u32     = u32_arg("head_dim", head_dim)?;
         let split_k_u32      = u32_arg("split_k", DECODE_SPLIT_K)?;
-        let max_chunk_len_u32 = u32_arg("max_chunk_len", DECODE_MAX_CHUNK_LEN)?;
+        // Dynamic-size shared mem to fit `scores[chunk_len]` at long seqs.
+        // See `attention_decode_split_ptr_device` for full rationale.
+        let chunk_len_for_seq = seq_len_hint.div_ceil(DECODE_SPLIT_K).max(1);
+        let effective_max_chunk_len = DECODE_MAX_CHUNK_LEN.max(chunk_len_for_seq);
+        let max_chunk_len_u32 = u32_arg("max_chunk_len", effective_max_chunk_len)?;
         let window_size_u32  = u32_arg("window_size", window_size)?;
         let cache_capacity = key_cache.len() / (num_kv_heads * head_dim);
         let cache_capacity_u32 = u32_arg("cache_capacity", cache_capacity)?;
         let block_dim        = CUDA_ATTENTION_BLOCK_DIM;
-        let split_shared_bytes =
-            ((DECODE_MAX_CHUNK_LEN + 4 + 4 * head_dim) * std::mem::size_of::<f32>()) as u32;
+        let split_shared_bytes_usize =
+            (effective_max_chunk_len + 4 + 4 * head_dim) * std::mem::size_of::<f32>();
+        let split_shared_bytes = super::validate_dynamic_shared_bytes_with_cap(
+            "attention_decode_ptr_split_fp8",
+            split_shared_bytes_usize,
+            96 * 1024,
+        )?;
         let split_cfg = LaunchConfig {
             grid_dim: (num_heads_u32, split_k_u32, 1),
             block_dim: (block_dim, 1, 1),

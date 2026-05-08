@@ -238,11 +238,41 @@ impl CudaKernelFunctions {
             rope_kv_store_fp8_slots_batched: load(&module, "aegis_rope_kv_store_fp8_slots_batched")?,
             attention_decode_fp8: load(&module, "aegis_attention_decode_fp8")?,
             attention_decode_ptr_fp8: load(&module, "aegis_attention_decode_ptr_fp8")?,
-            attention_decode_ptr_split_fp8: load(&module, "aegis_attention_decode_ptr_split_fp8")?,
+            attention_decode_ptr_split_fp8: {
+                // Same long-context dynamic-shared opt-in as the F16
+                // attention_decode_ptr_split path — see comment there.
+                let f = load(&module, "aegis_attention_decode_ptr_split_fp8")?;
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on attention_decode_ptr_split_fp8: {e:?}"
+                )))?;
+                f
+            },
             attention_decode_streaming_fp8: load(&module, "aegis_attention_decode_streaming_fp8")?,
             attention: load(&module, "aegis_attention_decode")?,
             attention_ptr: load(&module, "aegis_attention_decode_ptr")?,
-            attention_decode_ptr_split: load(&module, "aegis_attention_decode_ptr_split")?,
+            attention_decode_ptr_split: {
+                // Opt the split-decode kernel into the 96 KiB dynamic shared
+                // pool so it can size `scores[chunk_len]` from the actual
+                // seq_len at long contexts. The captured-graph hot path
+                // (seq_len ≤ CUDA_GRAPH_ATTN_MAX_SEQ_LEN) still allocates
+                // only `DECODE_MAX_CHUNK_LEN`; the larger pool is used only
+                // for the eager long-context path. See decode.rs.
+                let f = load(&module, "aegis_attention_decode_ptr_split")?;
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on attention_decode_ptr_split: {e:?}"
+                )))?;
+                f
+            },
             attention_decode_ptr_combine: load(&module, "aegis_attention_decode_ptr_combine")?,
             attention_decode_streaming: load(&module, "aegis_attention_decode_streaming")?,
             attention_prefill_batched: load(&module, "aegis_attention_prefill_batched")?,
