@@ -1240,23 +1240,47 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc(
         __syncthreads();
 
 #if __CUDA_ARCH__ >= 800
-        // Q*K WMMA: k_tile=16 fits a single 16x16 tile, only warp 0
-        // participates. The K-loop walks the full HDIM via 16-wide
-        // sub-tiles (HDIM/16 = 32 mma.sync calls).
-        if (warp < 1u) {
+        // Q*K WMMA: split HDIM=512 reduction across `qk_warps` warps so
+        // 15/16 warps don't sit idle. Each of the first `qk_warps` warps
+        // accumulates an independent 16x16 partial covering its slice of
+        // HDIM; results are summed elementwise into `scores` afterwards.
+        // Partial slots overlay k_shared (which is no longer needed once
+        // all warp mma chains have read it for the Q*K reduction). 4
+        // partials × 256 floats × 4 B = 4 KiB ≪ k_shared's 16 KiB.
+        constexpr unsigned int qk_warps = 4u;
+        constexpr unsigned int hdim_per_qk_warp = hdim / qk_warps;  // 128
+        float* partial_scores = reinterpret_cast<float*>(k_shared);
+        if (warp < qk_warps) {
             wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
             wmma::fill_fragment(c_frag, 0.0f);
+            const unsigned int kk_start = warp * hdim_per_qk_warp;
+            const unsigned int kk_end   = kk_start + hdim_per_qk_warp;
 #pragma unroll
-            for (unsigned int kk = 0u; kk < hdim; kk += 16u) {
+            for (unsigned int kk = kk_start; kk < kk_end; kk += 16u) {
                 const half* a_ptr = reinterpret_cast<const half*>(q_shared + kk);
                 const half* b_ptr = reinterpret_cast<const half*>(k_shared + kk);
                 wmma::load_matrix_sync(a_frag, a_ptr, hdim);
                 wmma::load_matrix_sync(b_frag, b_ptr, hdim);
                 wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
             }
-            wmma::store_matrix_sync(scores, c_frag, k_tile, wmma::mem_row_major);
+            // Sync so all qk_warps finish reading k_shared before any
+            // warp writes partials into the same buffer (overlay).
+            __syncthreads();
+            wmma::store_matrix_sync(
+                partial_scores + warp * 256u, c_frag, 16u, wmma::mem_row_major);
+        } else {
+            __syncthreads();
+        }
+        __syncthreads();
+        // Reduce 4 partials (16x16 each = 256 floats) → scores. 256 elems
+        // distributed across blockDim.x threads; idle threads at tail.
+        for (unsigned int e = tid; e < 256u; e += blockDim.x) {
+            scores[e] = partial_scores[0u * 256u + e]
+                      + partial_scores[1u * 256u + e]
+                      + partial_scores[2u * 256u + e]
+                      + partial_scores[3u * 256u + e];
         }
 #endif
         __syncthreads();
