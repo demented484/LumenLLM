@@ -3,6 +3,7 @@ pub mod block;
 mod forward;
 mod full;
 mod linear_ops;
+mod load_progress;
 mod loader;
 mod mlp;
 mod planning;

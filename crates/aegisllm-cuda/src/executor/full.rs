@@ -1,4 +1,5 @@
 use super::linear_ops::native_mxfp4_enabled;
+use super::load_progress::LoadProgress;
 use super::loader::{
     CudaLayerShape, cuda_residency_for_store, first_existing_tensor, load_cuda_layer,
     runtime_layouts_by_region,
@@ -94,6 +95,9 @@ impl CudaLlamaExecutor {
             .get(&RegionId("lm_head".into()))
             .ok_or_else(|| AegisError::InvalidPlan("missing lm_head placement".into()))?;
 
+        // 3 non-layer regions (embed, final_norm, lm_head) + N layers.
+        let progress = LoadProgress::new(3 + graph.num_layers);
+
         let embed_name = format!("{}embed_tokens.weight", graph.text_prefix);
         let embed_tokens = cuda_weights.load_bf16_matrix_with_store(
             first_existing_tensor(artifact, &[&embed_name, "model.embed_tokens.weight"])?,
@@ -101,12 +105,14 @@ impl CudaLlamaExecutor {
             cuda_residency_for_store(embed_region.store, device)?,
             &mut loader,
         )?;
+        progress.step("embed");
         let final_norm_name = format!("{}norm.weight", graph.text_prefix);
         let final_norm = cuda_weights.load_dense_vector_with_store(
             first_existing_tensor(artifact, &[&final_norm_name, "model.norm.weight"])?,
             final_norm_region.store,
             &mut loader,
         )?;
+        progress.step("final_norm");
         let lm_head_tensor = first_existing_tensor(
             artifact,
             &["lm_head.weight", &embed_name, "model.embed_tokens.weight"],
@@ -117,6 +123,7 @@ impl CudaLlamaExecutor {
             cuda_residency_for_store(lm_head_region.store, device)?,
             &mut loader,
         )?;
+        progress.step("lm_head");
 
         let mut layers = Vec::with_capacity(graph.num_layers);
         let shared_mlp_q = placement.shared_mlp_quantization;
@@ -190,6 +197,7 @@ impl CudaLlamaExecutor {
                 attention_store_override,
                 &mut loader,
             )?);
+            progress.step(&format!("layer {layer}"));
         }
 
         let has_staged_layers = layers.iter().any(|layer| {
