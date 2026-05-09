@@ -786,24 +786,42 @@ extern "C" __global__ void aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big(
 
     for (unsigned int k_tile = 0u; k_tile < cols; k_tile += (unsigned int)WMMA_K) {
         // Load 64×16 weight tile (TILE_M rows × WMMA_K cols), row-major.
-        // 1024 elements / 256 threads = 4 elements per thread.
-        // Per-element dequant order matches the t32 kernel exactly: same
-        // (row_g, col_g) → same byte/nibble/blk_scale → same f32 → same bf16.
-        for (unsigned int e = tid; e < A_ELEMS; e += BLOCK_THREADS) {
-            const unsigned int m = e / (unsigned int)WMMA_K;
-            const unsigned int k = e % (unsigned int)WMMA_K;
-            const unsigned int row_g = tile_row + m;
-            const unsigned int col_g = k_tile + k;
-            float v = 0.0f;
-            if (row_g < rows && col_g < cols) {
-                const size_t packed_idx = (size_t)row_g * packed_cols + (size_t)(col_g / 2u);
-                const unsigned int byte = packed[packed_idx];
-                const unsigned int nibble = (col_g & 1u) ? (byte >> 4u) : (byte & 0x0Fu);
-                const size_t scale_idx = (size_t)row_g * scale_cols + (size_t)(col_g / 16u);
-                const float blk_scale = decode_ue4m3_half(scales[scale_idx]);
-                v = (float)decode_nvfp4_nibble(nibble) * blk_scale;
+        // Scale-hoisted layout: thread covers 4 contiguous K positions in one
+        // row (instead of 4 random rows), so:
+        //   * 1 scale fetch+decode per thread (shared across all 4 elements)
+        //   * 2 contiguous packed-byte loads per thread → 4 nibbles
+        // Per-element decode order is byte/nibble/scale/f32-mul/bf16 cast —
+        // bit-identical to the original (row_g, col_g) layout, just reordered
+        // spatially. 256 threads × 4 elems = 1024 elems = full 64×16 tile.
+        {
+            const unsigned int m_local = tid >> 2;          // 0..63
+            const unsigned int k_chunk = tid & 3u;          // 0..3
+            const unsigned int k_start = k_chunk * 4u;      // 0/4/8/12
+            const unsigned int row_g = tile_row + m_local;
+            float blk_scale = 0.0f;
+            unsigned int byte0 = 0u, byte1 = 0u;
+            if (row_g < rows) {
+                const size_t scale_idx =
+                    (size_t)row_g * scale_cols + (size_t)(k_tile / 16u);
+                blk_scale = decode_ue4m3_half(scales[scale_idx]);
+                const size_t base_packed_idx =
+                    (size_t)row_g * packed_cols
+                    + (size_t)((k_tile + k_start) / 2u);
+                byte0 = packed[base_packed_idx];
+                byte1 = packed[base_packed_idx + 1u];
             }
-            sh_a[m * (unsigned int)WMMA_K + k] = __float2bfloat16(v);
+            #pragma unroll
+            for (unsigned int kk = 0u; kk < 4u; ++kk) {
+                const unsigned int k = k_start + kk;
+                const unsigned int byte = (kk < 2u) ? byte0 : byte1;
+                const unsigned int nibble =
+                    ((kk & 1u) == 1u) ? (byte >> 4u) : (byte & 0x0Fu);
+                float v = 0.0f;
+                if (row_g < rows) {
+                    v = (float)decode_nvfp4_nibble(nibble) * blk_scale;
+                }
+                sh_a[m_local * (unsigned int)WMMA_K + k] = __float2bfloat16(v);
+            }
         }
 
         // Load 64×16 input tile (TILE_N batch entries × WMMA_K cols), col-major:
@@ -1042,23 +1060,40 @@ extern "C" __global__ void aegis_nvfp4_grouped_prequant_gemm_wmma_bf16_t32_big_p
         const unsigned int buf_cur = k_idx & 1u;
         const unsigned int buf_nxt = buf_cur ^ 1u;
 
-        // ------ A weight tile (synchronous, identical to BIG kernel). ------
-        // 1024 elements / 256 threads = 4 elements per thread.
-        for (unsigned int e = tid; e < A_ELEMS; e += BLOCK_THREADS) {
-            const unsigned int m = e / (unsigned int)WMMA_K;
-            const unsigned int k = e % (unsigned int)WMMA_K;
-            const unsigned int row_g = tile_row + m;
-            const unsigned int col_g = k_tile + k;
-            float v = 0.0f;
-            if (row_g < rows && col_g < cols) {
-                const size_t packed_idx = (size_t)row_g * packed_cols + (size_t)(col_g / 2u);
-                const unsigned int byte = packed[packed_idx];
-                const unsigned int nibble = (col_g & 1u) ? (byte >> 4u) : (byte & 0x0Fu);
-                const size_t scale_idx = (size_t)row_g * scale_cols + (size_t)(col_g / 16u);
-                const float blk_scale = decode_ue4m3_half(scales[scale_idx]);
-                v = (float)decode_nvfp4_nibble(nibble) * blk_scale;
+        // ------ A weight tile (synchronous; scale-hoisted layout). ------
+        // Thread covers 4 contiguous K positions in one row → 1 scale
+        // decode + 2 contiguous packed-byte loads per thread per K-iter.
+        // Bit-identical to the per-element original — same byte/nibble/
+        // scale/f32-mul/bf16 cast chain, just reordered spatially.
+        {
+            const unsigned int m_local = tid >> 2;          // 0..63
+            const unsigned int k_chunk = tid & 3u;          // 0..3
+            const unsigned int k_start = k_chunk * 4u;      // 0/4/8/12
+            const unsigned int row_g = tile_row + m_local;
+            float blk_scale = 0.0f;
+            unsigned int byte0 = 0u, byte1 = 0u;
+            if (row_g < rows) {
+                const size_t scale_idx =
+                    (size_t)row_g * scale_cols + (size_t)(k_tile / 16u);
+                blk_scale = decode_ue4m3_half(scales[scale_idx]);
+                const size_t base_packed_idx =
+                    (size_t)row_g * packed_cols
+                    + (size_t)((k_tile + k_start) / 2u);
+                byte0 = packed[base_packed_idx];
+                byte1 = packed[base_packed_idx + 1u];
             }
-            sh_a[m * (unsigned int)WMMA_K + k] = __float2bfloat16(v);
+            #pragma unroll
+            for (unsigned int kk = 0u; kk < 4u; ++kk) {
+                const unsigned int k = k_start + kk;
+                const unsigned int byte = (kk < 2u) ? byte0 : byte1;
+                const unsigned int nibble =
+                    ((kk & 1u) == 1u) ? (byte >> 4u) : (byte & 0x0Fu);
+                float v = 0.0f;
+                if (row_g < rows) {
+                    v = (float)decode_nvfp4_nibble(nibble) * blk_scale;
+                }
+                sh_a[m_local * (unsigned int)WMMA_K + k] = __float2bfloat16(v);
+            }
         }
 
 #if __CUDA_ARCH__ >= 800
