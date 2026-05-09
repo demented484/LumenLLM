@@ -264,25 +264,26 @@ impl CudaLlamaExecutor {
         // including across `kill aegisllm`, until memory pressure forces
         // eviction. The arena's pinned copy is the runtime-of-record; the
         // page cache is wasted bytes from this point on.
-        {
-            use std::collections::HashSet;
-            use std::path::PathBuf;
-            let mut shards: HashSet<PathBuf> = HashSet::new();
-            for tensor in artifact.tensors.tensors.values() {
-                shards.insert(tensor.shard_path.clone());
-            }
-            for path in shards {
-                if let Ok(file) = std::fs::File::open(&path) {
-                    if let Ok(meta) = file.metadata() {
-                        aegisllm_base::tensor::storage::fadvise_dont_need(
-                            &file,
-                            0,
-                            meta.len(),
-                        );
-                    }
+        let shards: std::collections::HashSet<std::path::PathBuf> = artifact
+            .tensors
+            .tensors
+            .values()
+            .map(|t| t.shard_path.clone())
+            .collect();
+        for path in &shards {
+            if let Ok(file) = std::fs::File::open(path) {
+                if let Ok(meta) = file.metadata() {
+                    aegisllm_base::tensor::storage::fadvise_dont_need(&file, 0, meta.len());
                 }
             }
         }
+        // Install SIGTERM/SIGINT/SIGHUP handlers that re-run the fadvise
+        // sweep on graceful shutdown, since the OS may have re-cached
+        // shard pages while serving (e.g. inference shouldn't touch the
+        // shards directly, but stat() + readahead from monitoring tools
+        // can repopulate). SIGKILL is uncatchable; the in-load sweep
+        // above is the SIGKILL fallback.
+        super::cache_cleanup::install(shards);
 
         // Trim the device's default cudaMallocAsync memory pool back to its
         // live working set. Loading layers in sequence builds up the pool's

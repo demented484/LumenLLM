@@ -1,5 +1,6 @@
 mod attention;
 pub mod block;
+mod cache_cleanup;
 mod forward;
 mod full;
 mod linear_ops;
