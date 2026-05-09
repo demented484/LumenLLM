@@ -34,6 +34,20 @@ pub(super) fn forward_attention_device(
     _seq_len: usize,
 ) -> Result<()> {
     let kv_width = num_kv_heads * head_dim;
+    // Sliding-window layers allocate only `window_size` KV slots and the
+    // cache wraps via `slot = position % cache_capacity`. The kernel uses
+    // the `cache_capacity` arg as the wrap modulus AND as a bounds check
+    // (`if (slot < context_size)` inside `aegis_*_kv_store_*_batched`),
+    // so we MUST pass the per-layer effective capacity here, not the
+    // engine's full `kv_context_size`. Passing 262144 for a 1024-slot
+    // sliding layer makes the modulo a no-op and decode writes go
+    // out-of-bounds at position >= 1024 — visible as a deterministic
+    // collapse to gibberish ~920 tokens into generation.
+    let effective_kv_capacity = if layer.window_size > 0 {
+        layer.window_size.min(kv_context_size)
+    } else {
+        kv_context_size
+    };
 
     if let (Some(q), Some(k), Some(v)) = (layer.q_proj.as_nvfp4(), layer.k_proj.as_nvfp4(), layer.v_proj.as_nvfp4()) {
         // NVFP4 path (Llama, Qwen, etc.)
@@ -205,7 +219,7 @@ pub(super) fn forward_attention_device(
             &scratch.v,
             p_position,
             kv_width,
-            kv_context_size,
+            effective_kv_capacity,
         )?;
         runtime.attention_decode_split_ptr_device(
             &staging.keys,
@@ -230,7 +244,7 @@ pub(super) fn forward_attention_device(
         match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
             (KvBuffer::F16(keys), KvBuffer::F16(values)) => {
                 runtime.store_kv_ptr_device(
-                    keys, values, &scratch.k, &scratch.v, p_position, kv_width, kv_context_size,
+                    keys, values, &scratch.k, &scratch.v, p_position, kv_width, effective_kv_capacity,
                 )?;
                 runtime.attention_decode_split_ptr_device(
                     keys, values, &scratch.q, p_seq_len, num_attention_heads, num_kv_heads,
@@ -244,7 +258,7 @@ pub(super) fn forward_attention_device(
             }
             (KvBuffer::Fp8(keys), KvBuffer::Fp8(values)) => {
                 runtime.store_kv_fp8_ptr_device(
-                    keys, values, &scratch.k, &scratch.v, p_position, kv_width, kv_context_size,
+                    keys, values, &scratch.k, &scratch.v, p_position, kv_width, effective_kv_capacity,
                 )?;
                 runtime.attention_decode_split_ptr_fp8_device(
                     keys, values, &scratch.q, p_seq_len, num_attention_heads, num_kv_heads,
