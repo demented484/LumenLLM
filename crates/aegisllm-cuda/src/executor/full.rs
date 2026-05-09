@@ -94,11 +94,18 @@ impl CudaLlamaExecutor {
             .ok_or_else(|| AegisError::InvalidPlan("missing lm_head placement".into()))?;
 
         let embed_name = format!("{}embed_tokens.weight", graph.text_prefix);
-        let embed_tokens = cuda_weights.load_bf16_matrix_with_store(
+        // embed_tokens: force-VRAM regardless of `store=ram` config. The host-fallback
+        // path (linear.rs `bf16_rows_to_f32_device`) does a CPU gather over pinned
+        // WRITECOMBINED-uncached BF16 (~1-2 GB/s read bandwidth), making prefill embed
+        // ~10000× slower than memory-bound VRAM kernel. Decode is one row so the host
+        // path was acceptable; prefill of 9.6k tokens spent 506 ms here. Cost: ~1 GiB
+        // VRAM kept resident (vocab × hidden × 2 B) — same precedent as lm_head below.
+        let embed_tokens = cuda_weights.load_bf16_matrix_with_store_opts(
             first_existing_tensor(artifact, &[&embed_name, "model.embed_tokens.weight"])?,
             embed_region.store,
             cuda_residency_for_store(embed_region.store, device)?,
             &mut loader,
+            true,
         )?;
         let final_norm_name = format!("{}norm.weight", graph.text_prefix);
         let final_norm = cuda_weights.load_dense_vector_with_store(
@@ -113,7 +120,6 @@ impl CudaLlamaExecutor {
         // lm_head: force-VRAM regardless of `store=ram` config because the matvec path
         // against host-pinned BF16 (WRITECOMBINED-uncached for CPU reads) is 30× slower
         // than the VRAM kernel. Cost: ~1 GB VRAM kept resident even in hetero mode.
-        // embed_tokens (above) honors host-residency since per-token row lookup is cheap.
         let lm_head = cuda_weights.load_bf16_matrix_with_store_opts(
             lm_head_tensor,
             lm_head_region.store,
