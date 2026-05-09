@@ -132,7 +132,7 @@ impl CudaAttentionParamsV1 {
 /// `memcpy_htod`. Pinned source (Arena, Pinned) → fast direct DMA; Mmap →
 /// driver internal bounce (slower).
 #[derive(Debug)]
-pub(super) enum HostWeightBytes {
+pub(crate) enum HostWeightBytes {
     Arena {
         arena: ArenaHandle,
         offset: usize,
@@ -168,7 +168,7 @@ impl HostWeightBytes {
 }
 
 #[derive(Debug)]
-pub(super) struct HostResidentWeights {
+pub(crate) struct HostResidentWeights {
     pub packed: HostWeightBytes,
     pub scales: HostWeightBytes,
     /// Native MXFP4 repacked layout, if available (requires native_mxfp4_repack=true).

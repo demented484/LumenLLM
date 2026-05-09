@@ -192,6 +192,143 @@ impl CudaWeightLoader<'_> {
         self.runtime
     }
 
+    /// Borrow the loader's pinned arena (set when the loader was built via
+    /// `weight_loader_with_arena`). Returns `None` for the bare-loader
+    /// variant. Used by the parallel host-NVFP4 prefetch helper below.
+    pub fn arena(&self) -> Option<&super::host_arena::ArenaHandle> {
+        self.arena.as_ref()
+    }
+
+    /// Parallel-read pairs of NVFP4 tensors (`{prefix}.weight`,
+    /// `{prefix}.weight_scale`) into the loader's pinned host arena.
+    ///
+    /// Each `(weight, scales)` pair runs on a rayon worker that opens the
+    /// safetensors shard file, seeks to the tensor's byte range, and reads
+    /// directly into the arena via `arena.alloc_and_fill`. The arena bump
+    /// pointer is atomic (`SeqCst fetch_add`) so concurrent calls produce
+    /// disjoint regions. Returns the host bytes in input order so the
+    /// serial consumer can attach them to the matching `DeviceNvfp4Linear`
+    /// without re-reading.
+    ///
+    /// Used by the MoE expert loader to overlap the per-tensor file I/O
+    /// across all 128 routed experts × 3 projections instead of issuing
+    /// one read at a time. NVMe benefits from ≥4 concurrent in-flight
+    /// reads; rayon's default pool (≈ #cores) is plenty.
+    pub fn prefetch_host_nvfp4_pairs_par<'a>(
+        &self,
+        artifact: &'a ModelArtifact,
+        prefixes: &[String],
+    ) -> Result<Vec<(super::types::HostWeightBytes, super::types::HostWeightBytes)>> {
+        use rayon::prelude::*;
+        let arena = self.arena.as_ref().ok_or_else(|| {
+            AegisError::InvalidPlan(
+                "prefetch_host_nvfp4_pairs_par requires loader built with arena".into(),
+            )
+        })?;
+        prefixes
+            .par_iter()
+            .map(|prefix| -> Result<(super::types::HostWeightBytes, super::types::HostWeightBytes)> {
+                let weight = artifact
+                    .tensors
+                    .get(&format!("{prefix}.weight"))
+                    .ok_or_else(|| {
+                        AegisError::InvalidPlan(format!("missing `{prefix}.weight`"))
+                    })?;
+                let scales = artifact
+                    .tensors
+                    .get(&format!("{prefix}.weight_scale"))
+                    .ok_or_else(|| {
+                        AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`"))
+                    })?;
+                let packed = read_tensor_into_arena(arena, weight)?;
+                let s = read_tensor_into_arena(arena, scales)?;
+                Ok((packed, s))
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// Build a `DeviceNvfp4Linear` for a host-resident layer using bytes
+    /// already read into the arena by `prefetch_host_nvfp4_pairs_par`.
+    ///
+    /// This is the **finalize** half of the parallel-prefetch flow: the
+    /// expensive part (file I/O into pinned arena) ran on a rayon worker,
+    /// and now the main thread does the cheap CUDA-side work (two 1-byte
+    /// stub allocs and the metadata struct construction). `loader` is
+    /// still consulted for the optional `weight_scale_2` / `input_scale`
+    /// scalars which are tiny and stay on the mmap path.
+    ///
+    /// Skips the repack branches of the full
+    /// `load_nvfp4_linear_with_layout` because those run only for
+    /// VRAM-resident layouts (native MXFP4 / cutlass NVFP4), which the
+    /// prefetch path is not currently used for.
+    pub fn finalize_host_nvfp4_with_prefetched(
+        &self,
+        artifact: &ModelArtifact,
+        prefix: &str,
+        residency: TensorResidencyPlan,
+        store: StoragePlacement,
+        packed_bytes: super::types::HostWeightBytes,
+        scales_bytes: super::types::HostWeightBytes,
+        loader: &mut TensorStorageLoader,
+    ) -> Result<DeviceNvfp4Linear> {
+        let kernel_family = cuda_nvfp4_kernel_family_for_layout(
+            prefix,
+            aegisllm_base::tensor::layout::LinearResidentLayout::PackedSource,
+        )?;
+        let weight = artifact
+            .tensors
+            .get(&format!("{prefix}.weight"))
+            .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight`")))?;
+        let scales = artifact
+            .tensors
+            .get(&format!("{prefix}.weight_scale"))
+            .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`")))?;
+        let output_scale = artifact
+            .tensors
+            .get(&format!("{prefix}.weight_scale_2"))
+            .map(|tensor| read_scalar_f32_with_loader(loader, tensor, store))
+            .transpose()?
+            .unwrap_or(1.0);
+        let input_scale = artifact
+            .tensors
+            .get(&format!("{prefix}.input_scale"))
+            .map(|tensor| read_scalar_f32_with_loader(loader, tensor, store))
+            .transpose()?
+            .unwrap_or(1.0);
+        let spec = Nvfp4LinearSpec::from_tensors(prefix, weight, scales, input_scale, output_scale)?;
+        let stub_packed = self
+            .runtime
+            .stream
+            .clone_htod(&[0u8])
+            .map_err(map_cuda_err("htod nvfp4 host-resident stub packed"))?;
+        let stub_scales = self
+            .runtime
+            .stream
+            .clone_htod(&[0u8])
+            .map_err(map_cuda_err("htod nvfp4 host-resident stub scales"))?;
+        Ok(DeviceNvfp4Linear {
+            name: spec.name,
+            rows: spec.rows,
+            cols: spec.cols,
+            packed_bytes: spec.packed_bytes,
+            scale_bytes: spec.scale_bytes,
+            input_scale: spec.input_scale,
+            output_scale: spec.output_scale,
+            kernel_family,
+            resident_layout: aegisllm_base::tensor::layout::LinearResidentLayout::PackedSource,
+            residency,
+            packed: stub_packed,
+            scales: stub_scales,
+            native_mxfp4: None,
+            cutlass_nvfp4: None,
+            host_weights: Some(Box::new(super::types::HostResidentWeights {
+                packed: packed_bytes,
+                scales: scales_bytes,
+                native_mxfp4: None,
+            })),
+        })
+    }
+
     /// Ensure the loader's pinned bounce is ≥ `min_len` bytes, then read
     /// `tensor`'s bytes directly from disk into it. Returns a guard that
     /// callers use to access the populated pinned slice; on guard drop,
