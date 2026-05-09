@@ -1,5 +1,7 @@
 use std::fs;
+use std::sync::Arc;
 
+use minijinja::{Environment, Value, context};
 use tokenizers::Tokenizer;
 
 use crate::artifact::ModelArtifact;
@@ -20,11 +22,16 @@ impl TextProcessor {
         let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|error| {
             AegisError::Unsupported(format!("failed to load tokenizer: {error}"))
         })?;
+        let bos_token_id = artifact.config.bos_token_id.map(|id| id as usize);
+        let bos_token_str = bos_token_id
+            .and_then(|id| u32::try_from(id).ok())
+            .and_then(|id| tokenizer.id_to_token(id))
+            .unwrap_or_default();
         Ok(Self {
             tokenizer,
-            bos_token_id: artifact.config.bos_token_id.map(|id| id as usize),
+            bos_token_id,
             eos_token_ids: extract_eos_token_ids(artifact),
-            chat_template: ChatTemplate::from_artifact(artifact),
+            chat_template: ChatTemplate::from_artifact(artifact, bos_token_str)?,
         })
     }
 
@@ -43,7 +50,7 @@ impl TextProcessor {
 
     fn encode_with_options(&self, prompt: &str, apply_chat_template: bool) -> Result<Vec<usize>> {
         let prompt = if apply_chat_template {
-            self.chat_template.apply(prompt)
+            self.chat_template.apply_user_prompt(prompt)?
         } else {
             prompt.to_string()
         };
@@ -85,128 +92,193 @@ impl TextProcessor {
         self.eos_token_ids.contains(&token_id)
     }
 
+    /// Render a sequence of chat messages (with optional tool definitions)
+    /// using the model's actual chat_template.jinja. Used by the HTTP server
+    /// to honor OpenAI/Anthropic chat-completions semantics.
+    pub fn render_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: bool,
+    ) -> Result<String> {
+        self.chat_template
+            .render(messages, tools, enable_thinking, true)
+    }
+
     pub fn render_chat_messages_for_artifact(
         artifact: &ModelArtifact,
         messages: &[ChatMessage],
     ) -> Result<String> {
-        ChatTemplate::from_artifact(artifact).render_messages(messages)
+        // Same fallback path the constructor would take so callers without a
+        // built TextProcessor get consistent rendering.
+        let bos_token_str = artifact
+            .config
+            .bos_token_id
+            .map(|id| id as usize)
+            .and_then(|id| {
+                u32::try_from(id).ok().and_then(|id| {
+                    let path = artifact.root.join("tokenizer.json");
+                    Tokenizer::from_file(&path)
+                        .ok()
+                        .and_then(|t| t.id_to_token(id))
+                })
+            })
+            .unwrap_or_default();
+        ChatTemplate::from_artifact(artifact, bos_token_str)?.render(messages, None, false, true)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChatTemplate {
-    None,
-    Llama3Instruct,
-    /// Gemma 4 turn format: `<|turn>user\n…<turn|>\n<|turn>model\n`.
-    /// Detected by presence of `<|turn>` in the model's chat_template.jinja.
-    Gemma4,
+/// Real Jinja2 chat template renderer. Loads the model's
+/// `chat_template.jinja` (or `tokenizer_config.json#chat_template`) and uses
+/// `minijinja` to render with messages, tools, and BOS/generation flags as
+/// HuggingFace transformers does.
+#[derive(Debug, Clone)]
+struct ChatTemplate {
+    inner: Arc<ChatTemplateInner>,
+}
+
+#[derive(Debug)]
+struct ChatTemplateInner {
+    template: String,
+    bos_token: String,
+    /// `true` when no model-supplied template was found. We then synthesize a
+    /// minimal user-only prompt so callers that only care about pretraining-
+    /// style continuation still work.
+    is_fallback: bool,
 }
 
 impl ChatTemplate {
-    fn from_artifact(artifact: &ModelArtifact) -> Self {
-        let chat_template_path = artifact.root.join("chat_template.jinja");
-        let template = fs::read_to_string(&chat_template_path).unwrap_or_else(|_| {
+    fn from_artifact(artifact: &ModelArtifact, bos_token: String) -> Result<Self> {
+        let template_path = artifact.root.join("chat_template.jinja");
+        let template = fs::read_to_string(&template_path).ok().or_else(|| {
             artifact
                 .tokenizer_config
                 .as_ref()
-                .and_then(|config| config.chat_template.clone())
-                .unwrap_or_default()
+                .and_then(|cfg| cfg.chat_template.clone())
         });
-        if template.contains("<|start_header_id|>")
-            && template.contains("<|eot_id|>")
-            && artifact.config.model_type == "llama"
-        {
-            Self::Llama3Instruct
-        } else if template.contains("<|turn>") {
-            // Gemma 4 family. Without this wrap, the chat-tuned model is
-            // fed BOS + raw text — i.e. an out-of-distribution start —
-            // and produces low-quality completions (e.g. `" own"` for
-            // every short prompt).
-            Self::Gemma4
-        } else {
-            Self::None
-        }
-    }
-
-    fn apply(self, prompt: &str) -> String {
-        match self {
-            Self::None => prompt.to_string(),
-            Self::Llama3Instruct if looks_preformatted_chat(prompt) => prompt.to_string(),
-            Self::Llama3Instruct => format!(
-                "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
-                prompt.trim()
-            ),
-            Self::Gemma4 if looks_preformatted_gemma4(prompt) => prompt.to_string(),
-            Self::Gemma4 => format!(
-                "<|turn>user\n{}<turn|>\n<|turn>model\n",
-                prompt.trim()
-            ),
-        }
-    }
-
-    fn render_messages(self, messages: &[ChatMessage]) -> Result<String> {
-        match self {
-            Self::None => Err(AegisError::Unsupported(
-                "chat completions require a supported model chat template".into(),
-            )),
-            Self::Llama3Instruct => render_llama3_messages(messages),
-            Self::Gemma4 => render_gemma4_messages(messages),
-        }
-    }
-}
-
-fn looks_preformatted_chat(prompt: &str) -> bool {
-    prompt.contains("<|start_header_id|>")
-        || prompt.contains("<|begin_of_text|>")
-        || prompt.contains("<|eot_id|>")
-}
-
-fn looks_preformatted_gemma4(prompt: &str) -> bool {
-    prompt.contains("<|turn>") || prompt.contains("<turn|>")
-}
-
-fn render_gemma4_messages(messages: &[ChatMessage]) -> Result<String> {
-    let mut prompt = String::new();
-    for message in messages {
-        let role = match message.role.as_str() {
-            "system" | "user" => message.role.as_str(),
-            "assistant" => "model",
-            other => {
-                return Err(AegisError::InvalidConfig(format!(
-                    "Gemma 4 chat template: unsupported role `{other}`"
-                )));
-            }
+        let (template, is_fallback) = match template {
+            Some(t) if !t.is_empty() => (t, false),
+            _ => (String::new(), true),
         };
-        prompt.push_str("<|turn>");
-        prompt.push_str(role);
-        prompt.push('\n');
-        prompt.push_str(message.content.trim());
-        prompt.push_str("<turn|>\n");
+        Ok(Self {
+            inner: Arc::new(ChatTemplateInner {
+                template,
+                bos_token,
+                is_fallback,
+            }),
+        })
     }
-    prompt.push_str("<|turn>model\n");
-    Ok(prompt)
+
+    fn apply_user_prompt(&self, prompt: &str) -> Result<String> {
+        if self.inner.is_fallback {
+            return Ok(prompt.to_string());
+        }
+        // If the prompt is already wrapped in chat-template markup (caller
+        // pre-rendered), pass it through as-is. We detect this by looking
+        // for any of the well-known turn/header tokens.
+        if looks_preformatted(prompt) {
+            return Ok(prompt.to_string());
+        }
+        self.render(
+            &[ChatMessage {
+                role: "user".into(),
+                content: prompt.trim().to_string(),
+            }],
+            None,
+            false,
+            true,
+        )
+    }
+
+    fn render(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: bool,
+        add_generation_prompt: bool,
+    ) -> Result<String> {
+        if self.inner.is_fallback {
+            return self.fallback_render(messages, add_generation_prompt);
+        }
+        let mut env = Environment::new();
+        minijinja_contrib::add_to_environment(&mut env);
+        // HuggingFace chat templates routinely call Python-style methods on
+        // dicts and strings (.get(), .split(), .strip(), .upper()) that
+        // minijinja doesn't ship by default.
+        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        env.set_lstrip_blocks(true);
+        env.set_trim_blocks(true);
+        env.add_template("chat", &self.inner.template).map_err(|e| {
+            AegisError::Unsupported(format!("chat template parse failed: {e}"))
+        })?;
+        let tmpl = env.get_template("chat").map_err(|e| {
+            AegisError::Unsupported(format!("chat template lookup failed: {e}"))
+        })?;
+        let messages_value = messages_to_jinja(messages)?;
+        let tools_value = tools
+            .map(Value::from_serialize)
+            .unwrap_or_else(|| Value::from(()));
+        let ctx = context! {
+            messages => messages_value,
+            tools => tools_value,
+            bos_token => &self.inner.bos_token,
+            add_generation_prompt => add_generation_prompt,
+            enable_thinking => enable_thinking,
+        };
+        tmpl.render(ctx).map_err(|e| {
+            AegisError::Unsupported(format!("chat template render failed: {e}"))
+        })
+    }
+
+    fn fallback_render(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+    ) -> Result<String> {
+        // No chat template: stitch role-prefixed lines so debugging output
+        // remains readable. Real models always have a template; this is just
+        // for raw / pretrained checkpoints used in tests.
+        let mut out = String::new();
+        for m in messages {
+            out.push_str(&m.role);
+            out.push_str(": ");
+            out.push_str(m.content.trim());
+            out.push('\n');
+        }
+        if add_generation_prompt {
+            out.push_str("assistant: ");
+        }
+        Ok(out)
+    }
 }
 
-fn render_llama3_messages(messages: &[ChatMessage]) -> Result<String> {
-    let mut prompt = String::from("<|begin_of_text|>");
-    for message in messages {
-        if !matches!(
-            message.role.as_str(),
-            "system" | "user" | "assistant" | "tool"
-        ) {
-            return Err(AegisError::InvalidConfig(format!(
-                "unsupported chat message role `{}`",
-                message.role
-            )));
-        }
-        prompt.push_str("<|start_header_id|>");
-        prompt.push_str(&message.role);
-        prompt.push_str("<|end_header_id|>\n\n");
-        prompt.push_str(message.content.trim());
-        prompt.push_str("<|eot_id|>");
+/// Convert ChatMessage values to a minijinja-friendly representation. Today's
+/// ChatMessage is `{role, content}` only; richer fields (tool_calls,
+/// reasoning, content-parts) get layered on top of this conversion as the
+/// struct grows.
+fn messages_to_jinja(messages: &[ChatMessage]) -> Result<Value> {
+    let mut items: Vec<Value> = Vec::with_capacity(messages.len());
+    for m in messages {
+        items.push(context! {
+            role => &m.role,
+            content => &m.content,
+        });
     }
-    prompt.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
-    Ok(prompt)
+    Ok(Value::from(items))
+}
+
+fn looks_preformatted(prompt: &str) -> bool {
+    [
+        "<|start_header_id|>",
+        "<|begin_of_text|>",
+        "<|eot_id|>",
+        "<|turn>",
+        "<turn|>",
+        "<|im_start|>",
+        "<|im_end|>",
+    ]
+    .iter()
+    .any(|tok| prompt.contains(tok))
 }
 
 fn extract_eos_token_ids(artifact: &ModelArtifact) -> Vec<usize> {
@@ -235,36 +307,79 @@ fn extract_eos_token_ids(artifact: &ModelArtifact) -> Vec<usize> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn llama3_template_wraps_plain_user_prompt() {
-        let rendered = ChatTemplate::Llama3Instruct.apply("Hello");
-        assert!(rendered.starts_with("<|begin_of_text|><|start_header_id|>user"));
-        assert!(rendered.contains("\n\nHello<|eot_id|>"));
-        assert!(rendered.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+    fn build_template(template: &str) -> ChatTemplate {
+        ChatTemplate {
+            inner: Arc::new(ChatTemplateInner {
+                template: template.to_string(),
+                bos_token: "<bos>".into(),
+                is_fallback: false,
+            }),
+        }
     }
 
     #[test]
-    fn llama3_template_preserves_preformatted_prompt() {
-        let prompt = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nHello";
-        assert_eq!(ChatTemplate::Llama3Instruct.apply(prompt), prompt);
+    fn jinja_renders_simple_user_prompt() {
+        let tmpl = build_template(
+            "{{ bos_token }}{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}\
+             {% if add_generation_prompt %}<|assistant|>{% endif %}",
+        );
+        let out = tmpl.apply_user_prompt("Hello").unwrap();
+        assert_eq!(out, "<bos><|user|>Hello<|assistant|>");
     }
 
     #[test]
-    fn llama3_template_renders_structured_messages() {
-        let rendered = ChatTemplate::Llama3Instruct
-            .render_messages(&[
-                ChatMessage {
-                    role: "system".into(),
-                    content: "Be brief.".into(),
-                },
-                ChatMessage {
-                    role: "user".into(),
-                    content: "Hello".into(),
-                },
-            ])
+    fn jinja_passes_through_preformatted_prompt() {
+        let tmpl = build_template("{{ bos_token }}{{ messages[0].content }}");
+        let pre = "<|turn>user\nalready wrapped<turn|>";
+        assert_eq!(tmpl.apply_user_prompt(pre).unwrap(), pre);
+    }
+
+    #[test]
+    fn jinja_renders_message_list() {
+        let tmpl = build_template(
+            "{% for m in messages %}{{ m.role }}:{{ m.content }};{% endfor %}\
+             {% if add_generation_prompt %}go{% endif %}",
+        );
+        let out = tmpl
+            .render(
+                &[
+                    ChatMessage {
+                        role: "system".into(),
+                        content: "be brief".into(),
+                    },
+                    ChatMessage {
+                        role: "user".into(),
+                        content: "Hi".into(),
+                    },
+                ],
+                None,
+                false,
+                true,
+            )
             .unwrap();
-        assert!(rendered.contains("<|start_header_id|>system<|end_header_id|>"));
-        assert!(rendered.contains("<|start_header_id|>user<|end_header_id|>"));
-        assert!(rendered.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
+        assert_eq!(out, "system:be brief;user:Hi;go");
+    }
+
+    #[test]
+    fn fallback_renders_when_no_template() {
+        let tmpl = ChatTemplate {
+            inner: Arc::new(ChatTemplateInner {
+                template: String::new(),
+                bos_token: String::new(),
+                is_fallback: true,
+            }),
+        };
+        let out = tmpl
+            .render(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "Hi".into(),
+                }],
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        assert_eq!(out, "user: Hi\nassistant: ");
     }
 }

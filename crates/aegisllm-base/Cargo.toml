@@ -13,6 +13,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true
 wgpu.workspace = true
+minijinja.workspace = true
+minijinja-contrib.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
