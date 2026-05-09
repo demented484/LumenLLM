@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use super::planning::{cuda_limitations, dominant_cuda_device};
 use super::state::{CudaLlamaExecutor, CudaLlamaState};
 use aegisllm_base::artifact::ModelArtifact;
@@ -20,6 +22,11 @@ pub struct CudaExecutorProvider {
     limitations: Vec<String>,
     text: Option<TextProcessor>,
     cuda: Option<CudaLlamaExecutor>,
+    /// Warmed sequence state allocated at load time (KV cache + scratch).
+    /// Handed out to the first `new_sequence_state()` caller; subsequent
+    /// callers allocate fresh. This moves the ~10 GiB KV-cache `cudaMalloc`
+    /// off the first prompt's critical path.
+    prepared_state: Mutex<Option<CudaLlamaState>>,
 }
 
 impl CudaExecutorProvider {
@@ -29,6 +36,7 @@ impl CudaExecutorProvider {
             limitations,
             text: None,
             cuda: None,
+            prepared_state: Mutex::new(None),
         }
     }
 
@@ -87,6 +95,19 @@ impl CudaExecutorProvider {
                 "CUDA prefill attention uses the varlen continuation kernel with bounded shared memory".into()
             }
         };
+        let cuda_executor = CudaLlamaExecutor::from_artifact(
+            artifact,
+            graph,
+            placement,
+            runtime,
+            device,
+            cuda_config,
+        )?;
+        // Pre-allocate the per-sequence state (KV cache, scratch, sampled-token
+        // buffer, etc.) so the first prompt doesn't pay for a ~10 GiB cudaMalloc
+        // on its critical path. Cached in `prepared_state` and consumed by the
+        // first `new_sequence_state()` caller; later callers allocate fresh.
+        let warmed = cuda_executor.new_state()?;
         Ok(Self {
             device,
             limitations: vec![
@@ -95,14 +116,8 @@ impl CudaExecutorProvider {
                 attention_note,
             ],
             text: Some(TextProcessor::from_artifact(artifact)?),
-            cuda: Some(CudaLlamaExecutor::from_artifact(
-                artifact,
-                graph,
-                placement,
-                runtime,
-                device,
-                cuda_config,
-            )?),
+            cuda: Some(cuda_executor),
+            prepared_state: Mutex::new(Some(warmed)),
         })
     }
 
@@ -166,6 +181,16 @@ impl GenerationBackendPrimitives for CudaExecutorProvider {
                 self.limitations.join("; ")
             ))
         })?;
+        // First call after load consumes the state warmed in `from_artifact`.
+        // Concurrent callers (or a second sequential request) allocate fresh.
+        if let Some(prepared) = self
+            .prepared_state
+            .lock()
+            .ok()
+            .and_then(|mut g| g.take())
+        {
+            return Ok(Box::new(prepared));
+        }
         Ok(Box::new(cuda.new_state()?))
     }
 
