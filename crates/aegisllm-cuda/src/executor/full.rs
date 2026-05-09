@@ -253,6 +253,37 @@ impl CudaLlamaExecutor {
         drop(host_arena);
         let _ = has_staged_layers;
 
+        // Evict the safetensors shard files from the kernel page cache.
+        // Per-tensor `fadvise(DONTNEED)` calls during load are best-effort —
+        // Linux ignores them while any process holds a VMA covering the
+        // file, so the shard pages stay in the cache even after the read
+        // is done. Now that the loader (and its mmap cache) has dropped,
+        // there are no more VMAs and a full-file `posix_fadvise` reliably
+        // drops the pages. Without this, ~17 GiB of shard content sticks
+        // around in the OS page cache for the lifetime of the system —
+        // including across `kill aegisllm`, until memory pressure forces
+        // eviction. The arena's pinned copy is the runtime-of-record; the
+        // page cache is wasted bytes from this point on.
+        {
+            use std::collections::HashSet;
+            use std::path::PathBuf;
+            let mut shards: HashSet<PathBuf> = HashSet::new();
+            for tensor in artifact.tensors.tensors.values() {
+                shards.insert(tensor.shard_path.clone());
+            }
+            for path in shards {
+                if let Ok(file) = std::fs::File::open(&path) {
+                    if let Ok(meta) = file.metadata() {
+                        aegisllm_base::tensor::storage::fadvise_dont_need(
+                            &file,
+                            0,
+                            meta.len(),
+                        );
+                    }
+                }
+            }
+        }
+
         // Trim the device's default cudaMallocAsync memory pool back to its
         // live working set. Loading layers in sequence builds up the pool's
         // peak reservation, but most of those allocations are short-lived
