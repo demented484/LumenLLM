@@ -130,6 +130,13 @@ pub struct TensorStorageLoader {
 pub struct LoadedHostTensor {
     pub name: String,
     pub storage: HostTensorStorage,
+    /// Path to the safetensors shard backing this tensor. Used by
+    /// `advise_release_pages` to call `posix_fadvise(POSIX_FADV_DONTNEED)` on
+    /// the file's byte range so the kernel evicts the just-uploaded pages
+    /// from the page cache instead of letting them accumulate until the
+    /// system hits memory pressure (which manifests as a sawtooth in
+    /// `MemAvailable` during model load).
+    pub shard_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -216,6 +223,7 @@ impl TensorStorageLoader {
         Ok(LoadedHostTensor {
             name: tensor.name.clone(),
             storage,
+            shard_path: tensor.shard_path.clone(),
         })
     }
 
@@ -256,6 +264,7 @@ impl TensorStorageLoader {
         Ok(LoadedHostTensor {
             name: tensor.name.clone(),
             storage: HostTensorStorage::Ram(out),
+            shard_path: tensor.shard_path.clone(),
         })
     }
 
@@ -328,12 +337,21 @@ impl LoadedHostTensor {
     /// Called automatically on `Drop` for mmap-backed tensors so that streaming
     /// many GB of weights from disk into VRAM does not balloon the page cache and
     /// trigger the OOM killer on memory-tight hosts.
+    ///
+    /// Two-step: `MADV_DONTNEED` removes the pages from this process's VMA, then
+    /// `POSIX_FADV_DONTNEED` on the underlying shard file evicts them from the
+    /// kernel's page cache too. Without the second call, file-backed clean
+    /// pages stay in the cache indefinitely (until OS-wide memory pressure),
+    /// producing a sawtooth in `MemAvailable` during model load.
     pub fn advise_release_pages(&self) {
         if let HostTensorStorage::Mmap { map, offset, len } = &self.storage {
             // SAFETY: the underlying mmap is a read-only mapping of an immutable
             // safetensors shard; MADV_DONTNEED only drops cached pages, no data is lost.
             unsafe {
                 let _ = map.unchecked_advise_range(UncheckedAdvice::DontNeed, *offset, *len);
+            }
+            if let Ok(file) = File::open(&self.shard_path) {
+                fadvise_dont_need(&file, *offset as u64, *len as u64);
             }
         }
     }
