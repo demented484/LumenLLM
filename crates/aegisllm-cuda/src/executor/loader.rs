@@ -66,6 +66,7 @@ pub(super) fn load_cuda_layer(
     partial_dim: usize,
     shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
     attention_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
+    attention_store_override: Option<aegisllm_base::planning::placement::StoragePlacement>,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<CudaLayer> {
     if region_kind != GraphRegionKind::TransformerBlock {
@@ -87,6 +88,10 @@ pub(super) fn load_cuda_layer(
 
     let prefix = format!("{}layers.{layer}", shape.text_prefix);
     let residency = cuda_residency_for_store(placement.store, cuda.device_index())?;
+    // Attention sublayers (Q/K/V/O) follow `attention.store` from config when
+    // it overrides the enclosing transformer-block region's store.
+    let attn_store = attention_store_override.unwrap_or(placement.store);
+    let attn_residency = cuda_residency_for_store(attn_store, cuda.device_index())?;
 
     let is_moe = matches!(layer_kind, LayerKind::MoEDecoder { .. });
     let is_sliced = shape.is_sliced;
@@ -138,6 +143,8 @@ pub(super) fn load_cuda_layer(
             residency,
             resident_layout,
             shared_mlp_quantization,
+            attn_store,
+            attn_residency,
             loader,
         )?))
     } else {
@@ -221,12 +228,12 @@ pub(super) fn load_cuda_layer(
         },
         q_proj: load_cuda_linear(
             cuda, artifact, &format!("{prefix}.self_attn.q_proj"),
-            placement.store, residency, resident_layout,
+            attn_store, attn_residency, resident_layout,
             q_width, hidden, is_sliced, attention_quantization, loader,
         )?,
         k_proj: load_cuda_linear(
             cuda, artifact, &format!("{prefix}.self_attn.k_proj"),
-            placement.store, residency, resident_layout,
+            attn_store, attn_residency, resident_layout,
             kv_width, hidden, is_sliced, attention_quantization, loader,
         )?,
         v_proj: {
@@ -241,7 +248,7 @@ pub(super) fn load_cuda_layer(
             };
             load_cuda_linear(
                 cuda, artifact, &v_prefix,
-                placement.store, residency, resident_layout,
+                attn_store, attn_residency, resident_layout,
                 kv_width, hidden, is_sliced, attention_quantization, loader,
             )?
         },
@@ -265,7 +272,7 @@ pub(super) fn load_cuda_layer(
         },
         o_proj: load_cuda_linear(
             cuda, artifact, &format!("{prefix}.self_attn.o_proj"),
-            placement.store, residency, resident_layout,
+            attn_store, attn_residency, resident_layout,
             hidden, q_width, is_sliced, attention_quantization, loader,
         )?,
         // Gemma 4: per-head RMS norm on Q (applied between q_proj and RoPE).
@@ -316,6 +323,14 @@ fn load_cuda_moe(
     residency: TensorResidencyPlan,
     resident_layout: LinearResidentLayout,
     shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
+    // Store for the BF16 dense parts of the MoE block (router + shared MLP).
+    // Defaults to `store` when no `attention.store` override is set; when
+    // the user sets `attention.store=vram` we route shared MLP and routers
+    // there too because the BF16 batched matmul kernel doesn't support
+    // host-resident weights. Routed-expert NVFP4 weights still follow the
+    // main `store` because they have a per-call H2D streaming path.
+    bf16_dense_store: StoragePlacement,
+    bf16_dense_residency: TensorResidencyPlan,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<CudaMoE> {
     let prefix = format!("{text_prefix}layers.{layer}");
@@ -332,11 +347,15 @@ fn load_cuda_moe(
             &format!("{prefix}.block_sparse_moe.gate.weight"),
         ],
     )?;
-    // Router runs every layer's MoE block; host-resident BF16 matvec goes through the
-    // CPU rayon path which is ~30× slower than GPU. Force to VRAM (router is tiny,
-    // [num_experts, hidden_size] BF16 = ~720 KB per layer).
-    let router =
-        cuda.load_bf16_matrix_with_store(router_tensor, store, residency, loader)?;
+    // Router is BF16 [num_experts, hidden_size]. Follows the BF16-dense store
+    // (defaults to attention.store override) because host-resident BF16
+    // matvec routes through the slow CPU rayon path.
+    let router = cuda.load_bf16_matrix_with_store(
+        router_tensor,
+        bf16_dense_store,
+        bf16_dense_residency,
+        loader,
+    )?;
 
     // Gemma 4: per-input-dim scaling vector at `{prefix}.router.scale` (BF16, len=hidden_size).
     // Applied element-wise to router input BEFORE projection.
@@ -437,11 +456,11 @@ fn load_cuda_moe(
         use aegisllm_base::planning::placement::WeightQuantOverride as Wq;
         match shared_mlp_quantization {
             Wq::Default => {
-                let residency_store = cuda_residency_for_store(store, cuda.device_index())?;
+                // Shared MLP is BF16 dense — uses the dense override.
                 Some(CudaMoEShared {
-                    gate_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(gate_tensor, store, residency_store, loader)?),
-                    up_proj:   CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(up_tensor,   store, residency_store, loader)?),
-                    down_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(down_tensor, store, residency_store, loader)?),
+                    gate_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(gate_tensor, bf16_dense_store, bf16_dense_residency, loader)?),
+                    up_proj:   CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(up_tensor,   bf16_dense_store, bf16_dense_residency, loader)?),
+                    down_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(down_tensor, bf16_dense_store, bf16_dense_residency, loader)?),
                 })
             }
             Wq::Fp8 => Some(CudaMoEShared {

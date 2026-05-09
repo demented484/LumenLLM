@@ -36,6 +36,7 @@ impl CudaLlamaExecutor {
         cuda_config: CudaRuntimeConfig,
     ) -> Result<Self> {
         validate_cuda_placement(placement, device)?;
+        let attention_store_override = placement.attention_store_override;
         // Reject load-time quantization overrides that don't yet have a
         // runtime implementation. The schema parses all of mxfp4 / fp8 /
         // mxint4 / int4 / int8, but only the formats below have a wired
@@ -186,6 +187,7 @@ impl CudaLlamaExecutor {
                 partial_dim,
                 shared_mlp_q,
                 attention_q,
+                attention_store_override,
                 &mut loader,
             )?);
         }

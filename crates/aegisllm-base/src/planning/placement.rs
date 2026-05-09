@@ -140,6 +140,14 @@ pub struct ResolvedPlacement {
     /// weights. `Default` means "store as the checkpoint stored it".
     pub attention_quantization: WeightQuantOverride,
     pub shared_mlp_quantization: WeightQuantOverride,
+    /// Override for attention sublayers (Q/K/V/O proj). Carried from the
+    /// source `PlacementPolicy.attention_store_override`. When `Some`,
+    /// the CUDA executor loads attention weights with this store instead
+    /// of the enclosing transformer-block region's `store`. Lets users
+    /// set `hidden-layers.store=ram` (NVFP4 routed experts get RAM
+    /// streaming) while keeping `attention.store=vram` (BF16 QKV/O on
+    /// device, since there's no streaming-aware BF16 matmul).
+    pub attention_store_override: Option<StoragePlacement>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -312,6 +320,7 @@ impl ResolvedPlacement {
             warnings,
             attention_quantization: policy.attention_quantization,
             shared_mlp_quantization: policy.shared_mlp_quantization,
+            attention_store_override: policy.attention_store_override,
         })
     }
 
