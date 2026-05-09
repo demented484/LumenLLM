@@ -60,6 +60,7 @@ pub fn run_sample_diversity(
             prompt: request.prompt.clone(),
             max_tokens: request.max_tokens,
             sampling,
+            stop_token_ids: Vec::new(),
         })?;
         // First "word" of the output is usually a stable proxy for the
         // model's first sampled token (greedy-tokenizers concatenate

@@ -531,6 +531,7 @@ fn parse_generate_request(
             prompt,
             max_tokens,
             sampling,
+            stop_token_ids: Vec::new(),
         },
     ))
 }

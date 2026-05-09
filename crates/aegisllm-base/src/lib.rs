@@ -1,5 +1,6 @@
 pub mod artifact;
 pub mod backend;
+pub mod chat_parse;
 pub mod cuda_config;
 pub mod backend_types;
 pub mod error;

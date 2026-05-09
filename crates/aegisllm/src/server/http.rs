@@ -54,13 +54,42 @@ struct ServerState {
     /// Counts how many generation requests are currently in flight.
     /// Exposed as `kv_pages_used` (one active generation ↔ KV cache in use).
     active_generations: Arc<AtomicI64>,
+    /// Cached at server start: token IDs for `<tool_call|>` and `<turn|>`
+    /// (or whatever the model's chat template uses). Empty when the model
+    /// doesn't define these single-token markers. Server adds them to
+    /// `GenerateRequest.stop_token_ids` whenever the request includes
+    /// `tools`, so the model halts cleanly after a tool_call.
+    tool_call_stop_token_ids: Vec<usize>,
+    /// Cached parser kind (Gemma vs None) — avoids re-parsing the chat
+    /// template on every response.
+    parser_kind: aegisllm_base::chat_parse::ParserKind,
 }
 
 impl ServerState {
-    fn new() -> Self {
+    fn new(engine: &AegisEngine) -> Self {
+        // Try to build a TextProcessor for the loaded model so we can cache
+        // single-token stop markers and the parser kind. If construction
+        // fails (missing tokenizer.json etc.), fall back to empty/None —
+        // the server still works, just without tool-call stop sequences.
+        let (stop_ids, parser) = match TextProcessor::from_artifact(&engine.artifact) {
+            Ok(tp) => (tp.tool_call_stop_token_ids(), tp.parser_kind()),
+            Err(_) => (Vec::new(), aegisllm_base::chat_parse::ParserKind::None),
+        };
         Self {
             metrics: RefCell::new(ServerMetrics::default()),
             active_generations: Arc::new(AtomicI64::new(0)),
+            tool_call_stop_token_ids: stop_ids,
+            parser_kind: parser,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_tests() -> Self {
+        Self {
+            metrics: RefCell::new(ServerMetrics::default()),
+            active_generations: Arc::new(AtomicI64::new(0)),
+            tool_call_stop_token_ids: Vec::new(),
+            parser_kind: aegisllm_base::chat_parse::ParserKind::None,
         }
     }
 
@@ -124,7 +153,7 @@ pub fn serve_http(
 ) -> Result<()> {
     let api = normalize_api_compatibility(&api)?;
     let listener = TcpListener::bind(format!("{host}:{port}"))?;
-    let state = ServerState::new();
+    let state = ServerState::new(&engine);
     eprintln!(
         "serve: listening on http://{}:{} api={} runnable={} selected={}",
         host,
@@ -333,6 +362,14 @@ fn generate_http_response(
             Err(error) => return json_error(400, error),
         }
     };
+    // When the request carries `tools`, install single-token stop markers
+    // (`<tool_call|>`, `<turn|>`) so the model halts cleanly after a tool
+    // call instead of hallucinating a tool response.
+    let stop_token_ids = if chat && extract_tools(&parsed).is_some() {
+        state.tool_call_stop_token_ids.clone()
+    } else {
+        Vec::new()
+    };
     let request = GenerateRequest {
         prompt,
         max_tokens: json_usize_any(&parsed, &["max_tokens", "max_completion_tokens"], 32),
@@ -342,6 +379,7 @@ fn generate_http_response(
             top_k: json_usize(&parsed, "top_k", default_sampling.top_k),
             min_p: json_f32(&parsed, "min_p", default_sampling.min_p),
         },
+        stop_token_ids,
     };
     let started = Instant::now();
     let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
@@ -352,6 +390,45 @@ fn generate_http_response(
                 completion_tokens: output.completion_tokens,
             };
             state.record_generation(started, Some(stats));
+            let parsed_assistant = state.parser_kind.parse_assistant(&output.text);
+            let mut message = serde_json::Map::new();
+            message.insert("role".into(), serde_json::Value::String("assistant".into()));
+            message.insert(
+                "content".into(),
+                if parsed_assistant.content.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(parsed_assistant.content)
+                },
+            );
+            if let Some(reasoning) = parsed_assistant.reasoning {
+                message.insert("reasoning_content".into(), serde_json::Value::String(reasoning));
+            }
+            let has_tool_calls = !parsed_assistant.tool_calls.is_empty();
+            if has_tool_calls {
+                let arr: Vec<_> = parsed_assistant
+                    .tool_calls
+                    .iter()
+                    .map(|tc| {
+                        // Emit `arguments` as a JSON-encoded string per
+                        // OpenAI spec — clients parse it themselves.
+                        serde_json::json!({
+                            "id": tc.id,
+                            "type": tc.call_type,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        })
+                    })
+                    .collect();
+                message.insert("tool_calls".into(), serde_json::Value::Array(arr));
+            }
+            let finish_reason = if has_tool_calls {
+                serde_json::Value::String("tool_calls".into())
+            } else {
+                serde_json::Value::String(openai_finish_reason(&output.finish_reason).into())
+            };
             (
                 200,
                 serde_json::json!({
@@ -362,11 +439,8 @@ fn generate_http_response(
                 "system_fingerprint": system_fingerprint(readiness),
                 "choices": [{
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": output.text
-                    },
-                    "finish_reason": openai_finish_reason(&output.finish_reason)
+                    "message": serde_json::Value::Object(message),
+                    "finish_reason": finish_reason
                 }],
                 "usage": {
                     "prompt_tokens": output.prompt_tokens,
@@ -438,6 +512,7 @@ fn generate_anthropic_response(
             top_k: json_usize(&parsed, "top_k", default_sampling.top_k),
             min_p: json_f32(&parsed, "min_p", default_sampling.min_p),
         },
+        stop_token_ids: Vec::new(),
     };
     let started = Instant::now();
     let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
@@ -513,6 +588,7 @@ fn generate_google_response(
             top_k: json_usize(generation_config, "topK", default_sampling.top_k),
             min_p: json_f32(generation_config, "minP", default_sampling.min_p),
         },
+        stop_token_ids: Vec::new(),
     };
     let started = Instant::now();
     let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
@@ -655,6 +731,7 @@ fn sse_openai(
             top_k: json_usize(parsed, "top_k", default_sampling.top_k),
             min_p: json_f32(parsed, "min_p", default_sampling.min_p),
         },
+        stop_token_ids: Vec::new(),
     };
 
     write_sse_headers(stream)?;
@@ -756,6 +833,7 @@ fn sse_anthropic(
             top_k: json_usize(parsed, "top_k", default_sampling.top_k),
             min_p: json_f32(parsed, "min_p", default_sampling.min_p),
         },
+        stop_token_ids: Vec::new(),
     };
 
     write_sse_headers(stream)?;
@@ -863,6 +941,7 @@ fn sse_google(
             top_k: json_usize(generation_config, "topK", default_sampling.top_k),
             min_p: json_f32(generation_config, "minP", default_sampling.min_p),
         },
+        stop_token_ids: Vec::new(),
     };
 
     write_sse_headers(stream)?;
@@ -1096,7 +1175,7 @@ mod tests {
 
     #[test]
     fn server_metrics_record_success_and_error() {
-        let state = ServerState::new();
+        let state = ServerState::new_for_tests();
         state.record_request();
         state.record_generation(
             Instant::now(),
@@ -1120,7 +1199,7 @@ mod tests {
 
     #[test]
     fn prometheus_metrics_emits_all_required_aegis_names() {
-        let state = ServerState::new();
+        let state = ServerState::new_for_tests();
         state.record_request();
         state.record_generation(
             Instant::now(),
@@ -1196,8 +1275,6 @@ fn validate_openai_request_for_model(
         "top_logprobs",
         "presence_penalty",
         "frequency_penalty",
-        "tools",
-        "tool_choice",
         "response_format",
     ] {
         if value.get(key).is_some() {
@@ -1207,10 +1284,89 @@ fn validate_openai_request_for_model(
     Ok(())
 }
 
-fn chat_prompt_from_json(
-    engine: &AegisEngine,
+/// Detect the assistant-output parser to use for the engine's loaded model.
+/// Reads chat_template.jinja (or tokenizer_config.json#chat_template) and
+/// scans for the model-family special tokens.
+fn parser_kind_for_engine(engine: &AegisEngine) -> aegisllm_base::chat_parse::ParserKind {
+    let template = std::fs::read_to_string(engine.artifact.root.join("chat_template.jinja"))
+        .ok()
+        .or_else(|| {
+            engine
+                .artifact
+                .tokenizer_config
+                .as_ref()
+                .and_then(|c| c.chat_template.clone())
+        })
+        .unwrap_or_default();
+    aegisllm_base::chat_parse::ParserKind::detect(&template)
+}
+
+/// Extract tool definitions for chat-template rendering. OpenAI passes
+/// `tools: [{"type":"function","function":{...}}]`; we forward as-is so the
+/// model's chat_template (which expects this shape) can format them.
+fn extract_tools(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    let tools = value.get("tools")?;
+    if tools.as_array().map(|a| a.is_empty()).unwrap_or(false) {
+        None
+    } else {
+        Some(tools)
+    }
+}
+
+/// Read text content from either a plain string or an OpenAI content-parts
+/// array (`[{"type":"text","text":"..."}]`). Multimodal parts (image/audio)
+/// are ignored for now — they need separate handling.
+fn extract_message_text(value: &serde_json::Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = value.as_array() {
+        let mut buf = String::new();
+        for part in arr {
+            let kind = part.get("type").and_then(|v| v.as_str()).unwrap_or("text");
+            if kind == "text"
+                && let Some(t) = part.get("text").and_then(|v| v.as_str())
+            {
+                if !buf.is_empty() {
+                    buf.push('\n');
+                }
+                buf.push_str(t);
+            }
+        }
+        return Some(buf);
+    }
+    None
+}
+
+fn extract_tool_calls(value: &serde_json::Value) -> Vec<aegisllm_base::generation::ToolCall> {
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|tc| {
+            let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("call_0");
+            let call_type = tc.get("type").and_then(|v| v.as_str()).unwrap_or("function");
+            let f = tc.get("function")?;
+            let name = f.get("name").and_then(|v| v.as_str())?.to_string();
+            // arguments may be a JSON string (OpenAI canonical) or an object
+            // (some clients pre-parse). Normalize to a string.
+            let arguments = match f.get("arguments") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(other) => other.to_string(),
+                None => "{}".to_string(),
+            };
+            Some(aegisllm_base::generation::ToolCall {
+                id: id.to_string(),
+                call_type: call_type.to_string(),
+                function: aegisllm_base::generation::ToolCallFunction { name, arguments },
+            })
+        })
+        .collect()
+}
+
+fn parse_chat_messages(
     value: &serde_json::Value,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<Vec<ChatMessage>, String> {
     let messages = value
         .get("messages")
         .and_then(serde_json::Value::as_array)
@@ -1220,18 +1376,65 @@ fn chat_prompt_from_json(
         let role = message
             .get("role")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("user");
+            .unwrap_or("user")
+            .to_string();
         let content = message
             .get("content")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| "each message requires string `content`".to_string())?;
+            .map(extract_message_text)
+            .unwrap_or(None)
+            .unwrap_or_default();
+        let tool_calls = message
+            .get("tool_calls")
+            .map(extract_tool_calls)
+            .unwrap_or_default();
+        // Allow assistant turns that have only tool_calls and empty content.
+        // Tool turns may use content as the response payload.
+        if content.is_empty() && tool_calls.is_empty() && role != "tool" && role != "assistant" {
+            return Err("each non-tool message requires `content`".into());
+        }
+        let tool_call_id = message
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let name = message
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let reasoning_content = message
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         parsed.push(ChatMessage {
-            role: role.into(),
-            content: content.into(),
+            role,
+            content,
+            tool_calls,
+            tool_call_id,
+            name,
+            reasoning_content,
         });
     }
-    TextProcessor::render_chat_messages_for_artifact(&engine.artifact, &parsed)
-        .map_err(|error| error.to_string())
+    Ok(parsed)
+}
+
+fn chat_prompt_from_json(
+    engine: &AegisEngine,
+    value: &serde_json::Value,
+) -> std::result::Result<String, String> {
+    let parsed = parse_chat_messages(value)?;
+    let tools = extract_tools(value);
+    TextProcessor::render_chat_for_artifact_with_tools(
+        &engine.artifact,
+        &parsed,
+        tools,
+        // enable_thinking is opt-in via request field; OpenAI doesn't have
+        // a standard place for it, so support a custom `enable_thinking`
+        // bool that callers (curl, custom clients) can set.
+        value
+            .get("enable_thinking")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn google_prompt_from_json(value: &serde_json::Value) -> std::result::Result<String, String> {

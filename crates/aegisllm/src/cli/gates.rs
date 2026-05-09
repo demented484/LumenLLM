@@ -128,6 +128,7 @@ fn gate_determinism(engine: &AegisEngine) -> GateResult {
         prompt: GATE_PROMPT.to_string(),
         max_tokens: GATE_MAX_TOKENS,
         sampling: GREEDY,
+        stop_token_ids: Vec::new(),
     };
 
     let mut texts: Vec<String> = Vec::with_capacity(RUNS);
@@ -167,6 +168,7 @@ fn gate_greedy_coherence(engine: &AegisEngine) -> GateResult {
         prompt: GATE_PROMPT.to_string(),
         max_tokens: GATE_MAX_TOKENS,
         sampling: GREEDY,
+        stop_token_ids: Vec::new(),
     };
     match engine.generate(request) {
         Ok(output) => {
@@ -336,6 +338,7 @@ fn gate_long_prompt(engine: &AegisEngine) -> GateResult {
         prompt,
         max_tokens: 4,
         sampling: GREEDY,
+        stop_token_ids: Vec::new(),
     };
     match engine.generate(request) {
         Ok(output) => {
@@ -379,6 +382,7 @@ fn gate_chunk_sweep(base_config: EngineConfig) -> GateResult {
         prompt: GATE_PROMPT.to_string(),
         max_tokens: GATE_MAX_TOKENS,
         sampling: GREEDY,
+        stop_token_ids: Vec::new(),
     };
 
     // Build reference with no chunk override (use model default).
@@ -504,6 +508,7 @@ fn gate_gqa_consistency(engine: &AegisEngine) -> GateResult {
         prompt: GATE_PROMPT.to_string(),
         max_tokens: GATE_MAX_TOKENS,
         sampling: GREEDY,
+        stop_token_ids: Vec::new(),
     };
     match engine.generate(request) {
         Ok(output) => {
@@ -564,6 +569,7 @@ fn gate_long_context_32k(engine: &AegisEngine) -> GateResult {
         prompt,
         max_tokens: 4,
         sampling: GREEDY,
+        stop_token_ids: Vec::new(),
     };
     match engine.generate(request) {
         Ok(output) => {
@@ -611,6 +617,7 @@ fn gate_kv_fp8_parity(base_config: EngineConfig) -> GateResult {
         prompt: GATE_PROMPT.into(),
         max_tokens: GATE_MAX_TOKENS,
         sampling: GREEDY,
+        stop_token_ids: Vec::new(),
     };
 
     // BF16 baseline.

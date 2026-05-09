@@ -41,6 +41,11 @@ pub fn generate_with_backend_timed<B: GenerationBackendPrimitives + ?Sized>(
             finish_reason = "eos_token".into();
             break;
         }
+        if request.stop_token_ids.contains(&next) {
+            generated.push(next); // include the stop token so parsers see the closing marker
+            finish_reason = "stop".into();
+            break;
+        }
         generated.push(next);
         if generated.len() < request.max_tokens {
             next = backend.forward_next_token(state.as_mut(), next, &request.sampling)?;
@@ -82,6 +87,11 @@ pub fn generate_streaming_with_backend<B: GenerationBackendPrimitives + ?Sized>(
     for _ in 0..request.max_tokens {
         if backend.is_eos(next) {
             finish_reason = "eos_token".into();
+            break;
+        }
+        if request.stop_token_ids.contains(&next) {
+            generated.push(next);
+            finish_reason = "stop".into();
             break;
         }
         generated.push(next);

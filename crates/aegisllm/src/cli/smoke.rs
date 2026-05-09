@@ -149,6 +149,7 @@ fn cuda_prefill_compare_one_chunk(config: EngineConfig, configured_chunk: usize)
                 top_p: 1.0,
                 min_p: 0.0,
             },
+            stop_token_ids: Vec::new(),
         })
         .collect::<Vec<_>>();
 

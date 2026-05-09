@@ -83,9 +83,27 @@ impl TextProcessor {
                 u32::try_from(*id).map_err(|_| AegisError::Unsupported("token id overflow".into()))
             })
             .collect::<Result<Vec<_>>>()?;
-        self.tokenizer
-            .decode(&ids, true)
-            .map_err(|error| AegisError::Unsupported(format!("tokenizer decode failed: {error}")))
+        // skip_special_tokens=false so structural markers used by chat
+        // templates (<|tool_call>, <|channel>, <|turn>, etc.) survive into
+        // the decoded string for the assistant-output parser. We then
+        // strip the model's BOS/EOS strings explicitly — those are *real*
+        // junk for the user and the parser doesn't need them.
+        let mut text = self
+            .tokenizer
+            .decode(&ids, false)
+            .map_err(|error| AegisError::Unsupported(format!("tokenizer decode failed: {error}")))?;
+        for id in self
+            .bos_token_id
+            .into_iter()
+            .chain(self.eos_token_ids.iter().copied())
+        {
+            if let Ok(id_u32) = u32::try_from(id)
+                && let Some(tok) = self.tokenizer.id_to_token(id_u32)
+            {
+                text = text.replace(&tok, "");
+            }
+        }
+        Ok(text)
     }
 
     pub fn is_eos(&self, token_id: usize) -> bool {
@@ -102,6 +120,63 @@ impl TextProcessor {
         enable_thinking: bool,
     ) -> Result<String> {
         self.chat_template
+            .render(messages, tools, enable_thinking, true)
+    }
+
+    /// Returns the output-parser kind for this model — used by the HTTP
+    /// server to split assistant output into content / reasoning / tool
+    /// calls.
+    pub fn parser_kind(&self) -> crate::chat_parse::ParserKind {
+        crate::chat_parse::ParserKind::detect(&self.chat_template.inner.template)
+    }
+
+    /// Look up token IDs by their literal string form. Multi-token strings
+    /// resolve to None (we only stop on single-token markers — the engine's
+    /// token-by-token stop check can't span multiple tokens).
+    pub fn token_id_of(&self, literal: &str) -> Option<usize> {
+        self.tokenizer
+            .token_to_id(literal)
+            .map(|id| id as usize)
+    }
+
+    /// Convenience: collect single-token stop markers used by the model's
+    /// chat template for tool-call closure. Returns an empty vec if the
+    /// template doesn't use these markers (non-Gemma models). The server
+    /// merges these into `GenerateRequest.stop_token_ids` whenever the
+    /// caller passed `tools`, so the model halts cleanly after a tool_call
+    /// rather than hallucinating a fake tool response.
+    pub fn tool_call_stop_token_ids(&self) -> Vec<usize> {
+        let mut ids = Vec::new();
+        for marker in ["<tool_call|>", "<turn|>"] {
+            if let Some(id) = self.token_id_of(marker) {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// One-shot render against an artifact with optional tool definitions.
+    /// Used by HTTP handlers that don't keep a TextProcessor on hand.
+    pub fn render_chat_for_artifact_with_tools(
+        artifact: &ModelArtifact,
+        messages: &[ChatMessage],
+        tools: Option<&serde_json::Value>,
+        enable_thinking: bool,
+    ) -> Result<String> {
+        let bos_token_str = artifact
+            .config
+            .bos_token_id
+            .map(|id| id as usize)
+            .and_then(|id| {
+                u32::try_from(id).ok().and_then(|id| {
+                    let path = artifact.root.join("tokenizer.json");
+                    Tokenizer::from_file(&path)
+                        .ok()
+                        .and_then(|t| t.id_to_token(id))
+                })
+            })
+            .unwrap_or_default();
+        ChatTemplate::from_artifact(artifact, bos_token_str)?
             .render(messages, tools, enable_thinking, true)
     }
 
@@ -183,6 +258,7 @@ impl ChatTemplate {
             &[ChatMessage {
                 role: "user".into(),
                 content: prompt.trim().to_string(),
+                ..Default::default()
             }],
             None,
             false,
@@ -252,16 +328,43 @@ impl ChatTemplate {
     }
 }
 
-/// Convert ChatMessage values to a minijinja-friendly representation. Today's
-/// ChatMessage is `{role, content}` only; richer fields (tool_calls,
-/// reasoning, content-parts) get layered on top of this conversion as the
-/// struct grows.
+/// Convert ChatMessage values to a minijinja-friendly representation.
+/// Includes tool_calls, tool_call_id, name, and reasoning_content so the
+/// template can format Anthropic-/OpenAI-style tool turns and thinking
+/// channels. Optional fields are passed as None when absent so the
+/// template's `message.get('foo')` and `message['foo'] or default` checks
+/// behave like HuggingFace transformers.
 fn messages_to_jinja(messages: &[ChatMessage]) -> Result<Value> {
     let mut items: Vec<Value> = Vec::with_capacity(messages.len());
     for m in messages {
+        // Try to parse the JSON-encoded arguments string into a real
+        // mapping/scalar so templates that branch on `is mapping` get the
+        // right type. If it fails (e.g. not valid JSON), pass through as a
+        // raw string — the template's string-arg fallback will handle it.
+        let tool_calls: Vec<Value> = m
+            .tool_calls
+            .iter()
+            .map(|tc| {
+                let args_value: Value = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                    .map(Value::from_serialize)
+                    .unwrap_or_else(|_| Value::from(tc.function.arguments.clone()));
+                context! {
+                    id => &tc.id,
+                    type => &tc.call_type,
+                    function => context! {
+                        name => &tc.function.name,
+                        arguments => args_value,
+                    },
+                }
+            })
+            .collect();
         items.push(context! {
             role => &m.role,
             content => &m.content,
+            tool_calls => tool_calls,
+            tool_call_id => m.tool_call_id.as_deref(),
+            name => m.name.as_deref(),
+            reasoning_content => m.reasoning_content.as_deref(),
         });
     }
     Ok(Value::from(items))
@@ -346,10 +449,12 @@ mod tests {
                     ChatMessage {
                         role: "system".into(),
                         content: "be brief".into(),
+                        ..Default::default()
                     },
                     ChatMessage {
                         role: "user".into(),
                         content: "Hi".into(),
+                        ..Default::default()
                     },
                 ],
                 None,
@@ -374,6 +479,7 @@ mod tests {
                 &[ChatMessage {
                     role: "user".into(),
                     content: "Hi".into(),
+                    ..Default::default()
                 }],
                 None,
                 false,
