@@ -764,6 +764,13 @@ fn sse_openai(
             }
         }
     };
+    // Tools → install stop tokens so the model halts on `<tool_call|>`
+    // instead of role-playing a tool response.
+    let stop_token_ids = if chat && extract_tools(parsed).is_some() {
+        state.tool_call_stop_token_ids.clone()
+    } else {
+        Vec::new()
+    };
     let gen_request = GenerateRequest {
         prompt,
         max_tokens: json_usize_any(parsed, &["max_tokens", "max_completion_tokens"], 32),
@@ -773,7 +780,7 @@ fn sse_openai(
             top_k: json_usize(parsed, "top_k", default_sampling.top_k),
             min_p: json_f32(parsed, "min_p", default_sampling.min_p),
         },
-        stop_token_ids: Vec::new(),
+        stop_token_ids,
     };
 
     write_sse_headers(stream)?;
@@ -797,24 +804,74 @@ fn sse_openai(
 
     let started = Instant::now();
     let mut finish_str = "stop".to_string();
+    // Streaming parser splits tokens into Text / Reasoning / ToolCall events
+    // so chat clients see proper `delta.content`, `delta.reasoning_content`,
+    // and `delta.tool_calls` deltas instead of raw tokens with leaked
+    // structural markers.
+    let parser_kind = state.parser_kind;
+    let mut parser = aegisllm_base::chat_parse::StreamingParser::new(parser_kind);
+    let mut emitted_any_tool_call = false;
+    let mut emit_event = |event: aegisllm_base::chat_parse::StreamEvent,
+                         emitted_any_tool_call: &mut bool,
+                         stream: &mut TcpStream|
+     -> std::result::Result<(), std::io::Error> {
+        use aegisllm_base::chat_parse::StreamEvent::*;
+        let chunk = if chat {
+            match event {
+                Text(s) => serde_json::json!({
+                    "id": id, "object": object, "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"content": s}, "finish_reason": null}]
+                }),
+                Reasoning(s) => serde_json::json!({
+                    "id": id, "object": object, "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"reasoning_content": s}, "finish_reason": null}]
+                }),
+                ToolCallBegin { index, id: tc_id, name } => {
+                    *emitted_any_tool_call = true;
+                    serde_json::json!({
+                        "id": id, "object": object, "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"tool_calls": [{
+                            "index": index,
+                            "id": tc_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": ""}
+                        }]}, "finish_reason": null}]
+                    })
+                }
+                ToolCallArgsDelta { index, partial } => serde_json::json!({
+                    "id": id, "object": object, "created": created, "model": model,
+                    "choices": [{"index": 0, "delta": {"tool_calls": [{
+                        "index": index,
+                        "function": {"arguments": partial}
+                    }]}, "finish_reason": null}]
+                }),
+                ToolCallEnd { .. } => return Ok(()),
+            }
+        } else {
+            // /v1/completions (legacy): raw text only.
+            match event {
+                Text(s) => serde_json::json!({
+                    "id": id, "object": object, "created": created, "model": model,
+                    "choices": [{"index": 0, "text": s, "finish_reason": null}]
+                }),
+                _ => return Ok(()),
+            }
+        };
+        write_sse_chunk(stream, &format!("data: {}\n\n", chunk)).map(|_| ())
+    };
 
     let result = engine.generate_streaming(&gen_request, &mut |_tok, tok_text| {
-        let chunk = if chat {
-            serde_json::json!({
-                "id": id, "object": object, "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {"content": tok_text}, "finish_reason": null}]
-            })
-        } else {
-            serde_json::json!({
-                "id": id, "object": object, "created": created, "model": model,
-                "choices": [{"index": 0, "text": tok_text, "finish_reason": null}]
-            })
-        };
-        if write_sse_chunk(stream, &format!("data: {}\n\n", chunk)).is_err() {
-            return ControlFlow::Break(());
+        for event in parser.push(tok_text) {
+            if emit_event(event, &mut emitted_any_tool_call, stream).is_err() {
+                return ControlFlow::Break(());
+            }
         }
         ControlFlow::Continue(())
     });
+    // Flush parser tail (incomplete markers, residual text).
+    for event in parser.flush() {
+        let _ = emit_event(event, &mut emitted_any_tool_call, stream);
+    }
 
     match result {
         Ok(ref output) => {
@@ -828,6 +885,10 @@ fn sse_openai(
             );
         }
         Err(_) => state.record_generation(started, None),
+    }
+    // Override finish_reason when tool calls were emitted — OpenAI spec.
+    if chat && emitted_any_tool_call {
+        finish_str = "tool_calls".to_string();
     }
 
     // Final stop chunk

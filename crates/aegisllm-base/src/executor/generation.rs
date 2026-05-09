@@ -89,14 +89,19 @@ pub fn generate_streaming_with_backend<B: GenerationBackendPrimitives + ?Sized>(
             finish_reason = "eos_token".into();
             break;
         }
-        if request.stop_token_ids.contains(&next) {
-            generated.push(next);
-            finish_reason = "stop".into();
-            break;
-        }
+        let is_stop = request.stop_token_ids.contains(&next);
         generated.push(next);
+        // Always call the callback for the token — even on a stop token —
+        // so streaming clients (and any downstream parser) see the closing
+        // marker. Without this, e.g. `<tool_call|>` would push the model
+        // into the stop branch and the parser would never observe the
+        // close, dropping the entire tool_call block.
         let token_text = backend.decode_tokens(&[next]).unwrap_or_default();
         if callback(next, &token_text).is_break() {
+            break;
+        }
+        if is_stop {
+            finish_reason = "stop".into();
             break;
         }
         if generated.len() < request.max_tokens {
