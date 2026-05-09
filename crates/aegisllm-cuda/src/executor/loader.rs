@@ -336,7 +336,7 @@ fn load_cuda_moe(
     // CPU rayon path which is ~30× slower than GPU. Force to VRAM (router is tiny,
     // [num_experts, hidden_size] BF16 = ~720 KB per layer).
     let router =
-        cuda.load_bf16_matrix_with_store_opts(router_tensor, store, residency, loader, true)?;
+        cuda.load_bf16_matrix_with_store(router_tensor, store, residency, loader)?;
 
     // Gemma 4: per-input-dim scaling vector at `{prefix}.router.scale` (BF16, len=hidden_size).
     // Applied element-wise to router input BEFORE projection.
@@ -439,9 +439,9 @@ fn load_cuda_moe(
             Wq::Default => {
                 let residency_store = cuda_residency_for_store(store, cuda.device_index())?;
                 Some(CudaMoEShared {
-                    gate_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store_opts(gate_tensor, store, residency_store, loader, true)?),
-                    up_proj:   CudaLinear::Bf16(cuda.load_bf16_matrix_with_store_opts(up_tensor,   store, residency_store, loader, true)?),
-                    down_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store_opts(down_tensor, store, residency_store, loader, true)?),
+                    gate_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(gate_tensor, store, residency_store, loader)?),
+                    up_proj:   CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(up_tensor,   store, residency_store, loader)?),
+                    down_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(down_tensor, store, residency_store, loader)?),
                 })
             }
             Wq::Fp8 => Some(CudaMoEShared {
@@ -560,7 +560,7 @@ fn load_cuda_linear(
             // weights into VRAM — total ~600 MB across all attention layers, well within
             // a free-VRAM budget of several GB. Routed-expert weights remain streamed
             // because they're an order of magnitude larger.
-            let m = cuda.load_bf16_matrix_with_store_opts(tensor, store, residency, loader, true)?;
+            let m = cuda.load_bf16_matrix_with_store(tensor, store, residency, loader)?;
             Ok(CudaLinear::Bf16(m))
         }
         Wq::Fp8 => Ok(CudaLinear::Fp8(cuda.load_bf16_as_fp8_linear(tensor, loader)?)),

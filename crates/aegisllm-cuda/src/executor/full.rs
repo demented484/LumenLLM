@@ -94,22 +94,11 @@ impl CudaLlamaExecutor {
             .ok_or_else(|| AegisError::InvalidPlan("missing lm_head placement".into()))?;
 
         let embed_name = format!("{}embed_tokens.weight", graph.text_prefix);
-        // embed_tokens / lm_head are loaded with `force_vram=true`, consistent
-        // with how attention QKV/O, shared MLP, and routers are loaded
-        // throughout the codebase (loader.rs:339, 442-444, 563). The
-        // `store=ram` config option is currently a no-op for BF16 dense
-        // weights — there is no streaming-aware BF16 matmul kernel, so
-        // host-resident BF16 matrices fall through to a CPU rayon matvec
-        // (linear.rs:386) that costs ~1 sec per call on lm_head. Honoring
-        // `store=ram` here would silently regress decode TPS by ~30×. Only
-        // NVFP4 routed experts honor `store=ram` (they have a per-call H2D
-        // streaming path via bulk_slots).
-        let embed_tokens = cuda_weights.load_bf16_matrix_with_store_opts(
+        let embed_tokens = cuda_weights.load_bf16_matrix_with_store(
             first_existing_tensor(artifact, &[&embed_name, "model.embed_tokens.weight"])?,
             embed_region.store,
             cuda_residency_for_store(embed_region.store, device)?,
             &mut loader,
-            true,
         )?;
         let final_norm_name = format!("{}norm.weight", graph.text_prefix);
         let final_norm = cuda_weights.load_dense_vector_with_store(
@@ -121,12 +110,11 @@ impl CudaLlamaExecutor {
             artifact,
             &["lm_head.weight", &embed_name, "model.embed_tokens.weight"],
         )?;
-        let lm_head = cuda_weights.load_bf16_matrix_with_store_opts(
+        let lm_head = cuda_weights.load_bf16_matrix_with_store(
             lm_head_tensor,
             lm_head_region.store,
             cuda_residency_for_store(lm_head_region.store, device)?,
             &mut loader,
-            true,
         )?;
 
         let mut layers = Vec::with_capacity(graph.num_layers);

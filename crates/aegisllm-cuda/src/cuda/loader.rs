@@ -219,28 +219,18 @@ impl CudaWeightLoader<'_> {
         residency: TensorResidencyPlan,
         loader: &mut TensorStorageLoader,
     ) -> Result<DeviceBf16Matrix> {
-        self.load_bf16_matrix_with_store_opts(tensor, store, residency, loader, false)
-    }
-
-    /// `force_vram=true` overrides any `StagedHostToDevice` residency and uploads to VRAM.
-    /// Used for matrices where the host-resident path would be too slow (e.g. lm_head matvec
-    /// against pinned WRITECOMBINED RAM is ~30× slower than VRAM matvec).
-    pub fn load_bf16_matrix_with_store_opts(
-        &self,
-        tensor: &TensorInfo,
-        store: StoragePlacement,
-        residency: TensorResidencyPlan,
-        loader: &mut TensorStorageLoader,
-        force_vram: bool,
-    ) -> Result<DeviceBf16Matrix> {
         if tensor.dtype != TensorDType::BF16 || tensor.shape.len() != 2 {
             return Err(AegisError::InvalidPlan(format!(
                 "`{}` must be a BF16 matrix",
                 tensor.name
             )));
         }
-        let is_host_resident = !force_vram
-            && matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
+        // Residency is now strictly config-driven: `store=ram` → host-pinned;
+        // `store=vram` → device-resident. There is no force_vram override.
+        // If the host-resident matvec path is too slow for a given workload
+        // (e.g. lm_head over WRITECOMBINED RAM is ~30× slower than the VRAM
+        // kernel), set `output-layer.store = vram` in parameters.json.
+        let is_host_resident = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
         if is_host_resident {
             // Read directly from file into pinned u16 memory — avoids the mmap page-cache
             // copy and the intermediate Vec<u16>; only one copy of the data exists in RAM.
