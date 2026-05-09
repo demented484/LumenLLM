@@ -1402,6 +1402,373 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim512_regacc(
 }
 
 // =============================================================================
+// HDIM=512 register-resident-accumulator twin with Q_BLOCK=32 (was 16).
+// =============================================================================
+//
+// Goal: halve the K/V HBM bandwidth per output token at long context. With
+// q_block=16 each K/V tile (32 KiB total per K-iter) is reused across 16 query
+// rows. Doubling q_block to 32 means each K/V tile is reused across 32 query
+// rows → ~2x reduction in K/V global-memory traffic per output token.
+//
+// At 38.4k context the parent kernel had attention = 51% of prefill stage
+// time and per-token attention scales linearly with sequence length (full
+// causal). Halving K/V bandwidth is a direct attack on the bottleneck.
+//
+// Structural changes vs `..._hdim512_regacc`:
+//   * `q_block`               16 → 32
+//   * `q_shared`              16 KiB → 32 KiB
+//   * `scores`                 1 KiB →  2 KiB     (q_block * k_tile floats)
+//   * `scalars`              48 B → 96 B          (q_block * 3 floats)
+//   * `weights_half`           0.5 KiB → 1 KiB    (q_block * k_tile halfs)
+//   * Per-warp persistent c_frags: 2 → 4
+//       Each warp owns a 32-col slice spanning 2 row-strips x 2 col-strips.
+//       Row-strip 0: rows  0..15, cols [warp*32 .. warp*32+15]  → frag[0]
+//       Row-strip 0: rows  0..15, cols [warp*32+16 .. warp*32+31] → frag[1]
+//       Row-strip 1: rows 16..31, cols [warp*32 .. warp*32+15]  → frag[2]
+//       Row-strip 1: rows 16..31, cols [warp*32+16 .. warp*32+31] → frag[3]
+//   * Q*K WMMA: still 4 warps split across HDIM, but each warp now produces
+//     a 32x16 partial (= two 16x16 mma chains, one per row-strip) instead of
+//     a single 16x16. 4 warps * 32x16 floats * 4 B = 8 KiB partial scratch,
+//     still ≪ 16 KiB k_shared overlay region.
+//   * Softmax: 32 rows distributed across 16 warps → each warp handles 2 rows
+//     (`for (row = warp; row < q_block; row += warps_per_block)`).
+//   * P*V: each warp's 4 c_frags rescaled and mma'd with V. Same scratch
+//     round-trip pattern as the q_block=16 twin. 16 warps * 1 KiB scratch =
+//     16 KiB, still overlays k_shared (16 KiB).
+//   * Block grid: blockIdx.y covers ceil(total_q / 32).
+//   * `__launch_bounds__(512, 1)` — accept 1 block/SM (vs 2 in q_block=16).
+//
+// Shared-mem layout (total ≤ 96 KiB sm_120 dynamic-shared cap):
+//   q_shared       = 32 * 512 * 2  =     32 KiB
+//   k_shared       = 16 * 512 * 2  =     16 KiB  (reused as acc_scratch)
+//   v_shared       = 16 * 512 * 2  =     16 KiB
+//   scores         = 32 * 16  * 4  =      2 KiB
+//   scalars        = 32 *  3  * 4  =    384  B
+//   weights_half   = 32 * 16  * 2  =      1 KiB
+//                                  --------
+//                                  ~67.5 KiB  (well under 96 KiB)
+//
+// Numerical correctness: same online softmax math, same per-element
+// accumulation order within each c_frag. Results may bit-differ vs the
+// q_block=16 twin (different reduction tree across warps for Q*K) but the
+// algorithm is equivalent.
+
+extern "C" __global__
+__launch_bounds__(512, 1)
+void aegis_attention_prefill_dense_halfq_wmma_hdim512_q32_regacc(
+    const unsigned short* __restrict__ key_cache,
+    const unsigned short* __restrict__ value_cache,
+    const unsigned short* __restrict__ query,
+    const unsigned int start_position,
+    const unsigned int total_q,
+    const unsigned int context_len,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int cache_capacity,
+    const unsigned int window_size,
+    float* __restrict__ output
+) {
+    constexpr unsigned int hdim = 512u;
+    constexpr unsigned int q_block = 32u;
+    constexpr unsigned int k_tile = 16u;
+    constexpr unsigned int warps_per_block = 16u;       // 512 threads / 32
+    constexpr unsigned int cols_per_warp = hdim / warps_per_block; // 32
+    constexpr unsigned int frags_per_warp_col = cols_per_warp / 16u; // 2
+    constexpr unsigned int row_strips = q_block / 16u;               // 2
+    constexpr unsigned int frags_per_warp = row_strips * frags_per_warp_col; // 4
+    const unsigned int head = blockIdx.x;
+    const unsigned int global_q_base = blockIdx.y * q_block;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    if (head_dim != hdim || head >= num_attention_heads || blockDim.x < warps_per_block * 32u) {
+        return;
+    }
+
+    const unsigned int last_q_in_block = min(total_q, global_q_base + q_block) - 1u;
+    const unsigned int block_max_visible = global_q_base < total_q
+        ? min(context_len, start_position + last_q_in_block + 1u)
+        : 0u;
+    if (block_max_visible == 0u) {
+        return;
+    }
+    const unsigned int block_min_visible_raw = (window_size > 0u
+        && start_position + global_q_base + 1u > window_size)
+        ? (start_position + global_q_base + 1u - window_size)
+        : 0u;
+    const unsigned int block_min_tile_start =
+        (block_min_visible_raw / k_tile) * k_tile;
+
+    extern __shared__ __align__(16) unsigned char smem[];
+    unsigned short* q_shared = reinterpret_cast<unsigned short*>(smem);
+    unsigned short* k_shared = q_shared + q_block * hdim;
+    unsigned short* v_shared = k_shared + k_tile * hdim;
+    float* scores = reinterpret_cast<float*>(v_shared + k_tile * hdim);
+    float* scalars = scores + q_block * k_tile;
+    half* weights_half = reinterpret_cast<half*>(scalars + q_block * 3u);
+    // Per-warp 16x16 = 1 KiB scratch reused for the alpha rescale of one
+    // c_frag at a time. Overlays k_shared (which has been consumed by
+    // the time we reach the rescale step). 16 warps * 1 KiB = 16 KiB,
+    // and k_shared is 16 KiB (k_tile=16 * hdim=512 * 2 B). Same overlay
+    // pattern as the q_block=16 twin.
+    float* acc_scratch = reinterpret_cast<float*>(k_shared);
+    constexpr unsigned int acc_scratch_per_warp = 16u * 16u; // 256 floats per warp
+
+    const unsigned int group = num_attention_heads / num_kv_heads;
+    const unsigned int kv_head = head / group;
+    const float scale = rsqrtf(float(hdim));
+    const float log2e = 1.4426950408889634f;
+
+    for (unsigned int idx = tid; idx < q_block * hdim; idx += blockDim.x) {
+        const unsigned int row = idx / hdim;
+        const unsigned int dim = idx - row * hdim;
+        const unsigned int global_q = global_q_base + row;
+        q_shared[idx] = global_q < total_q
+            ? query[(size_t(global_q) * num_attention_heads + head) * hdim + dim]
+            : 0u;
+    }
+    for (unsigned int row = tid; row < q_block; row += blockDim.x) {
+        scalars[row * 3u + 0u] = -3.402823466e38f;
+        scalars[row * 3u + 1u] = 0.0f;
+        scalars[row * 3u + 2u] = 0.0f;
+    }
+    __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    // Persistent register-resident output accumulator: each warp owns
+    // `frags_per_warp` (=4) WMMA fragments covering its 32-col slice
+    // across both row-strips (rows 0..15 and rows 16..31).
+    //   acc_frag[0] : rows  0..15, cols [warp*32 + 0  .. warp*32 + 15]
+    //   acc_frag[1] : rows  0..15, cols [warp*32 + 16 .. warp*32 + 31]
+    //   acc_frag[2] : rows 16..31, cols [warp*32 + 0  .. warp*32 + 15]
+    //   acc_frag[3] : rows 16..31, cols [warp*32 + 16 .. warp*32 + 31]
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag[frags_per_warp];
+    wmma::fill_fragment(acc_frag[0], 0.0f);
+    wmma::fill_fragment(acc_frag[1], 0.0f);
+    wmma::fill_fragment(acc_frag[2], 0.0f);
+    wmma::fill_fragment(acc_frag[3], 0.0f);
+#endif
+
+    const uint4 zero_vec = make_uint4(0u, 0u, 0u, 0u);
+    for (unsigned int tile_start = block_min_tile_start; tile_start < block_max_visible; tile_start += k_tile) {
+        const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
+        constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
+        constexpr unsigned int kv_vecs = k_tile * hdim / halfs_per_vec;
+        uint4* k_shared_vec = reinterpret_cast<uint4*>(k_shared);
+        uint4* v_shared_vec = reinterpret_cast<uint4*>(v_shared);
+        for (unsigned int vec = tid; vec < kv_vecs; vec += blockDim.x) {
+            const unsigned int idx = vec * halfs_per_vec;
+            const unsigned int col = idx / hdim;
+            const unsigned int dim = idx - col * hdim;
+            const unsigned int pos = tile_start + col;
+            const bool valid_k = col < tile_count;
+            const size_t kv_offset =
+                (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
+            k_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(key_cache + kv_offset)
+                : zero_vec;
+            v_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(value_cache + kv_offset)
+                : zero_vec;
+        }
+        __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+        // Q*K WMMA: split HDIM=512 reduction across `qk_warps` warps so
+        // 12/16 warps don't sit idle. Each of the first `qk_warps` warps
+        // accumulates two independent 16x16 partials (one per row-strip)
+        // covering its slice of HDIM. Layout per warp:
+        //   row-strip 0 (Q rows  0..15) over kk in [warp*128, (warp+1)*128)
+        //   row-strip 1 (Q rows 16..31) over kk in [warp*128, (warp+1)*128)
+        // Results are summed elementwise into `scores` afterwards.
+        // Partial slots overlay k_shared (which is no longer needed once
+        // all warp mma chains have read it for the Q*K reduction).
+        // 4 warps * 2 row-strips * 256 floats * 4 B = 8 KiB ≪ 16 KiB.
+        constexpr unsigned int qk_warps = 4u;
+        constexpr unsigned int hdim_per_qk_warp = hdim / qk_warps;  // 128
+        constexpr unsigned int partial_stride = 256u * row_strips;  // floats per qk-warp
+        float* partial_scores = reinterpret_cast<float*>(k_shared);
+        if (warp < qk_warps) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag[row_strips];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[row_strips];
+            wmma::fill_fragment(c_frag[0], 0.0f);
+            wmma::fill_fragment(c_frag[1], 0.0f);
+            const unsigned int kk_start = warp * hdim_per_qk_warp;
+            const unsigned int kk_end   = kk_start + hdim_per_qk_warp;
+#pragma unroll
+            for (unsigned int kk = kk_start; kk < kk_end; kk += 16u) {
+                const half* a_ptr0 = reinterpret_cast<const half*>(q_shared +  0u * hdim + kk);
+                const half* a_ptr1 = reinterpret_cast<const half*>(q_shared + 16u * hdim + kk);
+                const half* b_ptr  = reinterpret_cast<const half*>(k_shared + kk);
+                wmma::load_matrix_sync(a_frag[0], a_ptr0, hdim);
+                wmma::load_matrix_sync(a_frag[1], a_ptr1, hdim);
+                wmma::load_matrix_sync(b_frag,    b_ptr,  hdim);
+                wmma::mma_sync(c_frag[0], a_frag[0], b_frag, c_frag[0]);
+                wmma::mma_sync(c_frag[1], a_frag[1], b_frag, c_frag[1]);
+            }
+            // Sync so all qk_warps finish reading k_shared before any
+            // warp writes partials into the same buffer (overlay).
+            __syncthreads();
+            wmma::store_matrix_sync(
+                partial_scores + warp * partial_stride + 0u * 256u,
+                c_frag[0], 16u, wmma::mem_row_major);
+            wmma::store_matrix_sync(
+                partial_scores + warp * partial_stride + 1u * 256u,
+                c_frag[1], 16u, wmma::mem_row_major);
+        } else {
+            __syncthreads();
+        }
+        __syncthreads();
+        // Reduce 4 partials per row-strip → scores[q_block * k_tile = 512].
+        // Each partial is q_block(=32) rows * k_tile(=16) cols laid out as
+        // two 16x16 row-strip blocks contiguously: [strip0 (256) | strip1 (256)].
+        // We want scores[row * k_tile + col] for row in [0,32), col in [0,16).
+        // For row in row-strip s (s = row / 16, r = row % 16), the source
+        // index inside `partial_scores[w]` is `s * 256 + r * 16 + col`.
+        // Since the layout per qk-warp is exactly that, indexing by linear
+        // element e in [0, 512) gives:
+        //   row = e / 16    (covers 0..31)
+        //   col = e % 16
+        //   source index inside qk-warp w = e   (because s*256 + r*16 + col == e)
+        for (unsigned int e = tid; e < q_block * k_tile; e += blockDim.x) {
+            scores[e] = partial_scores[0u * partial_stride + e]
+                      + partial_scores[1u * partial_stride + e]
+                      + partial_scores[2u * partial_stride + e]
+                      + partial_scores[3u * partial_stride + e];
+        }
+#endif
+        __syncthreads();
+
+        // Softmax / online stats. q_block=32 rows distributed across
+        // warps_per_block=16 warps → each warp handles 2 rows
+        // (`for (row = warp; row < q_block; row += warps_per_block)`).
+        for (unsigned int row = warp; row < q_block; row += warps_per_block) {
+            const unsigned int global_q = global_q_base + row;
+            const bool valid_q = global_q < total_q;
+            const unsigned int visible_len = valid_q
+                ? min(context_len, start_position + global_q + 1u)
+                : 0u;
+            const unsigned int row_min_visible = (window_size > 0u && start_position + global_q + 1u > window_size)
+                ? (start_position + global_q + 1u - window_size) : 0u;
+            const float old_m = scalars[row * 3u + 0u];
+            const float old_l = scalars[row * 3u + 1u];
+            // k_tile=16: only the lower half of each warp (lanes 0..15)
+            // carries a real score. Lanes 16..31 contribute -inf to the
+            // warp-wide reduce so they don't bias the row max/sum.
+            const unsigned int pos = tile_start + lane;
+            float score = (valid_q && lane < k_tile && lane < tile_count && pos < visible_len && pos >= row_min_visible)
+                ? scores[row * k_tile + lane] * scale
+                : -3.402823466e38f;
+            const float tile_m = aegis_warp_reduce_max(score);
+            const float new_m = fmaxf(old_m, tile_m);
+            float weight = 0.0f;
+            if (score > -3.0e38f) {
+                weight = exp2f((score - new_m) * log2e);
+            }
+            if (lane < k_tile) {
+                scores[row * k_tile + lane] = weight;
+            }
+            const float tile_l = aegis_warp_reduce_sum(weight);
+            if (lane == 0u) {
+                const float alpha = old_l > 0.0f ? exp2f((old_m - new_m) * log2e) : 0.0f;
+                scalars[row * 3u + 0u] = new_m;
+                scalars[row * 3u + 1u] = old_l * alpha + tile_l;
+                scalars[row * 3u + 2u] = alpha;
+            }
+        }
+        __syncthreads();
+
+        for (unsigned int idx = tid; idx < q_block * k_tile; idx += blockDim.x) {
+            weights_half[idx] = __float2half_rn(scores[idx]);
+        }
+        __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+        // Alpha rescale + P*V WMMA. For each of the warp's `frags_per_warp`
+        // (=4) c_frags:
+        //   1. Store frag to per-warp scratch (1 KiB, overlays k_shared).
+        //   2. Multiply each scratch element by alpha[row].
+        //      Row index for the rescale: row-strip s → rows [16s .. 16s+15].
+        //      Within the 16x16 scratch, e = row_inside*16 + col, so
+        //      scalars row index = s*16 + (e/16).
+        //   3. Reload into c_frag.
+        //   4. P[16x16] @ V[16x16] (single mma covers the full k_tile).
+        // Two P fragments needed (one per row-strip): P_top = weights_half
+        // rows  0..15, P_bot = weights_half rows 16..31.
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag[row_strips];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
+        wmma::load_matrix_sync(p_frag[0], weights_half +  0u * k_tile, k_tile);
+        wmma::load_matrix_sync(p_frag[1], weights_half + 16u * k_tile, k_tile);
+        float* warp_scratch = acc_scratch + warp * acc_scratch_per_warp;
+#pragma unroll
+        for (unsigned int s = 0u; s < row_strips; ++s) {
+            const unsigned int row_base = s * 16u;
+#pragma unroll
+            for (unsigned int f = 0u; f < frags_per_warp_col; ++f) {
+                const unsigned int frag_idx = s * frags_per_warp_col + f;
+                const unsigned int n_off = warp * cols_per_warp + f * 16u;
+                // Step 1: store c_frag to warp-private scratch.
+                wmma::store_matrix_sync(warp_scratch, acc_frag[frag_idx], 16u, wmma::mem_row_major);
+                // Step 2: rescale by per-row alpha. 256 elements / 32 lanes
+                // = 8 elements per lane. Stride elements by 32 (lane).
+                //   row index inside scratch = e / 16 (covers 0..15)
+                //   absolute row in q_block = row_base + (e / 16)
+#pragma unroll
+                for (unsigned int e = lane; e < 256u; e += 32u) {
+                    const unsigned int row_in_strip = e / 16u;
+                    const unsigned int abs_row = row_base + row_in_strip;
+                    warp_scratch[e] *= scalars[abs_row * 3u + 2u];
+                }
+                // Step 3: reload rescaled values back into the accumulator
+                // fragment. This serves as the seed for the upcoming
+                // mma_sync (acc + P*V).
+                wmma::load_matrix_sync(acc_frag[frag_idx], warp_scratch, 16u, wmma::mem_row_major);
+                // Step 4: load V slice and mma-fuse-add into acc_frag.
+                const half* v_ptr = reinterpret_cast<const half*>(v_shared + n_off);
+                wmma::load_matrix_sync(v_frag, v_ptr, hdim);
+                wmma::mma_sync(acc_frag[frag_idx], p_frag[s], v_frag, acc_frag[frag_idx]);
+            }
+        }
+#endif
+        __syncthreads();
+    }
+
+    // Final epilogue: divide by row-sum and write to global output.
+    // Each warp writes its 32-col slice of every row across both row-strips.
+#if __CUDA_ARCH__ >= 800
+    float* warp_scratch = acc_scratch + warp * acc_scratch_per_warp;
+#pragma unroll
+    for (unsigned int s = 0u; s < row_strips; ++s) {
+        const unsigned int row_base = s * 16u;
+#pragma unroll
+        for (unsigned int f = 0u; f < frags_per_warp_col; ++f) {
+            const unsigned int frag_idx = s * frags_per_warp_col + f;
+            const unsigned int n_off = warp * cols_per_warp + f * 16u;
+            wmma::store_matrix_sync(warp_scratch, acc_frag[frag_idx], 16u, wmma::mem_row_major);
+            // Each warp has 32 lanes; 16x16 = 256 elements; 8 per lane.
+#pragma unroll
+            for (unsigned int e = lane; e < 256u; e += 32u) {
+                const unsigned int row_in_strip = e / 16u;
+                const unsigned int col = e - row_in_strip * 16u;
+                const unsigned int abs_row = row_base + row_in_strip;
+                const unsigned int global_q = global_q_base + abs_row;
+                if (global_q >= total_q) {
+                    continue;
+                }
+                const float denom = fmaxf(scalars[abs_row * 3u + 1u], 1.0e-20f);
+                const unsigned int dim = n_off + col;
+                output[(size_t(global_q) * num_attention_heads + head) * hdim + dim] =
+                    warp_scratch[e] / denom;
+            }
+        }
+    }
+#endif
+}
+
+// =============================================================================
 // HDIM=512 register-resident-accumulator + cp.async pipelined K-only variant —
 // Round 3 attention pipelining.
 //
