@@ -140,6 +140,19 @@ pub struct CudaWeightLoader<'a> {
     /// pinned allocations into one. `None` for paths that don't need host
     /// residency (used for backwards-compatible callers).
     arena: Option<super::host_arena::ArenaHandle>,
+    /// Single reusable pinned-host bounce buffer for VRAM-resident weight
+    /// uploads. Replaces the prior `mmap shard → clone_htod` path which
+    /// (a) ballooned the kernel page cache by the full ~17 GiB model size
+    /// and (b) bounced through the CUDA driver's internal pinned staging on
+    /// every memcpy from a pageable mmap source. With this buffer, each
+    /// VRAM-resident tensor is read directly from disk into pinned memory
+    /// (no page-cache fill) and then DMA'd to the device with a single
+    /// pinned→device memcpy. Sized to the largest tensor seen so far —
+    /// grows on demand and stays at high-water mark for the rest of the
+    /// load. Wrapped in `RefCell` because `&CudaWeightLoader` is used by
+    /// many `&self` methods and only the inner buffer needs interior
+    /// mutability.
+    bounce: std::cell::RefCell<Option<PinnedHostSlice<u8>>>,
 }
 
 impl CudaRuntime {
@@ -147,6 +160,7 @@ impl CudaRuntime {
         CudaWeightLoader {
             runtime: self,
             arena: None,
+            bounce: std::cell::RefCell::new(None),
         }
     }
 
@@ -160,6 +174,7 @@ impl CudaRuntime {
         CudaWeightLoader {
             runtime: self,
             arena: Some(arena),
+            bounce: std::cell::RefCell::new(None),
         }
     }
 }
@@ -176,6 +191,55 @@ impl CudaWeightLoader<'_> {
     pub fn runtime(&self) -> &CudaRuntime {
         self.runtime
     }
+
+    /// Ensure the loader's pinned bounce is ≥ `min_len` bytes, then read
+    /// `tensor`'s bytes directly from disk into it. Returns a guard that
+    /// callers use to access the populated pinned slice; on guard drop,
+    /// the bounce stays allocated for reuse by the next tensor.
+    ///
+    /// This is the load-time replacement for `loader.load_for_store(...,
+    /// Vram) → mmap → clone_htod`. Two payoffs vs the mmap path:
+    ///
+    ///   1. No kernel page-cache fill. The destination is pinned host
+    ///      memory; reading into it does not populate the page cache for
+    ///      the source file. Combined with the `fadvise(DONTNEED)` on the
+    ///      file range afterwards, the kernel evicts the just-read pages
+    ///      eagerly instead of accumulating ~17 GiB of cached weights and
+    ///      then discarding them in 8 GiB sawtooth bursts.
+    ///   2. No implicit pageable→pinned bounce inside `cudaMemcpy`. The
+    ///      source is already pinned, so the H2D is a single DMA hop.
+    fn read_tensor_into_pinned(
+        &self,
+        tensor: &TensorInfo,
+    ) -> Result<()> {
+        let len = tensor.data_len_bytes() as usize;
+        let need_realloc = self
+            .bounce
+            .borrow()
+            .as_ref()
+            .map(|b| b.len() < len)
+            .unwrap_or(true);
+        if need_realloc {
+            *self.bounce.borrow_mut() = None;
+            let pinned = self.runtime.alloc_pinned_u8(len)?;
+            *self.bounce.borrow_mut() = Some(pinned);
+        }
+        let mut bounce_ref = self.bounce.borrow_mut();
+        let bounce = bounce_ref.as_mut().expect("bounce just ensured to exist");
+        let bytes = bounce
+            .as_mut_slice()
+            .map_err(map_cuda_err("bounce as_mut_slice"))?;
+        let mut file = std::fs::File::open(&tensor.shard_path)?;
+        file.seek(SeekFrom::Start(tensor.file_offsets.0))?;
+        file.read_exact(&mut bytes[..len])?;
+        aegisllm_base::tensor::storage::fadvise_dont_need(
+            &file,
+            tensor.file_offsets.0,
+            len as u64,
+        );
+        Ok(())
+    }
+
 
     pub fn load_dense_vector_with_store(
         &self,
@@ -253,32 +317,39 @@ impl CudaWeightLoader<'_> {
                 host_values: Some(Box::new(HostBf16Weights { values: pinned })),
             });
         }
-        let loaded = loader.load_for_store(tensor, store)?;
-        // Zero-copy reinterpret of the BF16 byte slice as &[u16] before HtoD.
-        // The previous code built an intermediate `Vec<u16>` via
-        // `.chunks_exact(2).map(...).collect()` which doubled RAM peak per
-        // tensor (e.g. +1 GiB transient for lm_head) and showed up as a
-        // sawtooth on htop — and slowed the HtoD ramp because the per-tensor
-        // copy was single-threaded.
-        let bytes = loaded.as_bytes();
-        if bytes.len() % 2 != 0 {
+        // VRAM-resident BF16: bypass the mmap path entirely. Read the
+        // tensor's bytes from disk into the loader's pinned bounce buffer,
+        // then DMA from pinned → fresh u16-typed VRAM. Avoids both the
+        // kernel page-cache fill and the implicit pageable→pinned bounce
+        // inside `cudaMemcpy` from the old `mmap → clone_htod` path.
+        // `loader` is unused on this branch but kept in the signature
+        // because the host-resident branch above still consults it.
+        let _ = loader;
+        let len_bytes = tensor.data_len_bytes() as usize;
+        if len_bytes % 2 != 0 {
             return Err(AegisError::InvalidPlan(format!(
-                "BF16 tensor `{}` has odd byte length {}", tensor.name, bytes.len()
+                "BF16 tensor `{}` has odd byte length {}", tensor.name, len_bytes
             )));
         }
-        // SAFETY: `bytes` is from a host buffer that's at least 2-byte aligned
-        // (mmap'd safetensors regions are page-aligned; pinned u16 allocs are
-        // u16-aligned). Length is even-checked above. The lifetime is bound
-        // to `loaded` which lives until the HtoD finishes synchronously below.
-        let values_u16: &[u16] = unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr() as *const u16, bytes.len() / 2)
+        let len_u16 = len_bytes / 2;
+        self.read_tensor_into_pinned(tensor)?;
+        let mut buffer = self.runtime.alloc_u16(len_u16)?;
+        let bounce_ref = self.bounce.borrow();
+        let bounce = bounce_ref
+            .as_ref()
+            .expect("bounce populated by read_tensor_into_pinned");
+        let bounce_bytes = bounce
+            .as_slice()
+            .map_err(map_cuda_err("bounce as_slice for bf16 htod"))?;
+        // SAFETY: cuMemAllocHost returns page-aligned memory (so 2-byte
+        // alignment is satisfied), and `len_bytes` is even-checked above.
+        let bounce_u16: &[u16] = unsafe {
+            std::slice::from_raw_parts(bounce_bytes.as_ptr() as *const u16, len_u16)
         };
-        let len = values_u16.len();
-        let mut buffer = self.runtime.alloc_u16(len)?;
         self.runtime
             .stream
-            .memcpy_htod(values_u16, &mut buffer.slice)
-            .map_err(map_cuda_err("htod bf16 matrix"))?;
+            .memcpy_htod(bounce_u16, &mut buffer.slice)
+            .map_err(map_cuda_err("htod bf16 matrix from pinned"))?;
         Ok(DeviceBf16Matrix {
             name: tensor.name.clone(),
             rows: tensor.shape[0],
