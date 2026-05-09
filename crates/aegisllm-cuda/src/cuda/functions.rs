@@ -115,6 +115,10 @@ pub(crate) struct CudaKernelFunctions {
     // Q_BLOCK=32 twin of `..._hdim512_regacc`. Halves K/V HBM bandwidth per
     // output token at long context. Opt-in via `AEGIS_HDIM512_Q32_ENABLE=1`.
     pub(crate) attention_prefill_dense_halfq_wmma_hdim512_q32_regacc: CudaFunction,
+    // cp.async K-only pipelined twin of `..._hdim512_q32_regacc`. Double-
+    // buffers the K tile (32 KiB extra shmem); V stays synchronous. Opt-in
+    // via `AEGIS_HDIM512_Q32_PIPELINE_ENABLE=1`.
+    pub(crate) attention_prefill_dense_halfq_wmma_hdim512_q32_regacc_pipeline: CudaFunction,
     // ===== Round 3 attention pipeline (cp.async K/V double-buffer) =====
     // Numerical-twin of `..._hdim512_regacc`; opt-in via env var.
     pub(crate) attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline: CudaFunction,
@@ -411,6 +415,26 @@ impl CudaKernelFunctions {
                 )
                 .map_err(|e| AegisError::Unsupported(format!(
                     "set max dynamic shared mem on hdim512_q32_regacc kernel: {e:?}"
+                )))?;
+                f
+            },
+            attention_prefill_dense_halfq_wmma_hdim512_q32_regacc_pipeline: {
+                let f = load(
+                    &module,
+                    "aegis_attention_prefill_dense_halfq_wmma_hdim512_q32_regacc_pipeline",
+                )?;
+                // cp.async K-only pipelined Q_BLOCK=32 twin. q_shared 32 KiB
+                // + k_shared[2] 32 KiB + v_shared 16 KiB + scores 2 KiB +
+                // weights_half 1 KiB + scalars 0.4 KiB = ~83.4 KiB, within
+                // sm_120's 96 KiB opt-in dynamic-shared cap. Same 1 block/SM
+                // residency as the synchronous q32 twin (no occupancy loss).
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on hdim512_q32_regacc_pipeline kernel: {e:?}"
                 )))?;
                 f
             },

@@ -802,6 +802,29 @@ impl CudaRuntime {
         window_size: u32,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
+        // cp.async K-only pipelined Q_BLOCK=32 twin. Default-ON after A/B:
+        // neutral at 9.6k (within noise), neutral at 19k, +5.2% at 38.4k
+        // where attention dominates. Q32 is already 1 block/SM so the
+        // 16 KiB k_shared double-buffer doesn't lose any more occupancy
+        // (which is why the q16 pipeline twin was neutral and this isn't).
+        // Opt-out via `AEGIS_HDIM512_Q32_PIPELINE_DISABLE=1`. Checked
+        // BEFORE the Q32-default arm so the pipeline path takes precedence.
+        let use_hdim512_q32_pipeline = head_dim == 512
+            && std::env::var("AEGIS_HDIM512_Q32_PIPELINE_DISABLE").is_err();
+        if use_hdim512_q32_pipeline {
+            return self.attention_prefill_dense_halfq_wmma_hdim512_q32_pipeline_device(
+                key_cache,
+                value_cache,
+                query_half,
+                start_position,
+                batch,
+                context_len,
+                num_attention_heads,
+                num_kv_heads,
+                window_size,
+                output,
+            );
+        }
         // Q_BLOCK=32 twin of the hdim=512 register-resident-accumulator
         // kernel. Halves K/V HBM bandwidth per output token at long context
         // (each loaded K/V tile is reused across 32 query rows instead of
@@ -1103,6 +1126,122 @@ impl CudaRuntime {
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch dense halfq wmma hdim512 q32 prefill attention"))?;
+        Ok(())
+    }
+
+    /// cp.async K-only pipelined twin of the Q_BLOCK=32 hdim=512 kernel.
+    /// Double-buffers the K tile in shared mem; V stays single-buffered and
+    /// synchronous. Opt-in via `AEGIS_HDIM512_Q32_PIPELINE_ENABLE=1`.
+    /// Numerically equivalent to the synchronous q32 twin.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attention_prefill_dense_halfq_wmma_hdim512_q32_pipeline_device(
+        &self,
+        key_cache: &DeviceBuffer<u16>,
+        value_cache: &DeviceBuffer<u16>,
+        query_half: &DeviceBuffer<u16>,
+        start_position: usize,
+        batch: usize,
+        context_len: usize,
+        num_attention_heads: usize,
+        num_kv_heads: usize,
+        window_size: u32,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        const HEAD_DIM: usize = 512;
+        const Q_BLOCK: usize = 32;
+        const K_TILE: usize = 16;
+        let q_width = checked_len("dense wmma q32 pipeline q width", num_attention_heads, HEAD_DIM)?;
+        let q_tokens = checked_len("dense wmma q32 pipeline q tokens", batch, q_width)?;
+        let kv_width = checked_len("dense wmma q32 pipeline kv width", num_kv_heads, HEAD_DIM)?;
+        let cache_len = checked_len("dense wmma q32 pipeline kv cache", context_len, kv_width)?;
+        if query_half.len() < q_tokens || output.len() < q_tokens {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense wmma q32 pipeline attention q/output shape mismatch: query_half={} output={} required={}",
+                query_half.len(),
+                output.len(),
+                q_tokens
+            )));
+        }
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len()
+            || key_cache.len() % kv_width != 0
+            || key_cache.is_empty()
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense wmma q32 pipeline attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
+                key_cache.len(),
+                value_cache.len(),
+                cache_len
+            )));
+        }
+        if !num_attention_heads.is_multiple_of(num_kv_heads) {
+            return Err(AegisError::InvalidPlan(
+                "dense wmma q32 pipeline attention heads must be divisible by kv heads".into(),
+            ));
+        }
+        // Shared-mem layout (mirrors the kernel comment block):
+        //   q_shared       = Q_BLOCK * HEAD_DIM       halfs   = 32 KiB
+        //   k_shared[2]    = 2 * K_TILE * HEAD_DIM    halfs   = 32 KiB
+        //   v_shared       = K_TILE  * HEAD_DIM       halfs   = 16 KiB
+        //   scores         = Q_BLOCK * K_TILE         floats  =  2 KiB
+        //   scalars        = Q_BLOCK * 3              floats  =  0.4 KiB
+        //   weights_half   = Q_BLOCK * K_TILE         halfs   =  1 KiB
+        //                                                     --------
+        //                                                     ~83.4 KiB
+        // (acc_scratch overlays k_shared[buf_cur] within the iter and
+        // k_shared_buf[0] in the epilogue — no extra allocation needed.)
+        let half_values = Q_BLOCK * HEAD_DIM      // q_shared
+            + 3 * K_TILE * HEAD_DIM               // k_shared[2] + v_shared
+            + Q_BLOCK * K_TILE;                   // weights_half
+        let float_values = Q_BLOCK * K_TILE       // scores
+            + Q_BLOCK * 3;                        // scalars
+        let block_threads: u32 = 16 * 32;         // 16 warps
+        let cfg = LaunchConfig {
+            grid_dim: (
+                u32_arg("num_attention_heads", num_attention_heads)?,
+                u32_arg("dense wmma q32 pipeline q blocks", batch.div_ceil(Q_BLOCK))?,
+                1,
+            ),
+            block_dim: (block_threads, 1, 1),
+            shared_mem_bytes: super::validate_dynamic_shared_bytes_with_cap(
+                "prefill_dense_halfq_wmma_hdim512_q32_pipeline",
+                half_values * std::mem::size_of::<u16>()
+                    + float_values * std::mem::size_of::<f32>(),
+                96 * 1024,
+            )?,
+        };
+        let start_position = u32_arg("start_position", start_position)?;
+        let total_q = u32_arg("total_query_tokens", batch)?;
+        let context_len = u32_arg("context_len", context_len)?;
+        let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
+        let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
+        let head_dim = u32_arg("head_dim", HEAD_DIM)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * HEAD_DIM),
+        )?;
+        unsafe {
+            self.stream
+                .launch_builder(
+                    &self
+                        .kernels
+                        .attention_prefill_dense_halfq_wmma_hdim512_q32_regacc_pipeline,
+                )
+                .arg(&key_cache.slice)
+                .arg(&value_cache.slice)
+                .arg(&query_half.slice)
+                .arg(&start_position)
+                .arg(&total_q)
+                .arg(&context_len)
+                .arg(&num_attention_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&cache_capacity_u32)
+                .arg(&window_size)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch dense halfq wmma hdim512 q32 pipeline prefill attention"))?;
         Ok(())
     }
 

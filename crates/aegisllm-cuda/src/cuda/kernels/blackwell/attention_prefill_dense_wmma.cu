@@ -1769,6 +1769,460 @@ void aegis_attention_prefill_dense_halfq_wmma_hdim512_q32_regacc(
 }
 
 // =============================================================================
+// HDIM=512 Q_BLOCK=32 register-resident-accumulator + cp.async K-only pipeline.
+// =============================================================================
+//
+// Drop-in numerical-twin of `aegis_attention_prefill_dense_halfq_wmma_hdim512_q32_regacc`.
+// Adds a double-buffered K-tile cp.async prefetch on top of the just-shipped
+// Q_BLOCK=32 kernel. V remains synchronous (uint4 reads) — same K-only pattern
+// as `..._hdim512_regacc_pipeline` (the q_block=16 pipeline twin).
+//
+// Why K-only and not K+V:
+//   * sm_120 (RTX 5070 Ti, Blackwell consumer) opt-in dynamic-shared cap is
+//     96 KiB. q_shared(32 KiB) + k_shared[2](32 KiB) + v_shared(16 KiB) +
+//     scores(2 KiB) + weights_half(1 KiB) + scalars(0.4 KiB) = ~83.4 KiB,
+//     leaving ~12 KiB headroom. Pipelining V too would push us over the cap.
+//   * V is consumed late (P*V), so a synchronous global→shared V load issued
+//     after the cp.async-K-wait runs in parallel with Q*K and softmax via SM
+//     scoreboarding.
+//
+// Why this is expected to be a free win on q_block=32 (where the q_block=16
+// pipeline was perf-neutral):
+//   * The q_block=16 sync regacc kernel ran at 2 blocks/SM. Adding a second
+//     K buffer (16 KiB) dropped occupancy to 1 block/SM, and the cp.async
+//     overlap couldn't compensate for the residency loss.
+//   * The q_block=32 sync kernel is ALREADY at 1 block/SM (116 regs/thread,
+//     67 KiB shmem). Adding cp.async-K doesn't lose any more occupancy.
+//
+// Shared-mem layout (total ≤ 96 KiB):
+//   q_shared       = 32 * 512 * 2          = 32 KiB
+//   k_shared[2]    = 2 * 16 * 512 * 2      = 32 KiB
+//   v_shared       = 16 * 512 * 2          = 16 KiB
+//   scores         = 32 * 16 * 4           =  2 KiB
+//   scalars        = 32 * 3 * 4            =    384 B
+//   weights_half   = 32 * 16 * 2           =  1 KiB
+//                                          --------
+//                                          ~83.4 KiB
+//
+// k_shared[buf_cur] is reused TWICE within an iter, but only AFTER its K
+// data has been consumed by the Q*K WMMA chain:
+//   * partial_scores overlay (8 KiB ≤ 16 KiB) for the 4-way Q*K HDIM-split
+//     reduction. Same overlay pattern as the synchronous q32 twin.
+//   * acc_scratch overlay (16 warps × 1 KiB = 16 KiB == k_shared half-size)
+//     for the alpha rescale of one c_frag at a time. Same overlay pattern
+//     as the synchronous q32 twin.
+// The cp.async prefetch for iter (k+1) writes into k_shared[buf_nxt], which
+// is disjoint from buf_cur, so the overlays are safe. Note that buf_cur
+// alternates each iter — the acc_scratch base address is recomputed per
+// iter accordingly. This is fine: warp_scratch round-trips happen entirely
+// within the iter.
+//
+// Numerical correctness vs the synchronous q32 twin:
+//   * cp.async copies bf16 bytes — same byte stream the uint4 load reads.
+//   * OOB K rows: synchronous path stores `zero_vec` (16 zero bytes); cp.async
+//     with src_size=0 zero-fills 16 destination bytes. Identical.
+//   * V load is identical to the synchronous twin (same uint4 + zero_vec).
+//   * Q*K, softmax, P*V, alpha rescale — all unchanged.
+//   * `acc_frag[]` accumulation order is identical → bit-identical output.
+// =============================================================================
+extern "C" __global__
+__launch_bounds__(512, 1)
+void aegis_attention_prefill_dense_halfq_wmma_hdim512_q32_regacc_pipeline(
+    const unsigned short* __restrict__ key_cache,
+    const unsigned short* __restrict__ value_cache,
+    const unsigned short* __restrict__ query,
+    const unsigned int start_position,
+    const unsigned int total_q,
+    const unsigned int context_len,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int cache_capacity,
+    const unsigned int window_size,
+    float* __restrict__ output
+) {
+    constexpr unsigned int hdim = 512u;
+    constexpr unsigned int q_block = 32u;
+    constexpr unsigned int k_tile = 16u;
+    constexpr unsigned int warps_per_block = 16u;       // 512 threads / 32
+    constexpr unsigned int cols_per_warp = hdim / warps_per_block; // 32
+    constexpr unsigned int frags_per_warp_col = cols_per_warp / 16u; // 2
+    constexpr unsigned int row_strips = q_block / 16u;               // 2
+    constexpr unsigned int frags_per_warp = row_strips * frags_per_warp_col; // 4
+    const unsigned int head = blockIdx.x;
+    const unsigned int global_q_base = blockIdx.y * q_block;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+    if (head_dim != hdim || head >= num_attention_heads || blockDim.x < warps_per_block * 32u) {
+        return;
+    }
+
+    const unsigned int last_q_in_block = min(total_q, global_q_base + q_block) - 1u;
+    const unsigned int block_max_visible = global_q_base < total_q
+        ? min(context_len, start_position + last_q_in_block + 1u)
+        : 0u;
+    if (block_max_visible == 0u) {
+        return;
+    }
+    const unsigned int block_min_visible_raw = (window_size > 0u
+        && start_position + global_q_base + 1u > window_size)
+        ? (start_position + global_q_base + 1u - window_size)
+        : 0u;
+    const unsigned int block_min_tile_start =
+        (block_min_visible_raw / k_tile) * k_tile;
+
+    extern __shared__ __align__(16) unsigned char smem[];
+    unsigned short* q_shared      = reinterpret_cast<unsigned short*>(smem);
+    unsigned short* k_shared_buf  = q_shared + q_block * hdim;            // 2 * k_tile * hdim
+    unsigned short* v_shared      = k_shared_buf + 2u * k_tile * hdim;    // 1 * k_tile * hdim
+    float*          scores        = reinterpret_cast<float*>(v_shared + k_tile * hdim);
+    float*          scalars       = scores + q_block * k_tile;
+    half*           weights_half  = reinterpret_cast<half*>(scalars + q_block * 3u);
+    constexpr unsigned int acc_scratch_per_warp = 16u * 16u; // 256 floats per warp
+
+    const unsigned int group = num_attention_heads / num_kv_heads;
+    const unsigned int kv_head = head / group;
+    const float scale = rsqrtf(float(hdim));
+    const float log2e = 1.4426950408889634f;
+
+    // -------------------------------------------------------------------------
+    // Q tile load (synchronous, identical to the twin).
+    // -------------------------------------------------------------------------
+    for (unsigned int idx = tid; idx < q_block * hdim; idx += blockDim.x) {
+        const unsigned int row = idx / hdim;
+        const unsigned int dim = idx - row * hdim;
+        const unsigned int global_q = global_q_base + row;
+        q_shared[idx] = global_q < total_q
+            ? query[(size_t(global_q) * num_attention_heads + head) * hdim + dim]
+            : 0u;
+    }
+    for (unsigned int row = tid; row < q_block; row += blockDim.x) {
+        scalars[row * 3u + 0u] = -3.402823466e38f;
+        scalars[row * 3u + 1u] = 0.0f;
+        scalars[row * 3u + 2u] = 0.0f;
+    }
+
+#if __CUDA_ARCH__ >= 800
+    using namespace nvcuda;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag[frags_per_warp];
+    wmma::fill_fragment(acc_frag[0], 0.0f);
+    wmma::fill_fragment(acc_frag[1], 0.0f);
+    wmma::fill_fragment(acc_frag[2], 0.0f);
+    wmma::fill_fragment(acc_frag[3], 0.0f);
+#endif
+
+    // -------------------------------------------------------------------------
+    // cp.async helpers + per-iter K-tile prefetch (V is loaded synchronously).
+    //
+    // Each K tile is k_tile=16 rows × hdim=512 halfs = 8192 halfs = 16 KiB.
+    // Map each thread to one 16-byte (8-half) chunk: 512 threads × 16 B = 8 KiB.
+    // That covers HALF of the tile per pass; we issue TWO 16-byte cp.async ops
+    // per thread per tile (chunks 0 and 1). Together: 1024 chunks × 16 B = 16 KiB
+    // = exactly one tile.
+    //
+    // chunk layout (per pass):
+    //   chunk_id_in_tile = pass_idx * 512 + tid       (0..1023)
+    //   row              = chunk_id_in_tile / 64       (0..15)   — k_tile rows
+    //   half_idx_in_row  = (chunk_id_in_tile % 64) * 8 (0..504, step 8)
+    // -------------------------------------------------------------------------
+#if __CUDA_ARCH__ >= 800
+    auto cvt_smem = [] (const void* p) -> unsigned int {
+        unsigned int s;
+        asm volatile("{ .reg .u64 t;\n\t"
+                     "  cvta.to.shared.u64 t, %1;\n\t"
+                     "  cvt.u32.u64 %0, t; }\n"
+                     : "=r"(s) : "l"(p));
+        return s;
+    };
+    auto cp_async_16 = [] (unsigned int dst_smem, const void* src) {
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                     :: "r"(dst_smem), "l"(src));
+    };
+    auto cp_async_zero_16 = [] (unsigned int dst_smem) {
+        const unsigned long long any = 0ULL;
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, 0;\n"
+                     :: "r"(dst_smem), "l"((const void*)&any));
+    };
+    auto cp_async_commit = [] () {
+        asm volatile("cp.async.commit_group;\n" ::);
+    };
+    auto cp_async_wait_lt1 = [] () {
+        asm volatile("cp.async.wait_group 1;\n" ::);
+    };
+    auto cp_async_wait_lt0 = [] () {
+        asm volatile("cp.async.wait_group 0;\n" ::);
+    };
+
+    auto issue_k_prefetch = [&] (unsigned int tile_start_arg, unsigned int buf_idx) {
+        constexpr unsigned int halfs_per_chunk = 8u; // 16 bytes
+        constexpr unsigned int chunks_per_row  = hdim / halfs_per_chunk;     // 64
+        constexpr unsigned int chunks_per_tile = k_tile * chunks_per_row;    // 1024
+        constexpr unsigned int passes          = chunks_per_tile / 512u;     // 2
+        const unsigned int tile_count_arg = min(k_tile, block_max_visible - tile_start_arg);
+        unsigned short* k_buf = k_shared_buf + buf_idx * (k_tile * hdim);
+        #pragma unroll
+        for (unsigned int p = 0u; p < passes; ++p) {
+            const unsigned int chunk      = p * 512u + tid;
+            const unsigned int row        = chunk >> 6;     // / 64  (0..15)
+            const unsigned int half_off   = (chunk & 63u) << 3; // (chunk%64)*8
+            const bool valid              = row < tile_count_arg;
+            const unsigned int pos        = tile_start_arg + row;
+            const size_t kv_offset = valid
+                ? (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + half_off
+                : (size_t)half_off;
+            unsigned int k_dst_smem = cvt_smem(&k_buf[row * hdim + half_off]);
+            if (valid) {
+                cp_async_16(k_dst_smem, key_cache + kv_offset);
+            } else {
+                cp_async_zero_16(k_dst_smem);
+            }
+        }
+    };
+#endif
+
+    const unsigned int n_kiters = (block_max_visible > block_min_tile_start)
+        ? ((block_max_visible - block_min_tile_start + k_tile - 1u) / k_tile)
+        : 0u;
+
+#if __CUDA_ARCH__ >= 800
+    if (n_kiters > 0u) {
+        issue_k_prefetch(block_min_tile_start, 0u);
+        cp_async_commit();
+    }
+#endif
+    __syncthreads(); // ensure scalars/q_shared init visible before loop
+
+    const uint4 zero_vec = make_uint4(0u, 0u, 0u, 0u);
+    for (unsigned int it = 0u; it < n_kiters; ++it) {
+        const unsigned int tile_start = block_min_tile_start + it * k_tile;
+        const unsigned int tile_count = min(k_tile, block_max_visible - tile_start);
+        const unsigned int buf_cur = it & 1u;
+        const unsigned int buf_nxt = buf_cur ^ 1u;
+        unsigned short* k_shared = k_shared_buf + buf_cur * (k_tile * hdim);
+
+#if __CUDA_ARCH__ >= 800
+        // Issue the next iter's K prefetch, then wait until ≤1 group remains
+        // (i.e., the current iter's K data is ready).
+        if (it + 1u < n_kiters) {
+            issue_k_prefetch(block_min_tile_start + (it + 1u) * k_tile, buf_nxt);
+            cp_async_commit();
+            cp_async_wait_lt1();
+        } else {
+            cp_async_wait_lt0();
+        }
+
+        // Synchronous V load for the current iter. Bit-identical to the
+        // synchronous twin's V uint4 path. Issued AFTER the K cp.async wait
+        // so the K group is already in flight; the V load runs in parallel
+        // with the next iter's K cp.async DMA via the SM's load/store unit.
+        {
+            constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
+            constexpr unsigned int v_vecs = k_tile * hdim / halfs_per_vec;
+            uint4* v_shared_vec = reinterpret_cast<uint4*>(v_shared);
+            for (unsigned int vec = tid; vec < v_vecs; vec += blockDim.x) {
+                const unsigned int idx = vec * halfs_per_vec;
+                const unsigned int col = idx / hdim;
+                const unsigned int dim = idx - col * hdim;
+                const unsigned int pos = tile_start + col;
+                const bool valid_k = col < tile_count;
+                const size_t kv_offset =
+                    (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
+                v_shared_vec[vec] = valid_k
+                    ? *reinterpret_cast<const uint4*>(value_cache + kv_offset)
+                    : zero_vec;
+            }
+        }
+        __syncthreads();
+#else
+        // Pre-sm_80 fallback: synchronous load (matches the twin exactly).
+        constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
+        constexpr unsigned int kv_vecs = k_tile * hdim / halfs_per_vec;
+        uint4* k_shared_vec = reinterpret_cast<uint4*>(k_shared);
+        uint4* v_shared_vec = reinterpret_cast<uint4*>(v_shared);
+        for (unsigned int vec = tid; vec < kv_vecs; vec += blockDim.x) {
+            const unsigned int idx = vec * halfs_per_vec;
+            const unsigned int col = idx / hdim;
+            const unsigned int dim = idx - col * hdim;
+            const unsigned int pos = tile_start + col;
+            const bool valid_k = col < tile_count;
+            const size_t kv_offset =
+                (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim + dim;
+            k_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(key_cache + kv_offset)
+                : zero_vec;
+            v_shared_vec[vec] = valid_k
+                ? *reinterpret_cast<const uint4*>(value_cache + kv_offset)
+                : zero_vec;
+        }
+        __syncthreads();
+        (void)buf_nxt; // unused on pre-sm_80
+#endif
+
+#if __CUDA_ARCH__ >= 800
+        // Q*K WMMA: split HDIM=512 reduction across `qk_warps` warps. Each
+        // of the first `qk_warps` warps accumulates two 16x16 partials (one
+        // per row-strip) covering its slice of HDIM.
+        // Partial slots overlay k_shared[buf_cur] (which is no longer needed
+        // once all warp mma chains have read it for the Q*K reduction).
+        // 4 warps * 2 row-strips * 256 floats * 4 B = 8 KiB ≤ 16 KiB.
+        constexpr unsigned int qk_warps = 4u;
+        constexpr unsigned int hdim_per_qk_warp = hdim / qk_warps;  // 128
+        constexpr unsigned int partial_stride = 256u * row_strips;  // 512 floats per qk-warp
+        float* partial_scores = reinterpret_cast<float*>(k_shared);
+        if (warp < qk_warps) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag[row_strips];
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag[row_strips];
+            wmma::fill_fragment(c_frag[0], 0.0f);
+            wmma::fill_fragment(c_frag[1], 0.0f);
+            const unsigned int kk_start = warp * hdim_per_qk_warp;
+            const unsigned int kk_end   = kk_start + hdim_per_qk_warp;
+#pragma unroll
+            for (unsigned int kk = kk_start; kk < kk_end; kk += 16u) {
+                const half* a_ptr0 = reinterpret_cast<const half*>(q_shared +  0u * hdim + kk);
+                const half* a_ptr1 = reinterpret_cast<const half*>(q_shared + 16u * hdim + kk);
+                const half* b_ptr  = reinterpret_cast<const half*>(k_shared + kk);
+                wmma::load_matrix_sync(a_frag[0], a_ptr0, hdim);
+                wmma::load_matrix_sync(a_frag[1], a_ptr1, hdim);
+                wmma::load_matrix_sync(b_frag,    b_ptr,  hdim);
+                wmma::mma_sync(c_frag[0], a_frag[0], b_frag, c_frag[0]);
+                wmma::mma_sync(c_frag[1], a_frag[1], b_frag, c_frag[1]);
+            }
+            // Sync so all qk_warps finish reading k_shared before any
+            // warp writes partials into the same buffer (overlay).
+            __syncthreads();
+            wmma::store_matrix_sync(
+                partial_scores + warp * partial_stride + 0u * 256u,
+                c_frag[0], 16u, wmma::mem_row_major);
+            wmma::store_matrix_sync(
+                partial_scores + warp * partial_stride + 1u * 256u,
+                c_frag[1], 16u, wmma::mem_row_major);
+        } else {
+            __syncthreads();
+        }
+        __syncthreads();
+        // Reduce 4 partials → scores[q_block * k_tile = 512]; same layout as
+        // the synchronous q32 twin: source index inside qk-warp w == e.
+        for (unsigned int e = tid; e < q_block * k_tile; e += blockDim.x) {
+            scores[e] = partial_scores[0u * partial_stride + e]
+                      + partial_scores[1u * partial_stride + e]
+                      + partial_scores[2u * partial_stride + e]
+                      + partial_scores[3u * partial_stride + e];
+        }
+#endif
+        __syncthreads();
+
+        // Softmax / online stats. q_block=32 rows distributed across
+        // warps_per_block=16 warps → each warp handles 2 rows.
+        for (unsigned int row = warp; row < q_block; row += warps_per_block) {
+            const unsigned int global_q = global_q_base + row;
+            const bool valid_q = global_q < total_q;
+            const unsigned int visible_len = valid_q
+                ? min(context_len, start_position + global_q + 1u)
+                : 0u;
+            const unsigned int row_min_visible = (window_size > 0u && start_position + global_q + 1u > window_size)
+                ? (start_position + global_q + 1u - window_size) : 0u;
+            const float old_m = scalars[row * 3u + 0u];
+            const float old_l = scalars[row * 3u + 1u];
+            const unsigned int pos = tile_start + lane;
+            float score = (valid_q && lane < k_tile && lane < tile_count && pos < visible_len && pos >= row_min_visible)
+                ? scores[row * k_tile + lane] * scale
+                : -3.402823466e38f;
+            const float tile_m = aegis_warp_reduce_max(score);
+            const float new_m = fmaxf(old_m, tile_m);
+            float weight = 0.0f;
+            if (score > -3.0e38f) {
+                weight = exp2f((score - new_m) * log2e);
+            }
+            if (lane < k_tile) {
+                scores[row * k_tile + lane] = weight;
+            }
+            const float tile_l = aegis_warp_reduce_sum(weight);
+            if (lane == 0u) {
+                const float alpha = old_l > 0.0f ? exp2f((old_m - new_m) * log2e) : 0.0f;
+                scalars[row * 3u + 0u] = new_m;
+                scalars[row * 3u + 1u] = old_l * alpha + tile_l;
+                scalars[row * 3u + 2u] = alpha;
+            }
+        }
+        __syncthreads();
+
+        for (unsigned int idx = tid; idx < q_block * k_tile; idx += blockDim.x) {
+            weights_half[idx] = __float2half_rn(scores[idx]);
+        }
+        __syncthreads();
+
+#if __CUDA_ARCH__ >= 800
+        // Alpha rescale + P*V WMMA.
+        // acc_scratch overlays k_shared[buf_cur] (whose K data was consumed
+        // in the Q*K reduction above). The cp.async prefetch for iter (k+1)
+        // targets k_shared[buf_nxt], which is disjoint, so the overlay is
+        // safe even with the prefetch in flight.
+        float* acc_scratch = reinterpret_cast<float*>(k_shared);
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag[row_strips];
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
+        wmma::load_matrix_sync(p_frag[0], weights_half +  0u * k_tile, k_tile);
+        wmma::load_matrix_sync(p_frag[1], weights_half + 16u * k_tile, k_tile);
+        float* warp_scratch = acc_scratch + warp * acc_scratch_per_warp;
+#pragma unroll
+        for (unsigned int s = 0u; s < row_strips; ++s) {
+            const unsigned int row_base = s * 16u;
+#pragma unroll
+            for (unsigned int f = 0u; f < frags_per_warp_col; ++f) {
+                const unsigned int frag_idx = s * frags_per_warp_col + f;
+                const unsigned int n_off = warp * cols_per_warp + f * 16u;
+                wmma::store_matrix_sync(warp_scratch, acc_frag[frag_idx], 16u, wmma::mem_row_major);
+#pragma unroll
+                for (unsigned int e = lane; e < 256u; e += 32u) {
+                    const unsigned int row_in_strip = e / 16u;
+                    const unsigned int abs_row = row_base + row_in_strip;
+                    warp_scratch[e] *= scalars[abs_row * 3u + 2u];
+                }
+                wmma::load_matrix_sync(acc_frag[frag_idx], warp_scratch, 16u, wmma::mem_row_major);
+                const half* v_ptr = reinterpret_cast<const half*>(v_shared + n_off);
+                wmma::load_matrix_sync(v_frag, v_ptr, hdim);
+                wmma::mma_sync(acc_frag[frag_idx], p_frag[s], v_frag, acc_frag[frag_idx]);
+            }
+        }
+#endif
+        __syncthreads();
+    }
+
+    // Final epilogue: divide by row-sum and write to global output.
+    // For the epilogue, acc_scratch reuses k_shared_buf[0] (any half is fine
+    // since both K bufs are dead at end of last iter).
+#if __CUDA_ARCH__ >= 800
+    float* acc_scratch_ep = reinterpret_cast<float*>(k_shared_buf);
+    float* warp_scratch = acc_scratch_ep + warp * acc_scratch_per_warp;
+#pragma unroll
+    for (unsigned int s = 0u; s < row_strips; ++s) {
+        const unsigned int row_base = s * 16u;
+#pragma unroll
+        for (unsigned int f = 0u; f < frags_per_warp_col; ++f) {
+            const unsigned int frag_idx = s * frags_per_warp_col + f;
+            const unsigned int n_off = warp * cols_per_warp + f * 16u;
+            wmma::store_matrix_sync(warp_scratch, acc_frag[frag_idx], 16u, wmma::mem_row_major);
+#pragma unroll
+            for (unsigned int e = lane; e < 256u; e += 32u) {
+                const unsigned int row_in_strip = e / 16u;
+                const unsigned int col = e - row_in_strip * 16u;
+                const unsigned int abs_row = row_base + row_in_strip;
+                const unsigned int global_q = global_q_base + abs_row;
+                if (global_q >= total_q) {
+                    continue;
+                }
+                const float denom = fmaxf(scalars[abs_row * 3u + 1u], 1.0e-20f);
+                const unsigned int dim = n_off + col;
+                output[(size_t(global_q) * num_attention_heads + head) * hdim + dim] =
+                    warp_scratch[e] / denom;
+            }
+        }
+    }
+#endif
+}
+
+// =============================================================================
 // HDIM=512 register-resident-accumulator + cp.async pipelined K-only variant —
 // Round 3 attention pipelining.
 //
