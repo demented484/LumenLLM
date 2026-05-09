@@ -177,15 +177,20 @@ impl ParametersFile {
                 .map(|s| parse_storage(s, cuda_device))
                 .transpose()?;
             if hidden_layers.weights.is_none() {
+                // `hidden-layers.{store,compute}` shorthand applies to LAYER
+                // regions only — embed, lm_head, and final_norm are governed
+                // by `input-layer`, `output-layer`, and `model.*` respectively.
+                // `LayerSelector::All` would (silently) overwrite those.
+                let layer_selector = LayerSelector::Range { start: 0, end: usize::MAX };
                 if let Some(store) = parent_store {
                     policy.rules.push(PlacementRule {
-                        selector: LayerSelector::All,
+                        selector: layer_selector,
                         store: Some(store),
                         compute: parent_compute,
                     });
                 } else if let Some(compute) = parent_compute {
                     policy.rules.push(PlacementRule {
-                        selector: LayerSelector::All,
+                        selector: layer_selector,
                         store: None,
                         compute: Some(compute),
                     });
