@@ -97,32 +97,49 @@ impl CudaLlamaExecutor {
 
         // 3 non-layer regions (embed, final_norm, lm_head) + N layers.
         let progress = LoadProgress::new(3 + graph.num_layers);
+        let timing_enabled = std::env::var("AEGIS_LOAD_TIMING").is_ok();
+        let load_start = std::time::Instant::now();
+        let stage_t = |label: &str, t0: std::time::Instant| {
+            if timing_enabled {
+                eprintln!(
+                    "load-timing: {label:<22} {:>6.2}s  (cumulative {:>6.2}s)",
+                    t0.elapsed().as_secs_f64(),
+                    load_start.elapsed().as_secs_f64()
+                );
+            }
+        };
 
         let embed_name = format!("{}embed_tokens.weight", graph.text_prefix);
+        let t0 = std::time::Instant::now();
         let embed_tokens = cuda_weights.load_bf16_matrix_with_store(
             first_existing_tensor(artifact, &[&embed_name, "model.embed_tokens.weight"])?,
             embed_region.store,
             cuda_residency_for_store(embed_region.store, device)?,
             &mut loader,
         )?;
+        stage_t("embed", t0);
         progress.step("embed");
         let final_norm_name = format!("{}norm.weight", graph.text_prefix);
+        let t0 = std::time::Instant::now();
         let final_norm = cuda_weights.load_dense_vector_with_store(
             first_existing_tensor(artifact, &[&final_norm_name, "model.norm.weight"])?,
             final_norm_region.store,
             &mut loader,
         )?;
+        stage_t("final_norm", t0);
         progress.step("final_norm");
         let lm_head_tensor = first_existing_tensor(
             artifact,
             &["lm_head.weight", &embed_name, "model.embed_tokens.weight"],
         )?;
+        let t0 = std::time::Instant::now();
         let lm_head = cuda_weights.load_bf16_matrix_with_store(
             lm_head_tensor,
             lm_head_region.store,
             cuda_residency_for_store(lm_head_region.store, device)?,
             &mut loader,
         )?;
+        stage_t("lm_head", t0);
         progress.step("lm_head");
 
         let mut layers = Vec::with_capacity(graph.num_layers);
@@ -173,6 +190,7 @@ impl CudaLlamaExecutor {
                     }
                 })
                 .unwrap_or(0);
+            let t0 = std::time::Instant::now();
             layers.push(load_cuda_layer(
                 &cuda_weights,
                 artifact,
@@ -197,7 +215,14 @@ impl CudaLlamaExecutor {
                 attention_store_override,
                 &mut loader,
             )?);
+            stage_t(&format!("layer {layer}"), t0);
             progress.step(&format!("layer {layer}"));
+        }
+        if timing_enabled {
+            eprintln!(
+                "load-timing: weights total            {:>6.2}s",
+                load_start.elapsed().as_secs_f64()
+            );
         }
 
         let has_staged_layers = layers.iter().any(|layer| {
