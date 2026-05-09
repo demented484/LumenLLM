@@ -362,10 +362,14 @@ fn generate_http_response(
             Err(error) => return json_error(400, error),
         }
     };
-    // When the request carries `tools`, install single-token stop markers
-    // (`<tool_call|>`, `<turn|>`) so the model halts cleanly after a tool
-    // call instead of hallucinating a tool response.
-    let stop_token_ids = if chat && extract_tools(&parsed).is_some() {
+    // For chat requests, install single-token stop markers (`<tool_call|>`,
+    // `<turn|>`) so the model halts at end-of-turn or after a tool call.
+    // Without `<turn|>` as a stop token the model keeps sampling past the
+    // legitimate end of its response (since Gemma 4's `<turn|>` isn't in
+    // `eos_token_ids`) and the distribution collapses into multilingual
+    // garbage. Tools-only stop is the pre-fix legacy behaviour and
+    // produced the same collapse on multi-turn chat without tools.
+    let stop_token_ids = if chat {
         state.tool_call_stop_token_ids.clone()
     } else {
         Vec::new()
@@ -503,11 +507,10 @@ fn generate_anthropic_response(
         Ok(prompt) => prompt,
         Err(error) => return json_error(400, error),
     };
-    let stop_token_ids = if extract_tools(&parsed).is_some() {
-        state.tool_call_stop_token_ids.clone()
-    } else {
-        Vec::new()
-    };
+    // /v1/messages is always chat — always install <turn|> as stop so the
+    // model halts at end-of-turn (Gemma 4's <turn|> is not in eos_token_ids).
+    let stop_token_ids = state.tool_call_stop_token_ids.clone();
+    let _ = extract_tools(&parsed); // tool definitions are forwarded via chat template
     let request = GenerateRequest {
         prompt,
         max_tokens: json_usize_any(&parsed, &["max_tokens", "max_completion_tokens"], 32),
@@ -764,9 +767,11 @@ fn sse_openai(
             }
         }
     };
-    // Tools → install stop tokens so the model halts on `<tool_call|>`
-    // instead of role-playing a tool response.
-    let stop_token_ids = if chat && extract_tools(parsed).is_some() {
+    // Chat → install <turn|>/<tool_call|> as stop tokens. Without this the
+    // model keeps sampling past its own end-of-turn marker (Gemma 4 doesn't
+    // include <turn|> in eos_token_ids) and the distribution collapses
+    // into garbage on long multi-turn conversations.
+    let stop_token_ids = if chat {
         state.tool_call_stop_token_ids.clone()
     } else {
         Vec::new()
@@ -1562,13 +1567,14 @@ fn chat_prompt_from_json(
         &engine.artifact,
         &parsed,
         tools.as_ref(),
-        // enable_thinking is opt-in via request field; OpenAI doesn't have
-        // a standard place for it, so support a custom `enable_thinking`
-        // bool that callers (curl, custom clients) can set.
+        // enable_thinking defaults to TRUE for chat-tuned reasoning models
+        // (Gemma 4 IT, Qwen 3.5 with thinking, etc.) — matches llama.cpp's
+        // .gguf default and Google AI Studio behavior. Callers that want
+        // raw "no-thinking" output can pass `enable_thinking: false`.
         value
             .get("enable_thinking")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+            .unwrap_or(true),
     )
     .map_err(|error| error.to_string())
 }
