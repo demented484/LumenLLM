@@ -503,6 +503,11 @@ fn generate_anthropic_response(
         Ok(prompt) => prompt,
         Err(error) => return json_error(400, error),
     };
+    let stop_token_ids = if extract_tools(&parsed).is_some() {
+        state.tool_call_stop_token_ids.clone()
+    } else {
+        Vec::new()
+    };
     let request = GenerateRequest {
         prompt,
         max_tokens: json_usize_any(&parsed, &["max_tokens", "max_completion_tokens"], 32),
@@ -512,7 +517,7 @@ fn generate_anthropic_response(
             top_k: json_usize(&parsed, "top_k", default_sampling.top_k),
             min_p: json_f32(&parsed, "min_p", default_sampling.min_p),
         },
-        stop_token_ids: Vec::new(),
+        stop_token_ids,
     };
     let started = Instant::now();
     let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
@@ -523,6 +528,46 @@ fn generate_anthropic_response(
                 completion_tokens: output.completion_tokens,
             };
             state.record_generation(started, Some(stats));
+            // Anthropic content is an ordered array of typed blocks.
+            // Order: thinking (if any) → text (if any) → tool_use (if any).
+            let parsed_assistant = state.parser_kind.parse_assistant(&output.text);
+            let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+            if let Some(reasoning) = &parsed_assistant.reasoning {
+                content_blocks.push(serde_json::json!({
+                    "type": "thinking",
+                    "thinking": reasoning,
+                }));
+            }
+            if !parsed_assistant.content.is_empty() {
+                content_blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": parsed_assistant.content,
+                }));
+            }
+            for tc in &parsed_assistant.tool_calls {
+                let input = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                content_blocks.push(serde_json::json!({
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "input": input,
+                }));
+            }
+            // If neither parser produced anything (non-Gemma model), fall back
+            // to a single text block with the raw output so we still respond
+            // properly.
+            if content_blocks.is_empty() {
+                content_blocks.push(serde_json::json!({
+                    "type": "text",
+                    "text": output.text,
+                }));
+            }
+            let stop_reason = if !parsed_assistant.tool_calls.is_empty() {
+                "tool_use".to_string()
+            } else {
+                anthropic_stop_reason(&output.finish_reason).to_string()
+            };
             (
                 200,
                 serde_json::json!({
@@ -530,11 +575,8 @@ fn generate_anthropic_response(
                 "type": "message",
                 "role": "assistant",
                 "model": engine.placement.model,
-                "content": [{
-                    "type": "text",
-                    "text": output.text
-                }],
-                "stop_reason": anthropic_stop_reason(&output.finish_reason),
+                "content": content_blocks,
+                "stop_reason": stop_reason,
                 "usage": {
                     "input_tokens": output.prompt_tokens,
                     "output_tokens": output.completion_tokens
@@ -1301,15 +1343,48 @@ fn parser_kind_for_engine(engine: &AegisEngine) -> aegisllm_base::chat_parse::Pa
     aegisllm_base::chat_parse::ParserKind::detect(&template)
 }
 
-/// Extract tool definitions for chat-template rendering. OpenAI passes
-/// `tools: [{"type":"function","function":{...}}]`; we forward as-is so the
-/// model's chat_template (which expects this shape) can format them.
-fn extract_tools(value: &serde_json::Value) -> Option<&serde_json::Value> {
+/// Extract and normalize tool definitions to the OpenAI shape the
+/// chat_template expects. Accepts:
+///   * OpenAI: `[{"type":"function","function":{name, description, parameters}}]`
+///   * Anthropic: `[{"name":..., "description":..., "input_schema":{...}}]`
+/// Returns `None` when the request has no tools or an empty array.
+fn extract_tools(value: &serde_json::Value) -> Option<serde_json::Value> {
     let tools = value.get("tools")?;
-    if tools.as_array().map(|a| a.is_empty()).unwrap_or(false) {
+    let arr = tools.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    let mut normalized = Vec::with_capacity(arr.len());
+    for tool in arr {
+        // Already OpenAI shape?
+        if tool.get("type").and_then(|v| v.as_str()) == Some("function")
+            && tool.get("function").is_some()
+        {
+            normalized.push(tool.clone());
+            continue;
+        }
+        // Anthropic shape: flat {name, description, input_schema} — wrap.
+        if let Some(name) = tool.get("name") {
+            let mut function = serde_json::Map::new();
+            function.insert("name".into(), name.clone());
+            if let Some(desc) = tool.get("description") {
+                function.insert("description".into(), desc.clone());
+            }
+            // Anthropic input_schema → OpenAI parameters (same JSONSchema
+            // structure, different field name).
+            if let Some(schema) = tool.get("input_schema").or_else(|| tool.get("parameters")) {
+                function.insert("parameters".into(), schema.clone());
+            }
+            normalized.push(serde_json::json!({
+                "type": "function",
+                "function": function,
+            }));
+        }
+    }
+    if normalized.is_empty() {
         None
     } else {
-        Some(tools)
+        Some(serde_json::Value::Array(normalized))
     }
 }
 
@@ -1425,7 +1500,7 @@ fn chat_prompt_from_json(
     TextProcessor::render_chat_for_artifact_with_tools(
         &engine.artifact,
         &parsed,
-        tools,
+        tools.as_ref(),
         // enable_thinking is opt-in via request field; OpenAI doesn't have
         // a standard place for it, so support a custom `enable_thinking`
         // bool that callers (curl, custom clients) can set.
