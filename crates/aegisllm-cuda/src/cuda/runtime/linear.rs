@@ -384,9 +384,21 @@ impl CudaRuntime {
         Ok(())
     }
 
-    /// CPU-side matvec for host-resident BF16 matrices: avoid having lm_head (~1 GB)
-    /// permanently in VRAM at the cost of one D2H download (input) + ~30ms CPU compute
-    /// + one H2D upload (logits) per decode step. Saves ~1 GB VRAM.
+    /// GPU matvec for host-resident BF16 matrices. Uploads pinned host weights
+    /// into a transient VRAM scratch buffer and runs the existing BF16 matvec
+    /// kernel on `cuda:0`, honoring the `compute=cuda:0` contract.
+    ///
+    /// Per-call cost: ~size_in_bytes / PCIe bandwidth (≈90 ms for a 1.4 GB
+    /// lm_head over PCIe 5.0 ×16) + a few ms of GPU compute + a same-call alloc
+    /// from the cudarc allocator. CPU stays out of the matmul loop entirely;
+    /// pre-fix this path ran a rayon BF16 reduction that pinned the host CPU
+    /// at ~100% during decode.
+    ///
+    /// VRAM cost: a transient `rows*cols*2` byte allocation, freed when the
+    /// returned `DeviceBuffer<u16>` drops at the end of the function. For
+    /// `output-layer.store=ram` callers, this peaks at the lm_head size during
+    /// the matvec call only — the matrix is *not* permanently promoted to
+    /// VRAM, preserving the user-stated intent of `store=ram`.
     fn matvec_bf16_host_resident_device(
         &self,
         matrix: &DeviceBf16Matrix,
@@ -405,32 +417,39 @@ impl CudaRuntime {
                 matrix.name, input.len(), matrix.cols, output.len(), matrix.rows
             )));
         }
-        use rayon::prelude::*;
-        let input_host = self.download_f32(input)?;
-        let weights = host
+        let weights_host = host
             .values
             .as_slice()
             .map_err(map_cuda_err("read pinned bf16 weights"))?;
-        let cols = matrix.cols;
-        let rows = matrix.rows;
-        let mut result = vec![0.0_f32; rows];
-        result
-            .par_iter_mut()
-            .enumerate()
-            .for_each(|(row, slot)| {
-                let row_base = row * cols;
-                let mut acc = 0.0_f32;
-                for c in 0..cols {
-                    let bf16_bits = weights[row_base + c];
-                    let f = f32::from_bits((bf16_bits as u32) << 16);
-                    acc += f * input_host[c];
-                }
-                *slot = acc;
-            });
-        let mut out_dev = output.slice.slice_mut(0..rows);
+        let total = matrix.rows * matrix.cols;
+        if weights_host.len() < total {
+            return Err(AegisError::InvalidPlan(format!(
+                "bf16 host matvec: pinned host weights for `{}` have {} u16, need {}*{}={}",
+                matrix.name, weights_host.len(), matrix.rows, matrix.cols, total
+            )));
+        }
+        let mut weights_dev = self.alloc_u16(total)?;
         self.stream
-            .memcpy_htod(&result, &mut out_dev)
-            .map_err(map_cuda_err("upload host bf16 matvec result"))?;
+            .memcpy_htod(&weights_host[..total], &mut weights_dev.slice)
+            .map_err(map_cuda_err("htod bf16 host-resident upload"))?;
+        let rows_u32 = u32_arg("rows", matrix.rows)?;
+        let cols_u32 = u32_arg("cols", matrix.cols)?;
+        let cfg = LaunchConfig {
+            grid_dim: (rows_u32, 1, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 128 * std::mem::size_of::<f32>() as u32,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.bf16_matvec)
+                .arg(&weights_dev.slice)
+                .arg(&input.slice)
+                .arg(&rows_u32)
+                .arg(&cols_u32)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch bf16 matvec from host-streamed weights"))?;
         Ok(())
     }
 
