@@ -107,7 +107,7 @@ fn read_chunked_par(path: &std::path::Path, file_offset: u64, dst: &mut [u8]) ->
     if len == 0 {
         return Ok(());
     }
-    const CHUNK_COUNT: usize = 4;
+    const CHUNK_COUNT: usize = 8;
     let chunk_size = len.div_ceil(CHUNK_COUNT);
     let dst_ptr = dst.as_mut_ptr() as usize;
     (0..CHUNK_COUNT)
