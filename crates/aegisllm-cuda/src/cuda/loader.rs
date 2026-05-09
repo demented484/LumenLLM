@@ -254,21 +254,37 @@ impl CudaWeightLoader<'_> {
             });
         }
         let loaded = loader.load_for_store(tensor, store)?;
-        let values = loaded
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<_>>();
+        // Zero-copy reinterpret of the BF16 byte slice as &[u16] before HtoD.
+        // The previous code built an intermediate `Vec<u16>` via
+        // `.chunks_exact(2).map(...).collect()` which doubled RAM peak per
+        // tensor (e.g. +1 GiB transient for lm_head) and showed up as a
+        // sawtooth on htop — and slowed the HtoD ramp because the per-tensor
+        // copy was single-threaded.
+        let bytes = loaded.as_bytes();
+        if bytes.len() % 2 != 0 {
+            return Err(AegisError::InvalidPlan(format!(
+                "BF16 tensor `{}` has odd byte length {}", tensor.name, bytes.len()
+            )));
+        }
+        // SAFETY: `bytes` is from a host buffer that's at least 2-byte aligned
+        // (mmap'd safetensors regions are page-aligned; pinned u16 allocs are
+        // u16-aligned). Length is even-checked above. The lifetime is bound
+        // to `loaded` which lives until the HtoD finishes synchronously below.
+        let values_u16: &[u16] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const u16, bytes.len() / 2)
+        };
+        let len = values_u16.len();
+        let mut buffer = self.runtime.alloc_u16(len)?;
+        self.runtime
+            .stream
+            .memcpy_htod(values_u16, &mut buffer.slice)
+            .map_err(map_cuda_err("htod bf16 matrix"))?;
         Ok(DeviceBf16Matrix {
             name: tensor.name.clone(),
             rows: tensor.shape[0],
             cols: tensor.shape[1],
             residency,
-            values: self
-                .runtime
-                .stream
-                .clone_htod(&values)
-                .map_err(map_cuda_err("htod bf16 matrix"))?,
+            values: buffer.slice,
             host_values: None,
         })
     }
