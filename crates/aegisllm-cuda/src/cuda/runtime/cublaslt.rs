@@ -154,6 +154,103 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Variant of `matmul_bf16_cublaslt_device` that takes input already
+    /// quantized to BF16. Used for QKV projection where Q, K, and V share the
+    /// same input — caller quantizes once via `f32_to_bf16_device` and reuses
+    /// `input_bf16` across three GEMMs, skipping two redundant conversions.
+    /// Bit-identical to the f32-input variant for the same input bytes.
+    pub fn matmul_bf16_cublaslt_with_input_bf16_device(
+        &self,
+        weight: &DeviceBf16Matrix,
+        input_bf16: &DeviceBuffer<u16>,
+        batch: usize,
+        output_bf16: &mut DeviceBuffer<u16>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if weight.is_host_resident() {
+            return Err(AegisError::InvalidPlan(format!(
+                "cuBLASLt BF16 GEMM requires VRAM-resident weight matrix `{}`; host-resident weights must use the CPU rayon path",
+                weight.name
+            )));
+        }
+        let rows = weight.rows;
+        let cols = weight.cols;
+        let in_len = batch
+            .checked_mul(cols)
+            .ok_or_else(|| AegisError::InvalidPlan("cublaslt bf16 input len overflow".into()))?;
+        let out_len = batch
+            .checked_mul(rows)
+            .ok_or_else(|| AegisError::InvalidPlan("cublaslt bf16 output len overflow".into()))?;
+        if input_bf16.len() < in_len || output_bf16.len() < out_len {
+            return Err(AegisError::InvalidPlan(format!(
+                "cuBLASLt BF16 scratch too small: input_bf16={} need {}, output_bf16={} need {}",
+                input_bf16.len(), in_len, output_bf16.len(), out_len
+            )));
+        }
+        if output.len() < out_len {
+            return Err(AegisError::InvalidPlan(format!(
+                "cuBLASLt BF16 output shape: output={} need batch*rows={}*{}={}",
+                output.len(), batch, rows, out_len
+            )));
+        }
+        let cfg = MatmulConfig {
+            transa: true,
+            transb: false,
+            transc: false,
+            m: rows as u64,
+            n: batch as u64,
+            k: cols as u64,
+            alpha: 1.0,
+            lda: cols as i64,
+            ldb: cols as i64,
+            beta: 0.0,
+            ldc: rows as i64,
+            stride_a: None,
+            stride_b: None,
+            stride_c: None,
+            stride_bias: None,
+            batch_size: None,
+        };
+        let weight_view = unsafe { weight.values.transmute::<half::bf16>(weight.values.len()) }
+            .ok_or_else(|| {
+                AegisError::Unsupported(format!(
+                    "weight u16 → bf16 transmute failed for `{}` (len={})",
+                    weight.name, weight.values.len()
+                ))
+            })?;
+        let in_view = unsafe { input_bf16.slice.transmute::<half::bf16>(in_len) }
+            .ok_or_else(|| {
+                AegisError::Unsupported("input u16 → bf16 transmute failed".into())
+            })?;
+        let mut out_view = unsafe { output_bf16.slice.transmute_mut::<half::bf16>(out_len) }
+            .ok_or_else(|| {
+                AegisError::Unsupported("output u16 → bf16 transmute failed".into())
+            })?;
+        unsafe {
+            self.cublas_lt
+                .matmul(cfg, &weight_view, &in_view, &mut out_view, None, None)
+        }
+        .map_err(|e| {
+            AegisError::Unsupported(format!(
+                "cuBLASLt BF16 matmul failed for `{}` (m={} n={} k={}): {e:?}",
+                weight.name, rows, batch, cols
+            ))
+        })?;
+        self.bf16_to_f32_device(output_bf16, out_len, output)?;
+        Ok(())
+    }
+
+    /// Public wrapper around the F32→BF16 conversion kernel for callers that
+    /// want to share a quantized input across multiple GEMMs.
+    pub fn f32_to_bf16_into_device(
+        &self,
+        input: &DeviceBuffer<f32>,
+        len: usize,
+        out: &mut DeviceBuffer<u16>,
+    ) -> Result<()> {
+        self.f32_to_bf16_device(input, len, out)
+    }
+
     /// Compute `output = input @ weight^T` for an FP8 standalone weight by
     /// dequantizing into a BF16 scratch and routing through the existing
     /// BF16 cuBLASLt tensor-core path. Activates Blackwell SM_120 BF16

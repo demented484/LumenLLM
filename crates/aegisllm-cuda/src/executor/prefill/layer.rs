@@ -244,16 +244,48 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         // FP8 → dequant-to-BF16 + cuBLASLt GEMM (shared dequant scratch).
         // Mixed BF16/FP8 across q/k/v is fine since each is dispatched
         // independently. NVFP4 layers go through an earlier branch.
+        //
+        // Optimization: when all of Q/K/V are BF16+cublaslt-enabled, they share
+        // the same input (`prefill.input_normed`). Pre-quantize once into
+        // `prefill.bf16_in_scratch` and reuse across three GEMMs. Saves 2 of 3
+        // redundant f32→bf16 launches per layer per chunk. FP8/reference paths
+        // would clobber `bf16_in_scratch` so we only enable the optimization
+        // when all three projections take the cublaslt-bf16 branch.
+        let all_bf16_cublaslt = matches!(
+            (&layer.q_proj, &layer.k_proj, &layer.v_proj),
+            (CudaLinear::Bf16(_), CudaLinear::Bf16(_), CudaLinear::Bf16(_))
+        ) && match (&layer.q_proj, &layer.k_proj, &layer.v_proj) {
+            (CudaLinear::Bf16(q), CudaLinear::Bf16(k), CudaLinear::Bf16(v)) =>
+                runtime.cublaslt_bf16_enabled_for(q)
+                    && runtime.cublaslt_bf16_enabled_for(k)
+                    && runtime.cublaslt_bf16_enabled_for(v),
+            _ => false,
+        };
+        if all_bf16_cublaslt {
+            let in_len = params.batch * layer.q_proj.cols();
+            runtime.f32_to_bf16_into_device(
+                &prefill.input_normed,
+                in_len,
+                &mut prefill.bf16_in_scratch,
+            )?;
+        }
         macro_rules! dispatch_attn_proj {
             ($proj:expr, $output:expr) => {{
                 match $proj {
                     CudaLinear::Bf16(b) => {
                         if runtime.cublaslt_bf16_enabled_for(b) {
-                            runtime.matmul_bf16_cublaslt_device(
-                                b, &prefill.input_normed, params.batch,
-                                &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
-                                $output,
-                            )?;
+                            if all_bf16_cublaslt {
+                                runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+                                    b, &prefill.bf16_in_scratch, params.batch,
+                                    &mut prefill.bf16_out_scratch, $output,
+                                )?;
+                            } else {
+                                runtime.matmul_bf16_cublaslt_device(
+                                    b, &prefill.input_normed, params.batch,
+                                    &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
+                                    $output,
+                                )?;
+                            }
                         } else {
                             runtime.matmul_bf16_reference_batched_device(
                                 b, &prefill.input_normed, params.batch, $output,
