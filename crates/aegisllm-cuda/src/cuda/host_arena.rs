@@ -73,16 +73,24 @@ impl PinnedArena {
         })
     }
 
-    /// Page-lock the entire arena with the CUDA driver so subsequent
-    /// `memcpy_htod` calls from arena slices take the direct-DMA fast
-    /// path. Call this once after the load loop has finished writing
-    /// every tensor — pages are already committed by the writes, so
-    /// the registration just locks them in place without extra
-    /// physical-memory cost. Takes `&self` so the call can be made
-    /// through an `Arc<PinnedArena>` after host-resident weights have
-    /// already cloned their references.
+    /// Page-lock the **actually-used** prefix of the arena with the
+    /// CUDA driver so subsequent `memcpy_htod` calls from arena
+    /// slices take the direct-DMA fast path. Call this once after the
+    /// load loop has finished writing every tensor — used pages are
+    /// already committed by the writes, so registration only locks
+    /// them in place without extra physical-memory cost.
+    ///
+    /// Critically pins `[0, used)`, NOT `[0, capacity)`. With the
+    /// arena's `MAP_NORESERVE`-backed mmap, the trailing
+    /// `[used, capacity)` range is uncommitted; registering it would
+    /// force-commit AND lock those pages, costing several GiB of
+    /// resident RAM that's never read by the engine. The over-
+    /// estimation in `compute_host_arena_capacity` is intentional
+    /// (we'd rather over-allocate virtual address space than fail
+    /// mid-load), but the over-pin would be free RAM thrown away.
     pub(crate) fn pin_now(&self) -> Result<()> {
-        self._backing.pin_now()
+        let used = self.used.load(Ordering::Relaxed);
+        self._backing.pin_range(0, used)
     }
 
     /// Reserve `len` bytes and read them from `reader`. Returns the

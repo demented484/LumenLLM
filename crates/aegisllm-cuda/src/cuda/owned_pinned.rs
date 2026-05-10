@@ -36,7 +36,7 @@
 //! `memcpy_htod` as a pinned source — the driver detects the
 //! registered pinning and uses the fast direct-DMA path.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use aegisllm_base::error::{AegisError, Result};
 use cudarc::driver::{CudaStream, HostSlice, SyncOnDrop, sys};
@@ -50,6 +50,12 @@ pub(crate) struct OwnedPinnedBuf {
     /// underlying CUDA call is a pointer-based syscall, the only Rust
     /// state we mutate is this flag.
     registered: AtomicBool,
+    /// Byte offset where the cuMemHostRegister'd range starts.
+    /// `pin_range` may register a sub-range starting > 0 (e.g. when
+    /// the arena's used portion doesn't begin at offset 0), and
+    /// `cuMemHostUnregister` must be called with the exact pointer
+    /// that was registered. `pin_now`/full-buffer pin leaves this 0.
+    register_start: AtomicUsize,
 }
 
 // SAFETY: the underlying pages are pinned for the lifetime of the
@@ -121,6 +127,7 @@ impl OwnedPinnedBuf {
             ptr: ptr as *mut u8,
             len: len_aligned,
             registered: AtomicBool::new(false),
+            register_start: AtomicUsize::new(0),
         })
     }
 
@@ -134,22 +141,50 @@ impl OwnedPinnedBuf {
     /// the register call only page-locks already-committed pages
     /// (no extra physical-memory commits).
     pub(crate) fn pin_now(&self) -> Result<()> {
+        self.pin_range(0, self.len)
+    }
+
+    /// Register only the first `len` bytes (rounded up to a page).
+    /// Used by `PinnedArena::pin_now` to lock just the actually-
+    /// written portion of the arena, not the trailing unused pages
+    /// that `compute_host_arena_capacity` over-estimated. With
+    /// `MAP_NORESERVE` set, those trailing pages are uncommitted —
+    /// registering them would force the kernel to commit AND lock
+    /// pages we'll never read, costing free RAM that's not actually
+    /// needed for inference.
+    pub(crate) fn pin_range(&self, offset: usize, len: usize) -> Result<()> {
         if self.registered.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        // Round the registered range OUT to page boundaries (down on
+        // start, up on end) — `cuMemHostRegister` requires page
+        // alignment. Clamp to the buffer's bounds.
+        let start = (offset / page_size) * page_size;
+        let end = ((offset + len).div_ceil(page_size) * page_size).min(self.len);
+        let registered_len = end.saturating_sub(start);
+        if registered_len == 0 {
+            self.registered.store(true, Ordering::Release);
             return Ok(());
         }
         let r = unsafe {
             sys::cuMemHostRegister_v2(
-                self.ptr as *mut _,
-                self.len,
+                (self.ptr as *mut u8).add(start) as *mut _,
+                registered_len,
                 sys::CU_MEMHOSTREGISTER_PORTABLE,
             )
         };
         if r != sys::CUresult::CUDA_SUCCESS {
             return Err(AegisError::Unsupported(format!(
-                "OwnedPinnedBuf::pin_now: cuMemHostRegister failed: {r:?}"
+                "OwnedPinnedBuf::pin_range({start}, {registered_len}): cuMemHostRegister failed: {r:?}"
             )));
         }
+        // Track the registered start so Drop can unregister at the
+        // exact pointer we passed (cuMemHostUnregister wants the same
+        // address that was registered).
         self.registered.store(true, Ordering::Release);
+        self.register_start
+            .store(start, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -223,7 +258,11 @@ impl Drop for OwnedPinnedBuf {
     fn drop(&mut self) {
         unsafe {
             if self.registered.load(Ordering::Acquire) {
-                let _ = sys::cuMemHostUnregister(self.ptr as *mut _);
+                let start = self.register_start.load(Ordering::Acquire);
+                // cuMemHostUnregister wants the exact pointer that was
+                // registered via cuMemHostRegister — for partial pins
+                // (`pin_range`) that's `ptr + start`, not `ptr`.
+                let _ = sys::cuMemHostUnregister(self.ptr.add(start) as *mut _);
             }
             libc::munmap(self.ptr as *mut _, self.len);
         }

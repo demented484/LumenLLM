@@ -315,10 +315,16 @@ impl CudaLlamaExecutor {
         // written, instead of jumping by the full ~14 GiB capacity at
         // once and freezing the desktop on memory-tight hosts.
         let pin_t = std::time::Instant::now();
+        let arena_used_bytes = host_arena.used();
+        let arena_capacity_bytes = host_arena.capacity();
         host_arena.pin_now()?;
+        let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
         eprintln!(
-            "load-timing: arena pin (cuMemHostRegister) {:>6.2}s",
+            "load-timing: arena pin (cuMemHostRegister) {:>6.2}s  ({:>7.2} MiB pinned, {:>7.2} MiB capacity, {:>7.2} MiB unused tail saved)",
             pin_t.elapsed().as_secs_f64(),
+            mib(arena_used_bytes),
+            mib(arena_capacity_bytes),
+            mib(arena_capacity_bytes.saturating_sub(arena_used_bytes)),
         );
         // Empty `RegisteredShards` placeholder — the executor still
         // owns the field for type-system reasons but we don't register
