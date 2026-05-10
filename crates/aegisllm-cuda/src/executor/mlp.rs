@@ -253,11 +253,18 @@ fn forward_moe_decode_device(
     };
     runtime.matvec_bf16_reference_device(&moe.router, router_input, &mut moe_scratch.router_logits)?;
     let logits = runtime.download_f32(&moe_scratch.router_logits)?;
-    let (top_k_indices, top_k_weights) = softmax_top_k_normalized(
+    // Reuse pooled scratch on `moe_scratch` instead of allocating
+    // 4 fresh `Vec`s per token per MoE layer.
+    softmax_top_k_normalized_into(
         &logits,
         moe.top_k,
         moe.router_per_expert_scale_host.as_deref(),
+        &mut moe_scratch.router_probs,
+        &mut moe_scratch.router_indexed,
+        &mut moe_scratch.router_top_indices,
+        &mut moe_scratch.router_top_weights,
     );
+    let active_top_k = moe_scratch.router_top_indices.len();
 
     // Step 5: pre_feedforward_layernorm_2(residual) → hidden_out (expert input)
     // We store this in hidden_out temporarily; it will be overwritten later.
@@ -273,8 +280,14 @@ fn forward_moe_decode_device(
         staging.map_or(std::ptr::null_mut(), |p| p as *mut _);
 
     runtime.zero_f32_device(&mut moe_scratch.moe_acc)?;
-    for (expert_idx, weight) in top_k_indices.iter().zip(top_k_weights.iter()) {
-        let expert = &moe.experts[*expert_idx];
+    // Index-based iteration: each (expert_idx, weight) is copied out of
+    // the pooled scratch buffers as `usize`/`f32` so the loop body can
+    // borrow `&mut moe_scratch` for per-expert matvecs without conflicting
+    // with the `&[..]` borrow of the top-k arrays.
+    for i in 0..active_top_k {
+        let expert_idx = moe_scratch.router_top_indices[i];
+        let weight = moe_scratch.router_top_weights[i];
+        let expert = &moe.experts[expert_idx];
         matvec_nvfp4_device_with_scratch(
             runtime, &expert.gate_proj, hidden_out,
             &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
@@ -295,7 +308,7 @@ fn forward_moe_decode_device(
             &mut moe_scratch.expert_out,
             if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
         )?;
-        runtime.axpy_f32_device(*weight, &moe_scratch.expert_out, &mut moe_scratch.moe_acc)?;
+        runtime.axpy_f32_device(weight, &moe_scratch.expert_out, &mut moe_scratch.moe_acc)?;
     }
 
     // Step 7: post_feedforward_layernorm_2(moe_acc) → expert_out (stream2)
@@ -365,44 +378,95 @@ fn forward_moe_decode_device(
 ///   topk_w, topk_i = topk(probs, k)
 ///   topk_w /= sum(topk_w)                       # renormalize so top-k weights sum to 1
 ///   topk_w *= per_expert_scale[topk_i]           # if provided
-fn softmax_top_k_normalized(
+///
+/// Pooled-scratch variant: `probs_buf` and `indexed_buf` are reusable
+/// `Vec`s owned by the MoE scratch; `out_indices` / `out_weights` get
+/// `clear()` + `extend` so callers can borrow `&[usize]`/`&[f32]` views
+/// without per-call allocations. All four buffers must be pre-sized
+/// (with `Vec::with_capacity`) to at least `num_experts` / `top_k`
+/// elements respectively to avoid reallocation on the hot path.
+fn softmax_top_k_normalized_into(
     logits: &[f32],
     top_k: usize,
     per_expert_scale: Option<&[f32]>,
-) -> (Vec<usize>, Vec<f32>) {
-    let (mut indices, mut weights) = softmax_top_k(logits, top_k);
-    let sum: f32 = weights.iter().sum();
+    probs_buf: &mut Vec<f32>,
+    indexed_buf: &mut Vec<(usize, f32)>,
+    out_indices: &mut Vec<usize>,
+    out_weights: &mut Vec<f32>,
+) {
+    softmax_top_k_into(logits, top_k, probs_buf, indexed_buf, out_indices, out_weights);
+    let sum: f32 = out_weights.iter().sum();
     if sum > 0.0 {
-        for w in weights.iter_mut() {
+        for w in out_weights.iter_mut() {
             *w /= sum;
         }
     }
     if let Some(pes) = per_expert_scale {
-        for (i, w) in indices.iter().zip(weights.iter_mut()) {
+        for (i, w) in out_indices.iter().zip(out_weights.iter_mut()) {
             if let Some(s) = pes.get(*i) {
                 *w *= *s;
             }
         }
     }
-    (indices, weights)
 }
 
-/// Softmax over `logits`, return top-k `(indices, weights)` in descending weight order.
-fn softmax_top_k(logits: &[f32], top_k: usize) -> (Vec<usize>, Vec<f32>) {
+/// Softmax over `logits`, write top-k `(indices, weights)` into the
+/// provided buffers in descending weight order. `probs_buf` and
+/// `indexed_buf` are scratch reused across calls; `out_indices` /
+/// `out_weights` are cleared and re-extended.
+fn softmax_top_k_into(
+    logits: &[f32],
+    top_k: usize,
+    probs_buf: &mut Vec<f32>,
+    indexed_buf: &mut Vec<(usize, f32)>,
+    out_indices: &mut Vec<usize>,
+    out_weights: &mut Vec<f32>,
+) {
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exps: Vec<f32> = logits.iter().map(|&x| (x - max).exp()).collect();
-    let sum: f32 = exps.iter().sum();
-    let probs: Vec<f32> = exps.iter().map(|&e| e / sum).collect();
+    probs_buf.clear();
+    probs_buf.extend(logits.iter().map(|&x| (x - max).exp()));
+    let sum: f32 = probs_buf.iter().sum();
+    if sum > 0.0 {
+        for p in probs_buf.iter_mut() {
+            *p /= sum;
+        }
+    }
 
-    let k = top_k.min(probs.len());
-    let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
-    // Partial sort: place the k largest at the front
-    indexed.select_nth_unstable_by(k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let mut top = indexed[..k].to_vec();
+    let k = top_k.min(probs_buf.len());
+    indexed_buf.clear();
+    indexed_buf.extend(probs_buf.iter().cloned().enumerate());
+    if k > 0 {
+        // Partial sort: place the k largest at the front.
+        indexed_buf.select_nth_unstable_by(k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    let top = &mut indexed_buf[..k];
     top.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    let indices: Vec<usize> = top.iter().map(|(i, _)| *i).collect();
-    let weights: Vec<f32> = top.iter().map(|(_, w)| *w).collect();
+    out_indices.clear();
+    out_weights.clear();
+    out_indices.extend(top.iter().map(|(i, _)| *i));
+    out_weights.extend(top.iter().map(|(_, w)| *w));
+}
+
+/// Allocating wrapper kept for tests and for the prefill MoE path
+/// that hasn't been converted to scratch-based yet. The hot decode
+/// path goes through `softmax_top_k_into` directly.
+#[cfg(test)]
+fn softmax_top_k(logits: &[f32], top_k: usize) -> (Vec<usize>, Vec<f32>) {
+    let mut probs_buf = Vec::with_capacity(logits.len());
+    let mut indexed_buf = Vec::with_capacity(logits.len());
+    let mut indices = Vec::with_capacity(top_k);
+    let mut weights = Vec::with_capacity(top_k);
+    softmax_top_k_into(
+        logits,
+        top_k,
+        &mut probs_buf,
+        &mut indexed_buf,
+        &mut indices,
+        &mut weights,
+    );
     (indices, weights)
 }
 

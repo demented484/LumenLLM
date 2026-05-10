@@ -940,15 +940,22 @@ impl CudaLlamaExecutor {
                 },
                 moe: if moe_intermediate > 0 {
                     let max_input = self.hidden_size.max(max_expert_intermediate);
+                    let max_num_experts = self
+                        .layers
+                        .iter()
+                        .filter_map(|l| l.moe.as_ref())
+                        .map(|m| m.num_experts)
+                        .max()
+                        .unwrap_or(1);
+                    let max_top_k = self
+                        .layers
+                        .iter()
+                        .filter_map(|l| l.moe.as_ref())
+                        .map(|m| m.top_k)
+                        .max()
+                        .unwrap_or(1);
                     Some(Box::new(CudaMoEScratch {
-                        router_logits: self.runtime.alloc_f32(
-                            self.layers
-                                .iter()
-                                .filter_map(|l| l.moe.as_ref())
-                                .map(|m| m.num_experts)
-                                .max()
-                                .unwrap_or(1),
-                        )?,
+                        router_logits: self.runtime.alloc_f32(max_num_experts)?,
                         router_input_scratch: self.runtime.alloc_f32(self.hidden_size)?,
                         moe_acc: self.runtime.alloc_f32(self.hidden_size)?,
                         expert_gate: self.runtime.alloc_f32(max_expert_intermediate)?,
@@ -959,6 +966,15 @@ impl CudaLlamaExecutor {
                         mxfp4_expert: self
                             .runtime
                             .alloc_u8(CudaRuntime::mxfp4_vector_bytes(max_input)?)?,
+                        // CPU-side router top-K scratch: pre-sized to the
+                        // max num_experts/top_k seen across layers and
+                        // reused on every decode-token MoE router call.
+                        // Avoids ~5 Vec allocations per MoE layer per
+                        // token in the hot decode path.
+                        router_probs: Vec::with_capacity(max_num_experts),
+                        router_indexed: Vec::with_capacity(max_num_experts),
+                        router_top_indices: Vec::with_capacity(max_top_k),
+                        router_top_weights: Vec::with_capacity(max_top_k),
                     }))
                 } else {
                     None

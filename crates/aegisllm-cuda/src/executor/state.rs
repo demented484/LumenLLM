@@ -113,6 +113,18 @@ pub(super) struct CudaMoEScratch {
     pub(super) expert_out: DeviceBuffer<f32>,
     pub(super) quant_expert: DeviceBuffer<f32>,
     pub(super) mxfp4_expert: DeviceBuffer<u8>,
+    /// CPU-side scratch reused across decode-token MoE router calls so
+    /// `softmax_top_k_normalized` doesn't allocate 5+ small `Vec`s per
+    /// MoE layer per token. Shapes:
+    /// - `router_probs` is `Vec<f32>` sized to `num_experts`
+    /// - `router_indexed` is `Vec<(usize, f32)>` sized to `num_experts`
+    /// - `router_top_indices` / `router_top_weights` are sized to `top_k`
+    /// All owned by the per-state scratch (single-threaded inference);
+    /// callers `clear()` then `extend` in place.
+    pub(super) router_probs: Vec<f32>,
+    pub(super) router_indexed: Vec<(usize, f32)>,
+    pub(super) router_top_indices: Vec<usize>,
+    pub(super) router_top_weights: Vec<f32>,
 }
 
 /// Wraps `CudaGraph` so that `CudaLlamaState` satisfies `Send`.
