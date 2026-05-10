@@ -356,6 +356,44 @@ extern "C" __global__ void aegis_swiglu_inplace_gate(
     }
 }
 
+// Strided GeGLU over a row-stacked fused gate/up tensor.
+//
+// Input  `fused[batch, 2 * intermediate]` row-major. For each token row `r`:
+//   * elements `[0, intermediate)`            are gate logits.
+//   * elements `[intermediate, 2*intermediate)` are up   logits.
+// Output `output[batch, intermediate]` row-major: gelu_pytorch_tanh(gate) * up.
+//
+// Used by the fused shared-MLP path: a single cuBLASLt BF16 GEMM produces
+// `fused`, then this kernel produces the GeGLU output ready for the down
+// projection. Mathematically identical to the standalone gate/up + geglu_tanh
+// path (same single-precision arithmetic order).
+extern "C" __global__ void aegis_geglu_tanh_strided(
+    const float* fused,
+    const unsigned int batch,
+    const unsigned int intermediate,
+    float* output
+) {
+    const unsigned int row = blockIdx.y * blockDim.y + threadIdx.y;
+    const unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= batch || col >= intermediate) {
+        return;
+    }
+    // 64-bit arithmetic on offsets in case batch*2*intermediate overflows u32
+    // for very large prefill chunks (e.g. chunk=8192 * 2 * 16384 ≈ 2.7e8 — fits
+    // in u32 but cast guards future scaling).
+    const size_t row_off  = static_cast<size_t>(row)
+                          * static_cast<size_t>(2u) * static_cast<size_t>(intermediate);
+    const float x  = fused[row_off + col];
+    const float u  = fused[row_off + intermediate + col];
+    const float k  = 0.7978845608028654f;        // sqrt(2/pi)
+    const float k2 = 0.044715f;
+    const float inner = k * (x + k2 * x * x * x);
+    const float gelu  = 0.5f * x * (1.0f + tanhf(inner));
+    const size_t out_off = static_cast<size_t>(row) * static_cast<size_t>(intermediate)
+                         + static_cast<size_t>(col);
+    output[out_off] = gelu * u;
+}
+
 extern "C" __device__ __forceinline__ float rope_inv_freq_device(
     const unsigned int index,
     const unsigned int head_dim,

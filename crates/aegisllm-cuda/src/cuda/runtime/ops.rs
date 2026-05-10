@@ -648,6 +648,63 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Strided GeGLU over a row-stacked fused gate/up buffer.
+    ///
+    /// `fused` is `[batch, 2*intermediate]` row-major where, per row, the first
+    /// `intermediate` floats are the gate logits and the next `intermediate` are
+    /// the up logits. Writes `output[batch, intermediate]` row-major with
+    /// `gelu_pytorch_tanh(gate) * up`. Used by the fused shared-MLP path where
+    /// a single cuBLASLt GEMM produces `fused` and this kernel splits +
+    /// activates it ready for the down projection.
+    pub fn geglu_tanh_strided_device(
+        &self,
+        fused: &DeviceBuffer<f32>,
+        batch: usize,
+        intermediate: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if batch == 0 || intermediate == 0 {
+            return Ok(());
+        }
+        let need_in = checked_len("geglu_strided fused", batch, 2 * intermediate)?;
+        let need_out = checked_len("geglu_strided output", batch, intermediate)?;
+        if fused.len() < need_in {
+            return Err(AegisError::InvalidPlan(format!(
+                "geglu_strided fused buffer too small: have {} need batch*2*intermediate={}*2*{}={}",
+                fused.len(), batch, intermediate, need_in
+            )));
+        }
+        if output.len() < need_out {
+            return Err(AegisError::InvalidPlan(format!(
+                "geglu_strided output buffer too small: have {} need batch*intermediate={}*{}={}",
+                output.len(), batch, intermediate, need_out
+            )));
+        }
+        let batch_u32 = u32_arg("batch", batch)?;
+        let intermediate_u32 = u32_arg("intermediate", intermediate)?;
+        // 2D launch: x = column (intermediate), y = row (batch).
+        // Block 64×4 keeps occupancy high while letting one warp own
+        // a 32-col tile of one row (coalesced loads from `fused`).
+        let block_x = 64u32;
+        let block_y = 4u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(intermediate_u32, block_x), ceil_div(batch_u32, block_y), 1),
+            block_dim: (block_x, block_y, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.geglu_tanh_strided)
+                .arg(&fused.slice)
+                .arg(&batch_u32)
+                .arg(&intermediate_u32)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch geglu_tanh_strided"))?;
+        Ok(())
+    }
+
     /// Gemma 3/4 gated activation: `output[i] = gelu_tanh(gate[i]) * up[i]`.
     pub fn geglu_tanh_device(
         &self,
