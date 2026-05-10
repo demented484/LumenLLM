@@ -61,6 +61,18 @@ pub(super) fn validate_dynamic_shared_bytes_with_cap(
 pub(super) const FLASH_COMPAT_PAGE_TOKENS: usize = 256;
 pub(super) const FLASH_SPLIT_K_TOKENS: usize = 256;
 pub(super) const FLASH_SPLIT_Q_BLOCK: usize = 4;
+/// Cap on the number of split-K workers per (q_block, head) for the
+/// paged-varlen prefill kernel. Without a cap, very long contexts
+/// (32k+) produce `ceil(max_k / FLASH_SPLIT_K_TOKENS)` splits — e.g.
+/// 128 at ctx=32k. Each split contributes a partial output that the
+/// reduction phase has to combine, so reduction work scales linearly
+/// with split_count and the prefill TPS curve drops sharply past
+/// ctx≈8k. Capping splits at 32 (≈ enough to saturate the SM count
+/// of an RTX 5070 Ti) keeps reduction overhead bounded; per-split
+/// `split_tokens` grows correspondingly so the same K range is
+/// covered. Bit-rounding within FP32 precision noise (online-softmax
+/// reduction order changes by ULPs).
+pub(super) const FLASH_PREFILL_MAX_SPLIT_COUNT: usize = 32;
 pub(super) const TILED_HALFQ_Q_BLOCK: usize = 4;
 pub(super) const DENSE_WARP_TILE_Q_BLOCK: usize = 16;
 pub(super) const DENSE_WARP_TILE_K_TILE: usize = 32;

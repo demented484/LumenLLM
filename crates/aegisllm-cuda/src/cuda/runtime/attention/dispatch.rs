@@ -184,7 +184,24 @@ impl CudaRuntime {
         }
         let head_dim_usize = head_dim;
         let q_blocks_usize = total_query_tokens.div_ceil(FLASH_SPLIT_Q_BLOCK);
-        let split_count_usize = max_k.div_ceil(FLASH_SPLIT_K_TOKENS).max(1);
+        // Adaptive split-K: at ctx ≤ 8k the default 256-K-token split is
+        // optimal (raw_split ≤ 32, no cap). At ctx 32k the raw split
+        // would be 128 — way past the point where added parallelism
+        // saturates SM count. Cap split_count and grow per-split
+        // `split_tokens` correspondingly. Reduction work is now
+        // bounded by `FLASH_PREFILL_MAX_SPLIT_COUNT`, which is what
+        // dragged the prefill TPS curve down past ctx≈8k.
+        let raw_split_count = max_k.div_ceil(FLASH_SPLIT_K_TOKENS).max(1);
+        let split_count_usize = raw_split_count.min(FLASH_PREFILL_MAX_SPLIT_COUNT);
+        let split_tokens_usize = if split_count_usize >= raw_split_count {
+            FLASH_SPLIT_K_TOKENS
+        } else {
+            // When capped, each split worker covers ceil(max_k / cap) K
+            // tokens to span the full range. Round-up keeps the last
+            // split partial (handled by `min(context_len, split_end)`
+            // inside the kernel — see attention_prefill_paged.cu:762).
+            max_k.div_ceil(split_count_usize)
+        };
         let split_rows = q_blocks_usize
             .checked_mul(num_attention_heads)
             .and_then(|value| value.checked_mul(split_count_usize))
@@ -266,7 +283,7 @@ impl CudaRuntime {
         let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim = u32_arg("head_dim", head_dim)?;
         let page_tokens = u32_arg("page_tokens", page_tokens_usize)?;
-        let split_tokens = u32_arg("split_tokens", FLASH_SPLIT_K_TOKENS)?;
+        let split_tokens = u32_arg("split_tokens", split_tokens_usize)?;
         let split_count = u32_arg("split_count", split_count_usize)?;
         let block_table_stride = u32_arg("block_table_stride", block_table_stride)?;
         let physical_slots = u32_arg("physical_slots", physical_slots)?;
