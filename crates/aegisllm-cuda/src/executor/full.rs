@@ -70,13 +70,17 @@ impl CudaLlamaExecutor {
         }
         let cuda = CudaRuntime::new_with_config(device, cuda_config)?;
         let region_placements = placement.region_map();
-        // Host-resident weights live as borrowed views into the shard
-        // safetensors mmaps (cached by `TensorStorageLoader`). No pinned-
-        // host arena, no per-tensor `cuMemAllocHost`. Pages stay in the
-        // kernel page cache where they count as "Cached" (reclaimable),
-        // so peak host RAM is governed by what the kernel chooses to
-        // keep — not by an anonymous-RAM allocation that would scale
-        // with model size and freeze memory-tight desktops during load.
+        // Pre-size a pinned-host arena to fit every byte that will land
+        // in host-resident NVFP4 weights + their `weight_scale` companions
+        // + host-resident BF16 matrices (embed/lm_head when configured
+        // host-resident). The arena is one big anonymous-mapped pinned
+        // allocation; sub-allocated per-tensor by atomic bump. After
+        // load, `pin_now()` registers it with `cuMemHostRegister` so
+        // staging-pool DMAs from sub-slices take the direct-pinned path.
+        let host_arena_capacity = compute_host_arena_capacity(artifact, graph, &region_placements);
+        let host_arena = std::sync::Arc::new(
+            crate::cuda::host_arena::PinnedArena::new(&cuda, host_arena_capacity)?,
+        );
         let runtime_layouts = runtime_layouts_by_region(runtime);
         let mut loader = TensorStorageLoader::new();
 
@@ -99,7 +103,7 @@ impl CudaLlamaExecutor {
             let p = progress.clone();
             let sink: crate::cuda::LoadStatusSink =
                 std::sync::Arc::new(move |label: &str| p.tick(label));
-            cuda.weight_loader().with_status_sink(sink)
+            cuda.weight_loader_with_arena(host_arena.clone()).with_status_sink(sink)
         };
         let load_start = std::time::Instant::now();
         // Per-stage timings: only print as their own lines when stderr is
@@ -149,6 +153,12 @@ impl CudaLlamaExecutor {
             cuda_residency_for_store(lm_head_region.store, device)?,
             &mut loader,
         )?;
+        // lm_head is the last VRAM-resident BF16 weight loaded; the
+        // layer loop below only fills the host arena. Drop the
+        // ~1.4 GiB pinned bounce buffer NOW so it doesn't compete
+        // with the growing arena for host RAM during the layer load
+        // and push us over the OOM line on memory-tight hosts.
+        cuda_weights.release_bounce();
         stage_t("lm_head", t0);
         progress.step("lm_head");
 
@@ -253,32 +263,34 @@ impl CudaLlamaExecutor {
             })
         });
 
-        // Snapshot the shard set the loader marked as host-resident,
-        // then page-lock those shard mmaps with `cuMemHostRegister`.
-        // After this call, `memcpy_htod` from any pointer inside a
-        // registered shard takes the direct-DMA fast path (no
-        // per-token CPU memcpy through the staging-pool bounce). We
-        // do this AFTER prefault so the kernel page-locks pages that
-        // are already committed — `cuMemHostRegister` on uncommitted
-        // pages would force-fault them anyway, but doing prefault
-        // first keeps the timing breakdown clean.
-        let host_resident_shards = cuda_weights.host_resident_shards();
-        let register_t = std::time::Instant::now();
-        let registered_shards = crate::cuda::registered_shards::RegisteredShards::register(
-            &loader,
-            &host_resident_shards,
-        )?;
-        if !host_resident_shards.is_empty() {
-            eprintln!(
-                "load-timing: cuMemHostRegister sweep        {:>6.2}s",
-                register_t.elapsed().as_secs_f64(),
-            );
-        }
+        // All host-resident weights are now in the arena (NVFP4 packed/
+        // scales + BF16 host matrices). Page-lock the whole arena with
+        // `cuMemHostRegister` so per-token H2D streaming during inference
+        // takes the direct-DMA path. The pages are already committed by
+        // the load loop's writes, so the registration only locks them in
+        // place — no extra physical-memory cost. We deliberately
+        // deferred the registration from arena construction to here so
+        // the load-time RSS curve grows incrementally with each tensor
+        // written, instead of jumping by the full ~14 GiB capacity at
+        // once and freezing the desktop on memory-tight hosts.
+        let pin_t = std::time::Instant::now();
+        host_arena.pin_now()?;
+        eprintln!(
+            "load-timing: arena pin (cuMemHostRegister) {:>6.2}s",
+            pin_t.elapsed().as_secs_f64(),
+        );
+        // Empty `RegisteredShards` placeholder — the executor still
+        // owns the field for type-system reasons but we don't register
+        // any shards (host-resident weights are in the arena instead).
+        let registered_shards = crate::cuda::registered_shards::RegisteredShards::empty();
 
-        // Drop the loader now that registration is done. Host-resident
-        // weights keep their own `Arc<Mmap>` clones into the shard
-        // mmaps, so the shard mappings stay alive past the loader.
+        // Drop the loader and our local arena clone now that load is
+        // complete. The arena `Arc<PinnedArena>` is still cloned inside
+        // every host-resident weight's `HostWeightBytes::Arena { arena, .. }`,
+        // so these drops just decrement the refcount — the pinned bytes
+        // stay alive for streamed inference. Bookkeeping only.
         drop(cuda_weights);
+        drop(host_arena);
         let _ = has_staged_layers;
 
         // Build the shard set for the post-exit sidecar (below). We
@@ -1101,6 +1113,56 @@ fn prefill_attention_split_scratch(
         acc_f32: acc_f32.max(1),
         stats_f32: rows.max(1),
     })
+}
+
+/// Sum the bytes that will land in the pinned-host arena: every tensor
+/// in a host-resident region (NVFP4 packed + companion `.weight_scale`
+/// + the BF16 matrices that go to host RAM, e.g. embed/lm_head when
+/// configured `store=ram`).
+///
+/// Returned value is at least 1 to satisfy `PinnedArena::new`'s non-zero
+/// capacity check. When no region is host-resident (everything fits in
+/// VRAM) the arena is allocated tiny and never used.
+fn compute_host_arena_capacity(
+    artifact: &aegisllm_base::artifact::ModelArtifact,
+    graph: &aegisllm_base::graph::ModelGraph,
+    region_placements: &std::collections::BTreeMap<
+        &aegisllm_base::graph::RegionId,
+        &aegisllm_base::planning::placement::RegionPlacement,
+    >,
+) -> usize {
+    use aegisllm_base::planning::placement::StoragePlacement;
+    let mut total: usize = 0;
+    for region in &graph.regions {
+        let placement = match region_placements.get(&region.id) {
+            Some(p) => p,
+            None => continue,
+        };
+        // Only host-resident regions feed the arena.
+        if !matches!(placement.store, StoragePlacement::Ram | StoragePlacement::Mmap) {
+            continue;
+        }
+        for graph_tensor in &region.tensors {
+            let name = &graph_tensor.info.name;
+            // NVFP4 quantised weight: paired `.weight` + `.weight_scale`.
+            if let Some(stem) = name.strip_suffix(".weight") {
+                let scale_name = format!("{stem}.weight_scale");
+                if artifact.tensors.has(&scale_name) {
+                    total = total.saturating_add(graph_tensor.info.data_len_bytes() as usize);
+                    continue;
+                }
+                // Unpaired `.weight` (BF16 matrix like embed/lm_head when host-resident).
+                if matches!(graph_tensor.info.dtype, aegisllm_base::tensor::TensorDType::BF16) {
+                    total = total.saturating_add(graph_tensor.info.data_len_bytes() as usize);
+                }
+            } else if name.ends_with(".weight_scale") {
+                total = total.saturating_add(graph_tensor.info.data_len_bytes() as usize);
+            }
+            // Scalars (.input_scale, .weight_scale_2) are tiny f32; we
+            // overshoot by ignoring them rather than tracking precisely.
+        }
+    }
+    total.max(1)
 }
 
 fn cuda_prefill_chunk_size(config: CudaRuntimeConfig) -> usize {

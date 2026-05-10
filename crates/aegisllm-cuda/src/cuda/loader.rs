@@ -1,3 +1,6 @@
+use std::io::{Seek, SeekFrom};
+
+use super::host_arena::ArenaHandle;
 use super::repack::{
     cached_repack_nvfp4_to_cutlass_e2m1_ue4m3_host, cached_repack_nvfp4_to_mxfp4_host,
     repack_nvfp4_to_cutlass_e2m1_ue4m3_host,
@@ -14,8 +17,7 @@ use aegisllm_base::error::{AegisError, Result};
 /// Allocate a process-owned pinned host buffer and copy `bytes` into it.
 /// Used only for small, generated-at-load-time data (native MXFP4 repack
 /// output, MatFormer submatrix slices) where the source is a transient
-/// `Vec<u8>` with no file-backed mmap to point at. The general path keeps
-/// weights in shard mmaps; this helper covers the few exceptions.
+/// `Vec<u8>` with no file-backed mmap to point at.
 fn alloc_pinned_from_bytes(
     _runtime: &CudaRuntime,
     bytes: &[u8],
@@ -24,6 +26,35 @@ fn alloc_pinned_from_bytes(
     let mut pinned = OwnedPinnedBuf::new(bytes.len())?;
     pinned.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
     Ok(pinned)
+}
+
+/// Read a tensor's raw bytes from disk into the loader's pinned host
+/// arena via direct file I/O. Returns the byte offset inside the arena
+/// where bytes were placed; combined with the byte length this
+/// uniquely identifies the slice for downstream `HostWeightBytes::Arena`.
+///
+/// We open the shard file fresh each call. Per-call open is cheap
+/// relative to NVMe sequential read throughput; if it shows up as a
+/// hot spot the next step is a per-shard `File` cache or shard-wide
+/// reads.
+fn read_tensor_into_arena(
+    arena: &ArenaHandle,
+    tensor: &TensorInfo,
+) -> Result<HostWeightBytes> {
+    let len = tensor.data_len_bytes() as usize;
+    let mut file = std::fs::File::open(&tensor.shard_path)?;
+    file.seek(SeekFrom::Start(tensor.file_offsets.0))?;
+    let offset = arena.alloc_and_fill(&mut file, len)?;
+    aegisllm_base::tensor::storage::fadvise_dont_need(
+        &file,
+        tensor.file_offsets.0,
+        len as u64,
+    );
+    Ok(HostWeightBytes::Arena {
+        arena: arena.clone(),
+        offset,
+        len,
+    })
 }
 use aegisllm_base::graph::{GraphRegion, TensorRole};
 use aegisllm_base::planning::cuda_nvfp4_kernel_family_for_layout;
@@ -44,26 +75,53 @@ pub type LoadStatusSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct CudaWeightLoader<'a> {
     runtime: &'a CudaRuntime,
+    /// Pinned-host arena for host-resident NVFP4 + BF16 weights. When
+    /// set, host-resident loaders read tensor bytes directly into this
+    /// arena (single big `cuMemHostRegister`'d allocation, sub-allocated
+    /// by atomic bump). When `None`, host-resident paths cannot be
+    /// taken — the executor must always build the loader via
+    /// `weight_loader_with_arena(...)` for any config that has
+    /// host-resident weights.
+    arena: Option<ArenaHandle>,
+    /// Reusable pinned-host bounce buffer for VRAM-resident BF16
+    /// uploads. Replaces the prior `loader.load_for_store(_, Mmap)` →
+    /// `clone_htod` path that mmap'd the shard and filled the kernel
+    /// page cache by the tensor size on every read — for Gemma-4-26B
+    /// with embed + lm_head VRAM-resident that's ~3 GiB of page cache
+    /// retained until end of load, on top of the growing 12-14 GiB
+    /// arena. Combined that pushed peak host RAM near the system
+    /// limit and triggered OOM during the layer loop on 32 GiB hosts.
+    /// With this buffer, each VRAM-resident BF16 read goes directly
+    /// from disk into pinned memory (no page-cache fill) and DMAs to
+    /// device with a single pinned→device memcpy. Sized to the
+    /// largest tensor seen so far, reused across loads.
+    bounce: std::cell::RefCell<Option<OwnedPinnedBuf>>,
     /// Optional callback for fine-grained sub-step progress. Heavy inner
     /// loops (MoE experts, big BF16 uploads) call `report_status(...)` so
     /// the user's progress indicator can refresh between coarse `step`
     /// advances.
     status_sink: Option<LoadStatusSink>,
-    /// Set of safetensors shard paths from which at least one
-    /// host-resident weight has been loaded. Populated as a side effect
-    /// of `load_for_store(_, Mmap)` for host-resident NVFP4 / BF16
-    /// branches; the executor reads it after load to register those
-    /// shard mmaps with `cuMemHostRegister`, so per-token streaming
-    /// takes the direct-DMA fast path.
-    host_resident_shards: std::cell::RefCell<std::collections::HashSet<std::path::PathBuf>>,
 }
 
 impl CudaRuntime {
     pub fn weight_loader(&self) -> CudaWeightLoader<'_> {
         CudaWeightLoader {
             runtime: self,
+            arena: None,
+            bounce: std::cell::RefCell::new(None),
             status_sink: None,
-            host_resident_shards: std::cell::RefCell::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Create a weight loader bound to a pre-allocated pinned-host arena.
+    /// Required for any config with host-resident weights; non-host-resident
+    /// loads (VRAM-resident BF16 / NVFP4) ignore the arena.
+    pub fn weight_loader_with_arena(&self, arena: ArenaHandle) -> CudaWeightLoader<'_> {
+        CudaWeightLoader {
+            runtime: self,
+            arena: Some(arena),
+            bounce: std::cell::RefCell::new(None),
+            status_sink: None,
         }
     }
 }
@@ -97,19 +155,63 @@ impl CudaWeightLoader<'_> {
         self.runtime
     }
 
-    /// Snapshot the set of safetensors shard paths from which at least
-    /// one host-resident weight has been loaded. Called by the executor
-    /// at end-of-load to drive `cuMemHostRegister` on those shards.
-    pub fn host_resident_shards(&self) -> std::collections::HashSet<std::path::PathBuf> {
-        self.host_resident_shards.borrow().clone()
+    /// Borrow the loader's pinned-host arena. Returns `None` if the
+    /// loader was built bare via `weight_loader()` (no host-resident
+    /// path supported). The executor inspects this to know whether
+    /// `pin_now()` is needed at end of load.
+    pub fn arena(&self) -> Option<&ArenaHandle> {
+        self.arena.as_ref()
     }
 
-    /// Mark a tensor's shard as containing host-resident bytes. Called
-    /// from the host-resident NVFP4 / BF16 branches inside the loader.
-    fn mark_host_resident_shard(&self, tensor: &TensorInfo) {
-        self.host_resident_shards
-            .borrow_mut()
-            .insert(tensor.shard_path.clone());
+    /// Drop the VRAM-upload bounce buffer. The bounce is high-water-
+    /// mark sized to the largest VRAM-resident BF16 tensor (typically
+    /// lm_head ≈ 1.4 GiB on Gemma-4-26B). After all VRAM-resident
+    /// BF16 weights have been loaded (which happens BEFORE the layer
+    /// loop), the bounce is dead weight that competes with the
+    /// growing arena for host RAM. Callers must drop it explicitly
+    /// to keep the load-time peak inside the arena's footprint.
+    pub fn release_bounce(&self) {
+        *self.bounce.borrow_mut() = None;
+    }
+
+    /// Ensure the loader's pinned bounce is at least `len` bytes,
+    /// then read `tensor`'s bytes directly from disk into it. Uses
+    /// `pread`-equivalent reads (no `seek` then `read`, just
+    /// `read_exact_at`) to bypass the kernel's mmap page cache —
+    /// for VRAM-resident BF16 (embed/lm_head when configured to
+    /// stream once at load) this is the difference between holding
+    /// ~3 GiB of page-cache pages alongside the growing 14 GiB
+    /// arena (→ OOM on 32 GiB hosts) and bounded ~tensor-size
+    /// transient anon pages that get reused across loads.
+    fn read_tensor_into_bounce(&self, tensor: &TensorInfo) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        let len = tensor.data_len_bytes() as usize;
+        let need_realloc = self
+            .bounce
+            .borrow()
+            .as_ref()
+            .map(|b| b.len() < len)
+            .unwrap_or(true);
+        if need_realloc {
+            // Drop the old bounce first so peak memory is just the
+            // new size, not old + new during construction.
+            *self.bounce.borrow_mut() = None;
+            *self.bounce.borrow_mut() = Some(OwnedPinnedBuf::new(len)?);
+        }
+        let mut bounce_ref = self.bounce.borrow_mut();
+        let bounce = bounce_ref.as_mut().expect("bounce just ensured to exist");
+        let bytes = bounce.as_mut_slice();
+        let file = std::fs::File::open(&tensor.shard_path)?;
+        file.read_exact_at(&mut bytes[..len], tensor.file_offsets.0)?;
+        // Eagerly drop the just-read range from page cache so we
+        // don't accumulate ~tensor-size of cached shard bytes per
+        // VRAM-resident tensor on top of the bounce + arena.
+        aegisllm_base::tensor::storage::fadvise_dont_need(
+            &file,
+            tensor.file_offsets.0,
+            len as u64,
+        );
+        Ok(())
     }
 
     pub fn load_dense_vector_with_store(
@@ -162,30 +264,32 @@ impl CudaWeightLoader<'_> {
         }
         let is_host_resident = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
 
-        // Both branches read through the shared shard mmap (cached in
-        // `TensorStorageLoader`). The shard mmap IS the storage — host-
-        // resident weights borrow into it directly (file-backed pages,
-        // counted as "Cached", evictable under pressure), and VRAM-
-        // resident uploads memcpy from it once. No anonymous-RAM
-        // pinned copy, no per-tensor `cuMemAllocHost`, no bounce buffer
-        // — the load-time peak collapses to whatever the kernel chooses
-        // to keep in page cache, which is reclaimable.
-        let loaded = loader.load_for_store(tensor, StoragePlacement::Mmap)?;
-
         if is_host_resident {
-            // Synchronously fault every page so "model loaded" actually
-            // means the BF16 matrix is in RAM, not lazy-on-first-access.
-            loaded.prefault();
-            // Mark the shard so the executor can `cuMemHostRegister`
-            // it after load — restores direct-DMA from the mmap on
-            // subsequent inference accesses.
-            self.mark_host_resident_shard(tensor);
+            // Read tensor bytes from disk straight into the pinned host
+            // arena. After `pin_now()` (called at end-of-load by the
+            // executor) the arena is `cuMemHostRegister`'d, so DMA from
+            // any sub-slice takes the direct-pinned path.
+            let arena = self.arena.as_ref().ok_or_else(|| {
+                AegisError::InvalidPlan(format!(
+                    "host-resident BF16 `{}` requires loader built with weight_loader_with_arena(...)",
+                    tensor.name
+                ))
+            })?;
+            let len = tensor.data_len_bytes() as usize;
+            let mut file = std::fs::File::open(&tensor.shard_path)?;
+            file.seek(SeekFrom::Start(tensor.file_offsets.0))?;
+            let offset = arena.alloc_and_fill(&mut file, len)?;
+            aegisllm_base::tensor::storage::fadvise_dont_need(
+                &file,
+                tensor.file_offsets.0,
+                len as u64,
+            );
             let stub = self
                 .runtime
                 .stream
                 .clone_htod(&[0u16])
                 .map_err(map_cuda_err("htod bf16 host-resident stub"))?;
-            let host_weights = HostBf16Weights::from_loaded(loaded)?;
+            let host_weights = HostBf16Weights::from_arena(arena.clone(), offset, len)?;
             return Ok(DeviceBf16Matrix {
                 name: tensor.name.clone(),
                 rows: tensor.shape[0],
@@ -196,13 +300,14 @@ impl CudaWeightLoader<'_> {
             });
         }
 
-        // VRAM-resident BF16: H2D from the shard mmap straight into a
-        // fresh u16-typed VRAM buffer. The driver pays a one-time
-        // pageable→pinned bounce internally; that's fine for load-time
-        // (vs the prior 1.4 GiB pinned-anon bounce buffer). After this
-        // call returns, the loader's drop hooks call
-        // `posix_fadvise(DONTNEED)` on the touched range so the kernel
-        // can reclaim the page-cache pages immediately.
+        // VRAM-resident BF16: read directly from disk into the
+        // loader's reusable pinned bounce, then DMA bounce → VRAM.
+        // Bypasses the mmap page-cache fill that would otherwise
+        // hold ~tensor-size of shard pages alongside the growing
+        // arena and trigger OOM on 32 GiB hosts. `loader` arg is
+        // unused on this branch but stays in the signature for the
+        // host-resident branch above.
+        let _ = loader;
         let len_bytes = tensor.data_len_bytes() as usize;
         if len_bytes % 2 != 0 {
             return Err(AegisError::InvalidPlan(format!(
@@ -210,27 +315,26 @@ impl CudaWeightLoader<'_> {
             )));
         }
         let len_u16 = len_bytes / 2;
-        let bytes = loaded.as_bytes();
-        // Reinterpret as &[u16] — safetensors aligns tensor data to 8 bytes,
-        // so 2-byte alignment of the file offset is guaranteed.
-        if (bytes.as_ptr() as usize) % 2 != 0 {
-            return Err(AegisError::InvalidPlan(format!(
-                "BF16 mmap source for `{}` is not 2-byte aligned",
-                tensor.name
-            )));
-        }
-        // SAFETY: bytes from a shard mmap, aligned check above; len_u16 * 2 == len_bytes.
-        let src_u16: &[u16] = unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr() as *const u16, len_u16)
-        };
+        self.read_tensor_into_bounce(tensor)?;
         let mut buffer = self.runtime.alloc_u16(len_u16)?;
+        let bounce_ref = self.bounce.borrow();
+        let bounce = bounce_ref.as_ref().expect("bounce populated above");
+        // SAFETY: bounce is a process-owned mmap (page-aligned, so
+        // 2-byte alignment is satisfied); even-byte-length checked.
+        // Slice to exactly `len_u16` because the bounce may be
+        // larger when reused across smaller tensors.
+        let src_u16: &[u16] = &bounce.as_u16_slice()[..len_u16];
         self.runtime
             .stream
             .memcpy_htod(src_u16, &mut buffer.slice)
-            .map_err(map_cuda_err("htod bf16 matrix from mmap"))?;
-        // The `memcpy_htod` is synchronous from a pageable source (driver
-        // bounces internally and waits), so by the time we return the
-        // VRAM buffer is fully populated and `loaded` can drop safely.
+            .map_err(map_cuda_err("htod bf16 matrix from bounce"))?;
+        // `memcpy_htod` from a pinned source is async and returns
+        // before the DMA finishes; if the next loader call clobbers
+        // the bounce mid-transfer it'd corrupt the upload silently.
+        // Synchronise here so the bounce is safe to reuse.
+        self.runtime
+            .synchronize()
+            .map_err(|e| AegisError::Unsupported(format!("sync after bf16 bounce htod: {e}")))?;
         Ok(DeviceBf16Matrix {
             name: tensor.name.clone(),
             rows: tensor.shape[0],
@@ -486,32 +590,20 @@ impl CudaWeightLoader<'_> {
                 } else {
                     None
                 };
-            // Host-resident weights point straight into the shard mmap
-            // (cached in `TensorStorageLoader`). The mmap IS the
-            // storage — file-backed pages, counted as "Cached" (not
-            // RSS), reclaimable under memory pressure. Per-token
-            // inference does a CPU memcpy mmap → per-slot pinned
-            // bounce → DMA (handled by the staging pool) instead of
-            // the prior zero-copy arena DMA, which is slightly slower
-            // but eliminates the ~12 GiB anonymous-RAM pinned arena
-            // that used to make peak host RAM scale with model size.
-            let packed_loaded = loader.load_for_store(weight, StoragePlacement::Mmap)?;
-            let scales_loaded = loader.load_for_store(scales, StoragePlacement::Mmap)?;
-            // Synchronously fault every page in. Without this, the mmap
-            // pages stay un-faulted until first inference access, so
-            // "model loaded" wouldn't actually mean "all weights are in
-            // RAM" — the first request would block on disk reads.
-            packed_loaded.prefault();
-            scales_loaded.prefault();
-            // Mark the shards so the executor can `cuMemHostRegister`
-            // them after load — restores direct-DMA from the mmap on
-            // per-token expert streaming.
-            self.mark_host_resident_shard(weight);
-            self.mark_host_resident_shard(scales);
-            let (mmap_packed, mmap_scales) = (
-                HostWeightBytes::Mmap(packed_loaded),
-                HostWeightBytes::Mmap(scales_loaded),
-            );
+            // Host-resident weights live in the pinned-host arena: one
+            // big `cuMemHostRegister`'d allocation, sub-allocated per
+            // tensor by atomic bump. Per-token inference does direct
+            // DMA from the arena — no CPU memcpy through a staging
+            // bounce. RAM cost: ~12-14 GiB anonymous-mapped pinned
+            // pages for Gemma-4-26B.
+            let arena = self.arena.as_ref().ok_or_else(|| {
+                AegisError::InvalidPlan(format!(
+                    "host-resident NVFP4 `{}` requires loader built with weight_loader_with_arena(...)",
+                    spec.name
+                ))
+            })?;
+            let mmap_packed = read_tensor_into_arena(arena, weight)?;
+            let mmap_scales = read_tensor_into_arena(arena, scales)?;
             let _ = store;
             let stub_packed = self
                 .runtime

@@ -1,6 +1,7 @@
 mod compile;
 mod cutlass_bridge;
 mod functions;
+pub(crate) mod host_arena;
 mod kernels;
 pub(crate) mod loader;
 pub(crate) mod owned_pinned;

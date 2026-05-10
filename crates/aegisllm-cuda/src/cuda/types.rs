@@ -2,12 +2,13 @@ use std::ffi::c_void;
 
 use cudarc::driver::CudaSlice;
 
+use super::host_arena::ArenaHandle;
 use super::owned_pinned::OwnedPinnedBuf;
 use super::repack::CutlassNvfp4LinearLayout;
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::planning::runtime::KernelFamily;
 use aegisllm_base::tensor::layout::LinearResidentLayout;
-use aegisllm_base::tensor::storage::{HostTensorStorage, LoadedHostTensor, TensorResidencyPlan};
+use aegisllm_base::tensor::storage::{LoadedHostTensor, TensorResidencyPlan};
 
 #[derive(Debug)]
 pub struct DeviceBuffer<T> {
@@ -104,22 +105,28 @@ impl CudaAttentionParamsV1 {
     pub const FLAG_GQA: u32 = 1 << 2;
 }
 
-/// Host-resident weight bytes for a single tensor. Two variants now:
+/// Host-resident weight bytes for a single tensor. Three variants:
 ///
-///   * `Mmap` — file-backed safetensors region, the **primary** storage for
-///     all host-resident weights. Pages are owned by the kernel page cache,
-///     so they don't count against process RSS and are evictable under
-///     memory pressure (matches llama.cpp's default loader behavior).
-///   * `Pinned` — small process-owned pinned alloc. Used only for repacked
-///     bytes generated at load time (native-MXFP4 layout, MatFormer
-///     submatrix slices) where the source data doesn't have a file-backed
-///     region to point at.
+///   * `Arena` — sub-slice of a single big pinned-host arena that holds
+///     all NVFP4 host-resident weights. The fast path for inference: source
+///     is pinned, so `memcpy_htod` issues a direct DMA without driver
+///     bouncing and without any CPU memcpy in the hot loop.
+///   * `Pinned` — standalone process-owned pinned alloc. Used for generated
+///     data (native-MXFP4 repack output, MatFormer submatrix slices) where
+///     bytes are produced at load time, not directly read from a file region.
+///   * `Mmap` — file-backed safetensors region. Kept around for code paths
+///     that don't take the arena route (load-time repack input, VRAM upload).
 ///
-/// Both expose bytes via `as_bytes()`; staging feeds the slice to
-/// `memcpy_htod`. Pinned source → direct DMA; Mmap → per-slot CPU bounce
-/// then DMA (handled by the staging pool).
+/// All three expose bytes via `as_bytes()`; staging feeds the slice to
+/// `memcpy_htod`. Pinned source (Arena, Pinned) → direct DMA; Mmap → per-
+/// slot CPU bounce in the staging pool.
 #[derive(Debug)]
 pub(crate) enum HostWeightBytes {
+    Arena {
+        arena: ArenaHandle,
+        offset: usize,
+        len: usize,
+    },
     Pinned(OwnedPinnedBuf),
     Mmap(LoadedHostTensor),
 }
@@ -127,12 +134,14 @@ pub(crate) enum HostWeightBytes {
 impl HostWeightBytes {
     pub fn as_bytes(&self) -> Result<&[u8]> {
         match self {
+            Self::Arena { arena, offset, len } => Ok(arena.slice(*offset, *len)),
             Self::Pinned(p) => Ok(p.as_slice()),
             Self::Mmap(t) => Ok(t.as_bytes()),
         }
     }
     pub fn len(&self) -> usize {
         match self {
+            Self::Arena { len, .. } => *len,
             Self::Pinned(p) => p.len(),
             Self::Mmap(t) => t.as_bytes().len(),
         }
@@ -140,16 +149,8 @@ impl HostWeightBytes {
     /// `true` when bytes live in CUDA-pinned host memory and can be DMA'd
     /// directly without an intermediate CPU memcpy. The staging pool uses this
     /// to skip the bounce-buffer fast-path overhead for pinned sources.
-    ///
-    /// Returns `true` for both variants:
-    /// * `Pinned` — process-owned `OwnedPinnedBuf`, registered at construction.
-    /// * `Mmap` — file-backed shard mmap, registered post-load by
-    ///   `RegisteredShards` (every host-resident weight's shard is page-locked
-    ///   with `cuMemHostRegister` so DMA from any pointer inside the mapping
-    ///   takes the direct path; the CPU memcpy through the per-slot bounce
-    ///   would otherwise eat ~30 ms/token on Gemma-4-26B decode).
     pub fn is_pinned(&self) -> bool {
-        true
+        matches!(self, Self::Arena { .. } | Self::Pinned(_))
     }
 }
 
@@ -232,56 +233,54 @@ pub(super) struct DeviceCutlassNvfp4Linear {
     pub scales_ue4m3: CudaSlice<u8>,
 }
 
-/// BF16 matrix stored as a file-backed mmap region for `StagedHostToDevice`
-/// residency. Pages live in the kernel page cache (counted as Cached, not
-/// RSS) and are evictable under memory pressure — peak host RAM no longer
-/// scales with model size. Rows are streamed to a small VRAM scratch
-/// buffer for embedding lookup, or the whole matrix is uploaded to a
-/// transient VRAM buffer for matvec.
+/// BF16 matrix stored in the pinned host arena for `StagedHostToDevice`
+/// residency. Bytes live inside one big `cuMemHostRegister`'d arena
+/// (process-owned anonymous mmap), sub-allocated per tensor. Rows are
+/// streamed to a small VRAM scratch buffer for embedding lookup, or the
+/// whole matrix is uploaded to a transient VRAM buffer for matvec —
+/// both paths benefit from direct-DMA from the pinned arena.
 #[derive(Debug)]
 pub(super) struct HostBf16Weights {
-    /// The underlying `LoadedHostTensor` keeps the shard mmap alive
-    /// for the lifetime of this struct; on drop, its destructor hints
-    /// the kernel to release the touched range from page cache, which
-    /// is what we want at executor teardown (not during steady-state
-    /// inference, when the loaded tensor stays alive).
-    loaded: LoadedHostTensor,
+    /// Shared handle to the pinned arena holding this tensor's bytes.
+    /// On drop, the refcount drops; the arena itself stays alive until
+    /// the executor (which holds another clone) drops too.
+    arena: ArenaHandle,
+    /// Byte offset of this tensor's data inside the arena.
+    offset: usize,
     /// Element count (NOT byte count): `rows * cols`.
     len_u16: usize,
 }
 
 impl HostBf16Weights {
-    pub(super) fn from_loaded(loaded: LoadedHostTensor) -> Result<Self> {
-        let HostTensorStorage::Mmap { offset, len, .. } = &loaded.storage else {
-            return Err(AegisError::InvalidPlan(
-                "HostBf16Weights requires mmap-backed storage".into(),
-            ));
-        };
-        if len % 2 != 0 {
+    pub(super) fn from_arena(arena: ArenaHandle, offset: usize, len_bytes: usize) -> Result<Self> {
+        if len_bytes % 2 != 0 {
             return Err(AegisError::InvalidPlan(format!(
-                "BF16 mmap region has odd byte length {len}"
+                "BF16 arena region has odd byte length {len_bytes}"
             )));
         }
-        // Safetensors aligns tensor data to 8 bytes per spec, so 2-byte
-        // alignment of `offset` is guaranteed; bail loudly if a shard
-        // ever violates that (the u16 reinterpret below would UB).
+        // The arena's base ptr is page-aligned (≥ 4 KiB) and per-tensor
+        // offsets are byte-granular; check 2-byte alignment for the u16
+        // reinterpret below.
         if offset % 2 != 0 {
             return Err(AegisError::InvalidPlan(format!(
-                "BF16 mmap offset {offset} is not 2-byte aligned"
+                "BF16 arena offset {offset} is not 2-byte aligned"
             )));
         }
-        let len_u16 = len / 2;
-        Ok(Self { loaded, len_u16 })
+        Ok(Self {
+            arena,
+            offset,
+            len_u16: len_bytes / 2,
+        })
     }
 
-    /// View the bytes as `&[u16]` (BF16 stored as u16). The shard mmap
-    /// is page-aligned (≥ 4 KiB) and the safetensors offset within it
-    /// is checked to be 2-byte aligned, so the reinterpret is sound.
+    /// View the bytes as `&[u16]` (BF16 stored as u16). The arena's
+    /// base ptr is page-aligned and `offset` is checked to be 2-byte
+    /// aligned in `from_arena`, so the reinterpret is sound.
     pub fn values(&self) -> &[u16] {
-        let bytes = self.loaded.as_bytes();
-        // SAFETY: alignment validated in `from_loaded`; `bytes.len()` is
-        // exactly `self.len_u16 * 2` so the resulting slice covers the
-        // same range with the same lifetime as `self.loaded`.
+        let bytes = self.arena.slice(self.offset, self.len_u16 * 2);
+        // SAFETY: alignment validated in `from_arena`; `bytes.len() ==
+        // self.len_u16 * 2` so the resulting slice covers exactly the
+        // same range with the same lifetime as `self.arena`.
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, self.len_u16) }
     }
 }
