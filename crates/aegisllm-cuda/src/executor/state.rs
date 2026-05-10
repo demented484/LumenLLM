@@ -72,6 +72,18 @@ pub(super) struct CudaMoEShared {
     pub(super) gate_proj: CudaLinear,
     pub(super) up_proj: CudaLinear,
     pub(super) down_proj: CudaLinear,
+    /// Optional row-stacked `[2 * intermediate, hidden_size]` BF16 fused
+    /// gate+up matrix. When `Some`, the shared-MLP path runs a single fused
+    /// cuBLASLt BF16 GEMM into a `[batch, 2*intermediate]` row-major buffer,
+    /// then a strided GeGLU kernel that consumes the fused layout directly —
+    /// saving one BF16 GEMM launch per MoE layer per prefill chunk (and one
+    /// per token at decode). The original `gate_proj`/`up_proj` are kept as
+    /// metadata-only stubs (real `(name, rows, cols)`, 1-element VRAM
+    /// placeholder) so callers that introspect shapes still work; the actual
+    /// matmul **must** be routed through `gate_up_fused` when it is `Some`.
+    /// Built at load time by `fuse_bf16_gate_up` for the BF16 `Wq::Default`
+    /// shared-MLP path; left `None` for FP8 quantized shared MLP.
+    pub(super) gate_up_fused: Option<DeviceBf16Matrix>,
 }
 
 /// MoE data for one transformer layer.
@@ -111,6 +123,11 @@ pub(super) struct CudaMoEScratch {
     pub(super) expert_up: DeviceBuffer<f32>,
     pub(super) expert_swiglu: DeviceBuffer<f32>,
     pub(super) expert_out: DeviceBuffer<f32>,
+    /// Decode-side counterpart to `CudaMoEPrefillScratch.gather_shared_gate_up_fused`.
+    /// Sized to `2 * max_expert_intermediate` floats — fits one token's worth
+    /// of `[gate_logits, up_logits]` produced by the fused matvec when the
+    /// shared MLP has a `gate_up_fused` matrix.
+    pub(super) shared_gate_up_fused: DeviceBuffer<f32>,
     pub(super) quant_expert: DeviceBuffer<f32>,
     pub(super) mxfp4_expert: DeviceBuffer<u8>,
     /// CPU-side scratch reused across decode-token MoE router calls so
@@ -551,6 +568,14 @@ pub(super) struct CudaMoEPrefillScratch {
     pub(super) gather_intermediate: DeviceBuffer<f32>,
     /// Gather buffer for swiglu output: `[max_active_tokens, expert_intermediate]`.
     pub(super) gather_swiglu: DeviceBuffer<f32>,
+    /// Output buffer for the fused shared-MLP gate+up GEMM:
+    /// `[chunk_size, 2 * max_shared_intermediate]` row-major. Per token the
+    /// first `intermediate` floats are gate logits, the next `intermediate`
+    /// are up logits. Consumed by `geglu_tanh_strided_device`. Only the
+    /// `cs * 2 * shared_intermediate` prefix is written/read on each call.
+    /// Sized to `cs * 2 * max_expert_intermediate` (an upper bound across
+    /// MoE layers; shared intermediate is usually the larger of the two).
+    pub(super) gather_shared_gate_up_fused: DeviceBuffer<f32>,
     /// Gather buffer for down_proj output: `[max_active_tokens, hidden_size]`.
     pub(super) gather_out: DeviceBuffer<f32>,
     /// Quantized input scratch for NVFP4 expert matmuls: `[max_active_tokens, max_dim]`.

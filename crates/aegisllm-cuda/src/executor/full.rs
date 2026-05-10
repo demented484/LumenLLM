@@ -727,6 +727,12 @@ impl CudaLlamaExecutor {
                         gather_input: self.runtime.alloc_f32(cs * self.hidden_size)?,
                         gather_intermediate: self.runtime.alloc_f32(cs * max_expert_intermediate)?,
                         gather_swiglu: self.runtime.alloc_f32(cs * max_expert_intermediate)?,
+                        // Fused shared-MLP gate+up output: cs tokens × 2 × intermediate.
+                        // For Gemma-4-26B at chunk=1024, shared_intermediate=2112:
+                        // 1024 * 2 * 2112 * 4 ≈ 17 MiB.
+                        gather_shared_gate_up_fused: self
+                            .runtime
+                            .alloc_f32(cs * 2 * max_expert_intermediate)?,
                         gather_out: self.runtime.alloc_f32(cs * self.hidden_size)?,
                         gather_quant: self.runtime.alloc_f32(cs * max_dim)?,
                         gather_mxfp4: self.runtime.alloc_u8(
@@ -962,6 +968,11 @@ impl CudaLlamaExecutor {
                         expert_up: self.runtime.alloc_f32(max_expert_intermediate)?,
                         expert_swiglu: self.runtime.alloc_f32(max_expert_intermediate)?,
                         expert_out: self.runtime.alloc_f32(self.hidden_size)?,
+                        // Fused shared-MLP gate+up output for decode (M=1):
+                        // 2 × max_expert_intermediate floats. Trivial size.
+                        shared_gate_up_fused: self
+                            .runtime
+                            .alloc_f32(2 * max_expert_intermediate)?,
                         quant_expert: self.runtime.alloc_f32(max_input)?,
                         mxfp4_expert: self
                             .runtime

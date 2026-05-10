@@ -510,7 +510,7 @@ fn load_cuda_moe(
         let down_proj = CudaLinear::Nvfp4(cuda.load_nvfp4_linear_with_layout(
             artifact, &format!("{sp}.down_proj"), store, residency, resident_layout, loader,
         )?);
-        Some(CudaMoEShared { gate_proj, up_proj, down_proj })
+        Some(CudaMoEShared { gate_proj, up_proj, down_proj, gate_up_fused: None })
     } else if artifact.tensors.has(&format!("{prefix}.mlp.gate_proj.weight")) {
         // Gemma 4 style: mlp.* is always-active shared expert. Stored as
         // BF16 in the checkpoint; the user can opt into a smaller format
@@ -525,16 +525,33 @@ fn load_cuda_moe(
         match shared_mlp_quantization {
             Wq::Default => {
                 // Shared MLP is BF16 dense — uses the dense override.
+                // Load gate and up individually (force-VRAM by `bf16_dense_*`)
+                // then fuse them into a single row-stacked `[2*intermediate,
+                // hidden]` matrix so the runtime hot path can use one cuBLASLt
+                // BF16 GEMM + strided GeGLU instead of two GEMMs + standalone
+                // GeGLU. Per-MoE-layer: 4 BF16 launches → 3.
+                let gate_mat = cuda.load_bf16_matrix_with_store(
+                    gate_tensor, bf16_dense_store, bf16_dense_residency, loader,
+                )?;
+                let up_mat = cuda.load_bf16_matrix_with_store(
+                    up_tensor, bf16_dense_store, bf16_dense_residency, loader,
+                )?;
+                let down_mat = cuda.load_bf16_matrix_with_store(
+                    down_tensor, bf16_dense_store, bf16_dense_residency, loader,
+                )?;
+                let (fused, gate_stub, up_stub) = cuda.fuse_bf16_gate_up(gate_mat, up_mat)?;
                 Some(CudaMoEShared {
-                    gate_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(gate_tensor, bf16_dense_store, bf16_dense_residency, loader)?),
-                    up_proj:   CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(up_tensor,   bf16_dense_store, bf16_dense_residency, loader)?),
-                    down_proj: CudaLinear::Bf16(cuda.load_bf16_matrix_with_store(down_tensor, bf16_dense_store, bf16_dense_residency, loader)?),
+                    gate_proj: CudaLinear::Bf16(gate_stub),
+                    up_proj:   CudaLinear::Bf16(up_stub),
+                    down_proj: CudaLinear::Bf16(down_mat),
+                    gate_up_fused: Some(fused),
                 })
             }
             Wq::Fp8 => Some(CudaMoEShared {
                 gate_proj: CudaLinear::Fp8(cuda.load_bf16_as_fp8_linear(gate_tensor, loader)?),
                 up_proj:   CudaLinear::Fp8(cuda.load_bf16_as_fp8_linear(up_tensor,   loader)?),
                 down_proj: CudaLinear::Fp8(cuda.load_bf16_as_fp8_linear(down_tensor, loader)?),
+                gate_up_fused: None,
             }),
             other => return Err(AegisError::Unsupported(format!(
                 "shared-MLP-quantization={other:?} not yet wired into the loader"

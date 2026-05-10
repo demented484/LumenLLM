@@ -320,20 +320,43 @@ fn forward_moe_decode_device(
 
     // Steps 2-3: Shared MLP on post_normed (step 1 output) → result in moe_acc
     if let Some(ref shared) = moe.shared_expert {
-        matvec_cuda_linear_with_scratch(
-            runtime, &shared.gate_proj, post_normed,
-            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
-            &mut moe_scratch.expert_gate,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
-        matvec_cuda_linear_with_scratch(
-            runtime, &shared.up_proj, post_normed,
-            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
-            &mut moe_scratch.expert_up,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
-        // Gemma 4 shared MLP also uses gelu_pytorch_tanh activation.
-        runtime.geglu_tanh_device(&moe_scratch.expert_gate, &moe_scratch.expert_up, &mut moe_scratch.expert_swiglu)?;
+        if let Some(ref fused) = shared.gate_up_fused {
+            // Fused gate+up matvec produces `[2*intermediate]` row-major into
+            // `shared_gate_up_fused`; strided geglu kernel reads gate from
+            // the first half and up from the second, writing `[intermediate]`
+            // to `expert_swiglu`. M=1 so a single matvec replaces two.
+            let intermediate = shared.gate_proj.rows();
+            runtime.matvec_bf16_reference_device(
+                fused,
+                post_normed,
+                &mut moe_scratch.shared_gate_up_fused,
+            )?;
+            runtime.geglu_tanh_strided_device(
+                &moe_scratch.shared_gate_up_fused,
+                1,
+                intermediate,
+                &mut moe_scratch.expert_swiglu,
+            )?;
+        } else {
+            matvec_cuda_linear_with_scratch(
+                runtime, &shared.gate_proj, post_normed,
+                &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
+                &mut moe_scratch.expert_gate,
+                if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
+            )?;
+            matvec_cuda_linear_with_scratch(
+                runtime, &shared.up_proj, post_normed,
+                &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
+                &mut moe_scratch.expert_up,
+                if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
+            )?;
+            // Gemma 4 shared MLP also uses gelu_pytorch_tanh activation.
+            runtime.geglu_tanh_device(
+                &moe_scratch.expert_gate,
+                &moe_scratch.expert_up,
+                &mut moe_scratch.expert_swiglu,
+            )?;
+        }
         matvec_cuda_linear_with_scratch(
             runtime, &shared.down_proj, &moe_scratch.expert_swiglu,
             &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,

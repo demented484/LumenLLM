@@ -98,21 +98,39 @@ pub(super) fn forward_moe_prefill_chunk_device(
             // so the cublaslt path applies. Falls back to reference if any
             // reason VRAM-residency is unmet.
             if runtime.cublaslt_bf16_enabled_for(g) {
-                runtime.matmul_bf16_cublaslt_device(
-                    g, &pf.input_normed, batch,
-                    &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
-                    &mut moe_scratch.gather_intermediate,
-                )?;
-                runtime.matmul_bf16_cublaslt_device(
-                    u, &pf.input_normed, batch,
-                    &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
-                    &mut moe_scratch.gather_swiglu,
-                )?;
-                runtime.geglu_tanh_in_place_device(
-                    &moe_scratch.gather_intermediate,
-                    &mut moe_scratch.gather_swiglu,
-                    batch * intermediate,
-                )?;
+                if let Some(ref fused) = shared.gate_up_fused {
+                    // Fused gate+up: one cuBLASLt GEMM produces
+                    // `[batch, 2*intermediate]` row-major, then the strided
+                    // GeGLU kernel reads gate from the first `intermediate`
+                    // floats and up from the next `intermediate`.
+                    runtime.matmul_bf16_cublaslt_device(
+                        fused, &pf.input_normed, batch,
+                        &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
+                        &mut moe_scratch.gather_shared_gate_up_fused,
+                    )?;
+                    runtime.geglu_tanh_strided_device(
+                        &moe_scratch.gather_shared_gate_up_fused,
+                        batch,
+                        intermediate,
+                        &mut moe_scratch.gather_swiglu,
+                    )?;
+                } else {
+                    runtime.matmul_bf16_cublaslt_device(
+                        g, &pf.input_normed, batch,
+                        &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
+                        &mut moe_scratch.gather_intermediate,
+                    )?;
+                    runtime.matmul_bf16_cublaslt_device(
+                        u, &pf.input_normed, batch,
+                        &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
+                        &mut moe_scratch.gather_swiglu,
+                    )?;
+                    runtime.geglu_tanh_in_place_device(
+                        &moe_scratch.gather_intermediate,
+                        &mut moe_scratch.gather_swiglu,
+                        batch * intermediate,
+                    )?;
+                }
                 runtime.matmul_bf16_cublaslt_device(
                     d, &moe_scratch.gather_swiglu, batch,
                     &mut pf.bf16_in_scratch, &mut pf.bf16_out_scratch,
