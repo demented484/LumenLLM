@@ -30,6 +30,13 @@ pub struct CudaLayerBlockState {
     pub(super) hidden: DeviceBuffer<f32>,
     pub(super) layers: BTreeMap<usize, CudaLayerState>,
     pub(super) scratch: CudaScratch,
+    /// Reusable 1-element u32 device buffers for the per-layer
+    /// `position` / `seq_len` kernel args. Pre-allocated once at state
+    /// construction and overwritten per `forward_layer_device` call,
+    /// instead of `alloc_u32(1)` × 2 fresh allocations per layer per
+    /// token (each round-trips through the cudaMallocAsync pool).
+    pub(super) p_position: DeviceBuffer<u32>,
+    pub(super) p_seq_len: DeviceBuffer<u32>,
 }
 
 impl CudaLayerBlockExecutor {
@@ -250,6 +257,8 @@ impl CudaLayerBlockExecutor {
                 staging_pool: None,
                 kv_staging: None,
             },
+            p_position: self.runtime.alloc_u32(1)?,
+            p_seq_len: self.runtime.alloc_u32(1)?,
         })
     }
 }

@@ -480,21 +480,22 @@ impl CudaLayerBlockExecutor {
         let layer = self.layers.get(&layer_idx).ok_or_else(|| {
             AegisError::InvalidPlan(format!("missing CUDA hybrid layer `{layer_idx}`"))
         })?;
+        // Reuse pooled `p_position` / `p_seq_len` device buffers
+        // instead of `alloc_u32(1)` × 2 fresh allocations per layer
+        // per token (each round-trips through cudaMallocAsync).
+        self.runtime.copy_u32_to_device(&[position as u32], &mut state.p_position)?;
+        self.runtime.copy_u32_to_device(&[(position + 1) as u32], &mut state.p_seq_len)?;
         let layer_state = state.layers.get_mut(&layer_idx).ok_or_else(|| {
             AegisError::InvalidPlan(format!("missing CUDA hybrid layer state `{layer_idx}`"))
         })?;
-        let mut p_position = self.runtime.alloc_u32(1)?;
-        let mut p_seq_len = self.runtime.alloc_u32(1)?;
-        self.runtime.copy_u32_to_device(&[position as u32], &mut p_position)?;
-        self.runtime.copy_u32_to_device(&[(position + 1) as u32], &mut p_seq_len)?;
         forward_cuda_layer_device(
             &self.runtime,
             layer,
             layer_state,
             &mut state.hidden,
             &mut state.scratch,
-            &p_position,
-            &p_seq_len,
+            &state.p_position,
+            &state.p_seq_len,
             CudaLayerForwardParams {
                 rms_norm_eps: self.rms_norm_eps,
                 num_attention_heads: self.num_attention_heads,
