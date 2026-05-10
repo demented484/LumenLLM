@@ -278,6 +278,15 @@ impl TensorStorageLoader {
         Ok(map)
     }
 
+    /// Borrow a previously cached shard mmap by path. Returns `None`
+    /// if the loader has not yet faulted that shard in via
+    /// `mmap_shard` (no host-resident weight was loaded from it).
+    /// Used by `cuda::RegisteredShards` to find the `Arc<Mmap>` it
+    /// needs to register with `cuMemHostRegister`.
+    pub fn shard_mmap(&self, path: &PathBuf) -> Option<Arc<Mmap>> {
+        self.mmaps.get(path).cloned()
+    }
+
     /// Force the kernel to drop every page the loader paged in. Linux's
     /// `MADV_DONTNEED` on a file-backed mmap removes the mapping from this
     /// process's page tables but does NOT reliably evict the page-cache

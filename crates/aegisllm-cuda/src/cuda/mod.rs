@@ -4,6 +4,7 @@ mod functions;
 mod kernels;
 pub(crate) mod loader;
 pub(crate) mod owned_pinned;
+pub(crate) mod registered_shards;
 mod repack;
 pub(crate) mod runtime;
 pub(crate) mod staging;

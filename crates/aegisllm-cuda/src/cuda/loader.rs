@@ -49,6 +49,13 @@ pub struct CudaWeightLoader<'a> {
     /// the user's progress indicator can refresh between coarse `step`
     /// advances.
     status_sink: Option<LoadStatusSink>,
+    /// Set of safetensors shard paths from which at least one
+    /// host-resident weight has been loaded. Populated as a side effect
+    /// of `load_for_store(_, Mmap)` for host-resident NVFP4 / BF16
+    /// branches; the executor reads it after load to register those
+    /// shard mmaps with `cuMemHostRegister`, so per-token streaming
+    /// takes the direct-DMA fast path.
+    host_resident_shards: std::cell::RefCell<std::collections::HashSet<std::path::PathBuf>>,
 }
 
 impl CudaRuntime {
@@ -56,6 +63,7 @@ impl CudaRuntime {
         CudaWeightLoader {
             runtime: self,
             status_sink: None,
+            host_resident_shards: std::cell::RefCell::new(std::collections::HashSet::new()),
         }
     }
 }
@@ -87,6 +95,21 @@ impl CudaWeightLoader<'_> {
     /// accompanying device-resident metadata.
     pub fn runtime(&self) -> &CudaRuntime {
         self.runtime
+    }
+
+    /// Snapshot the set of safetensors shard paths from which at least
+    /// one host-resident weight has been loaded. Called by the executor
+    /// at end-of-load to drive `cuMemHostRegister` on those shards.
+    pub fn host_resident_shards(&self) -> std::collections::HashSet<std::path::PathBuf> {
+        self.host_resident_shards.borrow().clone()
+    }
+
+    /// Mark a tensor's shard as containing host-resident bytes. Called
+    /// from the host-resident NVFP4 / BF16 branches inside the loader.
+    fn mark_host_resident_shard(&self, tensor: &TensorInfo) {
+        self.host_resident_shards
+            .borrow_mut()
+            .insert(tensor.shard_path.clone());
     }
 
     pub fn load_dense_vector_with_store(
@@ -153,6 +176,10 @@ impl CudaWeightLoader<'_> {
             // Synchronously fault every page so "model loaded" actually
             // means the BF16 matrix is in RAM, not lazy-on-first-access.
             loaded.prefault();
+            // Mark the shard so the executor can `cuMemHostRegister`
+            // it after load — restores direct-DMA from the mmap on
+            // subsequent inference accesses.
+            self.mark_host_resident_shard(tensor);
             let stub = self
                 .runtime
                 .stream
@@ -476,6 +503,11 @@ impl CudaWeightLoader<'_> {
             // RAM" — the first request would block on disk reads.
             packed_loaded.prefault();
             scales_loaded.prefault();
+            // Mark the shards so the executor can `cuMemHostRegister`
+            // them after load — restores direct-DMA from the mmap on
+            // per-token expert streaming.
+            self.mark_host_resident_shard(weight);
+            self.mark_host_resident_shard(scales);
             let (mmap_packed, mmap_scales) = (
                 HostWeightBytes::Mmap(packed_loaded),
                 HostWeightBytes::Mmap(scales_loaded),

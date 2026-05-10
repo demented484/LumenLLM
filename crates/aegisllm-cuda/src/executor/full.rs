@@ -253,7 +253,29 @@ impl CudaLlamaExecutor {
             })
         });
 
-        // Drop the loader now that load is complete. Host-resident
+        // Snapshot the shard set the loader marked as host-resident,
+        // then page-lock those shard mmaps with `cuMemHostRegister`.
+        // After this call, `memcpy_htod` from any pointer inside a
+        // registered shard takes the direct-DMA fast path (no
+        // per-token CPU memcpy through the staging-pool bounce). We
+        // do this AFTER prefault so the kernel page-locks pages that
+        // are already committed — `cuMemHostRegister` on uncommitted
+        // pages would force-fault them anyway, but doing prefault
+        // first keeps the timing breakdown clean.
+        let host_resident_shards = cuda_weights.host_resident_shards();
+        let register_t = std::time::Instant::now();
+        let registered_shards = crate::cuda::registered_shards::RegisteredShards::register(
+            &loader,
+            &host_resident_shards,
+        )?;
+        if !host_resident_shards.is_empty() {
+            eprintln!(
+                "load-timing: cuMemHostRegister sweep        {:>6.2}s",
+                register_t.elapsed().as_secs_f64(),
+            );
+        }
+
+        // Drop the loader now that registration is done. Host-resident
         // weights keep their own `Arc<Mmap>` clones into the shard
         // mmaps, so the shard mappings stay alive past the loader.
         drop(cuda_weights);
@@ -417,6 +439,7 @@ impl CudaLlamaExecutor {
             kv_first_n_layers,
             kv_first_store,
             kv_quantization: placement.kv_cache.quantization,
+            registered_shards,
         })
     }
 

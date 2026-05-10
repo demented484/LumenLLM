@@ -140,8 +140,16 @@ impl HostWeightBytes {
     /// `true` when bytes live in CUDA-pinned host memory and can be DMA'd
     /// directly without an intermediate CPU memcpy. The staging pool uses this
     /// to skip the bounce-buffer fast-path overhead for pinned sources.
+    ///
+    /// Returns `true` for both variants:
+    /// * `Pinned` — process-owned `OwnedPinnedBuf`, registered at construction.
+    /// * `Mmap` — file-backed shard mmap, registered post-load by
+    ///   `RegisteredShards` (every host-resident weight's shard is page-locked
+    ///   with `cuMemHostRegister` so DMA from any pointer inside the mapping
+    ///   takes the direct path; the CPU memcpy through the per-slot bounce
+    ///   would otherwise eat ~30 ms/token on Gemma-4-26B decode).
     pub fn is_pinned(&self) -> bool {
-        matches!(self, Self::Pinned(_))
+        true
     }
 }
 

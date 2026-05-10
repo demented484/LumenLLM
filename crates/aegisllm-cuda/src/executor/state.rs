@@ -160,6 +160,12 @@ pub(super) struct CudaLlamaExecutor {
     pub(super) kv_first_store: Option<StoragePlacement>,
     /// Storage dtype for the KV cache (f16/bf16/fp8). Per-layer is uniform.
     pub(super) kv_quantization: aegisllm_base::tensor::quant::KvCacheQuantization,
+    /// `cuMemHostRegister` registrations on safetensors shard mmaps that
+    /// hold host-resident weights. Kept alive for the executor's lifetime
+    /// so per-token H2D streaming pulls directly from the registered
+    /// pages (DMA fast path); on drop, every shard is unregistered before
+    /// its mmap is unmapped.
+    pub(super) registered_shards: crate::cuda::registered_shards::RegisteredShards,
 }
 
 #[derive(Debug)]
