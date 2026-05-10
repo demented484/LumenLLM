@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::engine::AegisEngine;
 use aegisllm_base::error::{AegisError, Result};
 use crate::executor::ExecutorReadiness;
-use aegisllm_base::generation::{ChatMessage, GenerateRequest, SamplingConfig};
+use aegisllm_base::generation::{ChatMessage, GenerateOutput, GenerateRequest, SamplingConfig, TimedGenerateOutput};
 use aegisllm_base::text::TextProcessor;
 
 #[derive(Debug)]
@@ -387,8 +387,11 @@ fn generate_http_response(
     };
     let started = Instant::now();
     let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
-    match engine.generate(request) {
-        Ok(output) if chat => {
+    let prompt_summary = extract_prompt_summary(&parsed);
+    match engine.generate_timed(request) {
+        Ok(timed) if chat => {
+            log_inference("openai-chat", &prompt_summary, &timed);
+            let output = timed.output;
             let stats = GenerateStats {
                 prompt_tokens: output.prompt_tokens,
                 completion_tokens: output.completion_tokens,
@@ -454,7 +457,9 @@ fn generate_http_response(
                 }),
             )
         }
-        Ok(output) => {
+        Ok(timed) => {
+            log_inference("openai-completion", &prompt_summary, &timed);
+            let output = timed.output;
             let stats = GenerateStats {
                 prompt_tokens: output.prompt_tokens,
                 completion_tokens: output.completion_tokens,
@@ -524,8 +529,11 @@ fn generate_anthropic_response(
     };
     let started = Instant::now();
     let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
-    match engine.generate(request) {
-        Ok(output) => {
+    let prompt_summary = extract_prompt_summary(&parsed);
+    match engine.generate_timed(request) {
+        Ok(timed) => {
+            log_inference("anthropic", &prompt_summary, &timed);
+            let output = timed.output;
             let stats = GenerateStats {
                 prompt_tokens: output.prompt_tokens,
                 completion_tokens: output.completion_tokens,
@@ -637,8 +645,11 @@ fn generate_google_response(
     };
     let started = Instant::now();
     let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
-    match engine.generate(request) {
-        Ok(output) => {
+    let prompt_summary = extract_prompt_summary(&parsed);
+    match engine.generate_timed(request) {
+        Ok(timed) => {
+            log_inference("google", &prompt_summary, &timed);
+            let output = timed.output;
             let stats = GenerateStats {
                 prompt_tokens: output.prompt_tokens,
                 completion_tokens: output.completion_tokens,
@@ -865,7 +876,12 @@ fn sse_openai(
         write_sse_chunk(stream, &format!("data: {}\n\n", chunk)).map(|_| ())
     };
 
+    let prompt_summary = extract_prompt_summary(parsed);
+    let mut first_token_at: Option<Instant> = None;
     let result = engine.generate_streaming(&gen_request, &mut |_tok, tok_text| {
+        if first_token_at.is_none() {
+            first_token_at = Some(Instant::now());
+        }
         for event in parser.push(tok_text) {
             if emit_event(event, &mut emitted_any_tool_call, stream).is_err() {
                 return ControlFlow::Break(());
@@ -881,6 +897,13 @@ fn sse_openai(
     match result {
         Ok(ref output) => {
             finish_str = openai_finish_reason(&output.finish_reason).to_string();
+            log_streaming(
+                if chat { "openai-chat-stream" } else { "openai-completion-stream" },
+                &prompt_summary,
+                output,
+                started,
+                first_token_at,
+            );
             state.record_generation(
                 started,
                 Some(GenerateStats {
@@ -972,7 +995,12 @@ fn sse_anthropic(
     let mut output_tokens = 0usize;
     let mut stop_reason = "end_turn".to_string();
 
+    let prompt_summary = extract_prompt_summary(parsed);
+    let mut first_token_at: Option<Instant> = None;
     let result = engine.generate_streaming(&gen_request, &mut |_tok, tok_text| {
+        if first_token_at.is_none() {
+            first_token_at = Some(Instant::now());
+        }
         let delta = serde_json::json!({
             "type": "content_block_delta",
             "index": 0,
@@ -988,6 +1016,7 @@ fn sse_anthropic(
         Ok(ref output) => {
             output_tokens = output.completion_tokens;
             stop_reason = anthropic_stop_reason(&output.finish_reason).to_string();
+            log_streaming("anthropic-stream", &prompt_summary, output, started, first_token_at);
             state.record_generation(
                 started,
                 Some(GenerateStats {
@@ -1059,7 +1088,12 @@ fn sse_google(
     let started = Instant::now();
     let mut finish_reason_str = "STOP".to_string();
 
+    let prompt_summary = extract_prompt_summary(parsed);
+    let mut first_token_at: Option<Instant> = None;
     let result = engine.generate_streaming(&gen_request, &mut |_tok, tok_text| {
+        if first_token_at.is_none() {
+            first_token_at = Some(Instant::now());
+        }
         let chunk = serde_json::json!({
             "candidates": [{"content": {"role": "model", "parts": [{"text": tok_text}]}, "index": 0}],
             "modelVersion": model
@@ -1072,6 +1106,7 @@ fn sse_google(
 
     match result {
         Ok(ref output) => {
+            log_streaming("google-stream", &prompt_summary, output, started, first_token_at);
             finish_reason_str = google_finish_reason(&output.finish_reason).to_string();
             state.record_generation(
                 started,
@@ -1711,6 +1746,146 @@ fn json_error(status: u16, message: impl Into<String>) -> (u16, serde_json::Valu
             }
         }),
     )
+}
+
+/// Extract the user-facing portion of the request for logging — the most
+/// recent `user` message in chat APIs (OpenAI/Anthropic message arrays,
+/// Google `contents` array), or the raw `prompt` field for completion-style
+/// requests. Truncated to 240 chars with `…` so logs stay scannable.
+fn extract_prompt_summary(parsed: &serde_json::Value) -> String {
+    fn truncate(s: &str, max: usize) -> String {
+        let trimmed: String = s
+            .chars()
+            .map(|c| match c { '\n' | '\r' | '\t' => ' ', _ => c })
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if trimmed.chars().count() <= max {
+            trimmed
+        } else {
+            let mut out: String = trimmed.chars().take(max).collect();
+            out.push('…');
+            out
+        }
+    }
+
+    // OpenAI / Anthropic: messages = [{role, content}, ...]
+    if let Some(messages) = parsed.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages.iter().rev() {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role != "user" {
+                continue;
+            }
+            if let Some(content) = msg.get("content") {
+                if let Some(s) = content.as_str() {
+                    return truncate(s, 240);
+                }
+                // Anthropic / OpenAI content-parts array.
+                if let Some(arr) = content.as_array() {
+                    for part in arr {
+                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                            return truncate(text, 240);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Google: contents = [{role, parts: [{text}]}]
+    if let Some(contents) = parsed.get("contents").and_then(|c| c.as_array()) {
+        for content in contents.iter().rev() {
+            let role = content.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+            if role != "user" {
+                continue;
+            }
+            if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+                for part in parts {
+                    if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                        return truncate(text, 240);
+                    }
+                }
+            }
+        }
+    }
+    // Plain completion API.
+    if let Some(p) = parsed.get("prompt").and_then(|p| p.as_str()) {
+        return truncate(p, 240);
+    }
+    "(no user prompt found)".to_string()
+}
+
+/// Streaming variant — `generate_streaming` only returns `GenerateOutput`,
+/// so we measure prefill ourselves: `started → first_token_at` is prefill,
+/// `first_token_at → now` is decode. Falls back to total/0 split if no
+/// first-token timestamp was recorded (e.g. zero completion tokens).
+fn log_streaming(
+    api: &str,
+    prompt_summary: &str,
+    output: &GenerateOutput,
+    started: Instant,
+    first_token_at: Option<Instant>,
+) {
+    let now = Instant::now();
+    let total_secs = (now - started).as_secs_f64();
+    let (prefill_secs, decode_secs) = match first_token_at {
+        Some(t) => (
+            (t - started).as_secs_f64(),
+            (now - t).as_secs_f64(),
+        ),
+        None => (total_secs, 0.0),
+    };
+    let prefill_tps = if prefill_secs > 0.0 {
+        output.prompt_tokens as f64 / prefill_secs
+    } else {
+        0.0
+    };
+    let decode_tps = if decode_secs > 0.0 {
+        output.completion_tokens as f64 / decode_secs
+    } else {
+        0.0
+    };
+    eprintln!(
+        "infer[{api}] prompt_tok={} completion_tok={} prefill={:.2}s ({:.0} tps) decode={:.2}s ({:.0} tps) total={:.2}s finish={} | prompt={:?}",
+        output.prompt_tokens,
+        output.completion_tokens,
+        prefill_secs,
+        prefill_tps,
+        decode_secs,
+        decode_tps,
+        total_secs,
+        output.finish_reason,
+        prompt_summary,
+    );
+}
+
+/// Single-line structured log of an inference call: prompt-summary,
+/// token counts, and prefill/decode breakdown with tokens-per-second.
+/// Goes to stderr so HTTP-server stdout (response bodies) stays clean.
+fn log_inference(api: &str, prompt_summary: &str, timed: &TimedGenerateOutput) {
+    let prefill_secs = timed.prefill_elapsed.as_secs_f64();
+    let decode_secs = timed.decode_elapsed.as_secs_f64();
+    let prefill_tps = if prefill_secs > 0.0 {
+        timed.output.prompt_tokens as f64 / prefill_secs
+    } else {
+        0.0
+    };
+    let decode_tps = if decode_secs > 0.0 {
+        timed.output.completion_tokens as f64 / decode_secs
+    } else {
+        0.0
+    };
+    eprintln!(
+        "infer[{api}] prompt_tok={} completion_tok={} prefill={:.2}s ({:.0} tps) decode={:.2}s ({:.0} tps) total={:.2}s finish={} | prompt={:?}",
+        timed.output.prompt_tokens,
+        timed.output.completion_tokens,
+        prefill_secs,
+        prefill_tps,
+        decode_secs,
+        decode_tps,
+        timed.total_elapsed.as_secs_f64(),
+        timed.output.finish_reason,
+        prompt_summary,
+    );
 }
 
 fn executor_not_ready(readiness: &ExecutorReadiness) -> (u16, serde_json::Value) {

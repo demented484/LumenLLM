@@ -2,6 +2,7 @@ use super::repack::{
     cached_repack_nvfp4_to_cutlass_e2m1_ue4m3_host, cached_repack_nvfp4_to_mxfp4_host,
     repack_nvfp4_to_cutlass_e2m1_ue4m3_host,
 };
+use super::owned_pinned::OwnedPinnedBuf;
 use super::runtime::{CudaRuntime, map_cuda_err};
 use super::types::{
     DeviceBf16Matrix, DeviceBuffer, DeviceCutlassNvfp4Linear, DeviceMxfp4Linear, DeviceNvfp4Linear,
@@ -9,166 +10,19 @@ use super::types::{
 };
 use aegisllm_base::artifact::ModelArtifact;
 use aegisllm_base::error::{AegisError, Result};
-use cudarc::driver::PinnedHostSlice;
-use std::io::{Read, Seek, SeekFrom};
 
-/// Allocate CUDA-pinned host memory and copy an in-memory byte slice into it.
-/// Only used for repacked data (native MXFP4) that is generated in a Vec<u8> at runtime.
-/// For tensors loaded from disk, prefer `alloc_pinned_u8_from_file` to avoid the
-/// intermediate mmap/pageable copy.
+/// Allocate a process-owned pinned host buffer and copy `bytes` into it.
+/// Used only for small, generated-at-load-time data (native MXFP4 repack
+/// output, MatFormer submatrix slices) where the source is a transient
+/// `Vec<u8>` with no file-backed mmap to point at. The general path keeps
+/// weights in shard mmaps; this helper covers the few exceptions.
 fn alloc_pinned_from_bytes(
-    runtime: &CudaRuntime,
+    _runtime: &CudaRuntime,
     bytes: &[u8],
-    label: &'static str,
-) -> Result<PinnedHostSlice<u8>> {
-    let mut pinned = unsafe { runtime.stream.context().alloc_pinned::<u8>(bytes.len()) }
-        .map_err(map_cuda_err(label))?;
-    pinned
-        .as_mut_slice()
-        .map_err(map_cuda_err(label))?
-        .copy_from_slice(bytes);
-    Ok(pinned)
-}
-
-/// Read a tensor's bytes directly from the safetensors file into a freshly allocated
-/// CUDA-pinned host buffer.  Avoids the mmap-then-copy double-allocation that occurs
-/// when weights are staged from disk: only one copy of the data exists in RAM (the
-/// pinned buffer), instead of the kernel page-cache pages + a separate pinned copy.
-fn alloc_pinned_u8_from_file(
-    runtime: &CudaRuntime,
-    tensor: &TensorInfo,
-    label: &'static str,
-) -> Result<PinnedHostSlice<u8>> {
-    let len = tensor.data_len_bytes() as usize;
-    let mut pinned = unsafe { runtime.stream.context().alloc_pinned::<u8>(len) }
-        .map_err(map_cuda_err(label))?;
-    {
-        let dst = pinned.as_mut_slice().map_err(map_cuda_err(label))?;
-        let mut file = std::fs::File::open(&tensor.shard_path)?;
-        file.seek(SeekFrom::Start(tensor.file_offsets.0))?;
-        file.read_exact(dst)?;
-        aegisllm_base::tensor::storage::fadvise_dont_need(
-            &file,
-            tensor.file_offsets.0,
-            len as u64,
-        );
-    }
-    Ok(pinned)
-}
-
-/// Read a tensor's bytes into the shared pinned-host arena via direct file
-/// I/O. Uses `read_exact` straight into the arena slice — sequential reads
-/// inside a shard let the OS aggressively prefetch.
-///
-/// Per-call file open is cheap relative to the file read itself (NVMe at
-/// ~3-5 GB/s dominates), but for very many tensors the open + seek overhead
-/// adds up. We accept this for code simplicity; if it shows up as a hot
-/// spot, the next step is a per-shard `File` handle cache or a single
-/// shard-wide read into a temporary buffer.
-fn read_tensor_into_arena(
-    arena: &super::host_arena::ArenaHandle,
-    tensor: &TensorInfo,
-) -> Result<super::types::HostWeightBytes> {
-    let len = tensor.data_len_bytes() as usize;
-    let mut file = std::fs::File::open(&tensor.shard_path)?;
-    file.seek(SeekFrom::Start(tensor.file_offsets.0))?;
-    let offset = arena.alloc_and_fill(&mut file, len)?;
-    aegisllm_base::tensor::storage::fadvise_dont_need(
-        &file,
-        tensor.file_offsets.0,
-        len as u64,
-    );
-    Ok(super::types::HostWeightBytes::Arena {
-        arena: arena.clone(),
-        offset,
-        len,
-    })
-}
-
-/// Parallel chunked read of a contiguous file range into `dst`. Splits the
-/// range into `CHUNK_COUNT` sub-ranges, opens `CHUNK_COUNT` independent
-/// `File` handles, and issues `pread` (`read_exact_at`) calls concurrently
-/// from rayon workers. Each thread writes a disjoint sub-slice of `dst`
-/// so there's no aliasing.
-///
-/// Single-thread `read_exact` on Gemma-4-26B's 1.4 GiB BF16 tensors
-/// (embed, lm_head) was running at ~440 MB/s, ~10× under NVMe Gen4 peak
-/// (4700 MB/s). The bottleneck is not the disk: a single read syscall
-/// keeps NVMe queue depth at 1 and pays page-cache copy + memcpy
-/// serialization. 4-way pread gives the device-mapper / NVMe queue
-/// enough concurrent in-flight requests to saturate the link.
-///
-/// More than 4 chunks adds `File::open` overhead without raising
-/// throughput on most desktop NVMe drives.
-fn read_chunked_par(path: &std::path::Path, file_offset: u64, dst: &mut [u8]) -> Result<()> {
-    use rayon::prelude::*;
-    use std::os::unix::fs::FileExt;
-    let len = dst.len();
-    if len == 0 {
-        return Ok(());
-    }
-    const CHUNK_COUNT: usize = 8;
-    let chunk_size = len.div_ceil(CHUNK_COUNT);
-    let dst_ptr = dst.as_mut_ptr() as usize;
-    (0..CHUNK_COUNT)
-        .into_par_iter()
-        .try_for_each(|i| -> Result<()> {
-            let chunk_start = i * chunk_size;
-            if chunk_start >= len {
-                return Ok(());
-            }
-            let chunk_end = (chunk_start + chunk_size).min(len);
-            let chunk_len = chunk_end - chunk_start;
-            let file = std::fs::File::open(path)?;
-            // SAFETY: chunks are disjoint by construction (i × chunk_size,
-            // non-overlapping ranges); `dst_ptr + chunk_start` is in-bounds
-            // because `chunk_end ≤ len`.
-            let chunk_dst = unsafe {
-                std::slice::from_raw_parts_mut(
-                    (dst_ptr as *mut u8).add(chunk_start),
-                    chunk_len,
-                )
-            };
-            file.read_exact_at(chunk_dst, file_offset + chunk_start as u64)?;
-            Ok(())
-        })?;
-    Ok(())
-}
-
-/// Read a BF16 tensor directly from disk into a CUDA-pinned u16 buffer.
-/// Safetensors uses little-endian byte order, same as x86/ARM, so the raw bytes
-/// can be reinterpreted as u16 values in-place without endian conversion.
-fn alloc_pinned_u16_from_file(
-    runtime: &CudaRuntime,
-    tensor: &TensorInfo,
-    label: &'static str,
-) -> Result<PinnedHostSlice<u16>> {
-    let len_bytes = tensor.data_len_bytes() as usize;
-    if len_bytes % 2 != 0 {
-        return Err(AegisError::InvalidPlan(format!(
-            "`{}` BF16 byte length is not even: {len_bytes}",
-            tensor.name
-        )));
-    }
-    let len_u16 = len_bytes / 2;
-    let mut pinned = unsafe { runtime.stream.context().alloc_pinned::<u16>(len_u16) }
-        .map_err(map_cuda_err(label))?;
-    {
-        let dst_u16 = pinned.as_mut_slice().map_err(map_cuda_err(label))?;
-        // Safety: u16 and u8 have the same alignment requirements here; we treat the
-        // pinned u16 buffer as a raw byte buffer for the initial file read.
-        let dst_u8 = unsafe {
-            std::slice::from_raw_parts_mut(dst_u16.as_mut_ptr() as *mut u8, len_bytes)
-        };
-        read_chunked_par(&tensor.shard_path, tensor.file_offsets.0, dst_u8)?;
-        if let Ok(file) = std::fs::File::open(&tensor.shard_path) {
-            aegisllm_base::tensor::storage::fadvise_dont_need(
-                &file,
-                tensor.file_offsets.0,
-                len_bytes as u64,
-            );
-        }
-    }
+    _label: &'static str,
+) -> Result<OwnedPinnedBuf> {
+    let mut pinned = OwnedPinnedBuf::new(bytes.len())?;
+    pinned.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
     Ok(pinned)
 }
 use aegisllm_base::graph::{GraphRegion, TensorRole};
@@ -182,49 +36,26 @@ use aegisllm_base::tensor::storage::{
 };
 use aegisllm_base::tensor::{TensorDType, TensorInfo};
 
+/// Callback invoked by the loader to report fine-grained sub-step progress
+/// (e.g. "layer 5 expert 64/128") between coarse `step` advances. The executor
+/// wires this to its TTY progress indicator; cross-crate callers that don't
+/// care about progress just leave it `None`.
+pub type LoadStatusSink = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 pub struct CudaWeightLoader<'a> {
     runtime: &'a CudaRuntime,
-    /// Shared pinned-host arena for staged-NVFP4 weight residency. When set,
-    /// host-resident NVFP4 weights are read directly into this arena instead
-    /// of allocating a separate `cuMemAllocHost` per tensor — collapses ~7700
-    /// pinned allocations into one. `None` for paths that don't need host
-    /// residency (used for backwards-compatible callers).
-    arena: Option<super::host_arena::ArenaHandle>,
-    /// Single reusable pinned-host bounce buffer for VRAM-resident weight
-    /// uploads. Replaces the prior `mmap shard → clone_htod` path which
-    /// (a) ballooned the kernel page cache by the full ~17 GiB model size
-    /// and (b) bounced through the CUDA driver's internal pinned staging on
-    /// every memcpy from a pageable mmap source. With this buffer, each
-    /// VRAM-resident tensor is read directly from disk into pinned memory
-    /// (no page-cache fill) and then DMA'd to the device with a single
-    /// pinned→device memcpy. Sized to the largest tensor seen so far —
-    /// grows on demand and stays at high-water mark for the rest of the
-    /// load. Wrapped in `RefCell` because `&CudaWeightLoader` is used by
-    /// many `&self` methods and only the inner buffer needs interior
-    /// mutability.
-    bounce: std::cell::RefCell<Option<PinnedHostSlice<u8>>>,
+    /// Optional callback for fine-grained sub-step progress. Heavy inner
+    /// loops (MoE experts, big BF16 uploads) call `report_status(...)` so
+    /// the user's progress indicator can refresh between coarse `step`
+    /// advances.
+    status_sink: Option<LoadStatusSink>,
 }
 
 impl CudaRuntime {
     pub fn weight_loader(&self) -> CudaWeightLoader<'_> {
         CudaWeightLoader {
             runtime: self,
-            arena: None,
-            bounce: std::cell::RefCell::new(None),
-        }
-    }
-
-    /// Create a weight loader bound to a pre-allocated pinned-host arena.
-    /// The arena is consumed by host-resident NVFP4 weights as they are loaded;
-    /// non-host-resident weights ignore it.
-    pub fn weight_loader_with_arena(
-        &self,
-        arena: super::host_arena::ArenaHandle,
-    ) -> CudaWeightLoader<'_> {
-        CudaWeightLoader {
-            runtime: self,
-            arena: Some(arena),
-            bounce: std::cell::RefCell::new(None),
+            status_sink: None,
         }
     }
 }
@@ -234,6 +65,22 @@ impl CudaWeightLoader<'_> {
         self.runtime.device_index()
     }
 
+    /// Attach a sub-step status callback (overwrites any prior sink). The
+    /// loader invokes it from heavy inner loops via `report_status`.
+    pub fn with_status_sink(mut self, sink: LoadStatusSink) -> Self {
+        self.status_sink = Some(sink);
+        self
+    }
+
+    /// Emit a sub-step status line via the attached sink, if any. Cheap
+    /// no-op when no sink is set, so call-site clutter is the only cost
+    /// for callers that don't wire one in.
+    pub fn report_status(&self, label: &str) {
+        if let Some(sink) = self.status_sink.as_ref() {
+            sink(label);
+        }
+    }
+
     /// Borrow the underlying runtime for callers that need direct access to
     /// allocator / upload primitives during loading. Used by the executor's
     /// loader to populate `router_per_expert_scale_device` and similar
@@ -241,196 +88,6 @@ impl CudaWeightLoader<'_> {
     pub fn runtime(&self) -> &CudaRuntime {
         self.runtime
     }
-
-    /// Borrow the loader's pinned arena (set when the loader was built via
-    /// `weight_loader_with_arena`). Returns `None` for the bare-loader
-    /// variant. Used by the parallel host-NVFP4 prefetch helper below.
-    pub fn arena(&self) -> Option<&super::host_arena::ArenaHandle> {
-        self.arena.as_ref()
-    }
-
-    /// Parallel-read pairs of NVFP4 tensors (`{prefix}.weight`,
-    /// `{prefix}.weight_scale`) into the loader's pinned host arena.
-    ///
-    /// Each `(weight, scales)` pair runs on a rayon worker that opens the
-    /// safetensors shard file, seeks to the tensor's byte range, and reads
-    /// directly into the arena via `arena.alloc_and_fill`. The arena bump
-    /// pointer is atomic (`SeqCst fetch_add`) so concurrent calls produce
-    /// disjoint regions. Returns the host bytes in input order so the
-    /// serial consumer can attach them to the matching `DeviceNvfp4Linear`
-    /// without re-reading.
-    ///
-    /// Used by the MoE expert loader to overlap the per-tensor file I/O
-    /// across all 128 routed experts × 3 projections instead of issuing
-    /// one read at a time. NVMe benefits from ≥4 concurrent in-flight
-    /// reads; rayon's default pool (≈ #cores) is plenty.
-    pub fn prefetch_host_nvfp4_pairs_par<'a>(
-        &self,
-        artifact: &'a ModelArtifact,
-        prefixes: &[String],
-    ) -> Result<Vec<(super::types::HostWeightBytes, super::types::HostWeightBytes)>> {
-        use rayon::prelude::*;
-        let arena = self.arena.as_ref().ok_or_else(|| {
-            AegisError::InvalidPlan(
-                "prefetch_host_nvfp4_pairs_par requires loader built with arena".into(),
-            )
-        })?;
-        prefixes
-            .par_iter()
-            .map(|prefix| -> Result<(super::types::HostWeightBytes, super::types::HostWeightBytes)> {
-                let weight = artifact
-                    .tensors
-                    .get(&format!("{prefix}.weight"))
-                    .ok_or_else(|| {
-                        AegisError::InvalidPlan(format!("missing `{prefix}.weight`"))
-                    })?;
-                let scales = artifact
-                    .tensors
-                    .get(&format!("{prefix}.weight_scale"))
-                    .ok_or_else(|| {
-                        AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`"))
-                    })?;
-                let packed = read_tensor_into_arena(arena, weight)?;
-                let s = read_tensor_into_arena(arena, scales)?;
-                Ok((packed, s))
-            })
-            .collect::<Result<Vec<_>>>()
-    }
-
-    /// Build a `DeviceNvfp4Linear` for a host-resident layer using bytes
-    /// already read into the arena by `prefetch_host_nvfp4_pairs_par`.
-    ///
-    /// This is the **finalize** half of the parallel-prefetch flow: the
-    /// expensive part (file I/O into pinned arena) ran on a rayon worker,
-    /// and now the main thread does the cheap CUDA-side work (two 1-byte
-    /// stub allocs and the metadata struct construction). `loader` is
-    /// still consulted for the optional `weight_scale_2` / `input_scale`
-    /// scalars which are tiny and stay on the mmap path.
-    ///
-    /// Skips the repack branches of the full
-    /// `load_nvfp4_linear_with_layout` because those run only for
-    /// VRAM-resident layouts (native MXFP4 / cutlass NVFP4), which the
-    /// prefetch path is not currently used for.
-    pub fn finalize_host_nvfp4_with_prefetched(
-        &self,
-        artifact: &ModelArtifact,
-        prefix: &str,
-        residency: TensorResidencyPlan,
-        store: StoragePlacement,
-        packed_bytes: super::types::HostWeightBytes,
-        scales_bytes: super::types::HostWeightBytes,
-        loader: &mut TensorStorageLoader,
-    ) -> Result<DeviceNvfp4Linear> {
-        let kernel_family = cuda_nvfp4_kernel_family_for_layout(
-            prefix,
-            aegisllm_base::tensor::layout::LinearResidentLayout::PackedSource,
-        )?;
-        let weight = artifact
-            .tensors
-            .get(&format!("{prefix}.weight"))
-            .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight`")))?;
-        let scales = artifact
-            .tensors
-            .get(&format!("{prefix}.weight_scale"))
-            .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`")))?;
-        let output_scale = artifact
-            .tensors
-            .get(&format!("{prefix}.weight_scale_2"))
-            .map(|tensor| read_scalar_f32_with_loader(loader, tensor, store))
-            .transpose()?
-            .unwrap_or(1.0);
-        let input_scale = artifact
-            .tensors
-            .get(&format!("{prefix}.input_scale"))
-            .map(|tensor| read_scalar_f32_with_loader(loader, tensor, store))
-            .transpose()?
-            .unwrap_or(1.0);
-        let spec = Nvfp4LinearSpec::from_tensors(prefix, weight, scales, input_scale, output_scale)?;
-        let stub_packed = self
-            .runtime
-            .stream
-            .clone_htod(&[0u8])
-            .map_err(map_cuda_err("htod nvfp4 host-resident stub packed"))?;
-        let stub_scales = self
-            .runtime
-            .stream
-            .clone_htod(&[0u8])
-            .map_err(map_cuda_err("htod nvfp4 host-resident stub scales"))?;
-        Ok(DeviceNvfp4Linear {
-            name: spec.name,
-            rows: spec.rows,
-            cols: spec.cols,
-            packed_bytes: spec.packed_bytes,
-            scale_bytes: spec.scale_bytes,
-            input_scale: spec.input_scale,
-            output_scale: spec.output_scale,
-            kernel_family,
-            resident_layout: aegisllm_base::tensor::layout::LinearResidentLayout::PackedSource,
-            residency,
-            packed: stub_packed,
-            scales: stub_scales,
-            native_mxfp4: None,
-            cutlass_nvfp4: None,
-            host_weights: Some(Box::new(super::types::HostResidentWeights {
-                packed: packed_bytes,
-                scales: scales_bytes,
-                native_mxfp4: None,
-            })),
-        })
-    }
-
-    /// Ensure the loader's pinned bounce is ≥ `min_len` bytes, then read
-    /// `tensor`'s bytes directly from disk into it. Returns a guard that
-    /// callers use to access the populated pinned slice; on guard drop,
-    /// the bounce stays allocated for reuse by the next tensor.
-    ///
-    /// This is the load-time replacement for `loader.load_for_store(...,
-    /// Vram) → mmap → clone_htod`. Two payoffs vs the mmap path:
-    ///
-    ///   1. No kernel page-cache fill. The destination is pinned host
-    ///      memory; reading into it does not populate the page cache for
-    ///      the source file. Combined with the `fadvise(DONTNEED)` on the
-    ///      file range afterwards, the kernel evicts the just-read pages
-    ///      eagerly instead of accumulating ~17 GiB of cached weights and
-    ///      then discarding them in 8 GiB sawtooth bursts.
-    ///   2. No implicit pageable→pinned bounce inside `cudaMemcpy`. The
-    ///      source is already pinned, so the H2D is a single DMA hop.
-    fn read_tensor_into_pinned(
-        &self,
-        tensor: &TensorInfo,
-    ) -> Result<()> {
-        let len = tensor.data_len_bytes() as usize;
-        let need_realloc = self
-            .bounce
-            .borrow()
-            .as_ref()
-            .map(|b| b.len() < len)
-            .unwrap_or(true);
-        if need_realloc {
-            *self.bounce.borrow_mut() = None;
-            let pinned = self.runtime.alloc_pinned_u8(len)?;
-            *self.bounce.borrow_mut() = Some(pinned);
-        }
-        let mut bounce_ref = self.bounce.borrow_mut();
-        let bounce = bounce_ref.as_mut().expect("bounce just ensured to exist");
-        let bytes = bounce
-            .as_mut_slice()
-            .map_err(map_cuda_err("bounce as_mut_slice"))?;
-        // 4-way parallel pread; 1.4 GiB BF16 tensors (embed, lm_head) were
-        // ~3.2 s single-threaded — saturating the read syscall at QD 1
-        // instead of letting NVMe Gen4 overlap requests. Concurrent pread
-        // halves it to ~0.7 s on a desktop NVMe.
-        read_chunked_par(&tensor.shard_path, tensor.file_offsets.0, &mut bytes[..len])?;
-        if let Ok(file) = std::fs::File::open(&tensor.shard_path) {
-            aegisllm_base::tensor::storage::fadvise_dont_need(
-                &file,
-                tensor.file_offsets.0,
-                len as u64,
-            );
-        }
-        Ok(())
-    }
-
 
     pub fn load_dense_vector_with_store(
         &self,
@@ -470,7 +127,7 @@ impl CudaWeightLoader<'_> {
     pub fn load_bf16_matrix_with_store(
         &self,
         tensor: &TensorInfo,
-        store: StoragePlacement,
+        _store: StoragePlacement,
         residency: TensorResidencyPlan,
         loader: &mut TensorStorageLoader,
     ) -> Result<DeviceBf16Matrix> {
@@ -480,42 +137,45 @@ impl CudaWeightLoader<'_> {
                 tensor.name
             )));
         }
-        // Residency is now strictly config-driven: `store=ram` → host-pinned;
-        // `store=vram` → device-resident. There is no force_vram override.
-        // If the host-resident matvec path is too slow for a given workload
-        // (e.g. lm_head over WRITECOMBINED RAM is ~30× slower than the VRAM
-        // kernel), set `output-layer.store = vram` in parameters.json.
         let is_host_resident = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
+
+        // Both branches read through the shared shard mmap (cached in
+        // `TensorStorageLoader`). The shard mmap IS the storage — host-
+        // resident weights borrow into it directly (file-backed pages,
+        // counted as "Cached", evictable under pressure), and VRAM-
+        // resident uploads memcpy from it once. No anonymous-RAM
+        // pinned copy, no per-tensor `cuMemAllocHost`, no bounce buffer
+        // — the load-time peak collapses to whatever the kernel chooses
+        // to keep in page cache, which is reclaimable.
+        let loaded = loader.load_for_store(tensor, StoragePlacement::Mmap)?;
+
         if is_host_resident {
-            // Read directly from file into pinned u16 memory — avoids the mmap page-cache
-            // copy and the intermediate Vec<u16>; only one copy of the data exists in RAM.
-            let pinned = alloc_pinned_u16_from_file(
-                self.runtime,
-                tensor,
-                "alloc pinned bf16 host",
-            )?;
+            // Synchronously fault every page so "model loaded" actually
+            // means the BF16 matrix is in RAM, not lazy-on-first-access.
+            loaded.prefault();
             let stub = self
                 .runtime
                 .stream
                 .clone_htod(&[0u16])
                 .map_err(map_cuda_err("htod bf16 host-resident stub"))?;
+            let host_weights = HostBf16Weights::from_loaded(loaded)?;
             return Ok(DeviceBf16Matrix {
                 name: tensor.name.clone(),
                 rows: tensor.shape[0],
                 cols: tensor.shape[1],
                 residency,
                 values: stub,
-                host_values: Some(Box::new(HostBf16Weights { values: pinned })),
+                host_values: Some(Box::new(host_weights)),
             });
         }
-        // VRAM-resident BF16: bypass the mmap path entirely. Read the
-        // tensor's bytes from disk into the loader's pinned bounce buffer,
-        // then DMA from pinned → fresh u16-typed VRAM. Avoids both the
-        // kernel page-cache fill and the implicit pageable→pinned bounce
-        // inside `cudaMemcpy` from the old `mmap → clone_htod` path.
-        // `loader` is unused on this branch but kept in the signature
-        // because the host-resident branch above still consults it.
-        let _ = loader;
+
+        // VRAM-resident BF16: H2D from the shard mmap straight into a
+        // fresh u16-typed VRAM buffer. The driver pays a one-time
+        // pageable→pinned bounce internally; that's fine for load-time
+        // (vs the prior 1.4 GiB pinned-anon bounce buffer). After this
+        // call returns, the loader's drop hooks call
+        // `posix_fadvise(DONTNEED)` on the touched range so the kernel
+        // can reclaim the page-cache pages immediately.
         let len_bytes = tensor.data_len_bytes() as usize;
         if len_bytes % 2 != 0 {
             return Err(AegisError::InvalidPlan(format!(
@@ -523,24 +183,27 @@ impl CudaWeightLoader<'_> {
             )));
         }
         let len_u16 = len_bytes / 2;
-        self.read_tensor_into_pinned(tensor)?;
-        let mut buffer = self.runtime.alloc_u16(len_u16)?;
-        let bounce_ref = self.bounce.borrow();
-        let bounce = bounce_ref
-            .as_ref()
-            .expect("bounce populated by read_tensor_into_pinned");
-        let bounce_bytes = bounce
-            .as_slice()
-            .map_err(map_cuda_err("bounce as_slice for bf16 htod"))?;
-        // SAFETY: cuMemAllocHost returns page-aligned memory (so 2-byte
-        // alignment is satisfied), and `len_bytes` is even-checked above.
-        let bounce_u16: &[u16] = unsafe {
-            std::slice::from_raw_parts(bounce_bytes.as_ptr() as *const u16, len_u16)
+        let bytes = loaded.as_bytes();
+        // Reinterpret as &[u16] — safetensors aligns tensor data to 8 bytes,
+        // so 2-byte alignment of the file offset is guaranteed.
+        if (bytes.as_ptr() as usize) % 2 != 0 {
+            return Err(AegisError::InvalidPlan(format!(
+                "BF16 mmap source for `{}` is not 2-byte aligned",
+                tensor.name
+            )));
+        }
+        // SAFETY: bytes from a shard mmap, aligned check above; len_u16 * 2 == len_bytes.
+        let src_u16: &[u16] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const u16, len_u16)
         };
+        let mut buffer = self.runtime.alloc_u16(len_u16)?;
         self.runtime
             .stream
-            .memcpy_htod(bounce_u16, &mut buffer.slice)
-            .map_err(map_cuda_err("htod bf16 matrix from pinned"))?;
+            .memcpy_htod(src_u16, &mut buffer.slice)
+            .map_err(map_cuda_err("htod bf16 matrix from mmap"))?;
+        // The `memcpy_htod` is synchronous from a pageable source (driver
+        // bounces internally and waits), so by the time we return the
+        // VRAM buffer is fully populated and `loaded` can drop safely.
         Ok(DeviceBf16Matrix {
             name: tensor.name.clone(),
             rows: tensor.shape[0],
@@ -692,9 +355,12 @@ impl CudaWeightLoader<'_> {
             Nvfp4LinearSpec::from_tensors(prefix, weight, scales, input_scale, output_scale)?;
         let is_host_resident = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
 
-        // Load mmap data only when it is needed: VRAM upload, or repacking for tensor cores.
-        // For plain host-resident layers (staged streaming) we read straight into pinned RAM
-        // via alloc_pinned_u8_from_file, avoiding the kernel page-cache copy entirely.
+        // We need the mmap'd bytes up-front whenever the call site has to
+        // read them on this thread: VRAM upload (clone_htod below), or
+        // load-time repacking into native MXFP4 / cutlass NVFP4. For the
+        // plain host-resident NVFP4 path the staging pool reads from the
+        // shard mmap on demand at inference time, so we don't fault the
+        // pages here.
         let needs_mmap = !is_host_resident
             || self.should_repack_native_mxfp4(prefix, kernel_family)
             || self.should_repack_cutlass_nvfp4(prefix, kernel_family, resident_layout);
@@ -793,24 +459,28 @@ impl CudaWeightLoader<'_> {
                 } else {
                     None
                 };
-            // Host-resident NVFP4 weights are read directly into the shared
-            // pinned-host arena. One `cuMemAllocHost` covers all weights;
-            // each tensor sub-allocates by atomic offset bump. This keeps the
-            // hot inference path with **zero CPU memcpy** (source is pinned →
-            // GPU DMA pulls directly) at the cost of locking ~total_model_size
-            // RAM. See `host_arena.rs` for the rationale and trade-off vs the
-            // earlier mmap+bounce approach.
-            let arena = self.arena.as_ref().ok_or_else(|| {
-                AegisError::InvalidPlan(format!(
-                    "host-resident NVFP4 layer `{}` requires the loader to be built \
-                     with `weight_loader_with_arena(...)`; got bare `weight_loader()`",
-                    spec.name,
-                ))
-            })?;
-            let packed_arena = read_tensor_into_arena(arena, weight)?;
-            let scales_arena = read_tensor_into_arena(arena, scales)?;
-            let mmap_packed = packed_arena;
-            let mmap_scales = scales_arena;
+            // Host-resident weights point straight into the shard mmap
+            // (cached in `TensorStorageLoader`). The mmap IS the
+            // storage — file-backed pages, counted as "Cached" (not
+            // RSS), reclaimable under memory pressure. Per-token
+            // inference does a CPU memcpy mmap → per-slot pinned
+            // bounce → DMA (handled by the staging pool) instead of
+            // the prior zero-copy arena DMA, which is slightly slower
+            // but eliminates the ~12 GiB anonymous-RAM pinned arena
+            // that used to make peak host RAM scale with model size.
+            let packed_loaded = loader.load_for_store(weight, StoragePlacement::Mmap)?;
+            let scales_loaded = loader.load_for_store(scales, StoragePlacement::Mmap)?;
+            // Synchronously fault every page in. Without this, the mmap
+            // pages stay un-faulted until first inference access, so
+            // "model loaded" wouldn't actually mean "all weights are in
+            // RAM" — the first request would block on disk reads.
+            packed_loaded.prefault();
+            scales_loaded.prefault();
+            let (mmap_packed, mmap_scales) = (
+                HostWeightBytes::Mmap(packed_loaded),
+                HostWeightBytes::Mmap(scales_loaded),
+            );
+            let _ = store;
             let stub_packed = self
                 .runtime
                 .stream

@@ -1,5 +1,6 @@
-use cudarc::driver::{CudaEvent, CudaSlice, CudaView, PinnedHostSlice};
+use cudarc::driver::{CudaEvent, CudaSlice, CudaView};
 
+use super::owned_pinned::OwnedPinnedBuf;
 use super::runtime::{CudaRuntime, map_cuda_err};
 use super::types::{HostResidentMxfp4, HostResidentWeights};
 use aegisllm_base::error::{AegisError, Result};
@@ -17,9 +18,9 @@ pub(crate) struct StagingSlot {
     packed: CudaSlice<u8>,
     scales: CudaSlice<u8>,
     native_mxfp4: Option<CudaSlice<u8>>,
-    bounce_packed: PinnedHostSlice<u8>,
-    bounce_scales: PinnedHostSlice<u8>,
-    bounce_native_mxfp4: Option<PinnedHostSlice<u8>>,
+    bounce_packed: OwnedPinnedBuf,
+    bounce_scales: OwnedPinnedBuf,
+    bounce_native_mxfp4: Option<OwnedPinnedBuf>,
     /// Reusable compute-stream event re-recorded after every kernel that reads
     /// this slot. Transfer waits on this before overwriting. Pre-allocated
     /// once — re-recording is cheap, allocating a fresh event each call is not.
@@ -93,15 +94,12 @@ impl LinearStagingPool {
                 .map_err(map_cuda_err("alloc staging packed buffer"))?;
             let scales = unsafe { stream.alloc::<u8>(cap_s) }
                 .map_err(map_cuda_err("alloc staging scales buffer"))?;
-            let bounce_packed = unsafe { stream.context().alloc_pinned::<u8>(cap_p) }
-                .map_err(map_cuda_err("alloc staging packed bounce"))?;
-            let bounce_scales = unsafe { stream.context().alloc_pinned::<u8>(cap_s) }
-                .map_err(map_cuda_err("alloc staging scales bounce"))?;
+            let bounce_packed = OwnedPinnedBuf::new(cap_p)?;
+            let bounce_scales = OwnedPinnedBuf::new(cap_s)?;
             let (native_mxfp4, bounce_native_mxfp4) = if max_native_mxfp4_bytes > 0 {
                 let dev = unsafe { stream.alloc::<u8>(max_native_mxfp4_bytes) }
                     .map_err(map_cuda_err("alloc staging native mxfp4 buffer"))?;
-                let bounce = unsafe { stream.context().alloc_pinned::<u8>(max_native_mxfp4_bytes) }
-                    .map_err(map_cuda_err("alloc staging native mxfp4 bounce"))?;
+                let bounce = OwnedPinnedBuf::new(max_native_mxfp4_bytes)?;
                 (Some(dev), Some(bounce))
             } else {
                 (None, None)
@@ -218,14 +216,16 @@ impl LinearStagingPool {
                 .map_err(map_cuda_err("staging async h2d packed (pinned src)"))?;
         } else {
             let src = hw.packed.as_bytes()?;
-            let bounce = slot
-                .bounce_packed
-                .as_mut_slice()
-                .map_err(map_cuda_err("staging packed bounce slice"))?;
+            let bounce = slot.bounce_packed.as_mut_slice();
             bounce[..packed_bytes].copy_from_slice(&src[..packed_bytes]);
             let mut dst = slot.packed.slice_mut(0..packed_bytes);
+            // Slice the bounce to exactly `packed_bytes`. Passing the whole
+            // `&OwnedPinnedBuf` would expose its full capacity (sized for
+            // the largest layer) and cudarc's memcpy_htod asserts
+            // `dst.len() >= src.len()` → panic on any smaller layer.
+            let src_pinned: &[u8] = &slot.bounce_packed.as_slice()[..packed_bytes];
             transfer_stream
-                .memcpy_htod(&slot.bounce_packed, &mut dst)
+                .memcpy_htod(src_pinned, &mut dst)
                 .map_err(map_cuda_err("staging async h2d packed (bounce)"))?;
         }
         if hw.scales.is_pinned() {
@@ -236,14 +236,12 @@ impl LinearStagingPool {
                 .map_err(map_cuda_err("staging async h2d scales (pinned src)"))?;
         } else {
             let src = hw.scales.as_bytes()?;
-            let bounce = slot
-                .bounce_scales
-                .as_mut_slice()
-                .map_err(map_cuda_err("staging scales bounce slice"))?;
+            let bounce = slot.bounce_scales.as_mut_slice();
             bounce[..scale_bytes].copy_from_slice(&src[..scale_bytes]);
             let mut dst = slot.scales.slice_mut(0..scale_bytes);
+            let src_pinned: &[u8] = &slot.bounce_scales.as_slice()[..scale_bytes];
             transfer_stream
-                .memcpy_htod(&slot.bounce_scales, &mut dst)
+                .memcpy_htod(src_pinned, &mut dst)
                 .map_err(map_cuda_err("staging async h2d scales (bounce)"))?;
         }
 
@@ -300,13 +298,12 @@ impl LinearStagingPool {
                         .into(),
                 )
             })?;
-            let bounce_slice = bounce
-                .as_mut_slice()
-                .map_err(map_cuda_err("staging native mxfp4 bounce slice"))?;
+            let bounce_slice = bounce.as_mut_slice();
             bounce_slice[..len].copy_from_slice(&src[..len]);
             let mut dst = buf.slice_mut(0..len);
+            let src_pinned: &[u8] = &bounce.as_slice()[..len];
             transfer_stream
-                .memcpy_htod(bounce, &mut dst)
+                .memcpy_htod(src_pinned, &mut dst)
                 .map_err(map_cuda_err("staging async h2d native mxfp4 (bounce)"))?;
         }
         // Re-record the same transfer event so the next compute_wait_event
@@ -400,14 +397,12 @@ impl LinearStagingPool {
                 .map_err(map_cuda_err("staging h2d packed (pinned src)"))?;
         } else {
             let src = hw.packed.as_bytes()?;
-            let bounce = slot
-                .bounce_packed
-                .as_mut_slice()
-                .map_err(map_cuda_err("sync staging packed bounce slice"))?;
+            let bounce = slot.bounce_packed.as_mut_slice();
             bounce[..packed_bytes].copy_from_slice(&src[..packed_bytes]);
             let mut dst = slot.packed.slice_mut(0..packed_bytes);
+            let src_pinned: &[u8] = &slot.bounce_packed.as_slice()[..packed_bytes];
             stream
-                .memcpy_htod(&slot.bounce_packed, &mut dst)
+                .memcpy_htod(src_pinned, &mut dst)
                 .map_err(map_cuda_err("staging h2d packed (bounce)"))?;
         }
         if hw.scales.is_pinned() {
@@ -418,14 +413,12 @@ impl LinearStagingPool {
                 .map_err(map_cuda_err("staging h2d scales (pinned src)"))?;
         } else {
             let src = hw.scales.as_bytes()?;
-            let bounce = slot
-                .bounce_scales
-                .as_mut_slice()
-                .map_err(map_cuda_err("sync staging scales bounce slice"))?;
+            let bounce = slot.bounce_scales.as_mut_slice();
             bounce[..scale_bytes].copy_from_slice(&src[..scale_bytes]);
             let mut dst = slot.scales.slice_mut(0..scale_bytes);
+            let src_pinned: &[u8] = &slot.bounce_scales.as_slice()[..scale_bytes];
             stream
-                .memcpy_htod(&slot.bounce_scales, &mut dst)
+                .memcpy_htod(src_pinned, &mut dst)
                 .map_err(map_cuda_err("staging h2d scales (bounce)"))?;
         }
         self.last_prepared_slot = Some(0);

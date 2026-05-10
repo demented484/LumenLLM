@@ -303,9 +303,13 @@ impl TensorStorageLoader {
 
 impl Drop for TensorStorageLoader {
     fn drop(&mut self) {
-        // Best-effort page-cache eviction at the end of weight loading.
-        // Safe to skip on errors (we just keep the cache; not fatal).
-        self.release_page_cache();
+        // Intentionally NO page-cache eviction here. Host-resident
+        // weights (mmap-as-storage) keep their `Arc<Mmap>` clones
+        // alive past the loader; a `posix_fadvise(DONTNEED)` on the
+        // whole shard would evict those pages and force every first
+        // inference access to re-read from disk. Per-tensor eviction
+        // for VRAM-resident uploads happens in `LoadedHostTensor::Drop`
+        // on a tighter range, leaving host-resident regions intact.
     }
 }
 
@@ -363,6 +367,53 @@ impl LoadedHostTensor {
         if let HostTensorStorage::Mmap { map, offset, len } = &self.storage {
             let _ = map.advise_range(Advice::WillNeed, *offset, *len);
         }
+    }
+
+    /// Force the kernel to populate every page covering this tensor's
+    /// mmap range — synchronously reads them from disk into the page
+    /// cache so the first inference doesn't pay disk-read latency on
+    /// cold pages. Bypasses the lazy-fault behavior of `mmap` + relies
+    /// on Linux-only `MADV_POPULATE_READ` (kernel ≥ 5.14, which our
+    /// dev hosts satisfy). Returns the number of pages touched so the
+    /// caller can log the prefault size.
+    ///
+    /// We use this at end-of-load on every host-resident weight so that
+    /// "model loaded" actually means "all weights are in RAM" — same
+    /// guarantee as the prior pinned-arena loader, just backed by file
+    /// pages (counted as `Cached` and reclaimable on shutdown) instead
+    /// of anonymous-RAM pinned allocations.
+    pub fn prefault(&self) -> usize {
+        let HostTensorStorage::Mmap { map, offset, len } = &self.storage else {
+            return 0;
+        };
+        if *len == 0 {
+            return 0;
+        }
+        // SAFETY: read-only access to a `MAP_SHARED|PROT_READ` file
+        // mapping; the bytes are valid for the lifetime of `self.map`.
+        let base = unsafe { map.as_ptr().add(*offset) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        // Try the kernel's synchronous prefault path first. On older
+        // kernels MADV_POPULATE_READ returns EINVAL and we fall back to
+        // touching one byte per page, which gets us the same effect via
+        // explicit page faults.
+        const MADV_POPULATE_READ: libc::c_int = 22;
+        let r = unsafe { libc::madvise(base as *mut _, *len, MADV_POPULATE_READ) };
+        if r == 0 {
+            return len.div_ceil(page_size);
+        }
+        // Fallback: touch one byte per page so the kernel faults the
+        // page in. `read_volatile` to make sure the compiler doesn't
+        // optimise the read away (`std::hint::black_box` would also
+        // work but is less explicit about the read semantics).
+        let mut touched = 0usize;
+        let mut off = 0usize;
+        while off < *len {
+            let _ = unsafe { std::ptr::read_volatile(base.add(off)) };
+            touched += 1;
+            off += page_size;
+        }
+        touched
     }
 }
 

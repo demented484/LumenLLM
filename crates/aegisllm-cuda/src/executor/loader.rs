@@ -410,66 +410,37 @@ fn load_cuda_moe(
     };
 
     let mut experts = Vec::with_capacity(num_experts);
-    let timing = std::env::var("AEGIS_LOAD_TIMING").is_ok();
     let t_experts = std::time::Instant::now();
 
-    // Parallel-prefetch fast path: when experts are host-resident and have
-    // the default resident layout (no native-MXFP4 / cutlass-NVFP4 repack),
-    // overlap the per-tensor file reads across rayon workers. The CUDA
-    // stubs and metadata struct construction still run serially (single
-    // CUDA stream) but those are cheap; the win is parallelizing 384 file
-    // reads (128 experts × 3 projections) per layer instead of issuing
-    // one at a time. The fall-through serial loop below is the original
-    // path, used when prefetch isn't applicable.
-    let prefetch_eligible = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. })
-        && resident_layout == LinearResidentLayout::PackedSource
-        && cuda.arena().is_some();
-    if prefetch_eligible {
-        // Build the ordered prefix list: expert_0.{gate, up, down}, expert_1.{gate, up, down}, …
-        let mut prefixes = Vec::with_capacity(num_experts * 3);
-        for expert_idx in 0..num_experts {
-            let ep = format!("{expert_base_prefix}.{expert_idx}");
-            prefixes.push(format!("{ep}.gate_proj"));
-            prefixes.push(format!("{ep}.up_proj"));
-            prefixes.push(format!("{ep}.down_proj"));
+    // Host-resident expert weights point straight into the shard mmaps
+    // (cached in `TensorStorageLoader`). The mmap is the storage, so
+    // there's no per-tensor file read to parallelize at load — page
+    // faults happen on first access during inference, and the OS handles
+    // readahead. Run the serial loop and let the loader hand back
+    // `HostWeightBytes::Mmap` slices.
+    for expert_idx in 0..num_experts {
+        if expert_idx % 8 == 0 {
+            cuda.report_status(&format!(
+                "layer {layer}: experts {expert_idx}/{num_experts}"
+            ));
         }
-        let prefetched = cuda.prefetch_host_nvfp4_pairs_par(artifact, &prefixes)?;
-        let mut iter = prefetched.into_iter();
-        let mut prefix_iter = prefixes.iter();
-        for _ in 0..num_experts {
-            let gate_p = prefix_iter.next().expect("prefix available");
-            let (gate_packed, gate_scales) = iter.next().expect("prefetched gate");
-            let gate_proj = cuda.finalize_host_nvfp4_with_prefetched(
-                artifact, gate_p, residency, store, gate_packed, gate_scales, loader,
-            )?;
-            let up_p = prefix_iter.next().expect("prefix available");
-            let (up_packed, up_scales) = iter.next().expect("prefetched up");
-            let up_proj = cuda.finalize_host_nvfp4_with_prefetched(
-                artifact, up_p, residency, store, up_packed, up_scales, loader,
-            )?;
-            let down_p = prefix_iter.next().expect("prefix available");
-            let (down_packed, down_scales) = iter.next().expect("prefetched down");
-            let down_proj = cuda.finalize_host_nvfp4_with_prefetched(
-                artifact, down_p, residency, store, down_packed, down_scales, loader,
-            )?;
-            experts.push(CudaMoEExpert { gate_proj, up_proj, down_proj });
-        }
-    } else {
-        for expert_idx in 0..num_experts {
-            let ep = format!("{expert_base_prefix}.{expert_idx}");
-            let gate_proj = cuda.load_nvfp4_linear_with_layout(
-                artifact, &format!("{ep}.gate_proj"), store, residency, resident_layout, loader,
-            )?;
-            let up_proj = cuda.load_nvfp4_linear_with_layout(
-                artifact, &format!("{ep}.up_proj"), store, residency, resident_layout, loader,
-            )?;
-            let down_proj = cuda.load_nvfp4_linear_with_layout(
-                artifact, &format!("{ep}.down_proj"), store, residency, resident_layout, loader,
-            )?;
-            experts.push(CudaMoEExpert { gate_proj, up_proj, down_proj });
-        }
+        let ep = format!("{expert_base_prefix}.{expert_idx}");
+        let gate_proj = cuda.load_nvfp4_linear_with_layout(
+            artifact, &format!("{ep}.gate_proj"), store, residency, resident_layout, loader,
+        )?;
+        let up_proj = cuda.load_nvfp4_linear_with_layout(
+            artifact, &format!("{ep}.up_proj"), store, residency, resident_layout, loader,
+        )?;
+        let down_proj = cuda.load_nvfp4_linear_with_layout(
+            artifact, &format!("{ep}.down_proj"), store, residency, resident_layout, loader,
+        )?;
+        experts.push(CudaMoEExpert { gate_proj, up_proj, down_proj });
     }
-    if timing {
+    // Skip per-layer expert timing on a TTY so it doesn't break the
+    // in-place progress bar (the bar already shows expert progress via
+    // `cuda.report_status(...)` ticks). Logs and pipes still get the
+    // detailed per-layer breakdown.
+    if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         eprintln!(
             "load-timing:   experts ({} × 3 NVFP4)  {:>5.2}s",
             num_experts,

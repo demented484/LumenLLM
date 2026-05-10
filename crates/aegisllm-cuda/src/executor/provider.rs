@@ -95,7 +95,6 @@ impl CudaExecutorProvider {
                 "CUDA prefill attention uses the varlen continuation kernel with bounded shared memory".into()
             }
         };
-        let timing_enabled = std::env::var("AEGIS_LOAD_TIMING").is_ok();
         let t0 = std::time::Instant::now();
         let cuda_executor = CudaLlamaExecutor::from_artifact(
             artifact,
@@ -105,24 +104,20 @@ impl CudaExecutorProvider {
             device,
             cuda_config,
         )?;
-        if timing_enabled {
-            eprintln!(
-                "load-timing: from_artifact total     {:>6.2}s",
-                t0.elapsed().as_secs_f64()
-            );
-        }
+        eprintln!(
+            "load-timing: from_artifact total     {:>6.2}s",
+            t0.elapsed().as_secs_f64()
+        );
         // Pre-allocate the per-sequence state (KV cache, scratch, sampled-token
         // buffer, etc.) so the first prompt doesn't pay for a ~10 GiB cudaMalloc
         // on its critical path. Cached in `prepared_state` and consumed by the
         // first `new_sequence_state()` caller; later callers allocate fresh.
         let t1 = std::time::Instant::now();
         let warmed = cuda_executor.new_state()?;
-        if timing_enabled {
-            eprintln!(
-                "load-timing: warmed new_state        {:>6.2}s",
-                t1.elapsed().as_secs_f64()
-            );
-        }
+        eprintln!(
+            "load-timing: warmed new_state        {:>6.2}s",
+            t1.elapsed().as_secs_f64()
+        );
         Ok(Self {
             device,
             limitations: vec![

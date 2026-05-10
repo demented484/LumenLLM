@@ -6,3 +6,4 @@
 *.prof
 *.nsys-rep
 *.sqlite
+.claude/

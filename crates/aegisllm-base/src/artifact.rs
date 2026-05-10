@@ -576,10 +576,19 @@ fn read_json_optional<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Optio
 }
 
 fn parse_lfs_pointer(path: &Path) -> Result<Option<u64>> {
-    let bytes = fs::read(path)?;
-    if bytes.len() > 512 {
+    // Git-LFS pointer files are tiny (~134 bytes); anything > 512 is not a
+    // pointer. Check the file size BEFORE reading — the previous version
+    // unconditionally loaded the whole file into a Vec via `fs::read`, then
+    // discarded everything if the size exceeded the cap. For 17 GiB of
+    // safetensors shards in a Gemma-4-26B layout, this wasted ~34 GiB of
+    // disk reads + transient Vec allocations on every artifact-open
+    // (and the Serve CLI opens twice — preview + real — so 68 GiB total).
+    // The runaway anon allocations were the visible "sawtooth" RAM pattern.
+    let size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if size > 512 {
         return Ok(None);
     }
+    let bytes = fs::read(path)?;
     let text = String::from_utf8_lossy(&bytes);
     if !text.starts_with("version https://git-lfs.github.com/spec/v1") {
         return Ok(None);

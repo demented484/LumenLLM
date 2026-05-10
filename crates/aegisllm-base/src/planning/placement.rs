@@ -278,18 +278,22 @@ impl ResolvedPlacement {
             .iter()
             .map(|region| {
                 let (store, compute) = apply_rules(region, graph.num_layers, policy);
-                // User-facing `ram` paired with a CUDA compute target is internally
-                // represented as `Mmap`: weights are file-backed and only the active
-                // working set lives in pinned host memory while the rest is paged
-                // in/out by the kernel under memory pressure. This avoids reserving
-                // the full model footprint in pinned RAM, which would not fit on
-                // memory-tight hosts even when the model itself fits in VRAM budgets.
-                let store = match (store, compute) {
-                    (StoragePlacement::Ram, ComputePlacement::Cuda { .. }) => {
-                        StoragePlacement::Mmap
-                    }
-                    other => other.0,
-                };
+                // Honor the user's `store` choice verbatim:
+                //   * `ram`  → load into pinned host arena. H2D from pinned is fast
+                //              (no driver bounce), so decode tps stays high. Costs
+                //              ~total_model_size of locked anon RAM — the user opts
+                //              into that explicitly.
+                //   * `mmap` → leave weights file-backed. The kernel pages them in
+                //              under memory pressure and out under reclaim, so RAM
+                //              stays bounded; decode is slower because each H2D
+                //              from pageable mmap pays the CUDA driver's internal
+                //              pinned-staging copy.
+                // Earlier code silently rewrote `ram → mmap` for CUDA compute on the
+                // assumption that the model wouldn't fit pinned. That removed the
+                // user's ability to opt into the fast-decode path — and the silent
+                // rewrite hid the choice. If `ram` doesn't fit on a given host the
+                // alloc fails loudly, which is the right signal to switch the
+                // config to `mmap` deliberately.
                 RegionPlacement {
                     region_id: region.id.clone(),
                     kind: region.kind,
@@ -309,6 +313,15 @@ impl ResolvedPlacement {
             policy,
             &mut warnings,
         );
+
+        // No auto-downgrade. The user's `store` choice is honored verbatim;
+        // if `store=ram` doesn't fit the budget, the gate in
+        // `validate_memory_budget` (engine.rs) emits a hard error directing
+        // the user to free RAM (`sudo sync; echo 3 > /proc/sys/vm/drop_caches`
+        // typically frees the leftover page cache from a previous run) or
+        // explicitly switch to `store=mmap`. Hidden downgrades surprise users
+        // who did the math and want pinned-arena decode speed, and they
+        // strip the user's ability to know what's actually configured.
 
         Ok(Self {
             model: model_name.into(),

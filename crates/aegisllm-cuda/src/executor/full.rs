@@ -16,7 +16,6 @@ use crate::cuda::{
     CudaRuntimeConfig,
 };
 use aegisllm_base::error::{AegisError, Result};
-use aegisllm_base::executor::tensors::require_tensor;
 use aegisllm_base::graph::{ModelGraph, RegionId};
 use aegisllm_base::planning::placement::{ResolvedPlacement, StoragePlacement};
 use aegisllm_base::planning::runtime::RuntimePlan;
@@ -71,17 +70,13 @@ impl CudaLlamaExecutor {
         }
         let cuda = CudaRuntime::new_with_config(device, cuda_config)?;
         let region_placements = placement.region_map();
-        // Pre-size the pinned-host arena to **only** what will actually live in
-        // it — NVFP4 weights (`.weight` + companion `.weight_scale`) inside
-        // regions whose placement is host-resident (store=Ram or Mmap). BF16
-        // weights inside the same regions get force-VRAM'd by the loader and
-        // never use the arena, so including them here would waste 3-4 GB of
-        // pinned RAM. Saves ~17 GB → ~14 GB locked for Gemma-4-26B.
-        let host_arena_capacity = compute_host_arena_capacity(artifact, graph, &region_placements);
-        let host_arena = std::sync::Arc::new(
-            crate::cuda::host_arena::PinnedArena::new(&cuda, host_arena_capacity)?,
-        );
-        let cuda_weights = cuda.weight_loader_with_arena(host_arena.clone());
+        // Host-resident weights live as borrowed views into the shard
+        // safetensors mmaps (cached by `TensorStorageLoader`). No pinned-
+        // host arena, no per-tensor `cuMemAllocHost`. Pages stay in the
+        // kernel page cache where they count as "Cached" (reclaimable),
+        // so peak host RAM is governed by what the kernel chooses to
+        // keep — not by an anonymous-RAM allocation that would scale
+        // with model size and freeze memory-tight desktops during load.
         let runtime_layouts = runtime_layouts_by_region(runtime);
         let mut loader = TensorStorageLoader::new();
 
@@ -96,11 +91,26 @@ impl CudaLlamaExecutor {
             .ok_or_else(|| AegisError::InvalidPlan("missing lm_head placement".into()))?;
 
         // 3 non-layer regions (embed, final_norm, lm_head) + N layers.
-        let progress = LoadProgress::new(3 + graph.num_layers);
-        let timing_enabled = std::env::var("AEGIS_LOAD_TIMING").is_ok();
+        let progress = std::sync::Arc::new(LoadProgress::new(3 + graph.num_layers));
+        // Wire the loader's sub-step sink to the progress indicator so MoE
+        // expert loops and other long inner stages emit fine-grained ticks
+        // (TTY only — non-TTY skips ticks to keep logs readable).
+        let cuda_weights = {
+            let p = progress.clone();
+            let sink: crate::cuda::LoadStatusSink =
+                std::sync::Arc::new(move |label: &str| p.tick(label));
+            cuda.weight_loader().with_status_sink(sink)
+        };
         let load_start = std::time::Instant::now();
-        let stage_t = |label: &str, t0: std::time::Instant| {
-            if timing_enabled {
+        // Per-stage timings: only print as their own lines when stderr is
+        // NOT a TTY (i.e. redirected to a log/pipe). On a TTY the progress
+        // bar updates in place — adding a fresh `load-timing:` line per
+        // stage pushes the bar off-screen on every step. The final
+        // `weights total` / `from_artifact total` summaries below still
+        // print unconditionally so the totals are visible everywhere.
+        let progress_for_stage = progress.clone();
+        let stage_t = move |label: &str, t0: std::time::Instant| {
+            if !progress_for_stage.is_tty() {
                 eprintln!(
                     "load-timing: {label:<22} {:>6.2}s  (cumulative {:>6.2}s)",
                     t0.elapsed().as_secs_f64(),
@@ -190,6 +200,7 @@ impl CudaLlamaExecutor {
                     }
                 })
                 .unwrap_or(0);
+            progress.tick(&format!("layer {layer}: starting"));
             let t0 = std::time::Instant::now();
             layers.push(load_cuda_layer(
                 &cuda_weights,
@@ -218,12 +229,10 @@ impl CudaLlamaExecutor {
             stage_t(&format!("layer {layer}"), t0);
             progress.step(&format!("layer {layer}"));
         }
-        if timing_enabled {
-            eprintln!(
-                "load-timing: weights total            {:>6.2}s",
-                load_start.elapsed().as_secs_f64()
-            );
-        }
+        eprintln!(
+            "load-timing: weights total            {:>6.2}s",
+            load_start.elapsed().as_secs_f64()
+        );
 
         let has_staged_layers = layers.iter().any(|layer| {
             [&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj]
@@ -244,46 +253,50 @@ impl CudaLlamaExecutor {
             })
         });
 
-        // Drop the loader and our local arena clone now that load is
-        // complete. The arena `Arc<PinnedArena>` is still cloned inside every
-        // host-resident weight's `HostWeightBytes::Arena { arena, .. }`, so
-        // these drops just decrement the refcount — the pinned ~12 GB stays
-        // alive for staged inference. Bookkeeping only.
+        // Drop the loader now that load is complete. Host-resident
+        // weights keep their own `Arc<Mmap>` clones into the shard
+        // mmaps, so the shard mappings stay alive past the loader.
         drop(cuda_weights);
-        drop(host_arena);
         let _ = has_staged_layers;
 
-        // Evict the safetensors shard files from the kernel page cache.
-        // Per-tensor `fadvise(DONTNEED)` calls during load are best-effort —
-        // Linux ignores them while any process holds a VMA covering the
-        // file, so the shard pages stay in the cache even after the read
-        // is done. Now that the loader (and its mmap cache) has dropped,
-        // there are no more VMAs and a full-file `posix_fadvise` reliably
-        // drops the pages. Without this, ~17 GiB of shard content sticks
-        // around in the OS page cache for the lifetime of the system —
-        // including across `kill aegisllm`, until memory pressure forces
-        // eviction. The arena's pinned copy is the runtime-of-record; the
-        // page cache is wasted bytes from this point on.
+        // Build the shard set for the post-exit sidecar (below). We
+        // intentionally do NOT `posix_fadvise(DONTNEED)` on the shards
+        // here: host-resident weights live in those shard mmaps and we
+        // just prefaulted their pages so "model loaded" actually means
+        // they're in RAM. A whole-shard fadvise would evict that work
+        // and force the first inference to re-read from disk. The
+        // sidecar runs only after process exit, when the mmap is
+        // already torn down — that's the right time to release the
+        // cache (so `Cached` doesn't outlive `aegisllm`).
         let shards: std::collections::HashSet<std::path::PathBuf> = artifact
             .tensors
             .tensors
             .values()
             .map(|t| t.shard_path.clone())
             .collect();
-        for path in &shards {
-            if let Ok(file) = std::fs::File::open(path) {
-                if let Ok(meta) = file.metadata() {
-                    aegisllm_base::tensor::storage::fadvise_dont_need(&file, 0, meta.len());
+        // Build the eviction list for the post-exit sidecar: every
+        // file under the model root that aegisllm could have touched
+        // — shards, tokenizer, configs, chat templates. Page cache
+        // grows with each (tokenizer.json alone can be 10s of MiB),
+        // and the sidecar that only knew about shards used to leave
+        // ~300-500 MiB stranded in `Cached` after kill. Walking the
+        // root once at load time captures everything; expanding the
+        // list is essentially free for the helper (a fadvise per
+        // file is ~µs).
+        let mut evict_list: std::collections::HashSet<std::path::PathBuf> = shards;
+        if let Ok(entries) = std::fs::read_dir(&artifact.root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    evict_list.insert(path);
                 }
             }
         }
-        // Install SIGTERM/SIGINT/SIGHUP handlers that re-run the fadvise
-        // sweep on graceful shutdown, since the OS may have re-cached
-        // shard pages while serving (e.g. inference shouldn't touch the
-        // shards directly, but stat() + readahead from monitoring tools
-        // can repopulate). SIGKILL is uncatchable; the in-load sweep
-        // above is the SIGKILL fallback.
-        super::cache_cleanup::install(shards);
+        // Install SIGTERM/SIGINT/SIGHUP handlers + fork the sidecar
+        // helper that runs the eviction after the parent exits.
+        // Works for graceful kills and SIGKILL alike (the parent's
+        // fd close on exit triggers the helper's pipe-EOF).
+        super::cache_cleanup::install(evict_list);
 
         // Trim the device's default cudaMallocAsync memory pool back to its
         // live working set. Loading layers in sequence builds up the pool's
@@ -1065,61 +1078,6 @@ fn prefill_attention_split_scratch(
         acc_f32: acc_f32.max(1),
         stats_f32: rows.max(1),
     })
-}
-
-/// Sum the bytes that will land in the pinned-host arena: NVFP4 weights and
-/// their `.weight_scale` companions inside host-resident regions (placement
-/// store is RAM or Mmap, not VRAM).
-///
-/// We skip:
-/// * tensors in VRAM-store regions (embed/lm_head/final_norm in our config) —
-///   they go straight to VRAM, not through the arena;
-/// * BF16 weights without a `.weight_scale` companion (attention Q/K/V/O,
-///   shared MLP, norms) — the loader force-VRAMs these even when their
-///   region's store is RAM, so they never touch the arena;
-/// * input_scale / output_scale scalars — read once into f32 at load time, no
-///   pinned host residency needed.
-///
-/// Returned value is at least 1 to satisfy `PinnedArena::new`'s non-zero
-/// capacity check (some configs may have no host-resident NVFP4 weights at
-/// all — for those the arena is allocated tiny and never used).
-fn compute_host_arena_capacity(
-    artifact: &aegisllm_base::artifact::ModelArtifact,
-    graph: &aegisllm_base::graph::ModelGraph,
-    region_placements: &std::collections::BTreeMap<
-        &aegisllm_base::graph::RegionId,
-        &aegisllm_base::planning::placement::RegionPlacement,
-    >,
-) -> usize {
-    use aegisllm_base::planning::placement::StoragePlacement;
-    let mut total: usize = 0;
-    for region in &graph.regions {
-        let placement = match region_placements.get(&region.id) {
-            Some(p) => p,
-            None => continue,
-        };
-        // Only host-resident regions contribute to the arena.
-        let host_resident = !matches!(placement.store, StoragePlacement::Vram { .. });
-        if !host_resident {
-            continue;
-        }
-        for graph_tensor in &region.tensors {
-            let name = &graph_tensor.info.name;
-            // NVFP4 quantised weight: paired `.weight` + `.weight_scale`.
-            if let Some(stem) = name.strip_suffix(".weight") {
-                let scale_name = format!("{stem}.weight_scale");
-                if artifact.tensors.has(&scale_name) {
-                    total = total.saturating_add(graph_tensor.info.data_len_bytes() as usize);
-                }
-            } else if name.ends_with(".weight_scale") {
-                total = total.saturating_add(graph_tensor.info.data_len_bytes() as usize);
-            }
-            // Scalar `.input_scale` / `.weight_scale_2` and unpaired `.weight`
-            // (BF16 attention etc.) are intentionally skipped — they don't go
-            // through the arena.
-        }
-    }
-    total.max(1)
 }
 
 fn cuda_prefill_chunk_size(config: CudaRuntimeConfig) -> usize {

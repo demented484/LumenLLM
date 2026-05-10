@@ -440,9 +440,17 @@ fn parse_bytes_string(value: &str) -> Result<u64> {
 
 pub fn parse_storage(value: &str, default_device: usize) -> Result<StoragePlacement> {
     match value.to_ascii_lowercase().as_str() {
-        // "ram" is the user-facing name for host memory; the engine picks the most
-        // memory-efficient internal residency (pinned vs mmap) based on the compute target.
+        // `ram`  → load weights into pinned host RAM (`cuMemAllocHost`).
+        //          Fast decode (zero-copy DMA), full model size locked in
+        //          host RAM. Best when you have plenty of free host RAM.
+        // `mmap` → leave shards file-backed via mmap; the kernel pages
+        //          them in/out under memory pressure. Slow decode (each
+        //          H2D pays the CUDA driver's pinned-staging copy) but
+        //          keeps host RAM bounded by the page-cache reclaim
+        //          policy. Best when host RAM is tight.
+        // `vram` → resident on the GPU. Fastest if it fits VRAM.
         "ram" => Ok(StoragePlacement::Ram),
+        "mmap" => Ok(StoragePlacement::Mmap),
         "vram" | "gpu" => Ok(StoragePlacement::Vram {
             device: default_device,
         }),
@@ -452,12 +460,8 @@ pub fn parse_storage(value: &str, default_device: usize) -> Result<StoragePlacem
                 .parse::<usize>()
                 .map_err(|_| AegisError::InvalidConfig(format!("invalid storage `{value}`")))?,
         }),
-        "mmap" => Err(AegisError::InvalidConfig(
-            "`mmap` is no longer accepted as a storage placement; use `ram` (the engine \
-             will mmap weights internally when staging to a GPU)".into()
-        )),
         _ => Err(AegisError::InvalidConfig(format!(
-            "unsupported storage placement `{value}` (use `ram` or `vram`)"
+            "unsupported storage placement `{value}` (use `ram`, `mmap`, or `vram`)"
         ))),
     }
 }

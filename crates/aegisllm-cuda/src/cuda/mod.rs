@@ -1,9 +1,9 @@
 mod compile;
 mod cutlass_bridge;
 mod functions;
-pub(crate) mod host_arena;
 mod kernels;
 pub(crate) mod loader;
+pub(crate) mod owned_pinned;
 mod repack;
 pub(crate) mod runtime;
 pub(crate) mod staging;
@@ -14,7 +14,7 @@ pub use aegisllm_base::cuda_config::{
     CudaPrefillAttentionKernel, CudaRuntimeConfig,
 };
 pub use aegisllm_base::backend_types::AttentionDType;
-pub use loader::CudaWeightLoader;
+pub use loader::{CudaWeightLoader, LoadStatusSink};
 pub use runtime::CudaRuntime;
 /// Maximum sequence length for CUDA Graph-captured decode attention.
 /// Must match CUDA_GRAPH_ATTN_MAX_SEQ_LEN in runtime/attention/decode.rs.

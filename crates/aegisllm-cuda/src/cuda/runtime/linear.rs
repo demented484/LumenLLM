@@ -417,10 +417,7 @@ impl CudaRuntime {
                 matrix.name, input.len(), matrix.cols, output.len(), matrix.rows
             )));
         }
-        let weights_host = host
-            .values
-            .as_slice()
-            .map_err(map_cuda_err("read pinned bf16 weights"))?;
+        let weights_host = host.values();
         let total = matrix.rows * matrix.cols;
         if weights_host.len() < total {
             return Err(AegisError::InvalidPlan(format!(
@@ -472,10 +469,7 @@ impl CudaRuntime {
         if let Some(host) = matrix.host_values.as_ref() {
             // Host-resident: extract just the requested row from pinned RAM, convert
             // BF16→f32 on host (cols × 4 bytes ≈ 16 KB), upload to GPU. Tiny copy.
-            let weights = host
-                .values
-                .as_slice()
-                .map_err(map_cuda_err("read pinned bf16 row"))?;
+            let weights = host.values();
             let row_base = row * matrix.cols;
             let row_f32: Vec<f32> = weights[row_base..row_base + matrix.cols]
                 .iter()
@@ -537,10 +531,7 @@ impl CudaRuntime {
                 .stream
                 .memcpy_dtov(&rows.slice.slice(0..batch))
                 .map_err(map_cuda_err("download bf16 row indices"))?;
-            let weights = host
-                .values
-                .as_slice()
-                .map_err(map_cuda_err("read pinned bf16 rows"))?;
+            let weights = host.values();
             let mut gathered = Vec::with_capacity(output_len);
             for &idx in &row_indices {
                 let idx = idx as usize;

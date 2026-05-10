@@ -194,13 +194,17 @@ pub fn run_env() -> Result<()> {
                 enable_executor: false,
                 cuda: config.engine.cuda,
             };
-            let preview = AegisEngine::build(engine_config.clone())?;
+            // Build the preview engine WITHOUT the executor first so we can
+            // compute readiness from the placement + runtime plan. If the
+            // plan is runnable, promote the preview in-place by attaching
+            // the executor — this reuses the already-parsed artifact and
+            // plan instead of re-running `ModelArtifact::from_local_path`
+            // (which scans every safetensors shard via `parse_lfs_pointer`
+            // and used to be a hidden ~38s + ~17 GiB-of-disk-reads pass).
+            let preview = AegisEngine::build(engine_config)?;
             let readiness = readiness_for_plan(&preview.placement, &preview.runtime);
             let engine = if readiness.runnable {
-                AegisEngine::build(EngineConfig {
-                    enable_executor: true,
-                    ..engine_config
-                })?
+                preview.with_executor()?
             } else {
                 preview
             };

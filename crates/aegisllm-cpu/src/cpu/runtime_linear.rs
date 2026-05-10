@@ -271,10 +271,12 @@ mod tests {
         let packed = LoadedHostTensor {
             name: "tiny.weight".into(),
             storage: HostTensorStorage::Ram(vec![0x21; packed_bytes]),
+            shard_path: std::path::PathBuf::new(),
         };
         let scales = LoadedHostTensor {
             name: "tiny.weight_scale".into(),
             storage: HostTensorStorage::Ram(vec![0x40; scale_bytes]),
+            shard_path: std::path::PathBuf::new(),
         };
         let data = match resident_layout {
             LinearResidentLayout::PackedSource => CpuNvfp4Data::Packed { packed, scales },

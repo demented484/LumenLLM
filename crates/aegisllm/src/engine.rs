@@ -112,6 +112,29 @@ impl AegisEngine {
         })
     }
 
+    /// Build the heavy native executor (CUDA weight load) on top of an
+    /// already-built preview engine, reusing the parsed `artifact`,
+    /// `graph`, `placement`, and `runtime` instead of re-running
+    /// `ModelArtifact::from_local_path` and replanning. Used by the
+    /// `serve` CLI: it builds a preview without an executor to compute
+    /// readiness, then promotes that preview here when the plan is
+    /// runnable. Avoids a second 17 GiB-shard scan and a duplicated
+    /// `parse_lfs_pointer` pass through every safetensors file.
+    pub fn with_executor(mut self) -> Result<Self> {
+        if self.executor.is_some() {
+            return Ok(self);
+        }
+        let executor = Executor::build_native(
+            &self.artifact,
+            &self.graph,
+            &self.placement,
+            self.runtime.clone(),
+            self.cuda,
+        )?;
+        self.executor = Some(executor);
+        Ok(self)
+    }
+
     pub fn generate(&self, request: GenerateRequest) -> Result<GenerateOutput> {
         let executor = self
             .executor
@@ -170,9 +193,18 @@ fn validate_memory_budget(memory: &MemoryPlan) -> Result<()> {
             return Ok(());
         }
         return Err(AegisError::InvalidPlan(format!(
-            "memory budget gate failed: {warning} \
-             (set AEGIS_BYPASS_BUDGET_GATE=1 to override; useful for wgpu where \
-             ram-stored weights actually upload to GPU and don't stay resident in host)"
+            "memory budget gate failed: {warning}. \n\
+             Options:\n\
+               * Free host RAM. If a previous aegisllm run left page-cache \
+                 behind, `sudo sync && echo 3 | sudo tee /proc/sys/vm/drop_caches` \
+                 reclaims it.\n\
+               * Close other applications competing for RAM.\n\
+               * Switch the offending region to `store: mmap` in your config to \
+                 trade decode speed for lower RAM footprint (each H2D pays the \
+                 CUDA driver's internal pinned-staging copy).\n\
+               * Set AEGIS_BYPASS_BUDGET_GATE=1 to skip the check (useful for \
+                 wgpu where ram-stored weights upload to GPU and don't stay \
+                 resident in host)."
         )));
     }
     Ok(())
