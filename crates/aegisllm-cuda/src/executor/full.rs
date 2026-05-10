@@ -263,6 +263,32 @@ impl CudaLlamaExecutor {
             })
         });
 
+        // Fork the post-exit sidecar BEFORE `pin_now()` so the child
+        // inherits a tiny, unregistered VMA tree. Forking after the
+        // 14 GiB arena is `cuMemHostRegister`'d would force the
+        // kernel to walk and CoW-protect every PTE in the pinned
+        // range — page-table allocation alone is ~28 MiB at 4 KiB
+        // granularity, and on memory-tight hosts the cumulative
+        // pressure (pinned arena + KV-cache about-to-be-allocated +
+        // page-table duplication) is enough to trip OOM-killer.
+        // Doing this before pin_now keeps the child's fork cost flat.
+        let shards: std::collections::HashSet<std::path::PathBuf> = artifact
+            .tensors
+            .tensors
+            .values()
+            .map(|t| t.shard_path.clone())
+            .collect();
+        let mut evict_list: std::collections::HashSet<std::path::PathBuf> = shards;
+        if let Ok(entries) = std::fs::read_dir(&artifact.root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    evict_list.insert(path);
+                }
+            }
+        }
+        super::cache_cleanup::install(evict_list);
+
         // All host-resident weights are now in the arena (NVFP4 packed/
         // scales + BF16 host matrices). Page-lock the whole arena with
         // `cuMemHostRegister` so per-token H2D streaming during inference
@@ -292,45 +318,6 @@ impl CudaLlamaExecutor {
         drop(cuda_weights);
         drop(host_arena);
         let _ = has_staged_layers;
-
-        // Build the shard set for the post-exit sidecar (below). We
-        // intentionally do NOT `posix_fadvise(DONTNEED)` on the shards
-        // here: host-resident weights live in those shard mmaps and we
-        // just prefaulted their pages so "model loaded" actually means
-        // they're in RAM. A whole-shard fadvise would evict that work
-        // and force the first inference to re-read from disk. The
-        // sidecar runs only after process exit, when the mmap is
-        // already torn down — that's the right time to release the
-        // cache (so `Cached` doesn't outlive `aegisllm`).
-        let shards: std::collections::HashSet<std::path::PathBuf> = artifact
-            .tensors
-            .tensors
-            .values()
-            .map(|t| t.shard_path.clone())
-            .collect();
-        // Build the eviction list for the post-exit sidecar: every
-        // file under the model root that aegisllm could have touched
-        // — shards, tokenizer, configs, chat templates. Page cache
-        // grows with each (tokenizer.json alone can be 10s of MiB),
-        // and the sidecar that only knew about shards used to leave
-        // ~300-500 MiB stranded in `Cached` after kill. Walking the
-        // root once at load time captures everything; expanding the
-        // list is essentially free for the helper (a fadvise per
-        // file is ~µs).
-        let mut evict_list: std::collections::HashSet<std::path::PathBuf> = shards;
-        if let Ok(entries) = std::fs::read_dir(&artifact.root) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    evict_list.insert(path);
-                }
-            }
-        }
-        // Install SIGTERM/SIGINT/SIGHUP handlers + fork the sidecar
-        // helper that runs the eviction after the parent exits.
-        // Works for graceful kills and SIGKILL alike (the parent's
-        // fd close on exit triggers the helper's pipe-EOF).
-        super::cache_cleanup::install(evict_list);
 
         // Trim the device's default cudaMallocAsync memory pool back to its
         // live working set. Loading layers in sequence builds up the pool's

@@ -88,12 +88,25 @@ impl OwnedPinnedBuf {
         }
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let len_aligned = len.div_ceil(page_size) * page_size;
+        // `MAP_NORESERVE` is **load-bearing** for the 14 GiB arena on
+        // 32 GiB hosts. Without it, mmap counts the full virtual range
+        // against `Committed_AS` immediately — the kernel reserves swap
+        // backing for every page even though we'll never touch some of
+        // them. With strict overcommit (or even default heuristic when
+        // swap is small), the next big allocation (KV cache during
+        // `new_state`, ~6 GiB) trips `Committed_AS > CommitLimit` and
+        // OOM-killer terminates us silently. CUDA's `cuMemHostAlloc`
+        // path bypasses this check entirely (driver-managed pool, not
+        // VMA accounting), which is why ba3b5b8 didn't OOM and the
+        // mmap-backed arena does. With `MAP_NORESERVE`, only physically-
+        // touched pages count — exactly what we want for a lazily-
+        // committed arena.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 len_aligned,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
                 -1,
                 0,
             )
