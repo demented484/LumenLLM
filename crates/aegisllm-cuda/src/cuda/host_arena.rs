@@ -90,6 +90,23 @@ impl PinnedArena {
     /// identifies the `slice` view callers will later use as the H2D
     /// source.
     pub(crate) fn alloc_and_fill<R: Read>(&self, mut reader: R, len: usize) -> Result<usize> {
+        let offset = self.reserve(len)?;
+        // SAFETY: `reserve` exclusively claimed `[offset, offset+len)`.
+        let dst = unsafe { self.slice_mut(offset, len) };
+        reader
+            .read_exact(dst)
+            .map_err(|e| AegisError::Unsupported(format!("pinned arena read_exact: {e}")))?;
+        Ok(offset)
+    }
+
+    /// Reserve `len` bytes via atomic bump-pointer alloc. Returns the
+    /// claimed offset. The caller is responsible for filling
+    /// `[offset, offset+len)` exactly once before the bytes are
+    /// observed by any other path. Use this when filling happens out
+    /// of band — e.g. via parallel `pread` workers each writing a
+    /// disjoint sub-region. Pair with `slice_mut` to get the write
+    /// destination.
+    pub(crate) fn reserve(&self, len: usize) -> Result<usize> {
         let offset = self.used.fetch_add(len, Ordering::SeqCst);
         if offset.saturating_add(len) > self.capacity {
             // Roll back the over-shoot so capacity reporting stays accurate.
@@ -99,15 +116,26 @@ impl PinnedArena {
                 capacity = self.capacity,
             )));
         }
-        // SAFETY: `[offset..offset+len)` is exclusively claimed by
-        // this call (atomic bump above) and inside the pinned alloc.
-        let dst = unsafe {
-            std::slice::from_raw_parts_mut((self.base_ptr as *mut u8).add(offset), len)
-        };
-        reader
-            .read_exact(dst)
-            .map_err(|e| AegisError::Unsupported(format!("pinned arena read_exact: {e}")))?;
         Ok(offset)
+    }
+
+    /// Mutable view of `[offset, offset+len)` for a slot the caller
+    /// has just reserved. The caller asserts that no other thread
+    /// holds a reference into the same range — the arena does NOT
+    /// track per-slot ownership; safety is on the caller. Used by
+    /// parallel `pread` paths where each worker writes a disjoint
+    /// sub-slice.
+    ///
+    /// # Safety
+    /// `offset..offset+len` must lie within the arena and must be
+    /// exclusively owned by this caller (no other reader or writer).
+    pub(crate) unsafe fn slice_mut(&self, offset: usize, len: usize) -> &mut [u8] {
+        debug_assert!(
+            offset.saturating_add(len) <= self.capacity,
+            "PinnedArena::slice_mut out of bounds (offset={offset} len={len} cap={cap})",
+            cap = self.capacity,
+        );
+        unsafe { std::slice::from_raw_parts_mut((self.base_ptr as *mut u8).add(offset), len) }
     }
 
     /// Read-only view of `len` bytes at `offset`.

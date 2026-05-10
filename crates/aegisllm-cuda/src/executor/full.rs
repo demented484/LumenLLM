@@ -239,9 +239,24 @@ impl CudaLlamaExecutor {
             stage_t(&format!("layer {layer}"), t0);
             progress.step(&format!("layer {layer}"));
         }
+        let weights_elapsed = load_start.elapsed().as_secs_f64();
+        let total_bytes_loaded: u64 = artifact
+            .tensors
+            .tensors
+            .values()
+            .map(|t| t.data_len_bytes())
+            .sum();
+        let mb_loaded = total_bytes_loaded as f64 / (1024.0 * 1024.0);
+        let mb_per_s = if weights_elapsed > 0.0 {
+            mb_loaded / weights_elapsed
+        } else {
+            0.0
+        };
         eprintln!(
-            "load-timing: weights total            {:>6.2}s",
-            load_start.elapsed().as_secs_f64()
+            "load-timing: weights total            {:>6.2}s  ({:>7.2} MiB at {:>7.2} MiB/s)",
+            weights_elapsed,
+            mb_loaded,
+            mb_per_s,
         );
 
         let has_staged_layers = layers.iter().any(|layer| {
@@ -318,6 +333,39 @@ impl CudaLlamaExecutor {
         drop(cuda_weights);
         drop(host_arena);
         let _ = has_staged_layers;
+
+        // Evict shard files from the kernel page cache. Per-tensor
+        // `posix_fadvise(DONTNEED)` during load only covers the exact
+        // byte range read; the kernel's readahead window prefetches
+        // past each request and those pages stay cached. For 7700+
+        // tensor reads with ~500 KiB readahead each, that adds up to
+        // ~3-4 GiB of "Cached" memory after load finishes — wasted
+        // since host-resident weights are now in the pinned arena
+        // (anonymous RAM), not in the shard mmap pages. Whole-shard
+        // fadvise here catches the leakage.
+        let evict_t = std::time::Instant::now();
+        let mut evicted_bytes: u64 = 0;
+        let unique_shards: std::collections::HashSet<&std::path::PathBuf> = artifact
+            .tensors
+            .tensors
+            .values()
+            .map(|t| &t.shard_path)
+            .collect();
+        for path in &unique_shards {
+            if let Ok(file) = std::fs::File::open(path) {
+                if let Ok(meta) = file.metadata() {
+                    let len = meta.len();
+                    aegisllm_base::tensor::storage::fadvise_dont_need(&file, 0, len);
+                    evicted_bytes = evicted_bytes.saturating_add(len);
+                }
+            }
+        }
+        eprintln!(
+            "load-timing: shard cache evict        {:>6.2}s  ({:>7.2} MiB across {} shard(s))",
+            evict_t.elapsed().as_secs_f64(),
+            evicted_bytes as f64 / (1024.0 * 1024.0),
+            unique_shards.len(),
+        );
 
         // Trim the device's default cudaMallocAsync memory pool back to its
         // live working set. Loading layers in sequence builds up the pool's
