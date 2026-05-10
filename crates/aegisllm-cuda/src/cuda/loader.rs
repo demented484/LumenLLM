@@ -513,6 +513,125 @@ impl CudaWeightLoader<'_> {
         })
     }
 
+    /// Fuse a pair of already-loaded VRAM-resident BF16 gate/up matrices into
+    /// one row-stacked `[2*rows, cols]` matrix and drop the originals' VRAM.
+    ///
+    /// Both inputs must be VRAM-resident and have identical `(rows, cols)` —
+    /// the standard Gemma 4 / Llama gate/up convention. Returns:
+    ///   * the fused matrix (rows = `2 * orig_rows`, cols unchanged), VRAM-
+    ///     resident, ready for a single cuBLASLt BF16 GEMM that produces
+    ///     `[batch, 2*orig_rows]` row-major. Per token the first `orig_rows`
+    ///     floats are the gate logits and the next `orig_rows` are the up
+    ///     logits — exactly the layout expected by `geglu_tanh_strided_device`.
+    ///   * a pair of `DeviceBf16Matrix` stubs that retain the original
+    ///     `(name, rows, cols, residency)` metadata but hold only a 1-element
+    ///     placeholder VRAM slice. Returned so downstream code that still calls
+    ///     `.rows()` / `.cols()` / `.name()` keeps working without further
+    ///     refactors. **Stubs must not be matmul'd against** — `cublaslt_bf16_enabled_for`
+    ///     still returns `true` (their `host_values` is `None`) but their
+    ///     1-element `values` slice would corrupt any GEMM. Callers route the
+    ///     matmul through the fused matrix instead.
+    ///
+    /// The fusion path uses a 1-shot device alloc + two D2D `memcpy_dtod`
+    /// calls. Original gate/up VRAM is freed on return (the two stubs hold tiny
+    /// `clone_htod(&[0u16])` slices), saving `2 * rows * cols * 2` bytes per
+    /// fused layer versus keeping both originals alive.
+    pub fn fuse_bf16_gate_up(
+        &self,
+        mut gate: DeviceBf16Matrix,
+        mut up: DeviceBf16Matrix,
+    ) -> Result<(DeviceBf16Matrix, DeviceBf16Matrix, DeviceBf16Matrix)> {
+        if gate.is_host_resident() || up.is_host_resident() {
+            return Err(AegisError::InvalidPlan(format!(
+                "fuse_bf16_gate_up requires VRAM-resident inputs; got gate.host_resident={} up.host_resident={}",
+                gate.is_host_resident(),
+                up.is_host_resident()
+            )));
+        }
+        if gate.rows != up.rows || gate.cols != up.cols {
+            return Err(AegisError::InvalidPlan(format!(
+                "fuse_bf16_gate_up shape mismatch: gate=({}, {}) up=({}, {})",
+                gate.rows, gate.cols, up.rows, up.cols
+            )));
+        }
+        let rows = gate.rows;
+        let cols = gate.cols;
+        let per_mat = rows
+            .checked_mul(cols)
+            .ok_or_else(|| AegisError::InvalidPlan("fuse gate/up elem count overflow".into()))?;
+        let fused_len = per_mat
+            .checked_mul(2)
+            .ok_or_else(|| AegisError::InvalidPlan("fuse gate/up doubled count overflow".into()))?;
+        if gate.values.len() < per_mat || up.values.len() < per_mat {
+            return Err(AegisError::InvalidPlan(format!(
+                "fuse_bf16_gate_up: input values too small: gate={} up={} need {}",
+                gate.values.len(), up.values.len(), per_mat
+            )));
+        }
+
+        // Allocate the row-stacked destination in VRAM and D2D-copy each
+        // input matrix into its sub-range. cuBLASLt sees a single
+        // `[2*rows, cols]` row-major weight, equivalent to stacking gate
+        // on top of up (so the GEMM output per token is
+        // `[gate_logits, up_logits]` row-major — the layout consumed by
+        // `aegis_geglu_tanh_strided`).
+        let mut fused_slice = unsafe { self.runtime.stream.alloc::<u16>(fused_len) }
+            .map_err(map_cuda_err("alloc fused gate/up bf16"))?;
+        {
+            let src_view = gate.values.slice(0..per_mat);
+            let mut dst_view = fused_slice.slice_mut(0..per_mat);
+            self.runtime
+                .stream
+                .memcpy_dtod(&src_view, &mut dst_view)
+                .map_err(map_cuda_err("d2d fused gate copy"))?;
+        }
+        {
+            let src_view = up.values.slice(0..per_mat);
+            let mut dst_view = fused_slice.slice_mut(per_mat..fused_len);
+            self.runtime
+                .stream
+                .memcpy_dtod(&src_view, &mut dst_view)
+                .map_err(map_cuda_err("d2d fused up copy"))?;
+        }
+        // Synchronise so the source buffers can safely be dropped below.
+        self.runtime
+            .synchronize()
+            .map_err(|e| AegisError::Unsupported(format!("sync after fuse gate/up d2d: {e}")))?;
+
+        let fused_name = format!(
+            "{}|fused|{}",
+            gate.name.trim_end_matches(".weight"),
+            up.name.trim_end_matches(".weight")
+        );
+        let fused = DeviceBf16Matrix {
+            name: fused_name,
+            rows: 2 * rows,
+            cols,
+            residency: gate.residency.clone(),
+            values: fused_slice,
+            host_values: None,
+        };
+
+        // Replace each original's `values` with a tiny 1-element stub. This
+        // drops the full-size VRAM allocation (Rust's `Drop` on `CudaSlice`
+        // returns the bytes to the pool) while keeping `(name, rows, cols,
+        // residency)` intact for downstream introspection.
+        let gate_stub_slice = self
+            .runtime
+            .stream
+            .clone_htod(&[0u16])
+            .map_err(map_cuda_err("htod gate stub"))?;
+        let up_stub_slice = self
+            .runtime
+            .stream
+            .clone_htod(&[0u16])
+            .map_err(map_cuda_err("htod up stub"))?;
+        gate.values = gate_stub_slice;
+        up.values = up_stub_slice;
+
+        Ok((fused, gate, up))
+    }
+
     /// Load a BF16 matrix from `tensor` and quantize it to FP8 E4M3 with
     /// per-row FP32 scales at load time. Used by
     /// `shared-MLP-quantization = "fp8"` (and `attention-quantization = "fp8"`
