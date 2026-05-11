@@ -158,12 +158,16 @@ impl CudaRuntime {
         let cache_capacity = key_cache.len() / (num_kv_heads * head_dim);
         let cache_capacity_u32 = u32_arg("cache_capacity", cache_capacity)?;
         let block_dim = CUDA_ATTENTION_BLOCK_DIM;
-        // Shared memory layout: scores[effective_max_chunk_len] +
-        // warp_partial[4] + vsum[4*head_dim], all f32.
-        // Capped at the kernel's MAX_DYNAMIC_SHARED_SIZE_BYTES opt-in
-        // (96 KiB) at load time.
+        // Shared memory layout:
+        //   scores[effective_max_chunk_len]    (f32)
+        //   warp_partial[4]                    (f32)
+        //   vsum[4 * head_dim]                 (f32)
+        //   kv_pipe[4 warps * 2 bufs * head_dim] (half) — cp.async K/V staging
+        // Capped at the kernel's MAX_DYNAMIC_SHARED_SIZE_BYTES opt-in (96 KiB).
+        let kv_pipe_bytes = 4 * 2 * head_dim * std::mem::size_of::<u16>();
         let split_shared_bytes_usize =
-            (effective_max_chunk_len + 4 + 4 * head_dim) * std::mem::size_of::<f32>();
+            (effective_max_chunk_len + 4 + 4 * head_dim) * std::mem::size_of::<f32>()
+            + kv_pipe_bytes;
         let split_shared_bytes = super::validate_dynamic_shared_bytes_with_cap(
             "attention_decode_ptr_split",
             split_shared_bytes_usize,

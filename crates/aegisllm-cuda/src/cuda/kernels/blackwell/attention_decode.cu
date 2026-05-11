@@ -1,18 +1,18 @@
-// FlashDecoding split-K decode attention — warp-level Q·K.
+// FlashDecoding split-K decode attention — warp-level Q·K with cp.async pipelining.
 // Grid: (num_attention_heads, DECODE_SPLIT_K).  Block: (128,1) = 4 warps.
 //
-// KEY OPTIMISATION: uses 1 warp per K-position for the Q·K dot product.
-//   Old: 1 thread per position, 128 serial u16 loads per thread (32 non-coalesced
-//        cache-line misses per d-iteration × 128 iterations = 4096 misses per warp).
-//   New: 1 warp per position, 32 threads × 4 u16 = 256 bytes fully coalesced
-//        (2 cache lines per position, 32× fewer misses).
+// Phase 1 (Q·K) and Phase 3 (V·w sum) use cp.async double-buffer staging of
+// the K (resp. V) cache: while one position's data is being consumed by the
+// dot-product, the next position's data is being prefetched in the background.
+// Each warp drives its own per-position pipeline at stride-4 in chunk_len.
 //
-// Shared memory layout (pre-allocated for worst-case at graph capture time):
-//   [0..max_chunk_len)           : scores[] (Q·K results, then softmax weights)
-//   [max_chunk_len..+4)          : warp_partial[4] (cross-warp reductions)
-//   [max_chunk_len+4..+4*head_dim): vsum[4 * head_dim] (per-warp V accumulators)
-// Total = (max_chunk_len + 4 + 4*head_dim) * 4 bytes.
-// With SPLIT_K=32, head_dim=128: (256 + 4 + 512) * 4 = 3072 bytes.
+// Shared memory layout:
+//   scores[max_chunk_len]              (f32)  — Q·K results / softmax weights
+//   warp_partial[4]                    (f32)  — cross-warp reductions
+//   vsum[4 * head_dim]                 (f32)  — Phase 3 per-warp V accumulators
+//   k_pipe[4 warps * 2 bufs * head_dim] (half) — Phase 1 K-tile pipeline
+//   v_pipe[4 warps * 2 bufs * head_dim] (half) — Phase 3 V-tile pipeline (overlapped with k_pipe)
+//
 extern "C" __global__ void aegis_attention_decode_ptr_split(
     const unsigned short* __restrict__ key_cache,
     const unsigned short* __restrict__ value_cache,
@@ -56,26 +56,133 @@ extern "C" __global__ void aegis_attention_decode_ptr_split(
     const unsigned int chunk_end = (chunk_start + chunk_size < seq_len) ? chunk_start + chunk_size : seq_len;
     const unsigned int chunk_len = chunk_end - chunk_start;
 
-    extern __shared__ float shared[];
-    float* scores      = shared;                        /* [max_chunk_len]  */
-    float* warp_partial = shared + max_chunk_len;        /* [4]              */
-    float* vsum        = shared + max_chunk_len + 4u;    /* [4 * head_dim]   */
+    /* Byte-addressed arena (cp.async requires 16-byte aligned shared dests). */
+    extern __shared__ __align__(16) unsigned char smem_bytes[];
+    float* scores       = reinterpret_cast<float*>(smem_bytes);
+    float* warp_partial = scores + max_chunk_len;
+    float* vsum         = warp_partial + 4u;
+    /* k_pipe (also reused as v_pipe in Phase 3) lives after vsum. */
+    half*  kv_pipe      = reinterpret_cast<half*>(vsum + 4u * head_dim);
+    /* Stride: per-warp per-buf = head_dim halves. */
+    const unsigned int kv_stride = head_dim;
 
     const unsigned int group   = num_attention_heads / num_kv_heads;
     const unsigned int kv_head = head / group;
     const float*       q       = query + (size_t)head * head_dim;
     const float        scale   = rsqrtf((float)head_dim);
 
-    /* --- Phase 1: Q·K, 1 warp per position, coalesced K loads ---
-     * Each warp handles positions warp_id, warp_id+4, warp_id+8, ...
-     * Each lane handles head_dim/32 = 4 contiguous dims (lane*4 .. lane*4+3).
-     * All 32 lanes read K[pos][lane*4..lane*4+3] → 256 bytes fully coalesced. */
+#if __CUDA_ARCH__ >= 800
+    /* Per-warp cp.async issue: each lane stages 8 halves (16 bytes) of one K
+     * position. Total per K position per warp: 32 lanes × 8 halves = 256
+     * halves. So head_dim must be ≥ 256. For head_dim=512 each lane stages
+     * 16 halves via TWO cp.async (16 + 16 = 32 bytes = 16 halves).
+     *
+     * Layout: kv_pipe[(warp_id * 2 + buf) * head_dim + d] holds one K position
+     * per warp per buf. We stage head_dim halves of one position. */
+    const unsigned int halves_per_load = 8u;
+    const unsigned int loads_per_pos = head_dim / halves_per_load / 32u;  /* hd=256→1, hd=512→2 */
+
+    auto k_buf_ptr = [&](unsigned int buf) -> half* {
+        return kv_pipe + (size_t)(warp_id * 2u + buf) * kv_stride;
+    };
+    auto issue_load = [&](const unsigned short* cache,
+                          unsigned int abs_pos, unsigned int buf, bool valid) {
+        half* dst_base = k_buf_ptr(buf);
+        for (unsigned int li = 0u; li < loads_per_pos; ++li) {
+            const unsigned int d_off = (li * 32u + lane) * halves_per_load;
+            half* dst = dst_base + d_off;
+            unsigned int dst_smem;
+            asm volatile("{ .reg .u64 smem64;\n\t"
+                         "  cvta.to.shared.u64 smem64, %1;\n\t"
+                         "  cvt.u32.u64 %0, smem64; }\n"
+                         : "=r"(dst_smem) : "l"((const void*)dst));
+            if (valid) {
+                const unsigned int slot = (cache_capacity > 0u) ? (abs_pos % cache_capacity) : abs_pos;
+                const unsigned short* src = cache +
+                    ((size_t)slot * num_kv_heads + kv_head) * head_dim + d_off;
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                             :: "r"(dst_smem), "l"((const void*)src));
+            } else {
+                asm volatile("cp.async.cg.shared.global [%0], [%1], 16, 0;\n"
+                             :: "r"(dst_smem), "l"((const void*)cache));
+            }
+        }
+    };
+    auto cp_async_commit = []() { asm volatile("cp.async.commit_group;\n" ::); };
+    auto cp_async_wait_lt1 = []() { asm volatile("cp.async.wait_group 1;\n" ::); };
+    auto cp_async_wait_lt0 = []() { asm volatile("cp.async.wait_group 0;\n" ::); };
+#endif
+
+    /* --- Phase 1: Q·K with cp.async-pipelined K loads, scalar dot-product ---
+     * Each warp covers positions warp_id, warp_id+4, ... in stride-4. We
+     * double-buffer: pre-issue tile[next] while computing tile[cur]. */
     float warp_local_max = -3.402823466e38f;
+
+#if __CUDA_ARCH__ >= 800
+    /* PROLOGUE: issue K for warp's first position. */
+    {
+        const unsigned int pos0 = warp_id;
+        if (pos0 < chunk_len) {
+            const unsigned int abs0 = chunk_start + pos0;
+            const bool ok = (abs0 >= window_start);
+            issue_load(key_cache, abs0, 0u, ok);
+        }
+        cp_async_commit();
+    }
+
+    for (unsigned int pos = warp_id; pos < chunk_len; pos += 4u) {
+        const unsigned int abs_pos = chunk_start + pos;
+        const unsigned int next_pos = pos + 4u;
+        const unsigned int buf_cur = (pos >> 2u) & 1u;
+        const unsigned int buf_nxt = buf_cur ^ 1u;
+
+        /* Issue cp.async for next position into the OTHER buf (overlaps with
+         * this iter's compute). */
+        if (next_pos < chunk_len) {
+            const unsigned int next_abs = chunk_start + next_pos;
+            const bool ok_next = (next_abs >= window_start);
+            issue_load(key_cache, next_abs, buf_nxt, ok_next);
+            cp_async_commit();
+            cp_async_wait_lt1();
+        } else {
+            cp_async_wait_lt0();
+        }
+        __syncwarp();
+
+        /* Compute Q·K_cur. */
+        float score;
+        if (abs_pos < window_start) {
+            score = -3.402823466e38f;
+        } else {
+            const half* k = k_buf_ptr(buf_cur);
+            float partial = 0.0f;
+            /* Each lane reads its share of head_dim halves from shared. With
+             * lane × 4u stride 128, lane covers d ∈ {lane*4..lane*4+3} and
+             * possibly +128 for head_dim=256, etc. */
+            for (unsigned int d = lane * 4u; d < head_dim; d += 128u) {
+                partial += q[d+0u] * __half2float(k[d+0u]);
+                partial += q[d+1u] * __half2float(k[d+1u]);
+                partial += q[d+2u] * __half2float(k[d+2u]);
+                partial += q[d+3u] * __half2float(k[d+3u]);
+            }
+            partial += __shfl_xor_sync(0xFFFFFFFFu, partial, 16u);
+            partial += __shfl_xor_sync(0xFFFFFFFFu, partial, 8u);
+            partial += __shfl_xor_sync(0xFFFFFFFFu, partial, 4u);
+            partial += __shfl_xor_sync(0xFFFFFFFFu, partial, 2u);
+            partial += __shfl_xor_sync(0xFFFFFFFFu, partial, 1u);
+            score = partial * scale;
+        }
+        if (lane == 0u) scores[pos] = score;
+        warp_local_max = fmaxf(warp_local_max, score);
+    }
+    cp_async_wait_lt0();
+    __syncwarp();
+#else
+    /* sm_<800 fallback: original scalar path (no cp.async). */
     for (unsigned int pos = warp_id; pos < chunk_len; pos += 4u) {
         const unsigned int abs_pos = chunk_start + pos;
         float score;
         if (abs_pos < window_start) {
-            /* Position is outside the sliding window — mask to -inf. */
             score = -3.402823466e38f;
         } else {
             const unsigned int slot = (cache_capacity > 0u) ? (abs_pos % cache_capacity) : abs_pos;
@@ -97,6 +204,7 @@ extern "C" __global__ void aegis_attention_decode_ptr_split(
         if (lane == 0u) scores[pos] = score;
         warp_local_max = fmaxf(warp_local_max, score);
     }
+#endif
 
     /* Cross-warp max reduction */
     if (lane == 0u) warp_partial[warp_id] = warp_local_max;
