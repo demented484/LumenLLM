@@ -98,7 +98,13 @@ pub(super) fn cuda_limitations(
              this can be lifted). See /tmp/fp8_kv_postmortem.md.".into(),
         ),
         KvCacheQuantization::Q8_0 => limitations.push(
-            "kv-cache q8_0 support is planned (Phase 3.4) but the store/load kernel is not yet implemented".into(),
+            "kv-cache q8_0: store/decode kernels and K8V16 (Q8_0 K + F16 V) hybrid \
+             infrastructure are in place, but on Gemma-4 26B even f16 V cannot rescue \
+             the softmax precision loss from Q8_0 K — output is gibberish at the first \
+             decode token. Path to enable: bit-faithful llama.cpp comparison + per-block \
+             Q dequant (Q8_1) to verify whether the QK score precision is the gating \
+             issue, or whether a different K layout / kernel structure is needed. \
+             See /tmp/kv_quant_v4_postmortem.md.".into(),
         ),
         KvCacheQuantization::Nvfp4 => limitations.push(
             "kv-cache nvfp4 (Blackwell FP4) support is planned (Phase 3.5) but the store/load kernel is not yet implemented".into(),

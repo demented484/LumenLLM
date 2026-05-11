@@ -510,8 +510,12 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         // f32 K/V tile into the persistent FP8 cache via
         // `store_kv_fp8_slots_batched_device`. Decode then reads FP8 only.
         let is_fp8 = matches!(layer_state.kv.keys, KvBuffer::Fp8(_));
+        let is_q8_0 = matches!(layer_state.kv.keys, KvBuffer::Q8_0 { .. });
+        // FP8: dual-write — f16 aux buffers for prefill, FP8 cache mirror.
+        // Q8_0 (= K8V16 hybrid): K → f16 aux (prefill only) + Q8_0 (persistent);
+        //                       V → f16 persistent (directly in `values.F16`, no aux).
+        // F16/BF16: write directly to persistent buffers.
         let (keys_f16_mut, values_f16_mut): (&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>) = if is_fp8 {
-            // SAFETY: prefill_f16_keys/values are Some when quant=Fp8 (allocated in CudaKvCache::dense).
             let pk = layer_state.kv.prefill_f16_keys.as_mut().ok_or_else(|| {
                 aegisllm_base::error::AegisError::InvalidPlan(
                     "FP8 KV cache missing prefill_f16_keys scratch (allocator bug)".into(),
@@ -523,6 +527,26 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
                 )
             })?;
             (pk, pv)
+        } else if is_q8_0 {
+            // K → f16 aux (prefill only); V → values.F16 (persistent).
+            // Borrow K aux mutably first, then V persistent mutably — need to
+            // restructure due to mutable borrow rules. Do K aux ref split.
+            let pk_ptr: *mut DeviceBuffer<u16> = layer_state.kv.prefill_f16_keys
+                .as_mut()
+                .ok_or_else(|| aegisllm_base::error::AegisError::InvalidPlan(
+                    "Q8_0 KV cache missing prefill_f16_keys aux".into(),
+                ))? as *mut _;
+            let pv_ptr: *mut DeviceBuffer<u16> = match &mut layer_state.kv.values {
+                KvBuffer::F16(v) => v as *mut _,
+                _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
+                    "Q8_0 (K8V16): values must be F16".into(),
+                )),
+            };
+            // SAFETY: pk and pv point to disjoint allocations within the same
+            // CudaKvCache; we hold &mut layer_state.kv.* exclusively through the
+            // raw pointer dance to satisfy the borrow checker since both fields
+            // live behind layer_state.kv.
+            unsafe { (&mut *pk_ptr, &mut *pv_ptr) }
         } else {
             match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
                 (KvBuffer::F16(k), KvBuffer::F16(v)) => (k, v),
@@ -545,10 +569,6 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.dense_metadata,
             layer.rope,
         )?;
-        // FP8 mirror write: prefill.up now holds RoPE'd K (the rope_kv_store
-        // kernel applies RoPE in-place). Push the same tile into the FP8
-        // persistent cache. Uses the non-RoPE FP8 slot store (it just casts
-        // f32→fp8 and writes to slot_mapping positions).
         if is_fp8 {
             let kv_width = layer.layer_num_kv_heads * layer.layer_head_dim;
             let (fp8_keys, fp8_values) = match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
@@ -569,6 +589,26 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
                 fp8_context_size,
                 params.dense_metadata,
             )?;
+        } else if is_q8_0 {
+            // K mirror: write K (RoPE'd) to Q8_0 persistent cache. V is already
+            // in the F16 persistent cache (written above by rope_kv_store).
+            let kv_width = layer.layer_num_kv_heads * layer.layer_head_dim;
+            let (kq, ks) = match &mut layer_state.kv.keys {
+                KvBuffer::Q8_0 { quants, scales } => (quants, scales),
+                _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
+                    "Q8_0 KV mirror: keys not Q8_0".into(),
+                )),
+            };
+            let q8_context_size = kq.len() / kv_width;
+            runtime.store_kv_q8_0_k_only_slots_batched_device(
+                kq, ks,
+                &prefill.up,
+                &prefill.slot_mapping,
+                params.batch,
+                kv_width,
+                q8_context_size,
+                params.dense_metadata,
+            )?;
         }
         record_prefill_stage(runtime, timings, kv_store_start, |timings, elapsed| {
             timings.kv_store_us += elapsed
@@ -580,8 +620,14 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         // write above needed a mutable borrow on layer_state.kv.
         let (keys_f16_ref, values_f16_ref): (&DeviceBuffer<u16>, &DeviceBuffer<u16>) = if is_fp8 {
             (
-                layer_state.kv.prefill_f16_keys.as_ref().expect("checked above"),
-                layer_state.kv.prefill_f16_values.as_ref().expect("checked above"),
+                layer_state.kv.prefill_f16_keys.as_ref().expect("FP8 K aux"),
+                layer_state.kv.prefill_f16_values.as_ref().expect("FP8 V aux"),
+            )
+        } else if is_q8_0 {
+            // K8V16: K from aux, V from persistent f16 (no V aux).
+            (
+                layer_state.kv.prefill_f16_keys.as_ref().expect("Q8_0 K aux"),
+                layer_state.kv.values.as_f16().expect("Q8_0 (K8V16) V f16"),
             )
         } else {
             (

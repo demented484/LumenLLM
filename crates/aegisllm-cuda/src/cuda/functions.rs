@@ -95,6 +95,14 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) attention_decode_ptr_fp8: CudaFunction,
     pub(crate) attention_decode_ptr_split_fp8: CudaFunction,
     pub(crate) attention_decode_streaming_fp8: CudaFunction,
+    pub(crate) kv_store_q8_0_ptr: CudaFunction,
+    pub(crate) kv_store_q8_0_slots_batched: CudaFunction,
+    pub(crate) attention_decode_ptr_split_q8_0: CudaFunction,
+    pub(crate) kv_store_q8_0_k_only_ptr: CudaFunction,
+    pub(crate) kv_store_q8_0_k_only_slots_batched: CudaFunction,
+    pub(crate) attention_decode_ptr_split_k8_v16: CudaFunction,
+    pub(crate) kv_store_f16_v_only_ptr: CudaFunction,
+    pub(crate) kv_store_f16_v_only_slots_batched: CudaFunction,
     pub(crate) attention: CudaFunction,
     pub(crate) attention_ptr: CudaFunction,
     pub(crate) attention_decode_ptr_split: CudaFunction,
@@ -301,6 +309,36 @@ impl CudaKernelFunctions {
                 f
             },
             attention_decode_streaming_fp8: load(&module, "aegis_attention_decode_streaming_fp8")?,
+            kv_store_q8_0_ptr: load(&module, "aegis_kv_store_q8_0_ptr")?,
+            kv_store_q8_0_slots_batched: load(&module, "aegis_kv_store_q8_0_slots_batched")?,
+            attention_decode_ptr_split_q8_0: {
+                let f = load(&module, "aegis_attention_decode_ptr_split_q8_0")?;
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on attention_decode_ptr_split_q8_0: {e:?}"
+                )))?;
+                f
+            },
+            kv_store_q8_0_k_only_ptr: load(&module, "aegis_kv_store_q8_0_k_only_ptr")?,
+            kv_store_q8_0_k_only_slots_batched: load(&module, "aegis_kv_store_q8_0_k_only_slots_batched")?,
+            kv_store_f16_v_only_ptr: load(&module, "aegis_kv_store_f16_v_only_ptr")?,
+            kv_store_f16_v_only_slots_batched: load(&module, "aegis_kv_store_f16_v_only_slots_batched")?,
+            attention_decode_ptr_split_k8_v16: {
+                let f = load(&module, "aegis_attention_decode_ptr_split_k8_v16")?;
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on attention_decode_ptr_split_k8_v16: {e:?}"
+                )))?;
+                f
+            },
             attention: load(&module, "aegis_attention_decode")?,
             attention_ptr: load(&module, "aegis_attention_decode_ptr")?,
             attention_decode_ptr_split: {

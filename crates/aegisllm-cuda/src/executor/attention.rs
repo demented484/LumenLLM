@@ -270,8 +270,33 @@ pub(super) fn forward_attention_device(
                     &mut scratch.attn_context,
                 )?;
             }
+            (
+                KvBuffer::Q8_0 { quants: kq, scales: ks },
+                KvBuffer::F16(vc),
+            ) => {
+                // K8V16 hybrid: K → Q8_0, V → f16 (preserves softmax @ V on Gemma-4).
+                runtime.store_kv_q8_0_k_only_ptr_device(
+                    kq, ks, &scratch.k, p_position, kv_width, effective_kv_capacity,
+                )?;
+                // V store: use the existing f16 KV store but only for V. The
+                // existing store_kv_ptr_device writes both K and V; here we want
+                // V only. Reuse a scratch K throw-away buffer.
+                runtime.store_kv_f16_v_only_ptr_device(
+                    vc, &scratch.v, p_position, kv_width, effective_kv_capacity,
+                )?;
+                runtime.attention_decode_split_ptr_k8_v16_device(
+                    kq, ks, vc,
+                    &scratch.q, p_seq_len, num_attention_heads, num_kv_heads,
+                    head_dim, layer.window_size,
+                    _seq_len,
+                    &mut scratch.attn_split_acc,
+                    &mut scratch.attn_split_m,
+                    &mut scratch.attn_split_l,
+                    &mut scratch.attn_context,
+                )?;
+            }
             _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
-                "KV cache keys/values dtype mismatch (one F16, one FP8)".into(),
+                "KV cache keys/values dtype mismatch (F16/FP8/Q8_0)".into(),
             )),
         }
     }

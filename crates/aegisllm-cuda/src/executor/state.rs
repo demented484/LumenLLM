@@ -330,6 +330,12 @@ pub(super) enum KvBuffer {
     /// FP8 (E4M3) — 1 byte per element. Dispatches to the `*_fp8_*`
     /// runtime methods.
     Fp8(DeviceBuffer<u8>),
+    /// Q8_0 — int8 quants (1 byte) + f16 scale per 32-element block.
+    /// Dispatches to `*_q8_0_*` runtime methods.
+    Q8_0 {
+        quants: DeviceBuffer<u8>,
+        scales: DeviceBuffer<u16>,
+    },
 }
 
 impl KvBuffer {
@@ -399,8 +405,41 @@ impl CudaKvCache {
                 Some(runtime.alloc_u16(len)?),
                 Some(runtime.alloc_u16(len)?),
             ),
+            KvCacheQuantization::Q8_0 => {
+                // K8V16 hybrid: Q8_0 K (int8 + f16 scale per 32-element block),
+                // F16 V (no quantization). Quantizing V destroys the softmax @ V
+                // cancellation residue on Gemma-4 due to v_norm channel concentration;
+                // see /tmp/fp8_kv_v3_postmortem.md. K8V16 preserves V exactly and
+                // tolerates K precision loss (softmax is robust to small score perturbations).
+                // Memory: K=1.06 b/elem, V=2.0 b/elem → avg 1.53 b/elem (~23% vs f16).
+                const QK: usize = 32;
+                if kv_width % QK != 0 {
+                    return Err(AegisError::InvalidPlan(format!(
+                        "Q8_0 (K8V16) KV requires kv_width % {QK} == 0, got kv_width={kv_width}"
+                    )));
+                }
+                let scale_len = effective_capacity.checked_mul(kv_width / QK).ok_or_else(|| {
+                    AegisError::InvalidPlan(format!(
+                        "Q8_0 scale length overflow: cap={effective_capacity} blocks_per_slot={}",
+                        kv_width / QK
+                    ))
+                })?;
+                (
+                    // K: Q8_0
+                    KvBuffer::Q8_0 {
+                        quants: runtime.alloc_u8(len)?,
+                        scales: runtime.alloc_u16(scale_len)?,
+                    },
+                    // V: F16 — IS the persistent V cache (no separate aux).
+                    KvBuffer::F16(runtime.alloc_u16(len)?),
+                    // K aux for prefill (prefill attention kernels need f16 K).
+                    Some(runtime.alloc_u16(len)?),
+                    // V aux: same as the persistent V cache, so no separate buffer.
+                    None,
+                )
+            }
             other => return Err(AegisError::Unsupported(format!(
-                "kv-cache quantization {other:?} not yet wired into CUDA executor; supported: f16, bf16, fp8"
+                "kv-cache quantization {other:?} not yet wired into CUDA executor; supported: f16, bf16, fp8, q8_0"
             ))),
         };
         Ok(Self {
