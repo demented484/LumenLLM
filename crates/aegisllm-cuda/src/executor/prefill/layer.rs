@@ -503,17 +503,37 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         )?;
     } else {
         use crate::executor::state::KvBuffer;
-        let (keys, values) = match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
-            (KvBuffer::F16(k), KvBuffer::F16(v)) => (k, v),
-            _ => return Err(aegisllm_base::error::AegisError::Unsupported(
-                "prefill attention with FP8 KV cache is not yet implemented; \
-                 use type-k=f16, type-v=f16 (decode-only FP8 KV is not supported \
-                 because prefill writes K/V to the cache too)".into(),
-            )),
+        // For FP8 KV: we maintain an auxiliary f16 cache for prefill (prefill
+        // attention kernels are templated on u16 cache lines). The f16 cache
+        // is read/written by the existing rope_kv_store + prefill attention
+        // kernels. After the f16 store, we additionally write the now-RoPE'd
+        // f32 K/V tile into the persistent FP8 cache via
+        // `store_kv_fp8_slots_batched_device`. Decode then reads FP8 only.
+        let is_fp8 = matches!(layer_state.kv.keys, KvBuffer::Fp8(_));
+        let (keys_f16_mut, values_f16_mut): (&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>) = if is_fp8 {
+            // SAFETY: prefill_f16_keys/values are Some when quant=Fp8 (allocated in CudaKvCache::dense).
+            let pk = layer_state.kv.prefill_f16_keys.as_mut().ok_or_else(|| {
+                aegisllm_base::error::AegisError::InvalidPlan(
+                    "FP8 KV cache missing prefill_f16_keys scratch (allocator bug)".into(),
+                )
+            })?;
+            let pv = layer_state.kv.prefill_f16_values.as_mut().ok_or_else(|| {
+                aegisllm_base::error::AegisError::InvalidPlan(
+                    "FP8 KV cache missing prefill_f16_values scratch (allocator bug)".into(),
+                )
+            })?;
+            (pk, pv)
+        } else {
+            match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
+                (KvBuffer::F16(k), KvBuffer::F16(v)) => (k, v),
+                _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
+                    "KV cache dtype mismatch in prefill dispatch".into(),
+                )),
+            }
         };
         runtime.store_kv_slots_batched_rope_key_device(
-            keys,
-            values,
+            keys_f16_mut,
+            values_f16_mut,
             &mut prefill.up,
             &prefill.v,
             &prefill.positions,
@@ -525,17 +545,53 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             params.dense_metadata,
             layer.rope,
         )?;
+        // FP8 mirror write: prefill.up now holds RoPE'd K (the rope_kv_store
+        // kernel applies RoPE in-place). Push the same tile into the FP8
+        // persistent cache. Uses the non-RoPE FP8 slot store (it just casts
+        // f32→fp8 and writes to slot_mapping positions).
+        if is_fp8 {
+            let kv_width = layer.layer_num_kv_heads * layer.layer_head_dim;
+            let (fp8_keys, fp8_values) = match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
+                (KvBuffer::Fp8(k), KvBuffer::Fp8(v)) => (k, v),
+                _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
+                    "FP8 KV mirror: keys/values not both Fp8".into(),
+                )),
+            };
+            let fp8_context_size = fp8_keys.len() / kv_width;
+            runtime.store_kv_fp8_slots_batched_device(
+                fp8_keys,
+                fp8_values,
+                &prefill.up,
+                &prefill.v,
+                &prefill.slot_mapping,
+                params.batch,
+                kv_width,
+                fp8_context_size,
+                params.dense_metadata,
+            )?;
+        }
         record_prefill_stage(runtime, timings, kv_store_start, |timings, elapsed| {
             timings.kv_store_us += elapsed
         })?;
 
         let attention_start = Instant::now();
-        // F16 KV is enforced by the dispatch above (FP8 path bails out with Unsupported).
-        let keys_f16 = layer_state.kv.keys.as_f16().expect("FP8 KV rejected upstream");
-        let values_f16 = layer_state.kv.values.as_f16().expect("FP8 KV rejected upstream");
+        // Prefill attention always reads from the f16 cache (auxiliary when FP8,
+        // primary when F16/BF16). Re-borrow immutably here since the FP8 mirror
+        // write above needed a mutable borrow on layer_state.kv.
+        let (keys_f16_ref, values_f16_ref): (&DeviceBuffer<u16>, &DeviceBuffer<u16>) = if is_fp8 {
+            (
+                layer_state.kv.prefill_f16_keys.as_ref().expect("checked above"),
+                layer_state.kv.prefill_f16_values.as_ref().expect("checked above"),
+            )
+        } else {
+            (
+                layer_state.kv.keys.as_f16().expect("F16 path verified above"),
+                layer_state.kv.values.as_f16().expect("F16 path verified above"),
+            )
+        };
         runtime.attention_prefill_dense_compat_device(
-            keys_f16,
-            values_f16,
+            keys_f16_ref,
+            values_f16_ref,
             &prefill.up,
             &prefill.v,
             &prefill.gate,

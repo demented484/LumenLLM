@@ -434,7 +434,11 @@ impl CudaRuntime {
         context_size: usize,
     ) -> Result<()> {
         let cache_len = checked_len("fp8 cache", context_size, kv_width)?;
-        if key.len() != kv_width || value.len() != kv_width {
+        // `key`/`value` are scratch buffers sized for the largest layer's kv_width
+        // (Gemma 4 has heterogeneous global vs sliding kv head counts), so we only
+        // require the buffer to hold at least `kv_width` elements. Mirror the F16
+        // path (`store_kv_ptr_device`).
+        if key.len() < kv_width || value.len() < kv_width {
             return Err(AegisError::InvalidPlan("kv_store_fp8_ptr vector shape mismatch".into()));
         }
         // Sliding-window layers may allocate cache to `window_size * kv_width`

@@ -311,6 +311,13 @@ pub(super) struct CudaKvCache {
     pub(super) values: KvBuffer,
     /// Non-None when `kv-cache.store=ram`: actual KV lives in pinned host RAM.
     pub(super) host: Option<Box<HostKvWeights>>,
+    /// Auxiliary f16 KV scratch used only when `quantization == Fp8`. Prefill
+    /// attention kernels read f16 cache lines, so we maintain a parallel f16
+    /// buffer that mirrors the FP8 cache during prefill. After prefill ends,
+    /// decode reads the FP8 buffer exclusively. The f16 scratch is allocated
+    /// at the same effective capacity as the FP8 cache.
+    pub(super) prefill_f16_keys: Option<DeviceBuffer<u16>>,
+    pub(super) prefill_f16_values: Option<DeviceBuffer<u16>>,
 }
 
 /// VRAM-resident KV-cache half (keys or values). The bit-width matches the
@@ -374,14 +381,23 @@ impl CudaKvCache {
                 effective_capacity, kv_width
             ))
         })?;
-        let (keys, values) = match quantization {
+        let (keys, values, prefill_f16_keys, prefill_f16_values) = match quantization {
             KvCacheQuantization::F16 | KvCacheQuantization::Bf16 => (
                 KvBuffer::F16(runtime.alloc_u16(len)?),
                 KvBuffer::F16(runtime.alloc_u16(len)?),
+                None,
+                None,
             ),
             KvCacheQuantization::Fp8 => (
                 KvBuffer::Fp8(runtime.alloc_u8(len)?),
                 KvBuffer::Fp8(runtime.alloc_u8(len)?),
+                // Auxiliary f16 cache for prefill attention. Same effective
+                // capacity as the FP8 cache. Costs 2 bytes/element vs FP8's 1
+                // byte/element; total KV memory is 1.5× pure-FP8 but the
+                // prefill kernels remain unchanged (they only know how to
+                // read u16 K/V cache lines).
+                Some(runtime.alloc_u16(len)?),
+                Some(runtime.alloc_u16(len)?),
             ),
             other => return Err(AegisError::Unsupported(format!(
                 "kv-cache quantization {other:?} not yet wired into CUDA executor; supported: f16, bf16, fp8"
@@ -396,6 +412,8 @@ impl CudaKvCache {
             keys,
             values,
             host: None,
+            prefill_f16_keys,
+            prefill_f16_values,
         })
     }
 
@@ -437,6 +455,8 @@ impl CudaKvCache {
                 keys: keys_host,
                 values: values_host,
             })),
+            prefill_f16_keys: None,
+            prefill_f16_values: None,
         })
     }
 

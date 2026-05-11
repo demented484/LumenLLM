@@ -334,7 +334,12 @@ impl CudaRuntime {
         if query.len() < query_len || output.len() < query_len {
             return Err(AegisError::InvalidPlan("attention_split_fp8 query/output shape mismatch".into()));
         }
-        let partial_len     = checked_len("fp8_split partial", num_attention_heads, DECODE_SPLIT_K)?;
+        // Adaptive split_k mirrors the F16 path (see attention_decode_split_ptr_device).
+        // Partial buffers are sized for DECODE_SPLIT_K_MAX so we never realloc.
+        let actual_split_k = seq_len_hint
+            .div_ceil(DECODE_TARGET_CHUNK_LEN)
+            .clamp(DECODE_SPLIT_K, DECODE_SPLIT_K_MAX);
+        let partial_len     = checked_len("fp8_split partial", num_attention_heads, DECODE_SPLIT_K_MAX)?;
         let partial_acc_len = checked_len("fp8_split partial_acc", partial_len, head_dim)?;
         if partial_acc.len() < partial_acc_len || partial_m.len() < partial_len || partial_l.len() < partial_len {
             return Err(AegisError::InvalidPlan(format!(
@@ -348,11 +353,15 @@ impl CudaRuntime {
         let num_heads_u32    = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads_u32 = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim_u32     = u32_arg("head_dim", head_dim)?;
-        let split_k_u32      = u32_arg("split_k", DECODE_SPLIT_K)?;
+        let split_k_u32      = u32_arg("split_k", actual_split_k)?;
         // Dynamic-size shared mem to fit `scores[chunk_len]` at long seqs.
         // See `attention_decode_split_ptr_device` for full rationale.
-        let chunk_len_for_seq = seq_len_hint.div_ceil(DECODE_SPLIT_K).max(1);
+        let chunk_len_for_seq = seq_len_hint.div_ceil(actual_split_k).max(1);
         let effective_max_chunk_len = DECODE_MAX_CHUNK_LEN.max(chunk_len_for_seq);
+        // Round to multiple of 4 to keep shared-mem alignment if the FP8 kernel
+        // also uses cp.async pipelines (defensive; the FP8 kernel today doesn't,
+        // but the alignment cost is negligible).
+        let effective_max_chunk_len = (effective_max_chunk_len + 3) & !3;
         let max_chunk_len_u32 = u32_arg("max_chunk_len", effective_max_chunk_len)?;
         let window_size_u32  = u32_arg("window_size", window_size)?;
         let cache_capacity = key_cache.len() / (num_kv_heads * head_dim);
