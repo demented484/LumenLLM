@@ -4,7 +4,10 @@ use super::*;
 use crate::cuda::DeviceBuffer;
 use aegisllm_base::error::{AegisError, Result};
 
-use crate::cuda::{CUDA_GRAPH_ATTN_MAX_SEQ_LEN, DECODE_MAX_CHUNK_LEN, DECODE_SPLIT_K};
+use crate::cuda::{
+    CUDA_GRAPH_ATTN_MAX_SEQ_LEN, DECODE_MAX_CHUNK_LEN, DECODE_SPLIT_K, DECODE_SPLIT_K_MAX,
+    DECODE_TARGET_CHUNK_LEN,
+};
 
 impl CudaRuntime {
     /// Like `attention_decode_device` but reads `seq_len` from a device buffer (index 0).
@@ -123,7 +126,16 @@ impl CudaRuntime {
                 query.len(), output.len(), query_len
             )));
         }
-        let partial_len = checked_len("decode_split partial", num_attention_heads, DECODE_SPLIT_K)?;
+        // Adaptive split_k: grow with seq_len so per-block chunk_len stays
+        // bounded near DECODE_TARGET_CHUNK_LEN. Mirrors the vLLM PARTITION_SIZE
+        // and TRT-LLM kMinHistoryTokensPerBlock strategies. At short ctx we
+        // keep the baseline DECODE_SPLIT_K=16 (well-tuned for chunk_len ≤ 32);
+        // past ctx≈4096 the split count starts growing. Partial buffers are
+        // sized for DECODE_SPLIT_K_MAX so we never realloc.
+        let actual_split_k = seq_len_hint
+            .div_ceil(DECODE_TARGET_CHUNK_LEN)
+            .clamp(DECODE_SPLIT_K, DECODE_SPLIT_K_MAX);
+        let partial_len = checked_len("decode_split partial", num_attention_heads, DECODE_SPLIT_K_MAX)?;
         let partial_acc_len = checked_len("decode_split partial_acc", partial_len, head_dim)?;
         if partial_acc.len() < partial_acc_len || partial_m.len() < partial_len || partial_l.len() < partial_len {
             return Err(AegisError::InvalidPlan(format!(
@@ -139,14 +151,14 @@ impl CudaRuntime {
         let num_heads_u32 = u32_arg("num_attention_heads", num_attention_heads)?;
         let num_kv_heads_u32 = u32_arg("num_kv_heads", num_kv_heads)?;
         let head_dim_u32 = u32_arg("head_dim", head_dim)?;
-        let split_k_u32 = u32_arg("split_k", DECODE_SPLIT_K)?;
+        let split_k_u32 = u32_arg("split_k", actual_split_k)?;
         // For the captured-graph hot path (seq_len ≤ CUDA_GRAPH_ATTN_MAX_SEQ_LEN),
         // chunk_len ≤ DECODE_MAX_CHUNK_LEN and we use the fixed allocation.
         // For longer seqs we widen `max_chunk_len` to fit the actual chunk size
         // so `scores[pos]` writes stay in-bounds. The kernel uses this both as
         // the shared-mem layout offset for warp_partial/vsum AND as the
         // implicit upper bound on `pos`.
-        let chunk_len_for_seq = seq_len_hint.div_ceil(DECODE_SPLIT_K).max(1);
+        let chunk_len_for_seq = seq_len_hint.div_ceil(actual_split_k).max(1);
         // Round up to multiple of 4 so the byte offset of `kv_pipe` (which
         // lives after `(max_chunk_len + 4 + 4*head_dim) * 4 bytes`) stays
         // 16-byte aligned. cp.async.cg requires 16-byte aligned shared dests;

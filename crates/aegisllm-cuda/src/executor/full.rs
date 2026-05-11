@@ -12,7 +12,8 @@ use super::state::{
 use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::artifact::ModelArtifact;
 use crate::cuda::{
-    CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, DECODE_SPLIT_K, CudaRuntime,
+    CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, DECODE_SPLIT_K, DECODE_SPLIT_K_MAX,
+    CudaRuntime,
     CudaRuntimeConfig,
 };
 use aegisllm_base::error::{AegisError, Result};
@@ -898,13 +899,13 @@ impl CudaLlamaExecutor {
                 qk_norm_scratch: self.runtime.alloc_f32(max_q_width.max(max_kv_width))?,
                 attn_split_acc: self
                     .runtime
-                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K * max_head_dim)?,
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K_MAX * max_head_dim)?,
                 attn_split_m: self
                     .runtime
-                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K)?,
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K_MAX)?,
                 attn_split_l: self
                     .runtime
-                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K)?,
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K_MAX)?,
                 attn_context: self.runtime.alloc_f32(max_q_width)?,
                 attn_out: self.runtime.alloc_f32(self.hidden_size)?,
                 residual: self.runtime.alloc_f32(self.hidden_size)?,

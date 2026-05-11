@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::loader::{CudaLayerShape, load_cuda_layer, runtime_layouts_by_region};
 use super::state::{CudaLayer, CudaLayerState, CudaScratch};
 use aegisllm_base::artifact::ModelArtifact;
-use crate::cuda::{DECODE_SPLIT_K, CudaRuntime, CudaRuntimeConfig, DeviceBuffer};
+use crate::cuda::{DECODE_SPLIT_K_MAX, CudaRuntime, CudaRuntimeConfig, DeviceBuffer};
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::graph::{ModelGraph, RegionId};
 use aegisllm_base::planning::placement::{ComputePlacement, ResolvedPlacement};
@@ -232,13 +232,13 @@ impl CudaLayerBlockExecutor {
                     .alloc_f32((self.num_attention_heads * self.head_dim).max(kv_width))?,
                 attn_split_acc: self
                     .runtime
-                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K * self.head_dim)?,
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K_MAX * self.head_dim)?,
                 attn_split_m: self
                     .runtime
-                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K)?,
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K_MAX)?,
                 attn_split_l: self
                     .runtime
-                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K)?,
+                    .alloc_f32(self.num_attention_heads * DECODE_SPLIT_K_MAX)?,
                 attn_context: self
                     .runtime
                     .alloc_f32(self.num_attention_heads * self.head_dim)?,
