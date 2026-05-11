@@ -239,17 +239,54 @@ extern "C" __global__ void aegis_attention_decode_ptr_split(
         partial_l[out_idx] = s;
     }
 
-    /* --- Phase 3: weighted V sum, 1 warp per position, coalesced V loads ---
-     * Each lane accumulates 4 consecutive V dims per d-block. d-blocks step by 128
-     * (32 lanes * 4 dims/lane). For head_dim=128 there is one d-block (Llama). For
-     * head_dim=256/512 (Gemma 4 sliding/global) there are 2 / 4 d-blocks. The previous
-     * implementation only had 4 accumulators total and silently summed contributions
-     * from every d-block into the same slot — correct for head_dim=128, garbage
-     * otherwise. We size the accumulator by the max supported head_dim (512 → 4
-     * d-blocks). */
+    /* --- Phase 3: weighted V sum with cp.async-pipelined V loads ---
+     * Same pattern as Phase 1: each warp drives its own per-position cp.async
+     * pipeline at stride-4. The kv_pipe buffer is reused for V staging. */
     constexpr unsigned int MAX_D_BLOCKS = 4u;  // supports head_dim up to 4*128 = 512
     float acc[MAX_D_BLOCKS][4] = { {0.0f, 0.0f, 0.0f, 0.0f} };
     const unsigned int d_blocks = (head_dim + 127u) / 128u;
+
+#if __CUDA_ARCH__ >= 800
+    /* PROLOGUE: issue V for warp's first position (positions are NOT masked
+     * for V — masked positions have score=0 from Phase 2's exp(-inf)=0 path). */
+    {
+        const unsigned int pos0 = warp_id;
+        if (pos0 < chunk_len) {
+            const unsigned int abs0 = chunk_start + pos0;
+            issue_load(value_cache, abs0, 0u, true);
+        }
+        cp_async_commit();
+    }
+
+    for (unsigned int pos = warp_id; pos < chunk_len; pos += 4u) {
+        const unsigned int next_pos = pos + 4u;
+        const unsigned int buf_cur = (pos >> 2u) & 1u;
+        const unsigned int buf_nxt = buf_cur ^ 1u;
+
+        if (next_pos < chunk_len) {
+            const unsigned int next_abs = chunk_start + next_pos;
+            issue_load(value_cache, next_abs, buf_nxt, true);
+            cp_async_commit();
+            cp_async_wait_lt1();
+        } else {
+            cp_async_wait_lt0();
+        }
+        __syncwarp();
+
+        const half* v = k_buf_ptr(buf_cur);
+        float w = scores[pos];
+        for (unsigned int b = 0u; b < d_blocks; ++b) {
+            const unsigned int d = b * 128u + lane * 4u;
+            if (d >= head_dim) break;
+            acc[b][0] += w * __half2float(v[d+0u]);
+            acc[b][1] += w * __half2float(v[d+1u]);
+            acc[b][2] += w * __half2float(v[d+2u]);
+            acc[b][3] += w * __half2float(v[d+3u]);
+        }
+    }
+    cp_async_wait_lt0();
+    __syncwarp();
+#else
     for (unsigned int pos = warp_id; pos < chunk_len; pos += 4u) {
         const unsigned int abs_pos_v = chunk_start + pos;
         const unsigned int slot_v = (cache_capacity > 0u) ? (abs_pos_v % cache_capacity) : abs_pos_v;
@@ -264,6 +301,7 @@ extern "C" __global__ void aegis_attention_decode_ptr_split(
             acc[b][3] += w * f16_bits_to_float(v[d+3u]);
         }
     }
+#endif
     /* Write per-warp V accumulators to shared memory at vsum[warp_id*head_dim + d + i]. */
     for (unsigned int b = 0u; b < d_blocks; ++b) {
         const unsigned int d = b * 128u + lane * 4u;
