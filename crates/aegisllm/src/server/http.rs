@@ -1140,6 +1140,11 @@ fn sse_google(
 }
 
 fn write_sse_headers(stream: &mut TcpStream) -> Result<()> {
+    // Disable Nagle's algorithm: per-token SSE chunks are tiny (~200 B) and
+    // accumulating them in the TCP send buffer stalls each chunk waiting for
+    // a delayed ACK, adding 10-40 ms per token to streaming latency. With
+    // NODELAY each chunk is sent immediately.
+    let _ = stream.set_nodelay(true);
     write!(
         stream,
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\naccess-control-allow-origin: *\r\naccess-control-allow-headers: content-type, authorization\r\naccess-control-allow-methods: GET, POST, OPTIONS\r\ntransfer-encoding: chunked\r\ncache-control: no-cache\r\nconnection: close\r\n\r\n"
