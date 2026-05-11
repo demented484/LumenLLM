@@ -147,7 +147,13 @@ impl CudaRuntime {
         // the shared-mem layout offset for warp_partial/vsum AND as the
         // implicit upper bound on `pos`.
         let chunk_len_for_seq = seq_len_hint.div_ceil(DECODE_SPLIT_K).max(1);
+        // Round up to multiple of 4 so the byte offset of `kv_pipe` (which
+        // lives after `(max_chunk_len + 4 + 4*head_dim) * 4 bytes`) stays
+        // 16-byte aligned. cp.async.cg requires 16-byte aligned shared dests;
+        // otherwise ctx > 8192 (eager path) with chunk_len_for_seq not
+        // divisible by 4 surfaces as CUDA_ERROR_MISALIGNED_ADDRESS at runtime.
         let effective_max_chunk_len = DECODE_MAX_CHUNK_LEN.max(chunk_len_for_seq);
+        let effective_max_chunk_len = (effective_max_chunk_len + 3) & !3;
         let max_chunk_len_u32 = u32_arg("max_chunk_len", effective_max_chunk_len)?;
         let window_size_u32 = u32_arg("window_size", window_size)?;
         // Cache capacity (in tokens) is inferred from the key buffer size:
