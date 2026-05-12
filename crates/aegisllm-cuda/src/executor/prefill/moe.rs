@@ -581,6 +581,23 @@ fn forward_moe_grouped_routed_experts(
         active_token_offsets_host.push(prev + count);
     }
     let total_active_tokens = *active_token_offsets_host.last().unwrap() as usize;
+    if std::env::var("AEGIS_MOE_M_DUMP").is_ok() {
+        let mut counts: Vec<u32> = active_experts.iter().map(|&e| counts_host[e]).collect();
+        counts.sort_unstable();
+        let n = counts.len();
+        let p50 = counts[n / 2];
+        let p90 = counts[(n * 9) / 10];
+        let mut lt64 = 0usize; let mut lt128 = 0usize;
+        let mut ge128 = 0usize; let mut ge256 = 0usize;
+        for &c in &counts {
+            if c < 64 { lt64 += 1; } else if c < 128 { lt128 += 1; }
+            else if c < 256 { ge128 += 1; } else { ge256 += 1; }
+        }
+        eprintln!(
+            "[MOE-M] active={} min={} p50={} p90={} max={} | <64:{}  64-127:{}  128-255:{}  >=256:{}",
+            n, counts[0], p50, p90, counts[n-1], lt64, lt128, ge128, ge256,
+        );
+    }
     runtime.upload_u32_slice_to_device(
         &active_token_offsets_host,
         &mut moe_scratch.bulk_token_offsets,
