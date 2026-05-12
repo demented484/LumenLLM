@@ -24,6 +24,14 @@ fn checked_len(label: &str, lhs: usize, rhs: usize) -> Result<usize> {
 }
 
 impl CudaRuntime {
+    /// True iff the CUTLASS NVFP4 grouped GEMM TU was compiled into the
+    /// bridge archive (env AEGIS_CUTLASS_NVFP4_GROUPED_BUILD=1 at build
+    /// time). The dispatcher uses this to fail fast if the runtime flag
+    /// is set but the symbols are absent.
+    pub fn cutlass_nvfp4_moe_grouped_built() -> bool {
+        cutlass_bridge::moe_grouped_supported()
+    }
+
     pub fn cutlass_nvfp4_activation_payload_bytes(rows: usize, cols: usize) -> Result<usize> {
         if !cols.is_multiple_of(32) {
             return Err(AegisError::InvalidPlan(format!(
