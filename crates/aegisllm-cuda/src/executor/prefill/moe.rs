@@ -1318,71 +1318,178 @@ fn forward_moe_cutlass_split_routed_experts(
         &mut moe_scratch.moe_acc,
     )?;
 
-    // ── Small-expert dispatch via the per-expert NVFP4 matvec path ─────
-    for &expert_idx in &small_experts {
-        let count = counts_host[expert_idx] as usize;
-        if count == 0 {
-            continue;
+    // ── Small-expert dispatch via grouped t32_big NVFP4 GEMM ───────────
+    // Previously this used the per-expert matvec path (3 launches per small
+    // expert + gather/scatter), which dominated wall-time when 10-20 small
+    // experts were live. The refactor below packs the small-expert subset
+    // into a compact permuted layout and runs ONE grouped GEMM per
+    // projection (gate / up / down) using the same `t32_big` kernel the
+    // pure-grouped path already uses.
+    //
+    // Invariants:
+    //   * `bulk_packed[pi]` / `bulk_scales[pi]` were staged for ALL active
+    //     experts (large + small) at the top of the function; we just need
+    //     to point at the small subset via fresh offset arrays.
+    //   * `permuted_input` / `permuted_intermediate` / `permuted_swiglu`
+    //     / `permuted_output` are free to reuse: the large-CUTLASS path
+    //     completed its `unpermute_scatter_add` above, so no further reads
+    //     from them are outstanding on the compute stream.
+    //   * `expert_counts` / `expert_offsets` on the device are also free
+    //     to overwrite (their large-path consumers have run).
+    if !small_experts.is_empty() {
+        let _ = staging_ptr; // not used in grouped small path
+
+        // ── small-only host-side metadata ───────────────────────────────
+        // small_counts[e] = counts[e] if e is small, else 0.
+        let mut small_counts_host = vec![0u32; num_experts];
+        for &e in &small_experts {
+            small_counts_host[e] = counts_host[e];
         }
-        let bucket_off = expert_idx * stride;
-        runtime.copy_u32_d2d_range(
-            &moe_scratch.expert_token_lists,
-            bucket_off,
-            &mut moe_scratch.gather_indices,
-            0,
-            count,
+        // small_offsets[e+1] = small_offsets[e] + small_counts[e].
+        // Each small expert's compact row range starts at small_offsets[e].
+        let mut small_offsets_host = vec![0u32; num_experts + 1];
+        for e in 0..num_experts {
+            small_offsets_host[e + 1] = small_offsets_host[e] + small_counts_host[e];
+        }
+        let total_small_tokens = small_offsets_host[num_experts] as usize;
+
+        // bulk_token_offsets for the grouped GEMM: contiguous prefix sum
+        // over small_experts in order (matches the compact layout that
+        // permute_gather will produce because each small expert's start
+        // equals the sum of preceding small experts' counts).
+        let mut small_bulk_tok_offsets_host: Vec<u32> =
+            Vec::with_capacity(small_experts.len() + 1);
+        small_bulk_tok_offsets_host.push(0);
+        let mut max_small_count = 0usize;
+        for &e in &small_experts {
+            let c = counts_host[e];
+            max_small_count = max_small_count.max(c as usize);
+            let prev = *small_bulk_tok_offsets_host.last().unwrap();
+            small_bulk_tok_offsets_host.push(prev + c);
+        }
+        let num_small = small_experts.len();
+
+        // small_pos_in_active: positions of small experts in the active_experts
+        // array (i.e. row index into bulk_packed / bulk_scales staging order).
+        let mut small_pos_in_active: Vec<usize> = Vec::with_capacity(num_small);
+        {
+            let mut ae_iter = 0usize;
+            for &ge in &small_experts {
+                while ae_iter < active_experts.len() && active_experts[ae_iter] != ge {
+                    ae_iter += 1;
+                }
+                small_pos_in_active.push(ae_iter);
+                ae_iter += 1;
+            }
+        }
+
+        // ── upload metadata ─────────────────────────────────────────────
+        // Overwrite expert_counts / expert_offsets / bulk_token_offsets
+        // (the large CUTLASS path has finished consuming them).
+        runtime.upload_u32_slice_to_device(
+            &small_counts_host,
+            &mut moe_scratch.expert_counts,
         )?;
-        runtime.copy_f32_d2d_range(
-            &moe_scratch.expert_weight_lists,
-            bucket_off,
-            &mut moe_scratch.gather_weights,
-            0,
-            count,
+        runtime.upload_u32_slice_to_device(
+            &small_offsets_host,
+            &mut moe_scratch.expert_offsets,
         )?;
-        runtime.gather_rows_f32_device(
+        runtime.upload_u32_slice_to_device(
+            &small_bulk_tok_offsets_host,
+            &mut moe_scratch.bulk_token_offsets,
+        )?;
+
+        // Per-projection: build small-only packed/scales offsets + output
+        // scales (subset of the all-active arrays already on the device).
+        for pi in 0..3 {
+            let mut packed_offs: Vec<u32> = Vec::with_capacity(num_small);
+            let mut scales_offs: Vec<u32> = Vec::with_capacity(num_small);
+            let mut output_scales: Vec<f32> = Vec::with_capacity(num_small);
+            for &spos in &small_pos_in_active {
+                packed_offs.push(per_proj_packed_offsets_host[pi][spos] as u32);
+                scales_offs.push(per_proj_scales_offsets_host[pi][spos] as u32);
+                output_scales.push(per_proj_alpha_host[pi][spos]);
+            }
+            let slot = &mut moe_scratch.bulk_slots[pi];
+            runtime.upload_u32_slice_to_device(&packed_offs, &mut slot.bulk_packed_offsets)?;
+            runtime.upload_u32_slice_to_device(&scales_offs, &mut slot.bulk_scales_offsets)?;
+            runtime.upload_f32_slice_to_device(&output_scales, &mut slot.bulk_output_scales)?;
+        }
+
+        // ── permute_gather: pack small experts' inputs contiguously into
+        //    permuted_input (rows [0, total_small_tokens)). ───────────────
+        runtime.permute_gather_f32_device(
             &moe_scratch.expert_input,
-            &moe_scratch.gather_indices,
-            count,
+            &moe_scratch.expert_token_lists,
+            &moe_scratch.expert_counts,
+            &moe_scratch.expert_offsets,
+            stride,
+            num_experts,
+            max_small_count,
             hidden_size,
-            &mut moe_scratch.gather_input,
+            &mut moe_scratch.permuted_input,
         )?;
-        let expert = &moe.experts[expert_idx];
-        let exp_intermediate_e = expert.gate_proj.rows;
-        matvec_nvfp4_batched_device_with_scratch(
-            runtime, &expert.gate_proj, &moe_scratch.gather_input, count,
-            &mut moe_scratch.gather_quant, &mut moe_scratch.gather_mxfp4,
-            &mut moe_scratch.gather_intermediate,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
-        matvec_nvfp4_batched_device_with_scratch(
-            runtime, &expert.up_proj, &moe_scratch.gather_input, count,
-            &mut moe_scratch.gather_quant, &mut moe_scratch.gather_mxfp4,
-            &mut moe_scratch.gather_swiglu,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
+
+        // ── grouped GEMM: gate, up, GeGLU, down ─────────────────────────
+        // Gate.
+        {
+            let slot = &moe_scratch.bulk_slots[0];
+            runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+                &slot.bulk_packed, &slot.bulk_scales,
+                &slot.bulk_packed_offsets, &slot.bulk_scales_offsets,
+                &slot.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+                &moe_scratch.permuted_input,
+                exp_intermediate, exp_cols_in, max_small_count, num_small,
+                &mut moe_scratch.permuted_intermediate,
+            )?;
+        }
+        // Up.
+        {
+            let slot = &moe_scratch.bulk_slots[1];
+            runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+                &slot.bulk_packed, &slot.bulk_scales,
+                &slot.bulk_packed_offsets, &slot.bulk_scales_offsets,
+                &slot.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+                &moe_scratch.permuted_input,
+                exp_intermediate, exp_cols_in, max_small_count, num_small,
+                &mut moe_scratch.permuted_swiglu,
+            )?;
+        }
+        // GeGLU(gate, up) → permuted_swiglu (in-place over up).
         runtime.geglu_tanh_in_place_device(
-            &moe_scratch.gather_intermediate,
-            &mut moe_scratch.gather_swiglu,
-            count * exp_intermediate_e,
+            &moe_scratch.permuted_intermediate,
+            &mut moe_scratch.permuted_swiglu,
+            total_small_tokens * exp_intermediate,
         )?;
-        matvec_nvfp4_batched_device_with_scratch(
-            runtime,
-            &expert.down_proj,
-            &moe_scratch.gather_swiglu,
-            count,
-            &mut moe_scratch.gather_quant,
-            &mut moe_scratch.gather_mxfp4,
-            &mut moe_scratch.gather_out,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
-        runtime.scatter_add_weighted_f32_device(
-            &moe_scratch.gather_out,
-            &moe_scratch.gather_indices,
-            &moe_scratch.gather_weights,
-            count,
+        // Down.
+        {
+            let slot = &moe_scratch.bulk_slots[2];
+            runtime.matmul_nvfp4_grouped_prequant_wmma_bf16_device(
+                &slot.bulk_packed, &slot.bulk_scales,
+                &slot.bulk_packed_offsets, &slot.bulk_scales_offsets,
+                &slot.bulk_output_scales, &moe_scratch.bulk_token_offsets,
+                &moe_scratch.permuted_swiglu,
+                down_rows, down_cols, max_small_count, num_small,
+                &mut moe_scratch.permuted_output,
+            )?;
+        }
+
+        // ── unpermute_scatter_add: write small-expert contributions back
+        //    into moe_acc using small-only counts/offsets. ────────────────
+        runtime.unpermute_scatter_add_f32_device(
+            &moe_scratch.permuted_output,
+            &moe_scratch.expert_token_lists,
+            &moe_scratch.expert_weight_lists,
+            &moe_scratch.expert_counts,
+            &moe_scratch.expert_offsets,
+            stride,
+            num_experts,
+            max_small_count,
             hidden_size,
             &mut moe_scratch.moe_acc,
         )?;
+    } else {
+        let _ = staging_ptr; // suppress unused warning when no small experts
     }
 
     Ok(())
