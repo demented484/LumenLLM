@@ -411,13 +411,19 @@ extern "C" int aegis_cutlass_moe_nvfp4_sfa_sfb_bytes_sm120(
       Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
   auto layout_sfb =
       Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+  // CUTLASS allocates `size(filter_zeros(layout))` slots — `filter_zeros`
+  // strips zero-stride modes so the result is the actual storage size,
+  // not the (much larger) cosize of the full swizzled layout. Mirrors
+  // the host setup in cutlass example 79d (block_SFA push_back).
   if (sfa_bytes_out) {
-    *sfa_bytes_out = static_cast<size_t>(cute::size(layout_sfa)) *
-                     sizeof(ElementSF);
+    *sfa_bytes_out =
+        static_cast<size_t>(cute::size(cute::filter_zeros(layout_sfa))) *
+        sizeof(ElementSF);
   }
   if (sfb_bytes_out) {
-    *sfb_bytes_out = static_cast<size_t>(cute::size(layout_sfb)) *
-                     sizeof(ElementSF);
+    *sfb_bytes_out =
+        static_cast<size_t>(cute::size(cute::filter_zeros(layout_sfb))) *
+        sizeof(ElementSF);
   }
   return 0;
 }

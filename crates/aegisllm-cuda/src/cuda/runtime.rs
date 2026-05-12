@@ -12,6 +12,7 @@ mod attention;
 mod blackwell;
 mod cublaslt;
 mod cutlass;
+pub mod cutlass_moe_smoke;
 mod gemm;
 mod graph;
 mod kv;

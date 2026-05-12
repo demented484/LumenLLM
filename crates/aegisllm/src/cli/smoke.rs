@@ -797,3 +797,54 @@ fn cuda_compare_linear(
     }
     Ok(())
 }
+
+/// Standalone smoke test for the CUTLASS NVFP4 grouped GEMM bridge.
+/// No model load required — exercises the three new helpers + grouped
+/// kernel on synthetic 4-expert data with M ∈ {128, 256, 512, 1024},
+/// N=K=128, and compares against a CPU NVFP4 dequant + f32 matmul
+/// reference. Pass criteria: cos_sim ≥ 0.998 per expert.
+pub(super) fn cuda_cutlass_nvfp4_smoke() -> Result<()> {
+    // Pick CUDA device 0. The CUTLASS NVFP4 grouped kernel only targets
+    // sm_120+; if the device isn't Blackwell, can_implement() inside the
+    // kernel will reject and we surface that here.
+    use aegisllm_base::cuda_config::CudaRuntimeConfig;
+    let runtime = aegisllm_cuda::cuda::CudaRuntime::new_with_config(
+        0,
+        CudaRuntimeConfig::from_env(),
+    )?;
+    if !aegisllm_cuda::cuda::CudaRuntime::cutlass_nvfp4_moe_grouped_built() {
+        eprintln!(
+            "cuda-cutlass-nvfp4-smoke FAIL: bridge not compiled — rebuild with \
+             AEGIS_CUTLASS_NVFP4_GROUPED_BUILD=1"
+        );
+        return Err(AegisError::Unsupported(
+            "AEGIS_CUTLASS_NVFP4_GROUPED_BUILD=1 required".into(),
+        ));
+    }
+    let report = runtime.cutlass_nvfp4_moe_grouped_smoke()?;
+    println!(
+        "cuda-cutlass-nvfp4-smoke: device={} experts={} workspace_bytes={} gemm_ms={:.3} threshold={:.4}",
+        runtime.device_index(),
+        report.num_experts,
+        report.workspace_bytes,
+        report.gemm_ms,
+        report.cos_sim_threshold,
+    );
+    for (g, e) in report.experts.iter().enumerate() {
+        let (sfa_b, sfb_b) = report.sfa_sfb_bytes[g];
+        let verdict = if e.cos_sim >= report.cos_sim_threshold { "PASS" } else { "FAIL" };
+        println!(
+            "  expert[{g}] m={} n={} k={} alpha={:.3} sfa_bytes={} sfb_bytes={} cos_sim={:.8} scale_ratio={:.6} abs_max_err={:.4e} ref_abs_max={:.4e} ref_l2={:.4e} {verdict}",
+            e.m, e.n, e.k, e.output_scale, sfa_b, sfb_b, e.cos_sim, e.scale_ratio, e.abs_max_err, e.ref_abs_max, e.ref_l2
+        );
+    }
+    if report.passed {
+        println!("cuda-cutlass-nvfp4-smoke: PASS");
+        Ok(())
+    } else {
+        eprintln!("cuda-cutlass-nvfp4-smoke: FAIL");
+        Err(AegisError::Unsupported(
+            "cuda-cutlass-nvfp4-smoke failed: at least one expert below cos_sim threshold".into(),
+        ))
+    }
+}

@@ -206,6 +206,42 @@ impl CudaRuntime {
             .map_err(map_cuda_err("dtoh u32 buffer"))
     }
 
+    pub fn download_u8(&self, buffer: &DeviceBuffer<u8>) -> Result<Vec<u8>> {
+        self.stream
+            .clone_dtoh(&buffer.slice)
+            .map_err(map_cuda_err("dtoh u8 buffer"))
+    }
+
+    pub fn upload_u8_slice_to_device(
+        &self,
+        values: &[u8],
+        buffer: &mut DeviceBuffer<u8>,
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        if buffer.len() < values.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "upload_u8_slice_to_device buffer too small: have {}, need {}",
+                buffer.len(),
+                values.len()
+            )));
+        }
+        let mut dst = buffer.slice.slice_mut(0..values.len());
+        self.stream
+            .memcpy_htod(values, &mut dst)
+            .map_err(map_cuda_err("htod u8 slice"))
+    }
+
+    pub fn upload_u64_slice(&self, values: &[u64]) -> Result<DeviceBuffer<u64>> {
+        Ok(DeviceBuffer {
+            slice: self
+                .stream
+                .clone_htod(values)
+                .map_err(map_cuda_err("htod u64 buffer"))?,
+        })
+    }
+
     /// Device-to-device copy of `len` elements from `src[src_offset..]` into
     /// `dst[dst_offset..]`. Used by the GPU router-bucket dispatch loop to
     /// pull a per-expert slice out of the bucket-sort output without going

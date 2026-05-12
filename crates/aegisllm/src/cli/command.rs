@@ -25,6 +25,7 @@ pub enum Command {
     CpuSmoke(EngineConfig),
     CpuMaterializeSmoke(EngineConfig),
     CudaSmoke(EngineConfig),
+    CudaCutlassNvfp4Smoke,
     CudaDenseSmoke(EngineConfig),
     CudaChainSmoke(EngineConfig),
     CudaCompare(EngineConfig),
