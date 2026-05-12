@@ -201,6 +201,63 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Decode-only packed variant of `router_softmax_topk_device`.
+    ///
+    /// Writes a single contiguous `[batch * top_k * 2]` u32 buffer containing
+    /// interleaved `(idx, bitcast<u32>(weight))` records. The host downloads
+    /// it once (`batch * top_k * 8` bytes) and reinterprets the f32 weights
+    /// on the CPU side. Replaces the two separate `out_idx` / `out_weights`
+    /// downloads with a single dtoh in the decode hot path.
+    pub fn router_softmax_topk_packed_device(
+        &self,
+        logits: &DeviceBuffer<f32>,
+        per_expert_scale: &DeviceBuffer<f32>,
+        batch: usize,
+        num_experts: usize,
+        top_k: usize,
+        out_packed: &mut DeviceBuffer<u32>,
+    ) -> Result<()> {
+        let total_logits = batch
+            .checked_mul(num_experts)
+            .ok_or_else(|| AegisError::InvalidPlan("router packed logits len overflow".into()))?;
+        let total_packed_words = batch
+            .checked_mul(top_k)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| AegisError::InvalidPlan("router packed top-k len overflow".into()))?;
+        if logits.len() < total_logits
+            || out_packed.len() < total_packed_words
+            || per_expert_scale.len() < num_experts
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "router topk packed shape mismatch: logits={} need {}, scale={} need {}, out={} need {}",
+                logits.len(), total_logits,
+                per_expert_scale.len(), num_experts,
+                out_packed.len(), total_packed_words,
+            )));
+        }
+        let batch_u32 = batch as u32;
+        let num_experts_u32 = num_experts as u32;
+        let top_k_u32 = top_k as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(batch_u32, 64), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.router_softmax_topk_packed)
+                .arg(&logits.slice)
+                .arg(&per_expert_scale.slice)
+                .arg(&batch_u32)
+                .arg(&num_experts_u32)
+                .arg(&top_k_u32)
+                .arg(&mut out_packed.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch router softmax topk packed"))?;
+        Ok(())
+    }
+
     /// Zero an `expert_counts[num_experts]` buffer in preparation for the
     /// `router_bucket_sort_device` scatter.
     pub fn router_zero_expert_counts_device(

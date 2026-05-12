@@ -114,6 +114,84 @@ extern "C" __global__ void aegis_router_softmax_topk(
     }
 }
 
+// Decode-only variant: per-token softmax + top-k that writes a SINGLE packed
+// output buffer with `(u32 idx, f32 weight)` records interleaved as raw u32
+// words. Used by `forward_moe_decode_device` so the host can issue ONE small
+// dtoh (top_k * 8 bytes) instead of two separate downloads. Otherwise byte-
+// identical to `aegis_router_softmax_topk`. Layout per token:
+//   packed[k*2 + 0] = expert_idx           (u32)
+//   packed[k*2 + 1] = bitcast<u32>(weight) (f32 bits as u32)
+extern "C" __global__ void aegis_router_softmax_topk_packed(
+    const float* __restrict__ logits,           // [batch, num_experts]
+    const float* __restrict__ per_expert_scale, // [num_experts] or null
+    const unsigned int batch,
+    const unsigned int num_experts,
+    const unsigned int top_k,
+    unsigned int* __restrict__ out_packed       // [batch * top_k * 2] u32 words
+) {
+    const unsigned int token = blockIdx.x * blockDim.x + threadIdx.x;
+    if (token >= batch) return;
+
+    constexpr unsigned int MAX_EXPERTS = 256;
+    if (num_experts > MAX_EXPERTS) return;
+
+    float local_logits[MAX_EXPERTS];
+    const float* row = logits + (size_t)token * num_experts;
+
+    float max_val = -3.402823466e38f;
+    for (unsigned int i = 0; i < num_experts; ++i) {
+        const float v = row[i];
+        local_logits[i] = v;
+        if (v > max_val) max_val = v;
+    }
+
+    float sum = 0.0f;
+    for (unsigned int i = 0; i < num_experts; ++i) {
+        const float e = __expf(local_logits[i] - max_val);
+        local_logits[i] = e;
+        sum += e;
+    }
+    const float inv_sum = 1.0f / sum;
+
+    constexpr unsigned int MAX_TOP_K = 16;
+    unsigned int picked_idx[MAX_TOP_K];
+    float        picked_w[MAX_TOP_K];
+    if (top_k > MAX_TOP_K) return;
+
+    for (unsigned int k = 0; k < top_k; ++k) {
+        float best_w = -1.0f;
+        unsigned int best_i = 0;
+        for (unsigned int i = 0; i < num_experts; ++i) {
+            const float w = local_logits[i];
+            if (w > best_w) {
+                best_w = w;
+                best_i = i;
+            }
+        }
+        picked_idx[k] = best_i;
+        picked_w[k]   = best_w * inv_sum;
+        local_logits[best_i] = -1.0f;
+    }
+
+    float renorm_sum = 0.0f;
+    for (unsigned int k = 0; k < top_k; ++k) renorm_sum += picked_w[k];
+    const float inv_renorm = (renorm_sum > 0.0f) ? (1.0f / renorm_sum) : 0.0f;
+    for (unsigned int k = 0; k < top_k; ++k) picked_w[k] *= inv_renorm;
+
+    if (per_expert_scale != nullptr) {
+        for (unsigned int k = 0; k < top_k; ++k) {
+            picked_w[k] *= per_expert_scale[picked_idx[k]];
+        }
+    }
+
+    unsigned int* out = out_packed + (size_t)token * top_k * 2u;
+    for (unsigned int k = 0; k < top_k; ++k) {
+        out[k * 2u + 0u] = picked_idx[k];
+        // Bit-cast f32 → u32 so the host can reinterpret without a copy.
+        out[k * 2u + 1u] = __float_as_uint(picked_w[k]);
+    }
+}
+
 // Zero `expert_counts[num_experts]`. Called before `bucket_sort` because
 // `bucket_sort` `atomicAdd`s into the same array.
 extern "C" __global__ void aegis_router_zero_expert_counts(

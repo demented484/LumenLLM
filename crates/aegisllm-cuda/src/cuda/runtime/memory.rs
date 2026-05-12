@@ -400,6 +400,58 @@ impl CudaRuntime {
         unsafe { self.stream.context().alloc_pinned::<u16>(len) }
             .map_err(map_cuda_err("alloc pinned u16 for kv host"))
     }
+
+    /// Allocate CUDA-pinned (page-locked) host memory for `len` u32 elements.
+    /// Used for the decode MoE packed top-k dtoh destination so the async copy
+    /// on the transfer stream takes the direct-DMA fast path.
+    pub fn alloc_pinned_u32(&self, len: usize) -> Result<PinnedHostSlice<u32>> {
+        unsafe { self.stream.context().alloc_pinned::<u32>(len) }
+            .map_err(map_cuda_err("alloc pinned u32"))
+    }
+
+    /// Issue an async D2H copy from `src` (`u32` device buffer) into `dst`
+    /// (CUDA-pinned host slice) on the **transfer stream**. Caller must record
+    /// a transfer event afterwards and host-synchronize on it before reading
+    /// `dst`.
+    ///
+    /// Internally goes through `CudaStream::memcpy_dtoh`, which on a
+    /// PinnedHostSlice destination enqueues a wait on the slice's internal
+    /// event (no host stall) and re-records it once the copy lands — providing
+    /// the producer/consumer ordering between successive layers without us
+    /// having to track an extra event per layer.
+    pub fn download_u32_to_pinned_async(
+        &self,
+        src: &DeviceBuffer<u32>,
+        dst: &mut PinnedHostSlice<u32>,
+        count: usize,
+    ) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        if src.len() < count || dst.len() < count {
+            return Err(AegisError::InvalidPlan(format!(
+                "download_u32_to_pinned_async out of bounds: src={} dst={} count={count}",
+                src.len(), dst.len(),
+            )));
+        }
+        let src_view = src.slice.slice(0..count);
+        // cudarc's memcpy_dtoh handles PinnedHostSlice destinations via
+        // `stream_synced_mut_slice`: enqueues an async wait on the slice's
+        // internal event (no host block) and re-records it on completion.
+        // We cannot pass a `&mut [u32]` subslice because that requires
+        // synchronously calling `as_mut_slice()` first (which would block).
+        // Instead pass the full slice and rely on `src` length being the
+        // copy-size driver (memcpy_dtoh uses `src.len()` for the byte count).
+        if count != src.len() {
+            // Defensive: cudarc's memcpy_dtoh sizes from src; we ensure src
+            // has exactly `count` elements by using a sliced view above.
+            // `src_view.len() == count` here, so this branch is unreachable
+            // in practice, kept for clarity.
+        }
+        self.transfer_stream
+            .memcpy_dtoh(&src_view, dst)
+            .map_err(map_cuda_err("d2h u32 packed topk async"))
+    }
 }
 
 impl<T> DeviceBuffer<T> {
