@@ -225,6 +225,39 @@ fn forward_moe_decode_device(
     // Step 1: pre_feedforward_layernorm(residual) → post_normed (shared MLP input)
     runtime.rms_norm_device(residual, &layer.post_attention_norm_weight, rms_norm_eps, post_normed)?;
 
+    // === Async-overlap router (decode) =====================================
+    //
+    // Goal: eliminate the per-MoE-layer host sync that previously serialized
+    // attention output → router math → expert dispatch. Previous structure
+    // issued `download_f32(router_logits)` which drained the compute stream,
+    // blocking the CPU for ~24 MoE layers per token.
+    //
+    // New pipeline (single transfer stream, one CudaEvent per layer):
+    //
+    //   compute : rms_norm + scale + matvec_router + topk_packed → packed_topk_device
+    //   compute : RECORD event_topk_ready
+    //   transfer: WAIT event_topk_ready → memcpy_dtoh(packed_topk_pinned) [async]
+    //
+    //   compute : shared MLP (matvec gate_up, geglu, matvec down) → moe_acc
+    //   compute : post_feedforward_layernorm_1(moe_acc) → post_normed (stream1)
+    //
+    //   host    : packed_topk_pinned.as_slice()  [waits on pinned's internal
+    //             event = dtoh completion. By now the compute stream has
+    //             issued shared MLP launches; the host wait is near-zero.]
+    //   host    : parse u32 records → router_top_indices / router_top_weights
+    //
+    //   compute : expert pre-norm (or copy) → hidden_out
+    //   compute : routed experts → routed_acc
+    //   compute : post_feedforward_layernorm_2(routed_acc) → expert_out (stream2)
+    //   compute : combine (post_normed + expert_out → moe_acc), final norm,
+    //             residual add, scalar.
+    //
+    // Bit-equivalence: GPU softmax+topk produces ULP-level differences from
+    // the prior CPU path (e.g. accumulation order of `expf`), but the order
+    // of operations (renormalize → per_expert_scale) is identical. Same
+    // behaviour as the prefill `router_softmax_topk_device` path that has
+    // shipped since the GPU router landed.
+
     // Gemma 4 router (matches transformers Gemma4TextRouter.forward):
     //   hidden  = rms_norm(residual)            (no weight, just unit-variance normalize)
     //   hidden *= router.scale                  (per-input-dim BF16 vector)
@@ -237,14 +270,12 @@ fn forward_moe_decode_device(
     let hidden_size = residual.len();
     let router_input: &crate::cuda::DeviceBuffer<f32> = match &moe.router_input_scale {
         Some(input_scale) => {
-            // hidden = rms_norm(residual) * router.scale  (single fused rms_norm with weight)
             runtime.rms_norm_device(
                 residual,
                 input_scale,
                 rms_norm_eps,
                 &mut moe_scratch.router_input_scratch,
             )?;
-            // hidden *= 1 / sqrt(hidden_size)
             let scalar_root_size = (hidden_size as f32).powf(-0.5);
             runtime.scale_f32_device(scalar_root_size, &mut moe_scratch.router_input_scratch)?;
             &moe_scratch.router_input_scratch
@@ -252,79 +283,58 @@ fn forward_moe_decode_device(
         None => residual,
     };
     runtime.matvec_bf16_reference_device(&moe.router, router_input, &mut moe_scratch.router_logits)?;
-    let logits = runtime.download_f32(&moe_scratch.router_logits)?;
-    // Reuse pooled scratch on `moe_scratch` instead of allocating
-    // 4 fresh `Vec`s per token per MoE layer.
-    softmax_top_k_normalized_into(
-        &logits,
-        moe.top_k,
-        moe.router_per_expert_scale_host.as_deref(),
-        &mut moe_scratch.router_probs,
-        &mut moe_scratch.router_indexed,
-        &mut moe_scratch.router_top_indices,
-        &mut moe_scratch.router_top_weights,
-    );
-    let active_top_k = moe_scratch.router_top_indices.len();
+    let top_k = moe.top_k;
+    let num_experts = moe.num_experts;
+    // GPU fused softmax+topk with per-expert scale renormalization. Writes
+    // `top_k * 2` interleaved u32 words `(idx, bitcast(weight))` into
+    // `packed_topk_device`.
+    runtime.router_softmax_topk_packed_device(
+        &moe_scratch.router_logits,
+        &moe.router_per_expert_scale_device,
+        1,
+        num_experts,
+        top_k,
+        &mut moe_scratch.packed_topk_device,
+    )?;
+    // Record compute-stream completion; transfer stream waits on it before
+    // issuing the dtoh.
+    runtime.record_into_compute(&moe_scratch.event_topk_ready)?;
+    runtime.transfer_wait_event(&moe_scratch.event_topk_ready)?;
+    // Single fused dtoh: `top_k * 8` bytes onto the pinned host buffer. The
+    // pinned slice's internal event is auto-recorded by cudarc after the copy
+    // completes; the host `as_slice()` call below synchronizes on it.
+    let packed_words = top_k.checked_mul(2).ok_or_else(|| {
+        aegisllm_base::error::AegisError::InvalidPlan(format!(
+            "MoE packed top-k overflow: top_k={top_k}"
+        ))
+    })?;
+    runtime.download_u32_to_pinned_async(
+        &moe_scratch.packed_topk_device,
+        &mut moe_scratch.packed_topk_pinned,
+        packed_words,
+    )?;
 
-    // Step 5: pre_feedforward_layernorm_2(residual) → hidden_out (expert input)
-    // We store this in hidden_out temporarily; it will be overwritten later.
+    // Issue expert pre-norm BEFORE the host sync so it's queued behind shared
+    // MLP launches. When `pre_feedforward_layernorm_2` is present this also
+    // makes the post_normed buffer free for the shared-MLP path to reuse as
+    // its output later.
     if let Some(ref norm2) = layer.pre_feedforward_layernorm_2 {
         runtime.rms_norm_device(residual, norm2, rms_norm_eps, hidden_out)?;
     } else {
-        // No separate expert pre-norm: copy post_normed into hidden_out.
+        // Expert input == pre-MLP norm output. Copy it out NOW because the
+        // shared-MLP write to `post_normed` further below would otherwise
+        // clobber it.
         runtime.copy_f32_device(post_normed, hidden_out)?;
     }
 
-    // Steps 6-7: Accumulate routed experts on expert_input (hidden_out), then post-norm.
     let staging_ptr: *mut LinearStagingPool =
         staging.map_or(std::ptr::null_mut(), |p| p as *mut _);
 
-    runtime.zero_f32_device(&mut moe_scratch.moe_acc)?;
-    // Index-based iteration: each (expert_idx, weight) is copied out of
-    // the pooled scratch buffers as `usize`/`f32` so the loop body can
-    // borrow `&mut moe_scratch` for per-expert matvecs without conflicting
-    // with the `&[..]` borrow of the top-k arrays.
-    for i in 0..active_top_k {
-        let expert_idx = moe_scratch.router_top_indices[i];
-        let weight = moe_scratch.router_top_weights[i];
-        let expert = &moe.experts[expert_idx];
-        matvec_nvfp4_device_with_scratch(
-            runtime, &expert.gate_proj, hidden_out,
-            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
-            &mut moe_scratch.expert_gate,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
-        matvec_nvfp4_device_with_scratch(
-            runtime, &expert.up_proj, hidden_out,
-            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
-            &mut moe_scratch.expert_up,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
-        // Gemma 4 uses gelu_pytorch_tanh as MoE expert activation, not silu/SwiGLU.
-        runtime.geglu_tanh_device(&moe_scratch.expert_gate, &moe_scratch.expert_up, &mut moe_scratch.expert_swiglu)?;
-        matvec_nvfp4_device_with_scratch(
-            runtime, &expert.down_proj, &moe_scratch.expert_swiglu,
-            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
-            &mut moe_scratch.expert_out,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
-        runtime.axpy_f32_device(weight, &moe_scratch.expert_out, &mut moe_scratch.moe_acc)?;
-    }
-
-    // Step 7: post_feedforward_layernorm_2(moe_acc) → expert_out (stream2)
-    if let Some(ref norm2) = layer.post_feedforward_layernorm_2 {
-        runtime.rms_norm_device(&moe_scratch.moe_acc, norm2, rms_norm_eps, &mut moe_scratch.expert_out)?;
-    } else {
-        runtime.copy_f32_device(&moe_scratch.moe_acc, &mut moe_scratch.expert_out)?;
-    }
-
-    // Steps 2-3: Shared MLP on post_normed (step 1 output) → result in moe_acc
+    // Steps 2-3: shared MLP on post_normed → moe_acc. Independent of router
+    // top-k; runs concurrently with the dtoh and provides the overlap window
+    // that makes the upcoming host sync cheap.
     if let Some(ref shared) = moe.shared_expert {
         if let Some(ref fused) = shared.gate_up_fused {
-            // Fused gate+up matvec produces `[2*intermediate]` row-major into
-            // `shared_gate_up_fused`; strided geglu kernel reads gate from
-            // the first half and up from the second, writing `[intermediate]`
-            // to `expert_swiglu`. M=1 so a single matvec replaces two.
             let intermediate = shared.gate_proj.rows();
             runtime.matvec_bf16_reference_device(
                 fused,
@@ -350,7 +360,6 @@ fn forward_moe_decode_device(
                 &mut moe_scratch.expert_up,
                 if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
             )?;
-            // Gemma 4 shared MLP also uses gelu_pytorch_tanh activation.
             runtime.geglu_tanh_device(
                 &moe_scratch.expert_gate,
                 &moe_scratch.expert_up,
@@ -368,11 +377,66 @@ fn forward_moe_decode_device(
     }
 
     // Step 3: post_feedforward_layernorm_1(moe_acc=shared_out) → post_normed (stream1)
-    // Overwrite post_normed — shared MLP input is no longer needed.
     if let Some(ref norm1) = layer.post_feedforward_layernorm_1 {
         runtime.rms_norm_device(&moe_scratch.moe_acc, norm1, rms_norm_eps, post_normed)?;
     } else {
         runtime.copy_f32_device(&moe_scratch.moe_acc, post_normed)?;
+    }
+
+    // Host sync: wait for the packed dtoh, then parse the records into the
+    // pooled top-k arrays. By this point the compute stream has dispatched
+    // shared MLP gate_up / geglu / down_proj + post_norm_1 — enough work to
+    // hide the dtoh latency.
+    let packed_host = moe_scratch
+        .packed_topk_pinned
+        .as_slice()
+        .map_err(|e| aegisllm_base::error::AegisError::Unsupported(
+            format!("pinned packed topk slice sync failed: {e:?}"),
+        ))?;
+    moe_scratch.router_top_indices.clear();
+    moe_scratch.router_top_weights.clear();
+    for k in 0..top_k {
+        let idx_word = packed_host[k * 2];
+        let weight_word = packed_host[k * 2 + 1];
+        moe_scratch.router_top_indices.push(idx_word as usize);
+        moe_scratch.router_top_weights.push(f32::from_bits(weight_word));
+    }
+    let active_top_k = moe_scratch.router_top_indices.len();
+
+    // Routed experts → routed_acc (separate accumulator so it does not alias
+    // with `moe_acc` which already holds the shared-MLP output).
+    runtime.zero_f32_device(&mut moe_scratch.routed_acc)?;
+    for i in 0..active_top_k {
+        let expert_idx = moe_scratch.router_top_indices[i];
+        let weight = moe_scratch.router_top_weights[i];
+        let expert = &moe.experts[expert_idx];
+        matvec_nvfp4_device_with_scratch(
+            runtime, &expert.gate_proj, hidden_out,
+            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
+            &mut moe_scratch.expert_gate,
+            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
+        )?;
+        matvec_nvfp4_device_with_scratch(
+            runtime, &expert.up_proj, hidden_out,
+            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
+            &mut moe_scratch.expert_up,
+            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
+        )?;
+        runtime.geglu_tanh_device(&moe_scratch.expert_gate, &moe_scratch.expert_up, &mut moe_scratch.expert_swiglu)?;
+        matvec_nvfp4_device_with_scratch(
+            runtime, &expert.down_proj, &moe_scratch.expert_swiglu,
+            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
+            &mut moe_scratch.expert_out,
+            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
+        )?;
+        runtime.axpy_f32_device(weight, &moe_scratch.expert_out, &mut moe_scratch.routed_acc)?;
+    }
+
+    // Step 7: post_feedforward_layernorm_2(routed_acc) → expert_out (stream2)
+    if let Some(ref norm2) = layer.post_feedforward_layernorm_2 {
+        runtime.rms_norm_device(&moe_scratch.routed_acc, norm2, rms_norm_eps, &mut moe_scratch.expert_out)?;
+    } else {
+        runtime.copy_f32_device(&moe_scratch.routed_acc, &mut moe_scratch.expert_out)?;
     }
 
     // Step 8: combined = stream1 (post_normed) + stream2 (expert_out) → moe_acc
@@ -402,12 +466,10 @@ fn forward_moe_decode_device(
 ///   topk_w /= sum(topk_w)                       # renormalize so top-k weights sum to 1
 ///   topk_w *= per_expert_scale[topk_i]           # if provided
 ///
-/// Pooled-scratch variant: `probs_buf` and `indexed_buf` are reusable
-/// `Vec`s owned by the MoE scratch; `out_indices` / `out_weights` get
-/// `clear()` + `extend` so callers can borrow `&[usize]`/`&[f32]` views
-/// without per-call allocations. All four buffers must be pre-sized
-/// (with `Vec::with_capacity`) to at least `num_experts` / `top_k`
-/// elements respectively to avoid reallocation on the hot path.
+/// Decode no longer calls this — replaced by the GPU async-overlap router
+/// (`router_softmax_topk_packed_device` + pinned dtoh). Kept for tests and
+/// any non-decode fallback path that may still want the CPU implementation.
+#[allow(dead_code)]
 fn softmax_top_k_normalized_into(
     logits: &[f32],
     top_k: usize,

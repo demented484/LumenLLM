@@ -119,6 +119,12 @@ pub(super) struct CudaMoEScratch {
     /// Sized to `hidden_size`; only used when `router_input_scale` is present.
     pub(super) router_input_scratch: DeviceBuffer<f32>,
     pub(super) moe_acc: DeviceBuffer<f32>,
+    /// Decode async-overlap router: separate routed-expert accumulator so the
+    /// shared-MLP output can be staged into `moe_acc` in parallel with the
+    /// router top-k dtoh, before routed experts begin to accumulate. Without
+    /// this split, shared MLP and routed-experts both write into `moe_acc`
+    /// and must serialize. Sized to `hidden_size`.
+    pub(super) routed_acc: DeviceBuffer<f32>,
     pub(super) expert_gate: DeviceBuffer<f32>,
     pub(super) expert_up: DeviceBuffer<f32>,
     pub(super) expert_swiglu: DeviceBuffer<f32>,
@@ -130,14 +136,24 @@ pub(super) struct CudaMoEScratch {
     pub(super) shared_gate_up_fused: DeviceBuffer<f32>,
     pub(super) quant_expert: DeviceBuffer<f32>,
     pub(super) mxfp4_expert: DeviceBuffer<u8>,
-    /// CPU-side scratch reused across decode-token MoE router calls so
-    /// `softmax_top_k_normalized` doesn't allocate 5+ small `Vec`s per
-    /// MoE layer per token. Shapes:
-    /// - `router_probs` is `Vec<f32>` sized to `num_experts`
-    /// - `router_indexed` is `Vec<(usize, f32)>` sized to `num_experts`
-    /// - `router_top_indices` / `router_top_weights` are sized to `top_k`
-    /// All owned by the per-state scratch (single-threaded inference);
-    /// callers `clear()` then `extend` in place.
+    /// Decode async-overlap router scratch.
+    ///
+    /// `packed_topk_device` is a `[max_top_k * 2]` u32 buffer that
+    /// `router_softmax_topk_packed_device` fills with interleaved
+    /// `(idx, bitcast<u32>(weight))` records. `packed_topk_pinned` is the
+    /// pinned host destination of the single fused dtoh issued on the
+    /// transfer stream; reads are gated by the pinned slice's internal event,
+    /// which `as_slice()` synchronizes on. `event_topk_ready` is an event
+    /// recorded on the compute stream after the packed top-k kernel; the
+    /// transfer stream waits on it before launching the dtoh.
+    ///
+    /// `router_probs`/`router_indexed` remain only for prefill / tests; the
+    /// decode hot path no longer touches them. `router_top_indices`/
+    /// `router_top_weights` are the parsed host-side outputs of the dtoh
+    /// reused across MoE layers.
+    pub(super) packed_topk_device: DeviceBuffer<u32>,
+    pub(super) packed_topk_pinned: PinnedHostSlice<u32>,
+    pub(super) event_topk_ready: cudarc::driver::CudaEvent,
     pub(super) router_probs: Vec<f32>,
     pub(super) router_indexed: Vec<(usize, f32)>,
     pub(super) router_top_indices: Vec<usize>,

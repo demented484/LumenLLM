@@ -961,10 +961,25 @@ impl CudaLlamaExecutor {
                         .map(|m| m.top_k)
                         .max()
                         .unwrap_or(1);
+                    // Packed top-k buffer: `[max_top_k * 2]` u32 words holding
+                    // `(idx, bitcast<u32>(weight))` records. Pinned host twin
+                    // is the destination of the per-layer async dtoh on the
+                    // transfer stream — single fused download replaces the
+                    // pre-async pattern of `download_f32(router_logits) +
+                    // CPU softmax+topk`.
+                    let packed_topk_words = max_top_k
+                        .checked_mul(2)
+                        .ok_or_else(|| aegisllm_base::error::AegisError::InvalidPlan(
+                            format!("MoE packed top-k overflow: top_k={max_top_k}"),
+                        ))?;
+                    let packed_topk_device = self.runtime.alloc_u32(packed_topk_words)?;
+                    let packed_topk_pinned = self.runtime.alloc_pinned_u32(packed_topk_words)?;
+                    let event_topk_ready = self.runtime.alloc_event()?;
                     Some(Box::new(CudaMoEScratch {
                         router_logits: self.runtime.alloc_f32(max_num_experts)?,
                         router_input_scratch: self.runtime.alloc_f32(self.hidden_size)?,
                         moe_acc: self.runtime.alloc_f32(self.hidden_size)?,
+                        routed_acc: self.runtime.alloc_f32(self.hidden_size)?,
                         expert_gate: self.runtime.alloc_f32(max_expert_intermediate)?,
                         expert_up: self.runtime.alloc_f32(max_expert_intermediate)?,
                         expert_swiglu: self.runtime.alloc_f32(max_expert_intermediate)?,
@@ -978,11 +993,13 @@ impl CudaLlamaExecutor {
                         mxfp4_expert: self
                             .runtime
                             .alloc_u8(CudaRuntime::mxfp4_vector_bytes(max_input)?)?,
-                        // CPU-side router top-K scratch: pre-sized to the
-                        // max num_experts/top_k seen across layers and
-                        // reused on every decode-token MoE router call.
-                        // Avoids ~5 Vec allocations per MoE layer per
-                        // token in the hot decode path.
+                        packed_topk_device,
+                        packed_topk_pinned,
+                        event_topk_ready,
+                        // Legacy CPU-side router top-K scratch (prefill / tests
+                        // / non-overlap fallback). Decode hot path now parses
+                        // the pinned packed buffer directly into
+                        // `router_top_indices` / `router_top_weights`.
                         router_probs: Vec::with_capacity(max_num_experts),
                         router_indexed: Vec::with_capacity(max_num_experts),
                         router_top_indices: Vec::with_capacity(max_top_k),
