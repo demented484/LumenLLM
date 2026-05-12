@@ -4,10 +4,12 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=src/cuda/cutlass_bridge.cu");
+    println!("cargo:rerun-if-changed=src/cuda/cutlass_bridge_moe.cu");
     println!("cargo:rerun-if-env-changed=CUTLASS_DIR");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=AEGIS_CUTLASS_CUDA_ARCH");
+    println!("cargo:rerun-if-env-changed=AEGIS_CUTLASS_NVFP4_GROUPED_BUILD");
 
     let cutlass_dir = env::var_os("CUTLASS_DIR")
         .map(PathBuf::from)
@@ -21,8 +23,30 @@ fn main() {
     let object = out_dir.join("cutlass_bridge.o");
     let archive = out_dir.join("libaegis_cutlass_bridge.a");
 
-    compile_cutlass_bridge(&cuda_dir, &cutlass_dir, &object);
-    archive_object(&archive, &object);
+    compile_cutlass_bridge(&cuda_dir, &cutlass_dir, "src/cuda/cutlass_bridge.cu", &object);
+
+    // Optional: compile the CUTLASS NVFP4 grouped MoE GEMM TU. Heavy
+    // template instantiation (~2-3 min standalone compile on sm_120f),
+    // so it's gated behind AEGIS_CUTLASS_NVFP4_GROUPED_BUILD=1. When the
+    // flag is unset, the Rust runtime gets a stub from a sibling module
+    // that returns "not built" so the dispatcher falls back to the
+    // existing home-rolled grouped kernel.
+    let build_grouped =
+        env::var("AEGIS_CUTLASS_NVFP4_GROUPED_BUILD").map(|v| v != "0").unwrap_or(false);
+    let mut objects = vec![object.clone()];
+    if build_grouped {
+        let moe_object = out_dir.join("cutlass_bridge_moe.o");
+        compile_cutlass_bridge(
+            &cuda_dir,
+            &cutlass_dir,
+            "src/cuda/cutlass_bridge_moe.cu",
+            &moe_object,
+        );
+        objects.push(moe_object);
+        println!("cargo:rustc-cfg=aegis_cutlass_nvfp4_grouped");
+    }
+
+    archive_objects(&archive, &objects);
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=aegis_cutlass_bridge");
@@ -34,12 +58,12 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=stdc++");
 }
 
-fn compile_cutlass_bridge(cuda_dir: &Path, cutlass_dir: &Path, object: &Path) {
+fn compile_cutlass_bridge(cuda_dir: &Path, cutlass_dir: &Path, src: &str, object: &Path) {
     let nvcc = cuda_dir.join("bin/nvcc");
     let cuda_arch = env::var("AEGIS_CUTLASS_CUDA_ARCH").unwrap_or_else(|_| "sm_120f".into());
     let status = Command::new(&nvcc)
         .arg("-c")
-        .arg("src/cuda/cutlass_bridge.cu")
+        .arg(src)
         .arg("-o")
         .arg(object)
         .arg("-std=c++17")
@@ -57,17 +81,20 @@ fn compile_cutlass_bridge(cuda_dir: &Path, cutlass_dir: &Path, object: &Path) {
         .unwrap_or_else(|error| panic!("failed to run {}: {error}", nvcc.display()));
 
     if !status.success() {
-        panic!("nvcc failed to compile CUTLASS bridge with status {status}");
+        panic!("nvcc failed to compile {src} with status {status}");
     }
 }
 
-fn archive_object(archive: &Path, object: &Path) {
-    let status = Command::new("ar")
-        .arg("crus")
-        .arg(archive)
-        .arg(object)
-        .status()
-        .expect("failed to run ar");
+fn archive_objects(archive: &Path, objects: &[PathBuf]) {
+    // `ar crus` creates/replaces; ensure a clean slate so a previous
+    // build's stale objects don't linger when we toggle the optional TU.
+    let _ = std::fs::remove_file(archive);
+    let mut cmd = Command::new("ar");
+    cmd.arg("crus").arg(archive);
+    for obj in objects {
+        cmd.arg(obj);
+    }
+    let status = cmd.status().expect("failed to run ar");
     if !status.success() {
         panic!("ar failed to create {}", archive.display());
     }
