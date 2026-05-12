@@ -257,6 +257,38 @@ unsafe extern "C" {
         problem_shape_bytes: *mut usize,
     ) -> c_int;
 
+    fn aegis_cutlass_moe_nvfp4_sfa_sfb_bytes_sm120(
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        sfa_bytes_out: *mut usize,
+        sfb_bytes_out: *mut usize,
+    ) -> c_int;
+
+    fn aegis_cutlass_moe_nvfp4_quantize_input_grouped(
+        input: *const f32,
+        cols: c_int,
+        num_groups: c_int,
+        token_offsets_device: *const u32,
+        payload_offsets_device: *const u64,
+        sfa_offsets_device: *const u64,
+        max_padded_rows_per_group: c_int,
+        payload_out: *mut u8,
+        sfa_out: *mut u8,
+        stream: *mut c_void,
+    ) -> c_int;
+
+    fn aegis_cutlass_moe_nvfp4_swizzle_weight_scales_grouped(
+        src: *const u8,
+        rows_per_group: c_int,
+        src_cols: c_int,
+        num_groups: c_int,
+        src_offsets_device: *const u64,
+        dst_offsets_device: *const u64,
+        dst: *mut u8,
+        stream: *mut c_void,
+    ) -> c_int;
+
     fn aegis_cutlass_moe_nvfp4_compute_strides_sm120(
         m: c_int,
         n: c_int,
@@ -466,6 +498,99 @@ pub(super) unsafe fn moe_grouped_run(
         });
     }
     Ok(())
+}
+
+/// Query the per-expert SFA/SFB byte sizes for a given (M, N, K)
+/// problem shape. Returns (sfa_bytes, sfb_bytes). SFA depends on (M, K),
+/// SFB on (N, K); both expressed as
+/// `cosize(Sm1xxBlkScaledConfig::tile_atom_to_shape_SF{A,B}) * sizeof(ElementSF)`.
+#[cfg(aegis_cutlass_nvfp4_grouped)]
+pub(super) fn moe_grouped_sfa_sfb_bytes(m: i32, n: i32, k: i32) -> Result<(usize, usize), String> {
+    let mut sfa: usize = 0;
+    let mut sfb: usize = 0;
+    let code = unsafe {
+        aegis_cutlass_moe_nvfp4_sfa_sfb_bytes_sm120(m, n, k, &mut sfa, &mut sfb)
+    };
+    if code != 0 {
+        return Err(format!(
+            "CUTLASS MoE NVFP4 sfa_sfb_bytes failed (m={m}, n={n}, k={k}) with code {code}"
+        ));
+    }
+    Ok((sfa, sfb))
+}
+
+/// Launch the per-expert NVFP4 activation quantizer. All buffer offsets
+/// are device-resident u64 arrays sized `num_groups`. `token_offsets` is
+/// a u32 prefix-sum of length `num_groups+1`.
+#[cfg(aegis_cutlass_nvfp4_grouped)]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn moe_grouped_quantize_input(
+    input: *const f32,
+    cols: i32,
+    num_groups: i32,
+    token_offsets_device: *const u32,
+    payload_offsets_device: *const u64,
+    sfa_offsets_device: *const u64,
+    max_padded_rows_per_group: i32,
+    payload_out: *mut u8,
+    sfa_out: *mut u8,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let code = unsafe {
+        aegis_cutlass_moe_nvfp4_quantize_input_grouped(
+            input,
+            cols,
+            num_groups,
+            token_offsets_device,
+            payload_offsets_device,
+            sfa_offsets_device,
+            max_padded_rows_per_group,
+            payload_out,
+            sfa_out,
+            stream,
+        )
+    };
+    if code != 0 {
+        Err(format!(
+            "CUTLASS MoE NVFP4 grouped input quantize failed with code {code}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// Launch the per-expert weight-scale row-major → swizzled transform.
+#[cfg(aegis_cutlass_nvfp4_grouped)]
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn moe_grouped_swizzle_weight_scales(
+    src: *const u8,
+    rows_per_group: i32,
+    src_cols: i32,
+    num_groups: i32,
+    src_offsets_device: *const u64,
+    dst_offsets_device: *const u64,
+    dst: *mut u8,
+    stream: *mut c_void,
+) -> Result<(), String> {
+    let code = unsafe {
+        aegis_cutlass_moe_nvfp4_swizzle_weight_scales_grouped(
+            src,
+            rows_per_group,
+            src_cols,
+            num_groups,
+            src_offsets_device,
+            dst_offsets_device,
+            dst,
+            stream,
+        )
+    };
+    if code != 0 {
+        Err(format!(
+            "CUTLASS MoE NVFP4 grouped weight-scale swizzle failed with code {code}"
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(not(aegis_cutlass_nvfp4_grouped))]

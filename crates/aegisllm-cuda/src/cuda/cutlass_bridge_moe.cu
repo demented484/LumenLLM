@@ -23,6 +23,8 @@
 #include <cstring>
 #include <type_traits>
 
+#include <cuda_fp8.h>
+
 #include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
 
@@ -39,6 +41,234 @@
 using namespace cute;
 
 namespace aegis_cutlass_bridge_moe {
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Device-side helpers shared with the dense path (intentionally re-declared
+// here so this TU is self-contained — both TUs are linked into the same
+// archive but ODR-isolated under their own namespaces). The SFA swizzle
+// layout matches `Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA` for
+// (Mtile=128, K-scale-tile=4) which is the layout produced by the CUTLASS
+// instantiation in this file (ThreadBlockShape = _128,_128,_128).
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+__device__ __forceinline__ unsigned moe_best_e2m1(float value, float scale) {
+  if (!(scale > 0.0f)) {
+    return 0;
+  }
+  float scaled = value / scale;
+  if (!isfinite(scaled)) {
+    return 0;
+  }
+  float mag = fabsf(scaled);
+  unsigned code = 0;
+  if (mag <= 0.25f) {
+    code = 0;
+  } else if (mag <= 0.75f) {
+    code = 1;
+  } else if (mag <= 1.25f) {
+    code = 2;
+  } else if (mag <= 1.75f) {
+    code = 3;
+  } else if (mag <= 2.5f) {
+    code = 4;
+  } else if (mag <= 3.5f) {
+    code = 5;
+  } else if (mag <= 5.0f) {
+    code = 6;
+  } else {
+    code = 7;
+  }
+  return scaled < 0.0f && code != 0 ? (code | 0x8u) : code;
+}
+
+// Layout: padded_rows × padded_scale_cols, tiled in 128×4 blocks of
+// 512 bytes each. row_in_blob is the row inside this per-expert SFA
+// blob (so >= 0 and < padded_rows). scale_col in [0, padded_scale_cols).
+__device__ __forceinline__ size_t moe_swizzled_scale_offset(
+    int row_in_blob, int scale_col, int scale_k_tiles) {
+  int m_tile_idx = row_in_blob >> 7;
+  int outer_m_idx = row_in_blob & 31;
+  int inner_m_idx = (row_in_blob >> 5) & 3;
+  int k_tile_idx = scale_col >> 2;
+  int inner_k_idx = scale_col & 3;
+  return (static_cast<size_t>(m_tile_idx) * scale_k_tiles + k_tile_idx) * 512u +
+         static_cast<size_t>(outer_m_idx) * 16u +
+         static_cast<size_t>(inner_m_idx) * 4u + inner_k_idx;
+}
+
+}  // namespace
+
+// Per-expert NVFP4 quantizer for grouped MoE inputs.
+//
+// Inputs:
+//   `input`              : permuted activations, [total_tokens, cols], row-major f32.
+//   `token_offsets`      : per-expert prefix-sum of token counts, length = num_groups+1.
+//   `payload_offsets`    : per-expert offset (bytes) into `payload_out` buffer,
+//                          length = num_groups. payload_out[payload_offsets[g] +
+//                          row_in_g * (cols/2) + .. ] holds expert g's packed nibbles.
+//   `sfa_offsets`        : per-expert offset (bytes) into `sfa_out` buffer,
+//                          length = num_groups. sfa_out[sfa_offsets[g] + ..]
+//                          holds expert g's swizzled SFA blob of size
+//                          padded_rows_g * padded_scale_cols bytes.
+// All offsets are device-resident (uploaded by the caller). The kernel
+// processes one (group, row, scale_col) tile per thread.
+//
+// Grid: (max_padded_scale_cols / threads_per_block, max_padded_rows_per_group, num_groups)
+// We over-launch and gate on per-group padded_rows / padded_scale_cols read
+// from token_offsets. This keeps the launch parameters static.
+__global__ void quantize_grouped_f32_to_e2m1_ue4m3_kernel(
+    const float* __restrict__ input, int cols, int scale_cols,
+    int padded_scale_cols, int scale_k_tiles, int num_groups,
+    const uint32_t* __restrict__ token_offsets,
+    const uint64_t* __restrict__ payload_offsets,
+    const uint64_t* __restrict__ sfa_offsets, uint8_t* __restrict__ payload_out,
+    uint8_t* __restrict__ sfa_out) {
+  int group = blockIdx.z;
+  if (group >= num_groups) return;
+  int row_in_group = blockIdx.y;
+  int scale_col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (scale_col >= padded_scale_cols) return;
+
+  uint32_t row_start = token_offsets[group];
+  uint32_t row_end = token_offsets[group + 1];
+  int rows_in_group = static_cast<int>(row_end - row_start);
+  int padded_rows = ((rows_in_group + 127) / 128) * 128;
+  if (row_in_group >= padded_rows) return;
+
+  uint64_t payload_off = payload_offsets[group];
+  uint64_t sfa_off = sfa_offsets[group];
+  uint8_t* group_payload = payload_out + payload_off;
+  uint8_t* group_sfa = sfa_out + sfa_off;
+
+  if (row_in_group >= rows_in_group || scale_col >= scale_cols) {
+    group_sfa[moe_swizzled_scale_offset(row_in_group, scale_col,
+                                        scale_k_tiles)] = 0;
+    return;
+  }
+
+  size_t absolute_row = static_cast<size_t>(row_start) + row_in_group;
+  int col_base = scale_col * 16;
+  float values[16];
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    float value = input[absolute_row * cols + col_base + i];
+    values[i] = value;
+    amax = fmaxf(amax, fabsf(value));
+  }
+
+  float scale = (amax > 0.0f) ? (amax / 6.0f) : 0.0f;
+  __nv_fp8_e4m3 encoded_scale(scale);
+  uint8_t scale_byte = reinterpret_cast<uint8_t&>(encoded_scale);
+  group_sfa[moe_swizzled_scale_offset(row_in_group, scale_col, scale_k_tiles)] =
+      scale_byte;
+  float decoded_scale = static_cast<float>(encoded_scale);
+
+#pragma unroll
+  for (int pair = 0; pair < 8; ++pair) {
+    unsigned lo = moe_best_e2m1(values[pair * 2], decoded_scale);
+    unsigned hi = moe_best_e2m1(values[pair * 2 + 1], decoded_scale);
+    group_payload[static_cast<size_t>(row_in_group) * (cols / 2) +
+                  scale_col * 8 + pair] = static_cast<uint8_t>(lo | (hi << 4));
+  }
+}
+
+// Per-expert weight-scale swizzler. Reads row-major scale bytes from a
+// staged bulk buffer (one per expert, as produced by the existing host
+// load + H2D path) and writes them into a swizzled per-expert SFB blob.
+//
+// Inputs:
+//   `src`              : row-major scales for each expert concatenated in `src`,
+//                        indexed by `src_offsets[g]` (in bytes).
+//   `src_rows_per_g`   : rows per expert (== N_g, the projection's output rows).
+//   `src_cols`         : == K_g / 16 (== scale_cols, same across experts since
+//                        K is shared).
+//   `dst_offsets`      : per-expert offsets (in bytes) into the swizzled
+//                        destination buffer.
+//   `padded_scale_cols`: scale_cols rounded up to multiple of 4.
+//   `scale_k_tiles`    : padded_scale_cols / 4.
+//   `padded_rows`      : src_rows_per_g rounded up to multiple of 128
+//                        (same for every expert since N is shared).
+//   `num_groups`       : number of experts.
+//   `dst`              : output buffer.
+__global__ void swizzle_grouped_scales_kernel(
+    const uint8_t* __restrict__ src, int src_rows_per_g, int src_cols,
+    int padded_scale_cols, int scale_k_tiles, int padded_rows, int num_groups,
+    const uint64_t* __restrict__ src_offsets,
+    const uint64_t* __restrict__ dst_offsets, uint8_t* __restrict__ dst) {
+  int group = blockIdx.z;
+  if (group >= num_groups) return;
+  int row = blockIdx.y;
+  int scale_col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= padded_rows || scale_col >= padded_scale_cols) return;
+
+  uint64_t src_off = src_offsets[group];
+  uint64_t dst_off = dst_offsets[group];
+  const uint8_t* src_grp = src + src_off;
+  uint8_t* dst_grp = dst + dst_off;
+
+  uint8_t value = 0;
+  if (row < src_rows_per_g && scale_col < src_cols) {
+    value = src_grp[static_cast<size_t>(row) * src_cols + scale_col];
+  }
+  dst_grp[moe_swizzled_scale_offset(row, scale_col, scale_k_tiles)] = value;
+}
+
+extern "C" int aegis_cutlass_moe_nvfp4_quantize_input_grouped(
+    const float* input, int cols, int num_groups,
+    const uint32_t* token_offsets_device, const uint64_t* payload_offsets_device,
+    const uint64_t* sfa_offsets_device, int max_padded_rows_per_group,
+    uint8_t* payload_out, uint8_t* sfa_out, void* stream) {
+  if (input == nullptr || token_offsets_device == nullptr ||
+      payload_offsets_device == nullptr || sfa_offsets_device == nullptr ||
+      payload_out == nullptr || sfa_out == nullptr) {
+    return 1;
+  }
+  if (num_groups <= 0 || cols <= 0 || (cols % 32) != 0) {
+    return 2;
+  }
+  int scale_cols = cols / 16;
+  int padded_scale_cols = ((scale_cols + 3) / 4) * 4;
+  int scale_k_tiles = padded_scale_cols / 4;
+  dim3 block(128, 1, 1);
+  dim3 grid((padded_scale_cols + block.x - 1) / block.x,
+            max_padded_rows_per_group, num_groups);
+  quantize_grouped_f32_to_e2m1_ue4m3_kernel<<<grid, block, 0,
+                                              reinterpret_cast<cudaStream_t>(
+                                                  stream)>>>(
+      input, cols, scale_cols, padded_scale_cols, scale_k_tiles, num_groups,
+      token_offsets_device, payload_offsets_device, sfa_offsets_device,
+      payload_out, sfa_out);
+  cudaError_t err = cudaGetLastError();
+  return (err == cudaSuccess) ? 0 : 3;
+}
+
+extern "C" int aegis_cutlass_moe_nvfp4_swizzle_weight_scales_grouped(
+    const uint8_t* src, int rows_per_group, int src_cols, int num_groups,
+    const uint64_t* src_offsets_device, const uint64_t* dst_offsets_device,
+    uint8_t* dst, void* stream) {
+  if (src == nullptr || src_offsets_device == nullptr ||
+      dst_offsets_device == nullptr || dst == nullptr) {
+    return 1;
+  }
+  if (num_groups <= 0 || rows_per_group <= 0 || src_cols <= 0) {
+    return 2;
+  }
+  int padded_scale_cols = ((src_cols + 3) / 4) * 4;
+  int scale_k_tiles = padded_scale_cols / 4;
+  int padded_rows = ((rows_per_group + 127) / 128) * 128;
+  dim3 block(128, 1, 1);
+  dim3 grid((padded_scale_cols + block.x - 1) / block.x, padded_rows,
+            num_groups);
+  swizzle_grouped_scales_kernel<<<grid, block, 0,
+                                  reinterpret_cast<cudaStream_t>(stream)>>>(
+      src, rows_per_group, src_cols, padded_scale_cols, scale_k_tiles,
+      padded_rows, num_groups, src_offsets_device, dst_offsets_device, dst);
+  cudaError_t err = cudaGetLastError();
+  return (err == cudaSuccess) ? 0 : 3;
+}
 
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
 
@@ -159,6 +389,36 @@ extern "C" int aegis_cutlass_moe_nvfp4_stride_sizes_sm120(
   if (problem_shape_bytes)
     *problem_shape_bytes =
         sizeof(typename ProblemShape::UnderlyingProblemShape);
+  return 0;
+}
+
+// Given a per-group problem (M_g, N_g, K_g), return the per-group
+// SFA/SFB tensor sizes in bytes (== cosize of the swizzled layout
+// times sizeof(ElementSF)). This is what the caller must allocate
+// for that group's scale-factor blob inside its bulk buffer.
+//
+// SFA depends on (M_g, K_g) only; SFB on (N_g, K_g) only — but we
+// take all three for symmetry with `compute_strides`.
+extern "C" int aegis_cutlass_moe_nvfp4_sfa_sfb_bytes_sm120(
+    int m, int n, int k, size_t* sfa_bytes_out, size_t* sfb_bytes_out) {
+  if (m <= 0 || n <= 0 || k <= 0) {
+    return 1;
+  }
+  if ((k % 32) != 0 || (n % 32) != 0) {
+    return 2;
+  }
+  auto layout_sfa =
+      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+  auto layout_sfb =
+      Sm1xxBlkScaledConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+  if (sfa_bytes_out) {
+    *sfa_bytes_out = static_cast<size_t>(cute::size(layout_sfa)) *
+                     sizeof(ElementSF);
+  }
+  if (sfb_bytes_out) {
+    *sfb_bytes_out = static_cast<size_t>(cute::size(layout_sfb)) *
+                     sizeof(ElementSF);
+  }
   return 0;
 }
 
@@ -342,6 +602,16 @@ extern "C" int aegis_cutlass_moe_nvfp4_compute_strides_sm120(
   (void)stride_d_out;
   (void)layout_sfa_out;
   (void)layout_sfb_out;
+  return 1000;
+}
+
+extern "C" int aegis_cutlass_moe_nvfp4_sfa_sfb_bytes_sm120(
+    int m, int n, int k, size_t* sfa_bytes_out, size_t* sfb_bytes_out) {
+  (void)m;
+  (void)n;
+  (void)k;
+  (void)sfa_bytes_out;
+  (void)sfb_bytes_out;
   return 1000;
 }
 
