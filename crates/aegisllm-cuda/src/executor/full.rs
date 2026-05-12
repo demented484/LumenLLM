@@ -813,6 +813,14 @@ impl CudaLlamaExecutor {
                             })?
                         },
                         bulk_token_offsets: self.runtime.alloc_u32(max_experts + 1)?,
+                        cutlass: Self::alloc_cutlass_moe_scratch(
+                            &self.runtime,
+                            cs,
+                            max_experts,
+                            max_top_k,
+                            self.hidden_size,
+                            max_expert_intermediate,
+                        )?,
                     }))
                 } else {
                     None
@@ -1060,6 +1068,135 @@ impl CudaLlamaExecutor {
             }
         }
         (max_p, max_s, max_m)
+    }
+
+    /// Allocate the CUTLASS NVFP4 grouped GEMM scratch attached to the
+    /// MoE prefill scratch. Returns `Ok(None)` when the build was not
+    /// compiled with `aegis_cutlass_nvfp4_grouped` — callers fall back
+    /// to the existing t32_big WMMA path.
+    #[cfg(not(aegis_cutlass_nvfp4_grouped))]
+    fn alloc_cutlass_moe_scratch(
+        _runtime: &CudaRuntime,
+        _cs: usize,
+        _max_experts: usize,
+        _max_top_k: usize,
+        _hidden_size: usize,
+        _max_expert_intermediate: usize,
+    ) -> Result<Option<Box<super::state::CutlassMoeScratch>>> {
+        Ok(None)
+    }
+
+    /// CUTLASS-grouped build: pre-allocate worst-case scratch sized so
+    /// the CUTLASS path can run without per-call alloc. Even when the
+    /// runtime flag is off we still pay this VRAM since the
+    /// allocation is gated on the compile-time cfg only — the runtime
+    /// flag merely toggles dispatch in `forward_moe_grouped_routed_experts`.
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    fn alloc_cutlass_moe_scratch(
+        runtime: &CudaRuntime,
+        cs: usize,
+        max_experts: usize,
+        max_top_k: usize,
+        hidden_size: usize,
+        max_expert_intermediate: usize,
+    ) -> Result<Option<Box<super::state::CutlassMoeScratch>>> {
+        use super::state::{CutlassMoeProjSlot, CutlassMoeScratch};
+
+        // Bail out early if CUTLASS preconditions don't hold (K must be
+        // divisible by 32). For Gemma-4: hidden=2816, intermediate=704,
+        // both divisible by 32. We still guard for safety.
+        if hidden_size % 32 != 0 || max_expert_intermediate % 32 != 0 {
+            return Ok(None);
+        }
+        let max_m_total = cs.saturating_mul(max_top_k).max(128);
+
+        let blob_sizes = runtime.cutlass_nvfp4_moe_grouped_blob_sizes()?;
+
+        // Worst-case per-group M used when sizing the per-group SFA / SFB.
+        // We bound it by cs*top_k (a single expert could in principle absorb
+        // every token if routing collapses).
+        let worst_m_per_group = max_m_total;
+        let (sfa_hidden_per_g, sfb_gate_per_g) = runtime
+            .cutlass_nvfp4_moe_grouped_sfa_sfb_bytes(
+                worst_m_per_group,
+                max_expert_intermediate,
+                hidden_size,
+            )?;
+        let (sfa_intermediate_per_g, sfb_down_per_g) = runtime
+            .cutlass_nvfp4_moe_grouped_sfa_sfb_bytes(
+                worst_m_per_group,
+                hidden_size,
+                max_expert_intermediate,
+            )?;
+
+        // Per-group activation packed buffer: M * (K/2) bytes per group.
+        // Sum bounded by max_m_total * (K/2) (every token routed somewhere).
+        let input_packed_hidden_bytes = max_m_total * (hidden_size / 2);
+        let input_packed_intermediate_bytes = max_m_total * (max_expert_intermediate / 2);
+
+        // SFA total = sum over groups; bounded by max_experts * per_group worst.
+        // Per-group SFA depends on padded(m)*padded(k/16), which scales with M.
+        // Summing the per-group SFA bytes for fixed total M actually gives more
+        // than the bounded `padded_rows_g * padded_scale_cols` for a single
+        // group because each group rounds up to 128 — so worst-case is when
+        // every group gets a partial M (high padding overhead).
+        let max_active = max_experts.min(max_m_total);
+        let sfa_hidden_total = max_active * sfa_hidden_per_g;
+        let sfa_intermediate_total = max_active * sfa_intermediate_per_g;
+        // SFB total = num_groups * SFB_per_g (one per active expert).
+        let sfb_gate_total = max_active * sfb_gate_per_g;
+        let sfb_down_total = max_active * sfb_down_per_g;
+
+        // CUTLASS workspace: 64 MiB is generous — typical SM120 grouped GEMM
+        // wants <2 MiB but we allocate worst-case.
+        let workspace_bytes = 64 * 1024 * 1024;
+
+        let make_slot = |sfb_total: usize| -> Result<CutlassMoeProjSlot> {
+            Ok(CutlassMoeProjSlot {
+                weight_sfb: runtime.alloc_u8(sfb_total.max(1))?,
+                src_offsets: runtime.alloc_u64(max_active.max(1))?,
+                dst_offsets: runtime.alloc_u64(max_active.max(1))?,
+                sfb_ptrs: runtime.alloc_u64(max_active.max(1))?,
+                a_ptrs: runtime.alloc_u64(max_active.max(1))?,
+                b_ptrs: runtime.alloc_u64(max_active.max(1))?,
+                d_ptrs: runtime.alloc_u64(max_active.max(1))?,
+                sfa_ptrs: runtime.alloc_u64(max_active.max(1))?,
+                alpha_ptrs: runtime.alloc_u64(max_active.max(1))?,
+                workspace: runtime.alloc_u8(workspace_bytes)?,
+            })
+        };
+
+        let slots = [
+            make_slot(sfb_gate_total)?, // gate: n=intermediate, k=hidden
+            make_slot(sfb_gate_total)?, // up:   n=intermediate, k=hidden
+            make_slot(sfb_down_total)?, // down: n=hidden, k=intermediate
+        ];
+
+        Ok(Some(Box::new(CutlassMoeScratch {
+            input_packed_hidden: runtime.alloc_u8(input_packed_hidden_bytes.max(1))?,
+            input_sfa_hidden: runtime.alloc_u8(sfa_hidden_total.max(1))?,
+            input_packed_intermediate: runtime.alloc_u8(input_packed_intermediate_bytes.max(1))?,
+            input_sfa_intermediate: runtime.alloc_u8(sfa_intermediate_total.max(1))?,
+            payload_offsets: runtime.alloc_u64(max_active.max(1))?,
+            sfa_offsets: runtime.alloc_u64(max_active.max(1))?,
+            slots,
+            stride_a: runtime.alloc_u8((blob_sizes.stride_a * max_active).max(1))?,
+            stride_b: runtime.alloc_u8((blob_sizes.stride_b * max_active).max(1))?,
+            stride_d: runtime.alloc_u8((blob_sizes.stride_d * max_active).max(1))?,
+            layout_sfa: runtime.alloc_u8((blob_sizes.layout_sfa * max_active).max(1))?,
+            layout_sfb: runtime.alloc_u8((blob_sizes.layout_sfb * max_active).max(1))?,
+            problem_shapes: runtime.alloc_u8((blob_sizes.problem_shape * max_active).max(1))?,
+            alpha_values: runtime.alloc_f32(max_active.max(1))?,
+            blob_stride_a: blob_sizes.stride_a,
+            blob_stride_b: blob_sizes.stride_b,
+            blob_stride_d: blob_sizes.stride_d,
+            blob_layout_sfa: blob_sizes.layout_sfa,
+            blob_layout_sfb: blob_sizes.layout_sfb,
+            blob_problem_shape: blob_sizes.problem_shape,
+            token_offsets: runtime.alloc_u32((max_active * 2).max(2))?,
+            quant_payload_off_scratch: runtime.alloc_u64(1)?,
+            quant_sfa_off_scratch: runtime.alloc_u64(1)?,
+        })))
     }
 }
 

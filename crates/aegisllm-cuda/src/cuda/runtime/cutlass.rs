@@ -32,6 +32,297 @@ impl CudaRuntime {
         cutlass_bridge::moe_grouped_supported()
     }
 
+    /// Per-group CUTLASS blob sizes. Required to pre-size the
+    /// stride/layout/problem-shape buffers in the MoE prefill scratch.
+    /// Returns `Err` if the build was not compiled with CUTLASS grouped
+    /// support.
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    pub fn cutlass_nvfp4_moe_grouped_blob_sizes(&self) -> Result<CutlassMoeGroupedBlobSizes> {
+        let sz = cutlass_bridge::moe_grouped_blob_sizes()
+            .map_err(AegisError::Unsupported)?;
+        Ok(CutlassMoeGroupedBlobSizes {
+            stride_a: sz.stride_a,
+            stride_b: sz.stride_b,
+            stride_d: sz.stride_d,
+            layout_sfa: sz.layout_sfa,
+            layout_sfb: sz.layout_sfb,
+            problem_shape: sz.problem_shape,
+        })
+    }
+
+    /// SFA / SFB byte sizes for one problem shape. Used to size the
+    /// per-group quantized-activation SFA buffer and the swizzled
+    /// weight-scale SFB buffer worst-case at executor init.
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    pub fn cutlass_nvfp4_moe_grouped_sfa_sfb_bytes(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<(usize, usize)> {
+        let m_i = i32_arg("m", m)?;
+        let n_i = i32_arg("n", n)?;
+        let k_i = i32_arg("k", k)?;
+        cutlass_bridge::moe_grouped_sfa_sfb_bytes(m_i, n_i, k_i)
+            .map_err(AegisError::Unsupported)
+    }
+}
+
+/// Public mirror of `cutlass_bridge::MoeGroupedBlobSizes` so callers
+/// outside the `cuda::cutlass_bridge` module can size scratch buffers.
+#[cfg(aegis_cutlass_nvfp4_grouped)]
+#[derive(Debug, Clone, Copy)]
+pub struct CutlassMoeGroupedBlobSizes {
+    pub stride_a: usize,
+    pub stride_b: usize,
+    pub stride_d: usize,
+    pub layout_sfa: usize,
+    pub layout_sfb: usize,
+    pub problem_shape: usize,
+}
+
+impl CudaRuntime {
+    /// Dummy placeholder so the symbol exists even when the CUTLASS
+    /// grouped build is disabled; gated callers use the cfg flag to
+    /// avoid calling this.
+    #[cfg(not(aegis_cutlass_nvfp4_grouped))]
+    pub fn cutlass_nvfp4_moe_grouped_blob_sizes(&self) -> Result<()> {
+        Err(AegisError::Unsupported(
+            "CUTLASS NVFP4 grouped not compiled into this build".into(),
+        ))
+    }
+
+    /// Quantize one or more groups of f32 activations into NVFP4 e2m1 +
+    /// ue4m3 scale-factor blob for CUTLASS grouped GEMM consumption.
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn cutlass_moe_nvfp4_quantize_input_grouped(
+        &self,
+        input: &DeviceBuffer<f32>,
+        cols: usize,
+        num_groups: usize,
+        token_offsets: &DeviceBuffer<u32>,
+        payload_offsets: &DeviceBuffer<u64>,
+        sfa_offsets: &DeviceBuffer<u64>,
+        max_padded_rows_per_group: usize,
+        payload_out: &mut DeviceBuffer<u8>,
+        sfa_out: &mut DeviceBuffer<u8>,
+    ) -> Result<()> {
+        let (input_ptr, _) = input.slice.device_ptr(&self.stream);
+        let (tok_ptr, _) = token_offsets.slice.device_ptr(&self.stream);
+        let (po_ptr, _) = payload_offsets.slice.device_ptr(&self.stream);
+        let (so_ptr, _) = sfa_offsets.slice.device_ptr(&self.stream);
+        let (payload_ptr, _) = payload_out.slice.device_ptr_mut(&self.stream);
+        let (sfa_ptr, _) = sfa_out.slice.device_ptr_mut(&self.stream);
+        let stream = self.stream.cu_stream().cast::<c_void>();
+        unsafe {
+            cutlass_bridge::moe_grouped_quantize_input(
+                input_ptr as *const f32,
+                i32_arg("cols", cols)?,
+                i32_arg("num_groups", num_groups)?,
+                tok_ptr as *const u32,
+                po_ptr as *const u64,
+                so_ptr as *const u64,
+                i32_arg("max_padded_rows_per_group", max_padded_rows_per_group)?,
+                payload_ptr as *mut u8,
+                sfa_ptr as *mut u8,
+                stream,
+            )
+        }
+        .map_err(AegisError::Unsupported)
+    }
+
+    /// Swizzle raw row-major weight-scale blobs (one per group, concatenated)
+    /// into the CUTLASS SFB layout.
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn cutlass_moe_nvfp4_swizzle_weight_scales_grouped(
+        &self,
+        src: &DeviceBuffer<u8>,
+        rows_per_group: usize,
+        src_cols: usize,
+        num_groups: usize,
+        src_offsets: &DeviceBuffer<u64>,
+        dst_offsets: &DeviceBuffer<u64>,
+        dst: &mut DeviceBuffer<u8>,
+    ) -> Result<()> {
+        let (src_ptr, _) = src.slice.device_ptr(&self.stream);
+        let (src_off_ptr, _) = src_offsets.slice.device_ptr(&self.stream);
+        let (dst_off_ptr, _) = dst_offsets.slice.device_ptr(&self.stream);
+        let (dst_ptr, _) = dst.slice.device_ptr_mut(&self.stream);
+        let stream = self.stream.cu_stream().cast::<c_void>();
+        unsafe {
+            cutlass_bridge::moe_grouped_swizzle_weight_scales(
+                src_ptr as *const u8,
+                i32_arg("rows_per_group", rows_per_group)?,
+                i32_arg("src_cols", src_cols)?,
+                i32_arg("num_groups", num_groups)?,
+                src_off_ptr as *const u64,
+                dst_off_ptr as *const u64,
+                dst_ptr as *mut u8,
+                stream,
+            )
+        }
+        .map_err(AegisError::Unsupported)
+    }
+
+    /// Launch the CUTLASS NVFP4 grouped GEMM. Per-group pointer arrays,
+    /// stride/layout/problem-shape blobs, alpha pointers, and workspace
+    /// must already be uploaded.
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn cutlass_moe_nvfp4_grouped_run(
+        &self,
+        num_groups: usize,
+        problem_shapes: &DeviceBuffer<u8>,
+        a_ptrs: &mut DeviceBuffer<u64>,
+        b_ptrs: &mut DeviceBuffer<u64>,
+        sfa_ptrs: &mut DeviceBuffer<u64>,
+        sfb_ptrs: &mut DeviceBuffer<u64>,
+        d_ptrs: &mut DeviceBuffer<u64>,
+        stride_a: &mut DeviceBuffer<u8>,
+        stride_b: &mut DeviceBuffer<u8>,
+        stride_d: &mut DeviceBuffer<u8>,
+        layout_sfa: &mut DeviceBuffer<u8>,
+        layout_sfb: &mut DeviceBuffer<u8>,
+        alpha_ptrs: &mut DeviceBuffer<u64>,
+        workspace: &mut DeviceBuffer<u8>,
+    ) -> Result<()> {
+        let (ps_ptr, _) = problem_shapes.slice.device_ptr(&self.stream);
+        let (a_pp, _) = a_ptrs.slice.device_ptr_mut(&self.stream);
+        let (b_pp, _) = b_ptrs.slice.device_ptr_mut(&self.stream);
+        let (sfa_pp, _) = sfa_ptrs.slice.device_ptr_mut(&self.stream);
+        let (sfb_pp, _) = sfb_ptrs.slice.device_ptr_mut(&self.stream);
+        let (d_pp, _) = d_ptrs.slice.device_ptr_mut(&self.stream);
+        let (sa_ptr, _) = stride_a.slice.device_ptr_mut(&self.stream);
+        let (sb_ptr, _) = stride_b.slice.device_ptr_mut(&self.stream);
+        let (sd_ptr, _) = stride_d.slice.device_ptr_mut(&self.stream);
+        let (lsfa_ptr, _) = layout_sfa.slice.device_ptr_mut(&self.stream);
+        let (lsfb_ptr, _) = layout_sfb.slice.device_ptr_mut(&self.stream);
+        let (alpha_pp, _) = alpha_ptrs.slice.device_ptr_mut(&self.stream);
+        let (ws_ptr, _) = workspace.slice.device_ptr_mut(&self.stream);
+        let ws_bytes = workspace.len();
+        let stream = self.stream.cu_stream().cast::<c_void>();
+        unsafe {
+            cutlass_bridge::moe_grouped_run(
+                i32_arg("num_groups", num_groups)?,
+                ps_ptr as *mut c_void,
+                std::ptr::null(),
+                a_pp as *mut *mut c_void,
+                b_pp as *mut *mut c_void,
+                sfa_pp as *mut *mut c_void,
+                sfb_pp as *mut *mut c_void,
+                d_pp as *mut *mut c_void,
+                sa_ptr as *mut c_void,
+                sb_ptr as *mut c_void,
+                sd_ptr as *mut c_void,
+                lsfa_ptr as *mut c_void,
+                lsfb_ptr as *mut c_void,
+                alpha_pp as *mut *mut f32,
+                ws_ptr as *mut c_void,
+                ws_bytes,
+                stream,
+            )
+        }
+        .map_err(AegisError::Unsupported)
+    }
+
+    /// Get raw device pointer (u64) for an f32 buffer. Used by the MoE
+    /// dispatcher to build per-group pointer arrays without exposing the
+    /// inner cudarc slice type to non-`cuda::` callers.
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    pub fn device_ptr_f32(&self, buf: &DeviceBuffer<f32>) -> u64 {
+        let (p, _) = buf.slice.device_ptr(&self.stream);
+        p
+    }
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    pub fn device_ptr_f32_mut(&self, buf: &mut DeviceBuffer<f32>) -> u64 {
+        let (p, _) = buf.slice.device_ptr_mut(&self.stream);
+        p
+    }
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    pub fn device_ptr_u8(&self, buf: &DeviceBuffer<u8>) -> u64 {
+        let (p, _) = buf.slice.device_ptr(&self.stream);
+        p
+    }
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    pub fn device_ptr_u8_mut(&self, buf: &mut DeviceBuffer<u8>) -> u64 {
+        let (p, _) = buf.slice.device_ptr_mut(&self.stream);
+        p
+    }
+
+    /// Variant of `cutlass_moe_nvfp4_quantize_input_grouped` that takes
+    /// pre-uploaded multi-group offset buffers and an `offset_index` selecting
+    /// which group's entry to use. Lets the caller upload `2*N` token-offsets,
+    /// `N` payload-offsets, `N` sfa-offsets in a SINGLE H2D, then issue
+    /// `N` quantize launches without touching the offset buffers.
+    /// The kernel always runs with `num_groups=1` (reads `[0]` and `[1]`
+    /// for token_offsets, `[0]` for payload/sfa offsets — strided via the
+    /// raw pointer offset).
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn cutlass_moe_nvfp4_quantize_input_single_strided(
+        &self,
+        input: &DeviceBuffer<f32>,
+        cols: usize,
+        token_offsets_base: &DeviceBuffer<u32>,
+        token_offsets_idx: usize, // entry index for [start, end] pair = 2*token_offsets_idx
+        payload_offsets_base: &DeviceBuffer<u64>,
+        payload_offsets_idx: usize,
+        sfa_offsets_base: &DeviceBuffer<u64>,
+        sfa_offsets_idx: usize,
+        max_padded_rows_per_group: usize,
+        payload_out: &mut DeviceBuffer<u8>,
+        sfa_out: &mut DeviceBuffer<u8>,
+    ) -> Result<()> {
+        let (input_ptr, _) = input.slice.device_ptr(&self.stream);
+        let (tok_ptr, _) = token_offsets_base.slice.device_ptr(&self.stream);
+        let (po_ptr, _) = payload_offsets_base.slice.device_ptr(&self.stream);
+        let (so_ptr, _) = sfa_offsets_base.slice.device_ptr(&self.stream);
+        let (payload_ptr, _) = payload_out.slice.device_ptr_mut(&self.stream);
+        let (sfa_ptr, _) = sfa_out.slice.device_ptr_mut(&self.stream);
+        let stream = self.stream.cu_stream().cast::<c_void>();
+        let tok_off = tok_ptr + (token_offsets_idx as u64) * 4 /* u32 */;
+        let payload_off = po_ptr + (payload_offsets_idx as u64) * 8 /* u64 */;
+        let sfa_off = so_ptr + (sfa_offsets_idx as u64) * 8;
+        unsafe {
+            cutlass_bridge::moe_grouped_quantize_input(
+                input_ptr as *const f32,
+                i32_arg("cols", cols)?,
+                1, // num_groups
+                tok_off as *const u32,
+                payload_off as *const u64,
+                sfa_off as *const u64,
+                i32_arg("max_padded_rows_per_group", max_padded_rows_per_group)?,
+                payload_ptr as *mut u8,
+                sfa_ptr as *mut u8,
+                stream,
+            )
+        }
+        .map_err(AegisError::Unsupported)
+    }
+
+    /// Compute one group's CUTLASS internal stride / layout blobs for
+    /// a given (m, n, k). Used to pre-populate the per-group blob arrays
+    /// before launching `cutlass_moe_nvfp4_grouped_run`.
+    #[cfg(aegis_cutlass_nvfp4_grouped)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn cutlass_moe_nvfp4_compute_strides(
+        &self,
+        m: usize, n: usize, k: usize,
+        stride_a_out: &mut [u8],
+        stride_b_out: &mut [u8],
+        stride_d_out: &mut [u8],
+        layout_sfa_out: &mut [u8],
+        layout_sfb_out: &mut [u8],
+    ) -> Result<()> {
+        cutlass_bridge::moe_grouped_compute_strides(
+            i32_arg("m", m)?, i32_arg("n", n)?, i32_arg("k", k)?,
+            stride_a_out, stride_b_out, stride_d_out, layout_sfa_out, layout_sfb_out,
+        )
+        .map_err(AegisError::Unsupported)
+    }
+
     pub fn cutlass_nvfp4_activation_payload_bytes(rows: usize, cols: usize) -> Result<usize> {
         if !cols.is_multiple_of(32) {
             return Err(AegisError::InvalidPlan(format!(

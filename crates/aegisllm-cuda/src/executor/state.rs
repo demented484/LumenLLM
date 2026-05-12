@@ -671,6 +671,87 @@ pub(super) struct CudaMoEPrefillScratch {
     /// projection so a single buffer is fine — written once per layer
     /// before any GEMM and not modified between projections.
     pub(super) bulk_token_offsets: DeviceBuffer<u32>,
+    /// CUTLASS NVFP4 grouped GEMM scratch. `None` unless the build was
+    /// compiled with `AEGIS_CUTLASS_NVFP4_GROUPED_BUILD=1` AND the runtime
+    /// flag `AEGIS_CUTLASS_NVFP4_GROUPED=1` was set at executor init.
+    /// Holds per-expert quantized-input + swizzled-weight-scale buffers,
+    /// per-group metadata blobs (strides, layouts, problem shapes), and
+    /// the pointer arrays the CUTLASS kernel expects. Sized for the
+    /// worst-case (all routed experts active, max chunk_size*top_k tokens).
+    pub(super) cutlass: Option<Box<CutlassMoeScratch>>,
+}
+
+/// Per-projection CUTLASS staging slot (gate / up / down each get one
+/// so the swizzled weight scales for projection N+1 can be computed
+/// while CUTLASS for projection N is still reading from its own slot).
+#[derive(Debug)]
+pub(super) struct CutlassMoeProjSlot {
+    /// Swizzled weight scales — sized for `max_experts * sfb_per_group`
+    /// at the worst-case (n, k) for this projection (gate/up = (intermediate, hidden),
+    /// down = (hidden, intermediate)).
+    pub(super) weight_sfb: DeviceBuffer<u8>,
+    /// Per-active-expert source offsets into `bulk_scales` (input to swizzle).
+    pub(super) src_offsets: DeviceBuffer<u64>,
+    /// Per-active-expert destination offsets into `weight_sfb`.
+    pub(super) dst_offsets: DeviceBuffer<u64>,
+    /// Per-active-expert SFB pointers passed to CUTLASS (device array of u64).
+    pub(super) sfb_ptrs: DeviceBuffer<u64>,
+    /// Per-active-expert A/B/D pointers (one per group). A/B point to
+    /// quantized activations and bulk_packed; D points into permuted output.
+    pub(super) a_ptrs: DeviceBuffer<u64>,
+    pub(super) b_ptrs: DeviceBuffer<u64>,
+    pub(super) d_ptrs: DeviceBuffer<u64>,
+    /// Per-active-expert SFA pointers (shared across gate/up since SFA depends
+    /// only on K = hidden, but down has K = intermediate so SFA differs;
+    /// keeping per-slot for simplicity).
+    pub(super) sfa_ptrs: DeviceBuffer<u64>,
+    /// Per-active-expert pointers into the per-group alpha f32 array.
+    pub(super) alpha_ptrs: DeviceBuffer<u64>,
+    /// Workspace for CUTLASS (size depends on problem shapes; sized for worst case).
+    pub(super) workspace: DeviceBuffer<u8>,
+}
+
+/// CUTLASS NVFP4 grouped GEMM scratch shared across all three projections.
+#[derive(Debug)]
+pub(super) struct CutlassMoeScratch {
+    /// Quantized A bytes per group concatenated. Sized for hidden K = max(K_gate_up, K_down).
+    /// We use TWO buffers: one sized for K=hidden (gate/up activations),
+    /// one for K=intermediate (down activations) — different K means
+    /// different per-row byte width.
+    pub(super) input_packed_hidden: DeviceBuffer<u8>,
+    pub(super) input_sfa_hidden: DeviceBuffer<u8>,
+    pub(super) input_packed_intermediate: DeviceBuffer<u8>,
+    pub(super) input_sfa_intermediate: DeviceBuffer<u8>,
+    /// Per-group offsets (u64 array) for `input_packed_*` / `input_sfa_*`.
+    /// Built per-call from the sorted active_experts slice (large-only).
+    pub(super) payload_offsets: DeviceBuffer<u64>,
+    pub(super) sfa_offsets: DeviceBuffer<u64>,
+    /// Per-projection slots.
+    pub(super) slots: [CutlassMoeProjSlot; 3],
+    /// Per-group stride blobs (sized at runtime via blob_sizes query).
+    pub(super) stride_a: DeviceBuffer<u8>,
+    pub(super) stride_b: DeviceBuffer<u8>,
+    pub(super) stride_d: DeviceBuffer<u8>,
+    pub(super) layout_sfa: DeviceBuffer<u8>,
+    pub(super) layout_sfb: DeviceBuffer<u8>,
+    /// Per-group problem-shape blob (3×i32 + padding).
+    pub(super) problem_shapes: DeviceBuffer<u8>,
+    /// Per-group alpha values (f32, one per active expert) — uploaded per call.
+    pub(super) alpha_values: DeviceBuffer<f32>,
+    /// CUTLASS blob sizes (queried once at construction).
+    pub(super) blob_stride_a: usize,
+    pub(super) blob_stride_b: usize,
+    pub(super) blob_stride_d: usize,
+    pub(super) blob_layout_sfa: usize,
+    pub(super) blob_layout_sfb: usize,
+    pub(super) blob_problem_shape: usize,
+    /// Active-expert token-count prefix-sum buffer (u32, num_experts+1), used
+    /// by the per-group quantize-input call. Reused per projection.
+    pub(super) token_offsets: DeviceBuffer<u32>,
+    /// Single-entry u64 scratch for per-group quantize_input calls (avoids
+    /// per-iter device allocations).
+    pub(super) quant_payload_off_scratch: DeviceBuffer<u64>,
+    pub(super) quant_sfa_off_scratch: DeviceBuffer<u64>,
 }
 
 /// One physical staging slot for a single MoE projection (gate / up /
