@@ -367,8 +367,13 @@ impl CudaRuntime {
         let cache_capacity = key_cache.len() / (num_kv_heads * head_dim);
         let cache_capacity_u32 = u32_arg("cache_capacity", cache_capacity)?;
         let block_dim        = CUDA_ATTENTION_BLOCK_DIM;
+        // Shared layout mirrors the f16 path; kv_pipe is sized in u8 here
+        // (half the bytes vs the u16 f16 cache → 4 * head_dim bytes added
+        // vs 8 * head_dim for f16).
+        let kv_pipe_bytes = 4 * 2 * head_dim * std::mem::size_of::<u8>();
         let split_shared_bytes_usize =
-            (effective_max_chunk_len + 4 + 4 * head_dim) * std::mem::size_of::<f32>();
+            (effective_max_chunk_len + 4 + 4 * head_dim) * std::mem::size_of::<f32>()
+            + kv_pipe_bytes;
         let split_shared_bytes = super::validate_dynamic_shared_bytes_with_cap(
             "attention_decode_ptr_split_fp8",
             split_shared_bytes_usize,
