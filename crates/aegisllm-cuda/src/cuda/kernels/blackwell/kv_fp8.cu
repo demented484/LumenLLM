@@ -426,23 +426,40 @@ extern "C" __global__ void aegis_attention_decode_ptr_split_fp8(
         partial_l[out_idx] = s;
     }
 
-    /* Phase 3: weighted V sum, 1 warp per position */
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    /* Phase 3: weighted V sum, 1 warp per position.
+     * Each lane accumulates 4 consecutive V dims per d-block. d-blocks step
+     * by 128 (32 lanes * 4 dims/lane). For head_dim=128 there is one
+     * d-block; head_dim=256/512 (Gemma 4 sliding/global) have 2/4 d-blocks.
+     * The original FP8 kernel had only 4 accumulators total and silently
+     * summed contributions from every d-block into the same slot — correct
+     * for head_dim=128 only, garbage for >128. Mirror the f16 fix: per-
+     * d-block accumulators + per-d-block writes to vsum. */
+    constexpr unsigned int MAX_D_BLOCKS = 4u;  // supports head_dim up to 4*128 = 512
+    float acc[MAX_D_BLOCKS][4] = { {0.0f, 0.0f, 0.0f, 0.0f} };
+    const unsigned int d_blocks = (head_dim + 127u) / 128u;
     for (unsigned int pos = warp_id; pos < chunk_len; pos += 4u) {
         const unsigned int abs_pos_v = chunk_start + pos;
         const unsigned int slot_v = (cache_capacity > 0u) ? (abs_pos_v % cache_capacity) : abs_pos_v;
         const unsigned char* v =
             value_cache + ((size_t)slot_v * num_kv_heads + kv_head) * head_dim;
         float w = scores[pos];
-        for (unsigned int d = lane * 4u; d < head_dim; d += 128u) {
-            acc[0] += w * fp8_e4m3_bits_to_float(v[d+0u]);
-            acc[1] += w * fp8_e4m3_bits_to_float(v[d+1u]);
-            acc[2] += w * fp8_e4m3_bits_to_float(v[d+2u]);
-            acc[3] += w * fp8_e4m3_bits_to_float(v[d+3u]);
+        for (unsigned int b = 0u; b < d_blocks; ++b) {
+            const unsigned int d = b * 128u + lane * 4u;
+            if (d >= head_dim) break;
+            acc[b][0] += w * fp8_e4m3_bits_to_float(v[d+0u]);
+            acc[b][1] += w * fp8_e4m3_bits_to_float(v[d+1u]);
+            acc[b][2] += w * fp8_e4m3_bits_to_float(v[d+2u]);
+            acc[b][3] += w * fp8_e4m3_bits_to_float(v[d+3u]);
         }
     }
-    for (unsigned int i = 0u; i < 4u; ++i)
-        vsum[warp_id * head_dim + lane * 4u + i] = acc[i];
+    for (unsigned int b = 0u; b < d_blocks; ++b) {
+        const unsigned int d = b * 128u + lane * 4u;
+        if (d >= head_dim) break;
+        vsum[warp_id * head_dim + d + 0u] = acc[b][0];
+        vsum[warp_id * head_dim + d + 1u] = acc[b][1];
+        vsum[warp_id * head_dim + d + 2u] = acc[b][2];
+        vsum[warp_id * head_dim + d + 3u] = acc[b][3];
+    }
     __syncthreads();
     for (unsigned int d = tid; d < head_dim; d += blockDim.x) {
         partial_acc[out_base + d] = vsum[0u * head_dim + d]

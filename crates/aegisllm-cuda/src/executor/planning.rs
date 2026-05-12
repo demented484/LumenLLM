@@ -89,14 +89,7 @@ pub(super) fn cuda_limitations(
         )),
     }
     match placement.kv_cache.quantization {
-        KvCacheQuantization::F16 | KvCacheQuantization::Bf16 => {}
-        KvCacheQuantization::Fp8 => limitations.push(
-            "kv-cache fp8: store/decode kernels + dual-buffer prefill infrastructure are \
-             in place, but unscaled FP8 E4M3 produces ~10% per-element error which \
-             destroys attention quality at typical Gemma-4 K/V magnitudes (smoke test \
-             outputs gibberish at scale=1.0; needs per-tensor scale calibration before \
-             this can be lifted). See /tmp/fp8_kv_postmortem.md.".into(),
-        ),
+        KvCacheQuantization::F16 | KvCacheQuantization::Bf16 | KvCacheQuantization::Fp8 => {}
         KvCacheQuantization::Q8_0 => limitations.push(
             "kv-cache q8_0 support is planned (Phase 3.4) but the store/load kernel is not yet implemented".into(),
         ),

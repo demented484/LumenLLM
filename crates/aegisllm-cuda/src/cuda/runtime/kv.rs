@@ -585,10 +585,18 @@ impl CudaRuntime {
     ) -> Result<()> {
         let vector_len = checked_len("fp8 slot kv", batch, kv_width)?;
         let cache_len  = checked_len("fp8 slot cache", context_size, kv_width)?;
-        if dense_metadata.batch() != batch || dense_metadata.context_len() > context_size {
+        // Proof check: batch must match. We do NOT compare context_len() against
+        // context_size — sliding-window layers allocate cache to window_size
+        // (< prefill chunk's logical context), but `slot_mapping` is pre-wrapped
+        // and the kernel guards each write with `slot < context_size` against
+        // the actual cache capacity, so writes are safe. The f16 path passes the
+        // engine's max context_size + separate cache_capacity to its kernel; the
+        // FP8 slot kernel takes only one `context_size` (= cache_capacity here),
+        // which means the proof.context_len() can legitimately exceed it.
+        if dense_metadata.batch() != batch {
             return Err(AegisError::InvalidPlan(format!(
-                "kv_store_fp8_slots: proof mismatch batch={} ctx={} proof_batch={} proof_ctx={}",
-                batch, context_size, dense_metadata.batch(), dense_metadata.context_len()
+                "kv_store_fp8_slots: batch mismatch batch={} proof_batch={}",
+                batch, dense_metadata.batch()
             )));
         }
         if key.len() < vector_len || value.len() < vector_len {
