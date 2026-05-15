@@ -19,6 +19,7 @@ pub use aegisllm_base::backend_types::AttentionDType;
 pub use loader::{CudaWeightLoader, LoadStatusSink};
 pub use runtime::CudaRuntime;
 pub use runtime::cutlass_moe_smoke::{CutlassMoeSmokeExpert, CutlassMoeSmokeReport};
+pub use runtime::fp8_mma_smoke::{Fp8MmaSmokeReport, Fp8MmaStageResult};
 /// Maximum sequence length for CUDA Graph-captured decode attention.
 /// Must match CUDA_GRAPH_ATTN_MAX_SEQ_LEN in runtime/attention/decode.rs.
 pub(crate) const CUDA_GRAPH_ATTN_MAX_SEQ_LEN: usize = 8192;

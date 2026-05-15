@@ -13,6 +13,7 @@ mod blackwell;
 mod cublaslt;
 mod cutlass;
 pub mod cutlass_moe_smoke;
+pub mod fp8_mma_smoke;
 mod gemm;
 mod graph;
 mod kv;

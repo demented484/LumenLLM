@@ -848,3 +848,38 @@ pub(super) fn cuda_cutlass_nvfp4_smoke() -> Result<()> {
         ))
     }
 }
+
+/// Standalone smoke test for the SM120 FP8 e4m3 `m16n8k32` tensor-core MMA.
+/// No model load — exercises the bare MMA primitive, a tiled FP8 GEMM, and a
+/// tiny synthetic FP8 attention against CPU references in escalating stages.
+/// This de-risks the raw `mma.sync.aligned.kind::f8f6f4.m16n8k32` instruction
+/// before a from-scratch FP8 FlashAttention kernel is written.
+pub(super) fn cuda_attn_fp8_smoke() -> Result<()> {
+    use aegisllm_base::cuda_config::CudaRuntimeConfig;
+    let runtime = aegisllm_cuda::cuda::CudaRuntime::new_with_config(
+        0,
+        CudaRuntimeConfig::from_env(),
+    )?;
+    let report = runtime.fp8_mma_smoke()?;
+    println!(
+        "cuda-attn-fp8-smoke: device={} compute_capability={}",
+        report.device_index, report.compute_capability,
+    );
+    for s in &report.stages {
+        let verdict = if s.passed { "PASS" } else { "FAIL" };
+        println!(
+            "  {} [{}] cos_sim={:.8} abs_max_err={:.4e} ref_abs_max={:.4e} \
+             deterministic={} bar={:.4} {verdict}",
+            s.name, s.shape, s.cos_sim, s.abs_max_err, s.ref_abs_max, s.deterministic, s.bar,
+        );
+    }
+    if report.passed {
+        println!("cuda-attn-fp8-smoke: PASS");
+        Ok(())
+    } else {
+        eprintln!("cuda-attn-fp8-smoke: FAIL");
+        Err(AegisError::Unsupported(
+            "cuda-attn-fp8-smoke failed: at least one stage below its cos_sim bar".into(),
+        ))
+    }
+}
