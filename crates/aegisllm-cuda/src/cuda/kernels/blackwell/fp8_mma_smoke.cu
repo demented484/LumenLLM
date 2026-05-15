@@ -40,10 +40,13 @@
 // =============================================================================
 
 #include <cuda_fp8.h>
-#include <cstdint>
 
 #ifndef AEGIS_FP8_SMOKE_GUARD
 #define AEGIS_FP8_SMOKE_GUARD
+
+// NVRTC has no <cstdint>; the kernel only needs a 32-bit unsigned type for the
+// MMA register operands.
+typedef unsigned int uint32_t;
 
 // -----------------------------------------------------------------------------
 // Stage 1 primitive: the bare 16x8x32 e4m3 MMA.
