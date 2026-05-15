@@ -575,46 +575,82 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         })?;
 
         let attention_start = Instant::now();
-        // Prefill attention always reads from the f16 cache (auxiliary when FP8,
-        // primary when F16/BF16). Re-borrow immutably here since the FP8 mirror
-        // write above needed a mutable borrow on layer_state.kv.
-        let (keys_f16_ref, values_f16_ref): (&DeviceBuffer<u16>, &DeviceBuffer<u16>) = if is_fp8 {
-            (
-                layer_state.kv.prefill_f16_keys.as_ref().expect("checked above"),
-                layer_state.kv.prefill_f16_values.as_ref().expect("checked above"),
-            )
+        // FP8 prefill attention fast path. Opt-in via `AEGIS_ATTN_FP8=1`,
+        // active only for head_dim=512 layers when the KV cache is FP8.
+        // Reads the persistent e4m3 cache directly (halving KV HBM traffic),
+        // dequants e4m3->half in shared memory, runs the FA-2 BF16 WMMA math.
+        // Default OFF -> falls through to the BF16-aux-cache compat path,
+        // which is bit-equivalent to main. The query (prefill.q_half) is
+        // already RoPE'd half from the rope step above. Output goes to
+        // prefill.qkv, exactly as the compat path does.
+        let use_fp8_attn = is_fp8
+            && layer.layer_head_dim == 512
+            && params.batch >= 16
+            && params.num_sequences == 1
+            && std::env::var("AEGIS_ATTN_FP8").as_deref() == Ok("1");
+        if use_fp8_attn {
+            let (fp8_keys, fp8_values) =
+                match (&layer_state.kv.keys, &layer_state.kv.values) {
+                    (KvBuffer::Fp8(k), KvBuffer::Fp8(v)) => (k, v),
+                    _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
+                        "FP8 prefill attention: keys/values not both Fp8".into(),
+                    )),
+                };
+            runtime.attention_prefill_dense_fa2_hdim512_fp8_device(
+                fp8_keys,
+                fp8_values,
+                &prefill.q_half,
+                params.start_position,
+                params.batch,
+                params.dense_metadata.context_len(),
+                params.num_attention_heads,
+                layer.layer_num_kv_heads,
+                layer.window_size as u32,
+                &mut prefill.qkv,
+            )?;
         } else {
-            (
-                layer_state.kv.keys.as_f16().expect("F16 path verified above"),
-                layer_state.kv.values.as_f16().expect("F16 path verified above"),
-            )
-        };
-        runtime.attention_prefill_dense_compat_device(
-            keys_f16_ref,
-            values_f16_ref,
-            &prefill.up,
-            &prefill.v,
-            &prefill.gate,
-            &mut prefill.q_half,
-            true,
-            &mut prefill.attn_split_acc,
-            &mut prefill.attn_split_m,
-            &mut prefill.attn_split_l,
-            &prefill.slot_mapping,
-            &prefill.cu_q,
-            &prefill.cu_k,
-            &prefill.context_lens,
-            &prefill.block_tables,
-            params.num_sequences,
-            params.start_position,
-            params.batch,
-            params.num_attention_heads,
-            layer.layer_num_kv_heads,
-            layer.layer_head_dim,
-            layer.window_size as u32,
-            &mut prefill.qkv,
-            params.dense_metadata,
-        )?;
+            // Prefill attention reads from the f16 cache (auxiliary when FP8,
+            // primary when F16/BF16). Re-borrow immutably here since the FP8
+            // mirror write above needed a mutable borrow on layer_state.kv.
+            let (keys_f16_ref, values_f16_ref): (&DeviceBuffer<u16>, &DeviceBuffer<u16>) =
+                if is_fp8 {
+                    (
+                        layer_state.kv.prefill_f16_keys.as_ref().expect("checked above"),
+                        layer_state.kv.prefill_f16_values.as_ref().expect("checked above"),
+                    )
+                } else {
+                    (
+                        layer_state.kv.keys.as_f16().expect("F16 path verified above"),
+                        layer_state.kv.values.as_f16().expect("F16 path verified above"),
+                    )
+                };
+            runtime.attention_prefill_dense_compat_device(
+                keys_f16_ref,
+                values_f16_ref,
+                &prefill.up,
+                &prefill.v,
+                &prefill.gate,
+                &mut prefill.q_half,
+                true,
+                &mut prefill.attn_split_acc,
+                &mut prefill.attn_split_m,
+                &mut prefill.attn_split_l,
+                &prefill.slot_mapping,
+                &prefill.cu_q,
+                &prefill.cu_k,
+                &prefill.context_lens,
+                &prefill.block_tables,
+                params.num_sequences,
+                params.start_position,
+                params.batch,
+                params.num_attention_heads,
+                layer.layer_num_kv_heads,
+                layer.layer_head_dim,
+                layer.window_size as u32,
+                &mut prefill.qkv,
+                params.dense_metadata,
+            )?;
+        }
         record_prefill_stage(runtime, timings, attention_start, |timings, elapsed| {
             timings.attention_us += elapsed
         })?;
