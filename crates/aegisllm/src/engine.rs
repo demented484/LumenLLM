@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 pub mod bench;
+pub mod eval_mmlu_pro;
 pub mod perplexity;
 pub mod quality;
 pub mod sample_diversity;
