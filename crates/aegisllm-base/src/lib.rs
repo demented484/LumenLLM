@@ -17,8 +17,8 @@ pub mod text;
 pub use artifact::{HfConfig, ModelArtifact, ModelArtifactSummary};
 pub use backend::{BackendDescriptor, BackendKind, BackendRegistry};
 pub use cuda_config::{
-    CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, CUDA_PREFILL_VARLEN_MIN_CONTEXT,
-    CudaPrefillAttentionKernel, CudaRuntimeConfig,
+    AttentionComputeQuant, CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS,
+    CUDA_PREFILL_VARLEN_MIN_CONTEXT, CudaPrefillAttentionKernel, CudaRuntimeConfig,
 };
 pub use backend_types::AttentionDType;
 pub use error::{AegisError, Result};

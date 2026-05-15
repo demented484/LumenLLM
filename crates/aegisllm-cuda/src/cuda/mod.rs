@@ -12,8 +12,8 @@ pub(crate) mod staging;
 mod types;
 
 pub use aegisllm_base::cuda_config::{
-    CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, CudaAttentionBackend,
-    CudaPrefillAttentionKernel, CudaRuntimeConfig,
+    AttentionComputeQuant, CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS,
+    CudaAttentionBackend, CudaPrefillAttentionKernel, CudaRuntimeConfig,
 };
 pub use aegisllm_base::backend_types::AttentionDType;
 pub use loader::{CudaWeightLoader, LoadStatusSink};

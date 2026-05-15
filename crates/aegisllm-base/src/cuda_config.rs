@@ -12,6 +12,75 @@ pub struct CudaRuntimeConfig {
     pub prefill_attention: CudaPrefillAttentionKernel,
     pub prefill_chunk_size: Option<usize>,
     pub prefill_stage_timings: bool,
+    /// Precision the prefill/decode attention KERNEL runs in. This is the
+    /// attention *compute* path, distinct from `attention-quantization`
+    /// (which re-quantizes the Q/K/V/O *weights* at load time) and from
+    /// `kv-cache.type-k/type-v` (which sets the K/V cache storage dtype).
+    ///
+    /// Set by `attention.compute-quantization` in `parameters.*.json`.
+    /// Converges with the `AEGIS_ATTN_FP8` / `AEGIS_ATTN_FA2` env gates:
+    /// the attention dispatch enables a path if EITHER the env var is set
+    /// OR this field requests it (env var stays a working override).
+    pub attention_compute_quant: AttentionComputeQuant,
+}
+
+/// Precision selector for the attention compute kernels (prefill + decode).
+///
+/// `Default` is bit-equivalent to main: the dispatch keeps honoring only the
+/// `AEGIS_ATTN_*` env gates. The non-default variants drive those same gates
+/// from config so the user does not have to export env vars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttentionComputeQuant {
+    /// Keep the historical default dispatch (env gates only).
+    #[default]
+    Default,
+    /// Run the BF16 (half-precision) attention kernels — the legacy WMMA
+    /// path. Equivalent to `Default` for dispatch, named for clarity in
+    /// configs that want to be explicit about precision.
+    Bf16,
+    /// Run the BF16 FlashAttention-2 rewrite (head_dim=512 path). Drives
+    /// the same gate as `AEGIS_ATTN_FA2=1`.
+    Bf16Fa2,
+    /// Run the FP8 (E4M3) attention kernels. Drives the same gate as
+    /// `AEGIS_ATTN_FP8=1`. Requires the KV cache to be FP8 because the
+    /// FP8 attention kernel reads FP8 K/V directly.
+    Fp8,
+}
+
+impl AttentionComputeQuant {
+    /// Parse the `attention.compute-quantization` config value.
+    /// `default` / `bf16` / `bf16-fa2` / `fp8` (with a few aliases).
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" | "auto" | "" => Ok(Self::Default),
+            "bf16" | "bfloat16" | "half" => Ok(Self::Bf16),
+            "bf16-fa2" | "bf16_fa2" | "fa2" | "flash-attention-2" => Ok(Self::Bf16Fa2),
+            "fp8" | "f8" | "fp8-e4m3" | "fp8_e4m3" => Ok(Self::Fp8),
+            other => Err(AegisError::InvalidConfig(format!(
+                "unsupported attention compute-quantization `{other}` \
+                 (use one of: default, bf16, bf16-fa2, fp8)"
+            ))),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Bf16 => "bf16",
+            Self::Bf16Fa2 => "bf16-fa2",
+            Self::Fp8 => "fp8",
+        }
+    }
+
+    /// Whether this selection requests the FP8 attention compute path.
+    pub fn wants_fp8(self) -> bool {
+        matches!(self, Self::Fp8)
+    }
+
+    /// Whether this selection requests the BF16 FlashAttention-2 path.
+    pub fn wants_fa2(self) -> bool {
+        matches!(self, Self::Bf16Fa2)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -78,7 +147,28 @@ impl CudaRuntimeConfig {
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok()),
             prefill_stage_timings: std::env::var_os("AEGISLLM_CUDA_STAGE_TIMINGS").is_some(),
+            // `from_env` keeps `Default` here: the historical `AEGIS_ATTN_FP8` /
+            // `AEGIS_ATTN_FA2` env gates are read directly at the attention
+            // dispatch site, so leaving this `Default` preserves bit-equivalent
+            // behavior when no config drives it. The config path sets this
+            // field explicitly in `into_engine_fragment`.
+            attention_compute_quant: AttentionComputeQuant::Default,
         }
+    }
+
+    /// Effective FP8-attention decision: config requests FP8 OR the
+    /// `AEGIS_ATTN_FP8=1` env override is set. This is the single
+    /// convergence point for the config path and the env gate.
+    pub fn attention_fp8_enabled(self) -> bool {
+        self.attention_compute_quant.wants_fp8()
+            || std::env::var("AEGIS_ATTN_FP8").as_deref() == Ok("1")
+    }
+
+    /// Effective BF16 FlashAttention-2 decision: config requests it OR the
+    /// `AEGIS_ATTN_FA2=1` env override is set.
+    pub fn attention_fa2_enabled(self) -> bool {
+        self.attention_compute_quant.wants_fa2()
+            || std::env::var("AEGIS_ATTN_FA2").as_deref() == Ok("1")
     }
 
     pub fn prefill_attention_selection(
@@ -402,6 +492,74 @@ mod tests {
         CudaAttentionBackend, CudaAttentionEffectivePath, CudaPrefillAttentionKernel,
         CudaPrefillAttentionSelection,
     };
+
+    use super::{AttentionComputeQuant, CudaRuntimeConfig};
+
+    #[test]
+    fn attention_compute_quant_parses_canonical_values() {
+        assert_eq!(
+            AttentionComputeQuant::parse("default").unwrap(),
+            AttentionComputeQuant::Default
+        );
+        assert_eq!(
+            AttentionComputeQuant::parse("bf16").unwrap(),
+            AttentionComputeQuant::Bf16
+        );
+        assert_eq!(
+            AttentionComputeQuant::parse("bf16-fa2").unwrap(),
+            AttentionComputeQuant::Bf16Fa2
+        );
+        assert_eq!(
+            AttentionComputeQuant::parse("fp8").unwrap(),
+            AttentionComputeQuant::Fp8
+        );
+        // empty string and `auto` fold to Default.
+        assert_eq!(
+            AttentionComputeQuant::parse("").unwrap(),
+            AttentionComputeQuant::Default
+        );
+        assert_eq!(
+            AttentionComputeQuant::parse("AUTO").unwrap(),
+            AttentionComputeQuant::Default
+        );
+    }
+
+    #[test]
+    fn attention_compute_quant_rejects_unknown() {
+        assert!(AttentionComputeQuant::parse("int3").is_err());
+        assert!(AttentionComputeQuant::parse("nvfp4").is_err());
+    }
+
+    #[test]
+    fn attention_compute_quant_default_is_default() {
+        assert_eq!(
+            AttentionComputeQuant::default(),
+            AttentionComputeQuant::Default
+        );
+    }
+
+    #[test]
+    fn attention_fp8_enabled_follows_config_field() {
+        // Config requesting FP8 enables the FP8 path regardless of env.
+        let cfg = CudaRuntimeConfig {
+            attention_compute_quant: AttentionComputeQuant::Fp8,
+            ..CudaRuntimeConfig::default()
+        };
+        assert!(cfg.attention_fp8_enabled());
+        // Default config does not enable FP8 (env var not set in test env).
+        let cfg_default = CudaRuntimeConfig::default();
+        assert!(!cfg_default.attention_fp8_enabled());
+    }
+
+    #[test]
+    fn attention_fa2_enabled_follows_config_field() {
+        let cfg = CudaRuntimeConfig {
+            attention_compute_quant: AttentionComputeQuant::Bf16Fa2,
+            ..CudaRuntimeConfig::default()
+        };
+        assert!(cfg.attention_fa2_enabled());
+        assert!(!CudaRuntimeConfig::default().attention_fa2_enabled());
+    }
 
     #[test]
     fn parses_flash_attention_4_aliases() {

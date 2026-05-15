@@ -534,10 +534,7 @@ mod tests {
             CudaRuntimeConfig {
                 native_mxfp4_repack: false,
                 cutlass_nvfp4_repack: false,
-                native_mxfp4_inference: false,
-                prefill_attention: Default::default(),
-                prefill_chunk_size: None,
-                prefill_stage_timings: false,
+                ..CudaRuntimeConfig::default()
             },
         );
         let enabled = MemoryPlan::from_placement_runtime_and_cuda(
@@ -546,10 +543,7 @@ mod tests {
             CudaRuntimeConfig {
                 native_mxfp4_repack: true,
                 cutlass_nvfp4_repack: false,
-                native_mxfp4_inference: false,
-                prefill_attention: Default::default(),
-                prefill_chunk_size: None,
-                prefill_stage_timings: false,
+                ..CudaRuntimeConfig::default()
             },
         );
         let cutlass_sidecar = MemoryPlan::from_placement_runtime_and_cuda(
@@ -558,10 +552,7 @@ mod tests {
             CudaRuntimeConfig {
                 native_mxfp4_repack: false,
                 cutlass_nvfp4_repack: true,
-                native_mxfp4_inference: false,
-                prefill_attention: Default::default(),
-                prefill_chunk_size: None,
-                prefill_stage_timings: false,
+                ..CudaRuntimeConfig::default()
             },
         );
 
