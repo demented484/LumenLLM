@@ -132,6 +132,11 @@ pub(crate) struct CudaKernelFunctions {
     // cp.async double-buffering. Opt-in via `AEGIS_ATTN_FA2=1`.
     pub(crate) attention_prefill_dense_fa2_hdim512: CudaFunction,
     pub(crate) attention_prefill_dense_fa2_hdim512_q64: CudaFunction,
+    // FP8-E4M3 KV-cache variant of the FA-2 hdim=512 q32 kernel. Reads the
+    // persistent e4m3 cache directly (half the KV HBM traffic), dequants
+    // e4m3->half in shared, runs the identical BF16 WMMA math. Opt-in via
+    // `AEGIS_ATTN_FP8=1` + KV cache quant=Fp8 + head_dim=512.
+    pub(crate) attention_prefill_dense_fa2_hdim512_fp8: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_fa: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4_split: CudaFunction,
@@ -511,6 +516,26 @@ impl CudaKernelFunctions {
                 )
                 .map_err(|e| AegisError::Unsupported(format!(
                     "set max dynamic shared mem on fa2_hdim512_q64 kernel: {e:?}"
+                )))?;
+                f
+            },
+            // ===================================================================
+            attention_prefill_dense_fa2_hdim512_fp8: {
+                let f = load(
+                    &module,
+                    "aegis_attention_prefill_dense_fa2_hdim512_fp8",
+                )?;
+                // FP8-E4M3 FA-2 hdim=512 kernel. Shared mem ~76.4 KiB
+                // (q_shared 32 KiB + e4m3_stage[2] 16 KiB + half_slab 16 KiB
+                // + s_shared 8 KiB + weights_h 4 KiB + scalars 0.4 KiB).
+                // Use sm_120's 96 KiB opt-in dynamic-shared cap.
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on fa2_hdim512_fp8 kernel: {e:?}"
                 )))?;
                 f
             },
