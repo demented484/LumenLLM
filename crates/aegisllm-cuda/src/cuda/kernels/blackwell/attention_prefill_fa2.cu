@@ -629,17 +629,21 @@ void aegis_attention_prefill_dense_fa2_hdim512_q64(
     // Stage one 128-wide hdim slab of K or V for a KV block (kv_block=32 rows)
     // into a slab buffer (kv_block*slab halfs = 8 KiB). Each thread copies
     // 8 halfs (16 B); kv_block*slab = 4096 halfs = 512 chunks, 512 threads ->
-    // 1 each.
+    // 1 pass.
     auto stage_slab = [&] (const unsigned short* __restrict__ cache,
                            unsigned int tile_start, unsigned int slab_idx,
                            unsigned short* buf, unsigned int tile_count) {
         constexpr unsigned int halfs_per_chunk = 8u;
         constexpr unsigned int chunks_per_row  = slab / halfs_per_chunk;       // 16
         constexpr unsigned int total_chunks    = kv_block * chunks_per_row;    // 512
+        constexpr unsigned int passes          = (total_chunks + 511u) / 512u; // 1
         const unsigned int hdim_base = slab_idx * slab;
-        if (tid < total_chunks) {
-            const unsigned int row  = tid / chunks_per_row;                    // 0..31
-            const unsigned int hoff = (tid % chunks_per_row) * halfs_per_chunk;
+#pragma unroll
+        for (unsigned int p = 0u; p < passes; ++p) {
+            const unsigned int chunk = p * 512u + tid;
+            if (chunk >= total_chunks) { continue; }
+            const unsigned int row  = chunk / chunks_per_row;                  // 0..31
+            const unsigned int hoff = (chunk % chunks_per_row) * halfs_per_chunk;
             const bool valid = row < tile_count;
             const unsigned int pos = tile_start + row;
             unsigned int dst = cvt_smem(&buf[row * slab + hoff]);

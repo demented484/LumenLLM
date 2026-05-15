@@ -818,6 +818,20 @@ impl CudaRuntime {
             // Lever A variant: q_block=64 (vs 32) doubles arithmetic intensity
             // and halves KV HBM re-reads. Selected via `AEGIS_ATTN_FA2_Q64=1`
             // (sub-flag, only meaningful with AEGIS_ATTN_FA2=1).
+            //
+            // A/B q32 -> q64 (Gemma-4-26B-A4B-NVFP4, RTX 5070 Ti):
+            //   attention_us ctx3k 569150->543153 (-4.6%)
+            //                ctx7.5k 1687281->1555050 (-7.8%)
+            //                ctx15k 5364778->4823634 (-10.1%)
+            //   prefill_tps  ctx7.5k 3701->3809 (+2.9%)  ctx15k 3047->3186 (+4.6%)
+            // Disambiguation: halving KV HBM traffic moved attention only ~10%,
+            // far from the ~50% proportional drop a memory-bound kernel shows.
+            // => the kernel is latency/sync-bound, not memory-bound. The win is
+            // the secondary effect (fewer Q-tile loads / block launches). The
+            // remaining ceiling is the head_dim=512 shared-memory wall: at
+            // q_block=64 q_shared alone is 64 KiB, leaving no room to double-
+            // buffer K AND V resident for real latency hiding within the
+            // 96 KiB sm_120 cap.
             let use_q64 = std::env::var("AEGIS_ATTN_FA2_Q64").as_deref() == Ok("1");
             if use_q64 {
                 return self.attention_prefill_dense_fa2_hdim512_q64_device(
