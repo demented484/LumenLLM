@@ -587,7 +587,8 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             && layer.layer_head_dim == 512
             && params.batch >= 16
             && params.num_sequences == 1
-            && std::env::var("AEGIS_ATTN_FP8").as_deref() == Ok("1");
+            // Converged gate: `AEGIS_ATTN_FP8=1` env OR `compute-quantization: fp8`.
+            && runtime.config().attention_fp8_enabled();
         if use_fp8_attn {
             let (fp8_keys, fp8_values) =
                 match (&layer_state.kv.keys, &layer_state.kv.values) {
