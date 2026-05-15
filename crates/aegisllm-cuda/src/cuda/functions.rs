@@ -125,6 +125,10 @@ pub(crate) struct CudaKernelFunctions {
     // Numerical-twin of `..._hdim512_regacc`; opt-in via env var.
     pub(crate) attention_prefill_dense_halfq_wmma_hdim512_regacc_pipeline: CudaFunction,
     // ===================================================================
+    // FlashAttention-2 style hdim=512 prefill kernel. kv_block=64 (4x the old
+    // k_tile=16), register-resident O accumulator, hdim-slab streamed K/V with
+    // cp.async double-buffering. Opt-in via `AEGIS_ATTN_FA2=1`.
+    pub(crate) attention_prefill_dense_fa2_hdim512: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_fa: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4_split: CudaFunction,
@@ -466,6 +470,25 @@ impl CudaKernelFunctions {
                 f
             },
             // ===================================================================
+            attention_prefill_dense_fa2_hdim512: {
+                let f = load(
+                    &module,
+                    "aegis_attention_prefill_dense_fa2_hdim512",
+                )?;
+                // FA-2 hdim=512 kernel. Shared mem ~76.5 KiB (q_shared 32 KiB
+                // + kv_slab[2] 32 KiB + s_shared 8 KiB + weights_h 4 KiB +
+                // scalars 0.4 KiB). Use sm_120's 96 KiB opt-in dynamic-shared
+                // cap. 1 block/SM expected (16 persistent o_frags, kv_block=64).
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on fa2_hdim512 kernel: {e:?}"
+                )))?;
+                f
+            },
             attention_prefill_dense_halfq_wmma_hdim128_fa: load(
                 &module,
                 "aegis_attention_prefill_dense_halfq_wmma_hdim128_fa",
