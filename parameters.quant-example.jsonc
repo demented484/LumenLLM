@@ -1,0 +1,61 @@
+// parameters.quant-example.jsonc
+//
+// Reference config showing the THREE distinct quantization knobs around the
+// attention block. They are independent — each controls a different thing.
+// JSONC: strip comments before feeding to the engine, or save as plain .json.
+//
+//   1. attention.attention-quantization  — the attention WEIGHT quant. Runs a
+//      load-time re-quantizer on the Q/K/V/O projection weights. Affects how
+//      the weights are STORED in VRAM, not how the kernel computes.
+//
+//   2. attention.compute-quantization    — the attention COMPUTE quant. Picks
+//      the precision the prefill/decode attention KERNEL runs in (BF16 vs FP8
+//      vs the BF16 FlashAttention-2 rewrite). Affects the KERNEL DISPATCH.
+//
+//   3. hidden-layers.kv-cache.type-k / type-v — the KV-cache STORAGE dtype.
+//      Sets the element type the K/V cache is held in (f16 / bf16 / fp8 / ...).
+//
+// Validation rule the parser enforces:
+//   compute-quantization: "fp8"  REQUIRES  kv-cache type-k/type-v: "fp8"
+//   (the FP8 attention kernel reads FP8 K/V directly). Every other combo is
+//   accepted — e.g. an FP8 KV cache with a BF16 attention kernel is legal
+//   (the kernel dequantizes K/V on read).
+{
+  "model": {
+    "path": "/models/gemma4-26b-a4b-nvfp4",
+    "store": "vram",
+    "compute": "cuda:0"
+  },
+
+  "attention": {
+    // WEIGHT quant for Q/K/V/O projections (load-time re-quantizer).
+    // "default" keeps the checkpoint format (BF16 here). Independent of
+    // compute-quantization below.
+    "attention-quantization": "default",
+
+    // COMPUTE quant — precision the attention KERNEL runs in:
+    //   "default"  : historical dispatch (env gates only); bit-equivalent
+    //                to omitting this field. Safe default.
+    //   "bf16"     : explicit BF16 (half) attention kernels.
+    //   "bf16-fa2" : BF16 FlashAttention-2 rewrite (head_dim=512 path).
+    //                Equivalent to exporting AEGIS_ATTN_FA2=1.
+    //   "fp8"      : FP8 (E4M3) attention kernels. Equivalent to exporting
+    //                AEGIS_ATTN_FP8=1. REQUIRES the FP8 KV cache below.
+    "compute-quantization": "fp8"
+  },
+
+  "hidden-layers": {
+    "compute": "cuda:0",
+    "weights": {
+      "store": "ram"
+    },
+    "kv-cache": {
+      "context-size": 32768,
+      "store": "vram",
+      // KV-cache STORAGE dtype. "fp8" halves the K/V footprint and is
+      // mandatory when attention.compute-quantization is "fp8".
+      "type-k": "fp8",
+      "type-v": "fp8"
+    }
+  }
+}

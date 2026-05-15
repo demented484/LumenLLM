@@ -812,8 +812,20 @@ impl CudaRuntime {
         //   ctx~15k  : 7387405 -> 5348320   (-27.6%),  1674 -> 1863 tps
         // quality-smoke output bit-identical to the legacy kernel on both
         // english_hello and russian_greeting. Keep opt-in until promoted.
-        let use_fa2 = head_dim == 512
-            && std::env::var("AEGIS_ATTN_FA2").as_deref() == Ok("1");
+        // FA-2 is enabled if EITHER the `AEGIS_ATTN_FA2=1` env override is set
+        // OR `attention.compute-quantization: bf16-fa2` was given in the config
+        // (`CudaRuntimeConfig::attention_fa2_enabled` is the convergence point).
+        let use_fa2 = head_dim == 512 && self.config.attention_fa2_enabled();
+        // ── FP8 attention dispatch hook (for the feat/fp8-attention merge) ──
+        // The FP8 prefill attention kernel is built on a parallel branch.
+        // When that branch merges, gate the FP8 kernel here with:
+        //     if self.config.attention_fp8_enabled() { /* launch fp8 kernel */ }
+        // `attention_fp8_enabled()` already returns true for BOTH the
+        // `AEGIS_ATTN_FP8=1` env override AND `compute-quantization: fp8` in
+        // the parameters file — so the env gate the kernel agent uses and the
+        // config knob converge on this single call. The parser guarantees the
+        // KV cache is FP8 whenever `compute-quantization: fp8` is set, so the
+        // FP8 kernel can assume FP8 K/V buffers without re-checking.
         if use_fa2 {
             // Lever A variant: q_block=64 (vs 32) doubles arithmetic intensity
             // and halves KV HBM re-reads. Selected via `AEGIS_ATTN_FA2_Q64=1`
