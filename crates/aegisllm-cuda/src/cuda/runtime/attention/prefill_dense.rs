@@ -806,6 +806,12 @@ impl CudaRuntime {
         // kv_block=64 (4x the old k_tile=16), register-resident O accumulator
         // with in-register alpha rescale, hdim-slab streamed K/V with cp.async
         // double-buffering. Default OFF -> default path bit-equivalent to main.
+        // A/B (Gemma-4-26B-A4B-NVFP4, RTX 5070 Ti, attention_us / prefill_tps):
+        //   ctx~1.5k : 172766 -> 154545 us  (-10.5%),  2265 -> 2301 tps
+        //   ctx~7.5k : 2224621 -> 1687220   (-24.2%),  1947 -> 2096 tps
+        //   ctx~15k  : 7387405 -> 5348320   (-27.6%),  1674 -> 1863 tps
+        // quality-smoke output bit-identical to the legacy kernel on both
+        // english_hello and russian_greeting. Keep opt-in until promoted.
         let use_fa2 = head_dim == 512
             && std::env::var("AEGIS_ATTN_FA2").as_deref() == Ok("1");
         if use_fa2 {
