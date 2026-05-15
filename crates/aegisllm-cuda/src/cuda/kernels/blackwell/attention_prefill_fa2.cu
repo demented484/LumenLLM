@@ -275,21 +275,32 @@ void aegis_attention_prefill_dense_fa2_hdim512(
         const unsigned int tile_count = min(kv_block, block_max_visible - tile_start);
 
         // ======================= Q*K -> S =======================
+        // Software-pipelined hdim-slab streaming: ONE __syncthreads() per slab
+        // (was two). Per slab iteration: wait for slab sl's load, ONE full
+        // block barrier, prefetch slab sl+1, then WMMA(sl). The single barrier
+        // simultaneously satisfies both hazards:
+        //   (a) RAW -- slab sl's cp.async has landed block-wide before WMMA
+        //       reads it (cp_wait orders the issuing thread; the barrier makes
+        //       the visibility block-wide), and
+        //   (b) WAR -- it runs after slab sl-1's WMMA, so the slab sl+1
+        //       prefetch (issued just after the barrier, into buffer
+        //       (sl+1)&1 == (sl-1)&1) cannot clobber data slab sl-1's WMMA is
+        //       still reading.
+        // The prefetch's cp.async overlaps WMMA(sl). Exactly one slab is in
+        // flight at a time, so a plain cp_wait_all is correct and cheapest.
         wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
         wmma::fill_fragment(s_frag, 0.0f);
         for (unsigned int sl = 0u; sl < n_slabs; ++sl) {
             const unsigned int buf = sl & 1u;
             unsigned short* k_buf = kv_slab + buf * (kv_block * slab);
-            // Prefetch the next K slab (double buffer).
+            cp_wait_all();     // slab sl's cp.async landed (issuing-thread order)
+            __syncthreads();   // slab sl visible block-wide AND slab sl-1 WMMA done
+            // Prefetch slab sl+1 into the other buffer; cp.async overlaps WMMA(sl).
             if (sl + 1u < n_slabs) {
                 stage_slab(key_cache, tile_start, sl + 1u,
                            kv_slab + ((sl + 1u) & 1u) * (kv_block * slab), tile_count);
                 cp_commit();
-                cp_wait_lt1();
-            } else {
-                cp_wait_all();
             }
-            __syncthreads();
             if (qk_active) {
                 // s_frag[16q x 16kv] += Q[16q x 128] . K[16kv x 128]^T over
                 // this slab. q rows  [qk_row*16 .. +16), kv [qk_kv*16 .. +16).
@@ -306,7 +317,6 @@ void aegis_attention_prefill_dense_fa2_hdim512(
                     wmma::mma_sync(s_frag, a_frag, b_frag, s_frag);
                 }
             }
-            __syncthreads();  // all warps done reading k_buf before reuse
         }
         // Store each warp's complete S tile to s_shared [q_block, kv_block].
         if (qk_active) {
@@ -370,6 +380,11 @@ void aegis_attention_prefill_dense_fa2_hdim512(
         // alpha applied directly to the m16n16 accumulator fragment via the
         // shared helper (reads scalars[row*3 + 2], the documented m16n16
         // lane->row mapping). No store/reload-through-shared scratch.
+        // NO trailing __syncthreads(): this phase only reads `scalars` (already
+        // visible after the softmax barrier above) and writes per-thread WMMA
+        // registers -- it touches no shared memory, so it creates no hazard for
+        // the V-stage / P*V phase that follows. The softmax barrier already
+        // separates the scalars writes from these reads.
 #pragma unroll
         for (unsigned int rs = 0u; rs < row_strips; ++rs) {
 #pragma unroll
@@ -378,31 +393,26 @@ void aegis_attention_prefill_dense_fa2_hdim512(
                     o_frag[rs * o_col_frags + cf], scalars, rs * 16u);
             }
         }
-        __syncthreads();
 
         // ======================= P*V -> O =======================
-        // weights_h holds P [q_block, kv_block] in BF16. Stream V slabs.
+        // weights_h holds P [q_block, kv_block] in BF16. Stream V slabs with
+        // the same software-pipelined one-barrier-per-slab structure as Q*K:
+        // V slab 0 is staged just above (after the softmax barrier, overlapping
+        // the rescale); per slab iteration: wait, ONE barrier, prefetch slab
+        // sl+1, WMMA(sl). The single barrier covers RAW (slab sl visible) and
+        // WAR (slab sl-1's WMMA done before the slab sl+1 prefetch).
+        stage_slab(value_cache, tile_start, 0u, kv_slab, tile_count);
+        cp_commit();
         for (unsigned int sl = 0u; sl < n_slabs; ++sl) {
             const unsigned int buf = sl & 1u;
             unsigned short* v_buf = kv_slab + buf * (kv_block * slab);
-            // Stage this V slab; prefetch next, or first K slab of next iter.
-            // We (re)issue the load for slab `sl` then wait, with `sl+1`
-            // prefetched. To keep it simple and correct: stage slab sl into
-            // buf, commit, wait_all before WMMA. Double-buffer via prefetch
-            // of sl+1.
-            if (sl == 0u) {
-                stage_slab(value_cache, tile_start, 0u, kv_slab, tile_count);
-                cp_commit();
-            }
+            cp_wait_all();     // slab sl's cp.async landed (issuing-thread order)
+            __syncthreads();   // slab sl visible block-wide AND slab sl-1 WMMA done
             if (sl + 1u < n_slabs) {
                 stage_slab(value_cache, tile_start, sl + 1u,
                            kv_slab + ((sl + 1u) & 1u) * (kv_block * slab), tile_count);
                 cp_commit();
-                cp_wait_lt1();
-            } else {
-                cp_wait_all();
             }
-            __syncthreads();
             if (o_slab == sl) {
                 // O[16q x 32] += P[16q x 64] . V[64 x 32] for this warp's cols.
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
@@ -425,16 +435,22 @@ void aegis_attention_prefill_dense_fa2_hdim512(
                     }
                 }
             }
-            __syncthreads();  // all warps done reading v_buf before reuse
+            // NO trailing barrier: slab sl+1's top barrier (next iteration)
+            // already separates this WMMA's v_buf reads from the slab sl+2
+            // prefetch that overwrites the same buffer. For the last slab the
+            // next-iter K slab-0 stage below overwrites buffer 0, last read by
+            // P*V slab sl=2 -- separated by slab sl=3's top barrier.
         }
 
-        // Prologue for next iter: stage its K slab 0.
+        // Prologue for next iter: stage its K slab 0. No barrier needed -- the
+        // next iteration's Q*K slab-0 cp_wait_all + top barrier provides the
+        // RAW; the WAR (buffer 0 last read by P*V slab 2) is covered by P*V
+        // slab 3's top barrier which ran before this stage.
         if (it + 1u < n_kiters) {
             const unsigned int next_start = tile_start + kv_block;
             const unsigned int next_tc = min(kv_block, block_max_visible - next_start);
             stage_slab(key_cache, next_start, 0u, kv_slab, next_tc);
             cp_commit();
-            __syncthreads();
         }
     }
 
