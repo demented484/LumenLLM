@@ -654,8 +654,22 @@ pub(super) struct CudaMoEPrefillScratch {
     /// Permuted up output (also reused as GeGLU output for down input).
     pub(super) permuted_swiglu: DeviceBuffer<f32>,
     /// Permuted down_proj output: `[chunk_size * top_k, hidden_size]`. Read
-    /// by `aegis_unpermute_scatter_add_f32` to write back into `moe_acc`.
+    /// by the deterministic unpermute-scatter to write back into `moe_acc`.
     pub(super) permuted_output: DeviceBuffer<f32>,
+    // ── Deterministic unpermute-scatter inverse index ──────────────────────
+    /// Per-token inverse routing table, `[chunk_size * top_k]`. Slot
+    /// `token*top_k + k` holds the permuted source row of the expert that is
+    /// `token`'s k-th (by ascending expert id) route. Built by
+    /// `aegis_router_build_unpermute_index`, consumed by
+    /// `aegis_unpermute_scatter_serial_f32`. Replaces the nondeterministic
+    /// `atomicAdd`-based scatter so greedy decode is bit-reproducible.
+    pub(super) unpermute_rows: DeviceBuffer<u32>,
+    /// Parallel to `unpermute_rows`: `bitcast<u32>(routing weight)` per slot.
+    pub(super) unpermute_wbits: DeviceBuffer<u32>,
+    /// Per-token count of routed experts, `[chunk_size]`. Zeroed before each
+    /// `build_unpermute_index` launch so multiple calls (CUTLASS split path)
+    /// do not mix subsets.
+    pub(super) unpermute_count: DeviceBuffer<u32>,
     // ── Bulk expert weight staging (grouped GEMM path) ─────────────────────
     /// Three projections per layer (gate / up / down) need three independent
     /// staging slots so the transfer stream can stage projection N+1 while

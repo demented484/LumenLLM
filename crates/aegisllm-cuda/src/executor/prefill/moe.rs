@@ -330,13 +330,13 @@ pub(super) fn forward_moe_prefill_chunk_device(
     if use_grouped && cutlass_enabled {
         forward_moe_cutlass_split_routed_experts(
             runtime, moe, moe_scratch, &active_experts, &counts_host,
-            stride, num_experts, hidden_size, staging_ptr,
+            stride, num_experts, hidden_size, batch, top_k, staging_ptr,
         )?;
         report(cp_experts, "experts_done");
     } else if use_grouped {
         forward_moe_grouped_routed_experts(
             runtime, moe, moe_scratch, &active_experts, &counts_host,
-            stride, num_experts, hidden_size,
+            stride, num_experts, hidden_size, batch, top_k,
         )?;
         report(cp_experts, "experts_done");
         // Skip the per-expert dispatch below.
@@ -568,6 +568,7 @@ fn stage_active_experts_projection_async(
 /// launches. Result is written into `moe_scratch.moe_acc` exactly as the
 /// per-expert path does (atomic scatter-add of weighted per-token outputs).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn forward_moe_grouped_routed_experts(
     runtime: &CudaRuntime,
     moe: &CudaMoE,
@@ -577,6 +578,8 @@ fn forward_moe_grouped_routed_experts(
     stride: usize,
     num_experts: usize,
     hidden_size: usize,
+    batch: usize,
+    top_k: usize,
 ) -> Result<()> {
     if active_experts.is_empty() {
         return Ok(());
@@ -754,7 +757,8 @@ fn forward_moe_grouped_routed_experts(
         )?;
     }
 
-    // Inverse permute + weighted scatter into moe_acc.
+    // Inverse permute + weighted scatter into moe_acc (deterministic — see
+    // `unpermute_scatter_add_f32_device`). `moe_acc` was zeroed at step 8.
     runtime.unpermute_scatter_add_f32_device(
         &moe_scratch.permuted_output,
         &moe_scratch.expert_token_lists,
@@ -765,6 +769,11 @@ fn forward_moe_grouped_routed_experts(
         num_experts,
         max_per_expert_overall,
         hidden_size,
+        batch,
+        top_k,
+        &mut moe_scratch.unpermute_rows,
+        &mut moe_scratch.unpermute_wbits,
+        &mut moe_scratch.unpermute_count,
         &mut moe_scratch.moe_acc,
     )?;
 
@@ -789,6 +798,8 @@ fn forward_moe_cutlass_split_routed_experts(
     _stride: usize,
     _num_experts: usize,
     _hidden_size: usize,
+    _batch: usize,
+    _top_k: usize,
     _staging_ptr: *mut LinearStagingPool,
 ) -> Result<()> {
     Err(AegisError::Unsupported(
@@ -808,6 +819,8 @@ fn forward_moe_cutlass_split_routed_experts(
     stride: usize,
     num_experts: usize,
     hidden_size: usize,
+    batch: usize,
+    top_k: usize,
     staging_ptr: *mut LinearStagingPool,
 ) -> Result<()> {
     if active_experts.is_empty() {
@@ -838,7 +851,7 @@ fn forward_moe_cutlass_split_routed_experts(
     if large_experts.is_empty() {
         return forward_moe_grouped_routed_experts(
             runtime, moe, moe_scratch, active_experts, counts_host,
-            stride, num_experts, hidden_size,
+            stride, num_experts, hidden_size, batch, top_k,
         );
     }
 
@@ -1315,6 +1328,11 @@ fn forward_moe_cutlass_split_routed_experts(
         num_experts,
         max_per_expert_overall,
         hidden_size,
+        batch,
+        top_k,
+        &mut moe_scratch.unpermute_rows,
+        &mut moe_scratch.unpermute_wbits,
+        &mut moe_scratch.unpermute_count,
         &mut moe_scratch.moe_acc,
     )?;
 
@@ -1475,7 +1493,8 @@ fn forward_moe_cutlass_split_routed_experts(
         }
 
         // ── unpermute_scatter_add: write small-expert contributions back
-        //    into moe_acc using small-only counts/offsets. ────────────────
+        //    into moe_acc using small-only counts/offsets. The serial kernel
+        //    uses `+=`, so this composes with the large-expert call above.
         runtime.unpermute_scatter_add_f32_device(
             &moe_scratch.permuted_output,
             &moe_scratch.expert_token_lists,
@@ -1486,6 +1505,11 @@ fn forward_moe_cutlass_split_routed_experts(
             num_experts,
             max_small_count,
             hidden_size,
+            batch,
+            top_k,
+            &mut moe_scratch.unpermute_rows,
+            &mut moe_scratch.unpermute_wbits,
+            &mut moe_scratch.unpermute_count,
             &mut moe_scratch.moe_acc,
         )?;
     } else {

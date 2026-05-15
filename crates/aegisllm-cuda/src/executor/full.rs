@@ -761,6 +761,10 @@ impl CudaLlamaExecutor {
                             .runtime
                             .alloc_f32(cs * max_top_k * max_expert_intermediate)?,
                         permuted_output: self.runtime.alloc_f32(cs * max_top_k * self.hidden_size)?,
+                        // Deterministic unpermute-scatter inverse index.
+                        unpermute_rows: self.runtime.alloc_u32(cs * max_top_k)?,
+                        unpermute_wbits: self.runtime.alloc_u32(cs * max_top_k)?,
+                        unpermute_count: self.runtime.alloc_u32(cs)?,
                         // 3-slot grouped staging (gate / up / down each get
                         // their own slot). Allows transfer stream to fill
                         // projection N+1's slot while compute stream's

@@ -1449,11 +1449,29 @@ impl CudaRuntime {
         Ok(())
     }
 
-    /// Unpermute-scatter-add: reads per-expert output rows from the permuted
-    /// buffer, multiplies each by its routing weight, and atomically adds
-    /// into `moe_acc[src_token, h]`. Multiple experts write to the same
-    /// source token (top_k > 1) — atomicAdd handles the contention. Single
-    /// launch replaces N `scatter_add_weighted_f32` calls.
+    /// Deterministic unpermute-scatter-add: reads per-expert output rows from
+    /// the permuted buffer, multiplies each by its routing weight, and adds
+    /// the result into `moe_acc[src_token, h]`.
+    ///
+    /// Replaces the original single `aegis_unpermute_scatter_add_f32` kernel,
+    /// whose `atomicAdd` made the per-token sum ORDER-DEPENDENT across runs
+    /// (blocks from different experts race on the same `moe_acc` cell, and
+    /// float atomic-add ordering is not reproducible). That ~1-ULP per-run
+    /// drift propagated through every prefill layer and flipped occasional
+    /// late-token argmax decisions, so greedy (temperature=0) decode produced
+    /// different completions run-to-run.
+    ///
+    /// The deterministic path is two kernels:
+    ///   1. `aegis_router_build_unpermute_index` — builds a per-token inverse
+    ///      routing table indexed by the expert's *canonical rank* (ascending
+    ///      expert id), so the slot assignment is scheduler-independent.
+    ///   2. `aegis_unpermute_scatter_serial_f32` — one block per
+    ///      `(hidden tile, token)`, accumulates that token's routes in fixed
+    ///      rank order and writes `moe_acc` once. No atomics, no contention.
+    ///
+    /// `moe_acc` must be pre-zeroed by the caller (it always is). The serial
+    /// kernel uses `+=` so the CUTLASS split path's two calls (large then
+    /// small experts) compose correctly.
     #[allow(clippy::too_many_arguments)]
     pub fn unpermute_scatter_add_f32_device(
         &self,
@@ -1466,35 +1484,91 @@ impl CudaRuntime {
         num_experts: usize,
         max_tokens_per_expert: usize,
         hidden: usize,
+        batch: usize,
+        top_k: usize,
+        unpermute_rows: &mut DeviceBuffer<u32>,
+        unpermute_wbits: &mut DeviceBuffer<u32>,
+        unpermute_count: &mut DeviceBuffer<u32>,
         moe_acc: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
-        if hidden == 0 || num_experts == 0 || max_tokens_per_expert == 0 {
+        if hidden == 0 || num_experts == 0 || max_tokens_per_expert == 0
+            || batch == 0 || top_k == 0
+        {
             return Ok(());
+        }
+        let index_len = batch.checked_mul(top_k).ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "unpermute index overflow: batch={batch} top_k={top_k}"
+            ))
+        })?;
+        if unpermute_rows.len() < index_len
+            || unpermute_wbits.len() < index_len
+            || unpermute_count.len() < batch
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "unpermute index buffers too small: rows={} wbits={} count={} need rows/wbits={} count={}",
+                unpermute_rows.len(), unpermute_wbits.len(), unpermute_count.len(),
+                index_len, batch,
+            )));
         }
         let stride_u32 = u32_arg("stride", stride)?;
         let hidden_u32 = u32_arg("hidden", hidden)?;
         let num_experts_u32 = u32_arg("num_experts", num_experts)?;
         let max_tok_u32 = u32_arg("max_tokens_per_expert", max_tokens_per_expert)?;
+        let batch_u32 = u32_arg("batch", batch)?;
+        let top_k_u32 = u32_arg("top_k", top_k)?;
+
+        // Zero the per-token route counter. `build_unpermute_index` only
+        // `atomicMax`es into it, so a stale value from a prior call (or a
+        // prior layer) would corrupt the result if not cleared. The buffer
+        // is `[chunk_size]` (a few KiB) so zeroing all of it is negligible.
+        self.stream
+            .memset_zeros(&mut unpermute_count.slice)
+            .map_err(map_cuda_err("zero unpermute_count"))?;
+
+        // Kernel 1: build the per-token inverse routing table.
         let block_dim = 256u32;
-        let cfg = LaunchConfig {
-            grid_dim: (ceil_div(hidden_u32, block_dim), max_tok_u32, num_experts_u32),
+        let build_cfg = LaunchConfig {
+            grid_dim: (ceil_div(max_tok_u32, block_dim), num_experts_u32, 1),
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.unpermute_scatter_add_f32)
-                .arg(&permuted.slice)
+                .launch_builder(&self.kernels.router_build_unpermute_index)
                 .arg(&expert_token_lists.slice)
-                .arg(&expert_weight_lists.slice)
                 .arg(&expert_counts.slice)
                 .arg(&expert_offsets.slice)
+                .arg(&expert_weight_lists.slice)
+                .arg(&num_experts_u32)
                 .arg(&stride_u32)
+                .arg(&top_k_u32)
+                .arg(&mut unpermute_rows.slice)
+                .arg(&mut unpermute_wbits.slice)
+                .arg(&mut unpermute_count.slice)
+                .launch(build_cfg)
+        }
+        .map_err(map_cuda_err("launch router_build_unpermute_index"))?;
+
+        // Kernel 2: deterministic serial scatter — one block per (h tile, token).
+        let scatter_cfg = LaunchConfig {
+            grid_dim: (ceil_div(hidden_u32, block_dim), batch_u32, 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.unpermute_scatter_serial_f32)
+                .arg(&permuted.slice)
+                .arg(&unpermute_rows.slice)
+                .arg(&unpermute_wbits.slice)
+                .arg(&unpermute_count.slice)
+                .arg(&top_k_u32)
                 .arg(&hidden_u32)
                 .arg(&mut moe_acc.slice)
-                .launch(cfg)
+                .launch(scatter_cfg)
         }
-        .map_err(map_cuda_err("launch unpermute_scatter_add_f32"))?;
+        .map_err(map_cuda_err("launch unpermute_scatter_serial_f32"))?;
         Ok(())
     }
 

@@ -274,6 +274,15 @@ extern "C" __global__ void aegis_permute_gather_f32(
 // buffer, multiplies each by its routing weight, and atomically adds into
 // `moe_acc[src_token, h]`. Multiple experts may write to the same source
 // token (top_k > 1), which is why scatter is atomic.
+//
+// DETERMINISM NOTE: this kernel's `atomicAdd` makes the per-token sum
+// ORDER-DEPENDENT across runs — blocks from different experts (`blockIdx.z`)
+// race on the same `moe_acc[src_token, h]` cell, and atomic-add ordering of
+// floats is not reproducible. The resulting ~1-ULP per-run drift propagates
+// through every prefill layer and flips occasional late-token argmax
+// decisions in greedy decode. It is kept only for reference / A-B testing;
+// the inference path uses the deterministic two-kernel pair below
+// (`aegis_router_build_unpermute_index` + `aegis_unpermute_scatter_serial_f32`).
 extern "C" __global__ void aegis_unpermute_scatter_add_f32(
     const float* __restrict__ permuted,                     // [total_assignments, hidden]
     const unsigned int* __restrict__ expert_token_lists,    // [num_experts × stride]
@@ -300,6 +309,105 @@ extern "C" __global__ void aegis_unpermute_scatter_add_f32(
 
     const float v = permuted[(size_t)src_row * hidden + h] * weight;
     atomicAdd(&moe_acc[(size_t)src_token * hidden + h], v);
+}
+
+// ── Deterministic unpermute-scatter, kernel 1 of 2 ──────────────────────────
+//
+// Builds a per-token inverse routing table so the scatter (kernel 2) can be a
+// race-free, fixed-order serial accumulation.
+//
+// One thread per routed assignment `(expert e, slot b)` with `b < count[e]`.
+// For each assignment it computes the source token `t` and the assignment's
+// *canonical rank* among `t`'s experts — the number of experts `e' < e` that
+// also routed `t`. That rank `k ∈ [0, top_k)` gives the assignment a
+// deterministic slot in `t`'s row of the inverse table, INDEPENDENT of block
+// scheduling. The table stores, per `(t, k)`, the packed pair
+//   out_rows  [t*top_k + k] = permuted source row  (expert_first_token_off[e] + b)
+//   out_wbits [t*top_k + k] = bitcast<u32>(routing weight)
+// and `out_count[t]` is set to the number of experts routing `t` (== top_k in
+// practice, but computed so a token with fewer routes is still correct).
+//
+// Rank computation scans experts `0..e`; total work is
+// `num_experts * total_assignments` — a few million ops per layer, negligible
+// next to the grouped GEMMs.
+extern "C" __global__ void aegis_router_build_unpermute_index(
+    const unsigned int* __restrict__ expert_token_lists,    // [num_experts × stride]
+    const unsigned int* __restrict__ expert_counts,         // [num_experts]
+    const unsigned int* __restrict__ expert_first_token_off,// [num_experts + 1]
+    const float*        __restrict__ expert_weight_lists,   // [num_experts × stride]
+    const unsigned int num_experts,
+    const unsigned int stride,
+    const unsigned int top_k,
+    unsigned int* __restrict__ out_rows,                    // [batch × top_k]
+    unsigned int* __restrict__ out_wbits,                   // [batch × top_k]
+    unsigned int* __restrict__ out_count                    // [batch]
+) {
+    const unsigned int expert = blockIdx.y;
+    if (expert >= num_experts) return;
+    const unsigned int slot = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int count = expert_counts[expert];
+    if (slot >= count) return;
+
+    const unsigned int token = expert_token_lists[expert * stride + slot];
+    const float        weight = expert_weight_lists[expert * stride + slot];
+    const unsigned int src_row = expert_first_token_off[expert] + slot;
+
+    // Canonical rank of this assignment among `token`'s experts: count experts
+    // with a smaller id that also routed `token`. Deterministic, scheduler-
+    // independent. Each such expert routes `token` at most once.
+    unsigned int rank = 0u;
+    for (unsigned int e = 0u; e < expert; ++e) {
+        const unsigned int ce = expert_counts[e];
+        const unsigned int* list = expert_token_lists + (size_t)e * stride;
+        for (unsigned int j = 0u; j < ce; ++j) {
+            if (list[j] == token) { ++rank; break; }
+        }
+    }
+    if (rank >= top_k) return;  // defensive: never expected (≤ top_k routes/token)
+
+    out_rows [(size_t)token * top_k + rank] = src_row;
+    out_wbits[(size_t)token * top_k + rank] = __float_as_uint(weight);
+    // `out_count[token]` is the number of experts routing `token`. The highest
+    // rank wins the max; every contributing assignment writes rank+1.
+    atomicMax(&out_count[token], rank + 1u);
+}
+
+// ── Deterministic unpermute-scatter, kernel 2 of 2 ──────────────────────────
+//
+// One block per `(hidden tile, source token)`. Each thread owns one hidden
+// channel `h` and accumulates that token's expert contributions in a FIXED
+// rank order `k = 0..in_count[token]` into a register, then adds the result
+// into `moe_acc[token, h]` exactly once. Each output cell is touched by
+// exactly one block → no atomics, no cross-block contention → bit-identical
+// across runs.
+//
+// The write is `+=` (not `=`) so the kernel composes when called more than
+// once into the same — pre-zeroed — `moe_acc` (the CUTLASS split path issues
+// one call for large experts and one for small experts). The read-modify-
+// write is race-free because the `(h_tile, token)` → block mapping is a
+// bijection over output cells within a single launch.
+extern "C" __global__ void aegis_unpermute_scatter_serial_f32(
+    const float* __restrict__ permuted,                     // [total_assignments, hidden]
+    const unsigned int* __restrict__ in_rows,               // [batch × top_k]
+    const unsigned int* __restrict__ in_wbits,              // [batch × top_k]
+    const unsigned int* __restrict__ in_count,              // [batch]
+    const unsigned int top_k,
+    const unsigned int hidden,
+    float* __restrict__ moe_acc                             // [batch, hidden]
+) {
+    const unsigned int token = blockIdx.y;
+    const unsigned int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+
+    const unsigned int n = in_count[token];
+    if (n == 0u) return;
+    float acc = 0.0f;
+    for (unsigned int k = 0u; k < n; ++k) {
+        const unsigned int src_row = in_rows[(size_t)token * top_k + k];
+        const float weight = __uint_as_float(in_wbits[(size_t)token * top_k + k]);
+        acc += permuted[(size_t)src_row * hidden + h] * weight;
+    }
+    moe_acc[(size_t)token * hidden + h] += acc;
 }
 
 extern "C" __global__ void aegis_router_bucket_sort(
