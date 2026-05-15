@@ -137,6 +137,12 @@ pub(crate) struct CudaKernelFunctions {
     // e4m3->half in shared, runs the identical BF16 WMMA math. Opt-in via
     // `AEGIS_ATTN_FP8=1` + KV cache quant=Fp8 + head_dim=512.
     pub(crate) attention_prefill_dense_fa2_hdim512_fp8: CudaFunction,
+    // Native FP8 e4m3 MMA variant of the FA-2 hdim=512 kernel. Keeps K/V e4m3
+    // in shared memory and feeds the bytes straight into the SM120
+    // `kind::f8f6f4.m16n8k32` tensor-core MMA (no half-slab dequant). The
+    // halved smem footprint fits 2 thread-blocks per SM. Opt-in via
+    // `AEGIS_ATTN_FP8=1` + KV cache quant=Fp8 + head_dim=512.
+    pub(crate) attention_prefill_dense_fa2_hdim512_fp8_mma: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_fa: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4_split: CudaFunction,
@@ -536,6 +542,28 @@ impl CudaKernelFunctions {
                 )
                 .map_err(|e| AegisError::Unsupported(format!(
                     "set max dynamic shared mem on fa2_hdim512_fp8 kernel: {e:?}"
+                )))?;
+                f
+            },
+            // ===================================================================
+            attention_prefill_dense_fa2_hdim512_fp8_mma: {
+                let f = load(
+                    &module,
+                    "aegis_attention_prefill_dense_fa2_hdim512_fp8_mma",
+                )?;
+                // Native FP8 e4m3 MMA FA-2 hdim=512 kernel. Shared mem ~42.5 KiB
+                // (q_e4m3 16 + kv_e4m3[2] 16 + s_shared 8 + p_e4m3 2 + scalars
+                // 0.4 + q_scale 0.1). Capped at 48 KiB: that is < 100 KiB / 2,
+                // so the driver can co-resident 2 thread-blocks per SM — the
+                // occupancy target of this kernel. (__launch_bounds__(512, 2)
+                // also requests the 2-block hint at compile time.)
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    48 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on fa2_hdim512_fp8_mma kernel: {e:?}"
                 )))?;
                 f
             },

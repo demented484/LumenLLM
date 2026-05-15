@@ -597,18 +597,42 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
                         "FP8 prefill attention: keys/values not both Fp8".into(),
                     )),
                 };
-            runtime.attention_prefill_dense_fa2_hdim512_fp8_device(
-                fp8_keys,
-                fp8_values,
-                &prefill.q_half,
-                params.start_position,
-                params.batch,
-                params.dense_metadata.context_len(),
-                params.num_attention_heads,
-                layer.layer_num_kv_heads,
-                layer.window_size as u32,
-                &mut prefill.qkv,
-            )?;
+            // Two FP8 prefill kernels exist for head_dim=512:
+            //   * the native FP8-MMA kernel (default) — K/V stay e4m3 in shared
+            //     and feed the SM120 `kind::f8f6f4.m16n8k32` tensor-core MMA
+            //     directly; ~42.5 KiB shared -> 2 blocks/SM.
+            //   * the option-b `_fp8` kernel — dequants e4m3->half in shared
+            //     and runs BF16 WMMA; ~76 KiB shared -> 1 block/SM. Kept as a
+            //     fallback, selected by `AEGIS_ATTN_FP8_OPTION_B=1`.
+            let use_option_b =
+                std::env::var("AEGIS_ATTN_FP8_OPTION_B").as_deref() == Ok("1");
+            if use_option_b {
+                runtime.attention_prefill_dense_fa2_hdim512_fp8_device(
+                    fp8_keys,
+                    fp8_values,
+                    &prefill.q_half,
+                    params.start_position,
+                    params.batch,
+                    params.dense_metadata.context_len(),
+                    params.num_attention_heads,
+                    layer.layer_num_kv_heads,
+                    layer.window_size as u32,
+                    &mut prefill.qkv,
+                )?;
+            } else {
+                runtime.attention_prefill_dense_fa2_hdim512_fp8_mma_device(
+                    fp8_keys,
+                    fp8_values,
+                    &prefill.q_half,
+                    params.start_position,
+                    params.batch,
+                    params.dense_metadata.context_len(),
+                    params.num_attention_heads,
+                    layer.layer_num_kv_heads,
+                    layer.window_size as u32,
+                    &mut prefill.qkv,
+                )?;
+            }
         } else {
             // Prefill attention reads from the f16 cache (auxiliary when FP8,
             // primary when F16/BF16). Re-borrow immutably here since the FP8

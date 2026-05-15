@@ -1548,6 +1548,128 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Native FP8 e4m3 MMA variant of the FA-2 hdim=512 prefill kernel.
+    /// Reads the PERSISTENT FP8-E4M3 KV cache (`unsigned char`) directly and
+    /// feeds the e4m3 bytes STRAIGHT into the SM120 `kind::f8f6f4.m16n8k32`
+    /// tensor-core MMA — K/V stay e4m3 in shared memory, no half-slab dequant.
+    /// The halved shared footprint (~42.5 KiB vs the option-b kernel's ~76 KiB)
+    /// fits 2 thread-blocks per SM, the latency-hiding occupancy the BF16 /
+    /// option-b kernels structurally cannot reach within the 100 KiB sm_120
+    /// cap. Q is quantized to e4m3 with a per-row absmax scale; P (softmax
+    /// probs, bounded in [0,1]) is requantized with the fixed constant 448.
+    ///
+    /// Selected via `AEGIS_ATTN_FP8=1` + KV cache quant=Fp8 + head_dim=512,
+    /// in preference to the option-b `_fp8` kernel. Default OFF -> the prefill
+    /// path is bit-equivalent to main.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_dense_fa2_hdim512_fp8_mma_device(
+        &self,
+        key_cache: &DeviceBuffer<u8>,
+        value_cache: &DeviceBuffer<u8>,
+        query_half: &DeviceBuffer<u16>,
+        start_position: usize,
+        batch: usize,
+        context_len: usize,
+        num_attention_heads: usize,
+        num_kv_heads: usize,
+        window_size: u32,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        const HEAD_DIM: usize = 512;
+        const Q_BLOCK: usize = 32;
+        const KV_BLOCK: usize = 64;
+        const SLAB: usize = 128;
+        let q_width = checked_len("dense fa2 fp8 mma q width", num_attention_heads, HEAD_DIM)?;
+        let q_tokens = checked_len("dense fa2 fp8 mma q tokens", batch, q_width)?;
+        let kv_width = checked_len("dense fa2 fp8 mma kv width", num_kv_heads, HEAD_DIM)?;
+        let cache_len = checked_len("dense fa2 fp8 mma kv cache", context_len, kv_width)?;
+        if query_half.len() < q_tokens || output.len() < q_tokens {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense fa2 fp8 mma attention q/output shape mismatch: query_half={} output={} required={}",
+                query_half.len(),
+                output.len(),
+                q_tokens
+            )));
+        }
+        let _ = cache_len;
+        if key_cache.len() != value_cache.len()
+            || key_cache.len() % kv_width != 0
+            || key_cache.is_empty()
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "dense fa2 fp8 mma attention kv cache shape mismatch: key_cache={} value_cache={} kv_width={}",
+                key_cache.len(),
+                value_cache.len(),
+                kv_width
+            )));
+        }
+        if !num_attention_heads.is_multiple_of(num_kv_heads) {
+            return Err(AegisError::InvalidPlan(
+                "dense fa2 fp8 mma attention heads must be divisible by kv heads".into(),
+            ));
+        }
+        // Shared-mem layout (mirrors the kernel header map):
+        //   q_e4m3      = Q_BLOCK * HEAD_DIM   bytes  = 16   KiB
+        //   kv_e4m3[2]  = 2 * KV_BLOCK * SLAB  bytes  = 16   KiB
+        //   s_shared    = Q_BLOCK * KV_BLOCK   floats =  8   KiB
+        //   p_e4m3      = Q_BLOCK * KV_BLOCK   bytes  =  2   KiB (16-aligned)
+        //   scalars     = Q_BLOCK * 3          floats =  0.4 KiB
+        //   q_scale     = Q_BLOCK              floats =  0.1 KiB
+        //                                              ----------
+        //                                              ~42.5 KiB  -> 2 blocks/SM
+        let e4m3_bytes = Q_BLOCK * HEAD_DIM                  // q_e4m3
+            + 2 * KV_BLOCK * SLAB                            // kv_e4m3[2]
+            + ((Q_BLOCK * KV_BLOCK + 15) & !15);             // p_e4m3, 16-aligned
+        let float_bytes = (Q_BLOCK * KV_BLOCK                // s_shared
+            + Q_BLOCK * 3                                    // scalars
+            + Q_BLOCK)                                       // q_scale
+            * std::mem::size_of::<f32>();
+        let block_threads: u32 = 16 * 32;                    // 16 warps
+        let cfg = LaunchConfig {
+            grid_dim: (
+                u32_arg("num_attention_heads", num_attention_heads)?,
+                u32_arg("dense fa2 fp8 mma q blocks", batch.div_ceil(Q_BLOCK))?,
+                1,
+            ),
+            block_dim: (block_threads, 1, 1),
+            // 48 KiB cap: < 100 KiB / 2 so the driver can co-resident 2 blocks.
+            shared_mem_bytes: super::validate_dynamic_shared_bytes_with_cap(
+                "prefill_dense_fa2_hdim512_fp8_mma",
+                e4m3_bytes + float_bytes,
+                48 * 1024,
+            )?,
+        };
+        let start_position = u32_arg("start_position", start_position)?;
+        let total_q = u32_arg("total_query_tokens", batch)?;
+        let context_len = u32_arg("context_len", context_len)?;
+        let num_attention_heads = u32_arg("num_attention_heads", num_attention_heads)?;
+        let num_kv_heads = u32_arg("num_kv_heads", num_kv_heads)?;
+        let head_dim = u32_arg("head_dim", HEAD_DIM)?;
+        let cache_capacity_u32 = u32_arg(
+            "cache_capacity",
+            key_cache.len() / (num_kv_heads as usize * HEAD_DIM),
+        )?;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.attention_prefill_dense_fa2_hdim512_fp8_mma)
+                .arg(&key_cache.slice)
+                .arg(&value_cache.slice)
+                .arg(&query_half.slice)
+                .arg(&start_position)
+                .arg(&total_q)
+                .arg(&context_len)
+                .arg(&num_attention_heads)
+                .arg(&num_kv_heads)
+                .arg(&head_dim)
+                .arg(&cache_capacity_u32)
+                .arg(&window_size)
+                .arg(&mut output.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch dense fa2 fp8 mma hdim512 prefill attention"))?;
+        Ok(())
+    }
+
     /// FA-2 hdim=512 prefill, q_block=64 variant (Lever A). Doubles the query
     /// block so each KV tile is re-read once per 64 query rows instead of 32 --
     /// halves KV HBM re-read traffic, doubles arithmetic intensity. kv_block is
