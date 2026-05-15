@@ -129,6 +129,7 @@ pub(crate) struct CudaKernelFunctions {
     // k_tile=16), register-resident O accumulator, hdim-slab streamed K/V with
     // cp.async double-buffering. Opt-in via `AEGIS_ATTN_FA2=1`.
     pub(crate) attention_prefill_dense_fa2_hdim512: CudaFunction,
+    pub(crate) attention_prefill_dense_fa2_hdim512_q64: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_fa: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4: CudaFunction,
     pub(crate) attention_prefill_dense_halfq_wmma_hdim128_gqa4_split: CudaFunction,
@@ -486,6 +487,26 @@ impl CudaKernelFunctions {
                 )
                 .map_err(|e| AegisError::Unsupported(format!(
                     "set max dynamic shared mem on fa2_hdim512 kernel: {e:?}"
+                )))?;
+                f
+            },
+            // ===================================================================
+            attention_prefill_dense_fa2_hdim512_q64: {
+                let f = load(
+                    &module,
+                    "aegis_attention_prefill_dense_fa2_hdim512_q64",
+                )?;
+                // FA-2 hdim=512 q_block=64 variant (Lever A: 2x arithmetic
+                // intensity, halved KV HBM re-reads). Shared mem ~92.75 KiB
+                // (q_shared 64 KiB + kv_slab[2] 16 KiB + s_shared 8 KiB +
+                // weights_h 4 KiB + scalars 0.75 KiB). 96 KiB opt-in cap.
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on fa2_hdim512_q64 kernel: {e:?}"
                 )))?;
                 f
             },

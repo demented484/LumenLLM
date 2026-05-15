@@ -469,4 +469,375 @@ void aegis_attention_prefill_dense_fa2_hdim512(
     }
 }
 
+// =============================================================================
+// FA-2 hdim=512 prefill, q_block=64 variant (Lever A: arithmetic-intensity).
+// =============================================================================
+//
+// Disambiguation experiment turned production variant. The q_block=32 kernel
+// re-reads every KV tile once per 32-query block: KV HBM traffic scales as
+// (total_q / q_block) x KV_total. Doubling q_block to 64 HALVES the KV HBM
+// re-read traffic and doubles arithmetic intensity (each loaded K/V element
+// feeds 2x the MACs before eviction). If the kernel is memory-bound this is
+// the dominant lever.
+//
+// The head_dim=512 shared wall forces a budget trade. With q_block=64:
+//   q_shared   = 64*512*2          = 64 KiB   (persistent)
+//   kv_slab[2] = 2 * kv_block*128*2            (cp.async double-buffered)
+//   s_shared   = q_block*kv_block*4
+//   weights_h  = q_block*kv_block*2
+//   scalars    = q_block*3*4
+// q_shared alone is 64 KiB, so kv_block is dropped 64 -> 32 to keep cp.async
+// double-buffering AND fit the 96 KiB sm_120 cap:
+//   q_shared 64 + kv_slab[2] 16 + s_shared 8 + weights_h 4 + scalars 0.75
+//   = 92.75 KiB.
+// KV HBM traffic depends ONLY on q_block (not kv_block) -- (total_q/64) full
+// KV sweeps -- so kv_block=32 keeps the full 2x traffic win; it only adds
+// mainloop-iteration / __syncthreads count, which is the latency-bound cost
+// this experiment measures against.
+//
+// Tiling:
+//   q_block=64, kv_block=32, hdim=512, slab=128, n_slabs=4, warps=16
+//   row_strips = 4   (q_block/16)   kv_strips = 2  (kv_block/16)
+//   cols_per_warp = 32  o_col_frags = 2  o_frags = 8  (4 row strips * 2 cols)
+//   Q*K S tile [64,32] = 4*2 = 8 WMMA tiles -> warps 0..7 active, 8..15 idle.
+//   O accumulator: 8 persistent acc frags/warp = 64 f32/thread. Feasible.
+//   Softmax: 64 rows / 16 warps -> 4 rows per warp.
+// =============================================================================
+
+extern "C" __global__
+__launch_bounds__(512, 1)
+void aegis_attention_prefill_dense_fa2_hdim512_q64(
+    const unsigned short* __restrict__ key_cache,
+    const unsigned short* __restrict__ value_cache,
+    const unsigned short* __restrict__ query,
+    const unsigned int start_position,
+    const unsigned int total_q,
+    const unsigned int context_len,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int cache_capacity,
+    const unsigned int window_size,
+    float* __restrict__ output
+) {
+    using namespace nvcuda;
+    constexpr unsigned int hdim          = 512u;
+    constexpr unsigned int q_block       = 64u;
+    constexpr unsigned int kv_block      = 32u;
+    constexpr unsigned int warps         = 16u;
+    constexpr unsigned int slab          = 128u;
+    constexpr unsigned int n_slabs       = hdim / slab;          // 4
+    constexpr unsigned int row_strips    = q_block / 16u;        // 4
+    constexpr unsigned int kv_strips     = kv_block / 16u;       // 2
+    constexpr unsigned int cols_per_warp = hdim / warps;         // 32
+    constexpr unsigned int o_col_frags   = cols_per_warp / 16u;  // 2
+    constexpr unsigned int o_frags       = row_strips * o_col_frags; // 8
+    constexpr unsigned int warps_per_slab = slab / cols_per_warp;    // 4
+    constexpr unsigned int slab_kk       = slab / 16u;           // 8
+    constexpr unsigned int rows_per_warp = q_block / warps;      // 4
+
+    const unsigned int head          = blockIdx.x;
+    const unsigned int global_q_base = blockIdx.y * q_block;
+    const unsigned int tid           = threadIdx.x;
+    const unsigned int lane          = tid & 31u;
+    const unsigned int warp          = tid >> 5u;
+    if (head_dim != hdim || head >= num_attention_heads || blockDim.x < warps * 32u) {
+        return;
+    }
+
+    const unsigned int last_q_in_block = min(total_q, global_q_base + q_block) - 1u;
+    const unsigned int block_max_visible = global_q_base < total_q
+        ? min(context_len, start_position + last_q_in_block + 1u)
+        : 0u;
+    if (block_max_visible == 0u) {
+        return;
+    }
+    const unsigned int block_min_visible_raw = (window_size > 0u
+        && start_position + global_q_base + 1u > window_size)
+        ? (start_position + global_q_base + 1u - window_size)
+        : 0u;
+    const unsigned int block_min_tile_start =
+        (block_min_visible_raw / kv_block) * kv_block;
+
+    // --- shared layout ---
+    extern __shared__ __align__(16) unsigned char smem[];
+    unsigned short* q_shared  = reinterpret_cast<unsigned short*>(smem);
+    unsigned short* kv_slab   = q_shared + q_block * hdim;             // 2*kv_block*slab
+    float*          s_shared  = reinterpret_cast<float*>(kv_slab + 2u * kv_block * slab);
+    half*           weights_h = reinterpret_cast<half*>(s_shared + q_block * kv_block);
+    float*          scalars   = reinterpret_cast<float*>(weights_h + q_block * kv_block);
+    // Epilogue scratch overlays kv_slab (free once the mainloop ends):
+    // 16 warps * 256 floats = 16 KiB; kv_slab here is only 2*32*128*2 = 16 KiB,
+    // so it fits exactly.
+    float*          o_scratch = reinterpret_cast<float*>(kv_slab);
+
+    const unsigned int group   = num_attention_heads / num_kv_heads;
+    const unsigned int kv_head = head / group;
+    const float scale  = rsqrtf(float(hdim));
+    const float log2e  = 1.4426950408889634f;
+    const float neg_inf = -3.402823466e38f;
+
+    // --- load Q tile once (whole hdim, persistent) ---
+    {
+        constexpr unsigned int halfs_per_vec = sizeof(uint4) / sizeof(unsigned short);
+        constexpr unsigned int q_vecs = q_block * hdim / halfs_per_vec;
+        uint4* q_shared_vec = reinterpret_cast<uint4*>(q_shared);
+        const uint4 zero_vec = make_uint4(0u, 0u, 0u, 0u);
+        for (unsigned int vec = tid; vec < q_vecs; vec += blockDim.x) {
+            const unsigned int idx = vec * halfs_per_vec;
+            const unsigned int row = idx / hdim;
+            const unsigned int dim = idx - row * hdim;
+            const unsigned int global_q = global_q_base + row;
+            q_shared_vec[vec] = global_q < total_q
+                ? *reinterpret_cast<const uint4*>(
+                      query + (size_t(global_q) * num_attention_heads + head) * hdim + dim)
+                : zero_vec;
+        }
+    }
+    for (unsigned int row = tid; row < q_block; row += blockDim.x) {
+        scalars[row * 3u + 0u] = neg_inf;   // m
+        scalars[row * 3u + 1u] = 0.0f;      // l
+        scalars[row * 3u + 2u] = 0.0f;      // alpha
+    }
+
+    // --- persistent register-resident O accumulator (8 frags / warp) ---
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> o_frag[o_frags];
+#pragma unroll
+    for (unsigned int f = 0u; f < o_frags; ++f) {
+        wmma::fill_fragment(o_frag[f], 0.0f);
+    }
+
+    // --- cp.async helpers ---
+    auto cvt_smem = [] (const void* p) -> unsigned int {
+        unsigned int s;
+        asm volatile("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }\n"
+                     : "=r"(s) : "l"(p));
+        return s;
+    };
+    auto cp_async_16 = [] (unsigned int dst, const void* src) {
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(dst), "l"(src));
+    };
+    auto cp_async_zero_16 = [] (unsigned int dst) {
+        const unsigned long long z = 0ULL;
+        asm volatile("cp.async.ca.shared.global [%0], [%1], 16, 0;\n"
+                     :: "r"(dst), "l"((const void*)&z));
+    };
+    auto cp_commit   = [] () { asm volatile("cp.async.commit_group;\n" ::); };
+    auto cp_wait_lt1 = [] () { asm volatile("cp.async.wait_group 1;\n" ::); };
+    auto cp_wait_all = [] () { asm volatile("cp.async.wait_group 0;\n" ::); };
+
+    // Stage one 128-wide hdim slab of K or V for a KV block (kv_block=32 rows)
+    // into a slab buffer (kv_block*slab halfs = 8 KiB). Each thread copies
+    // 8 halfs (16 B); kv_block*slab = 4096 halfs = 512 chunks, 512 threads ->
+    // 1 each.
+    auto stage_slab = [&] (const unsigned short* __restrict__ cache,
+                           unsigned int tile_start, unsigned int slab_idx,
+                           unsigned short* buf, unsigned int tile_count) {
+        constexpr unsigned int halfs_per_chunk = 8u;
+        constexpr unsigned int chunks_per_row  = slab / halfs_per_chunk;       // 16
+        constexpr unsigned int total_chunks    = kv_block * chunks_per_row;    // 512
+        const unsigned int hdim_base = slab_idx * slab;
+        if (tid < total_chunks) {
+            const unsigned int row  = tid / chunks_per_row;                    // 0..31
+            const unsigned int hoff = (tid % chunks_per_row) * halfs_per_chunk;
+            const bool valid = row < tile_count;
+            const unsigned int pos = tile_start + row;
+            unsigned int dst = cvt_smem(&buf[row * slab + hoff]);
+            if (valid) {
+                const size_t off =
+                    (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * hdim
+                    + hdim_base + hoff;
+                cp_async_16(dst, cache + off);
+            } else {
+                cp_async_zero_16(dst);
+            }
+        }
+    };
+
+    const unsigned int n_kiters = (block_max_visible > block_min_tile_start)
+        ? ((block_max_visible - block_min_tile_start + kv_block - 1u) / kv_block)
+        : 0u;
+
+    // Q*K warp -> S tile assignment (warps 0..7 active, S is [64,32] = 4*2).
+    const bool       qk_active = warp < (row_strips * kv_strips);  // 8
+    const unsigned int qk_row  = warp / kv_strips;                 // 0..3
+    const unsigned int qk_kv   = warp % kv_strips;                 // 0..1
+    // P*V warp -> hdim slab / column ownership (all 16 warps).
+    const unsigned int o_slab     = warp / warps_per_slab;         // 0..3
+    const unsigned int o_col_base = (warp % warps_per_slab) * cols_per_warp;
+
+    // Prologue: stage K slab 0 of the first KV block.
+    if (n_kiters > 0u) {
+        const unsigned int tc0 = min(kv_block, block_max_visible - block_min_tile_start);
+        stage_slab(key_cache, block_min_tile_start, 0u, kv_slab, tc0);
+        cp_commit();
+    }
+    __syncthreads();
+
+    // ----------------------------- mainloop --------------------------------
+    for (unsigned int it = 0u; it < n_kiters; ++it) {
+        const unsigned int tile_start = block_min_tile_start + it * kv_block;
+        const unsigned int tile_count = min(kv_block, block_max_visible - tile_start);
+
+        // ======================= Q*K -> S =======================
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
+        wmma::fill_fragment(s_frag, 0.0f);
+        for (unsigned int sl = 0u; sl < n_slabs; ++sl) {
+            const unsigned int buf = sl & 1u;
+            unsigned short* k_buf = kv_slab + buf * (kv_block * slab);
+            if (sl + 1u < n_slabs) {
+                stage_slab(key_cache, tile_start, sl + 1u,
+                           kv_slab + ((sl + 1u) & 1u) * (kv_block * slab), tile_count);
+                cp_commit();
+                cp_wait_lt1();
+            } else {
+                cp_wait_all();
+            }
+            __syncthreads();
+            if (qk_active) {
+#pragma unroll
+                for (unsigned int kk = 0u; kk < slab_kk; ++kk) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+                    wmma::load_matrix_sync(a_frag,
+                        reinterpret_cast<const half*>(
+                            q_shared + qk_row * 16u * hdim + sl * slab + kk * 16u), hdim);
+                    wmma::load_matrix_sync(b_frag,
+                        reinterpret_cast<const half*>(
+                            k_buf + qk_kv * 16u * slab + kk * 16u), slab);
+                    wmma::mma_sync(s_frag, a_frag, b_frag, s_frag);
+                }
+            }
+            __syncthreads();
+        }
+        if (qk_active) {
+            wmma::store_matrix_sync(
+                s_shared + qk_row * 16u * kv_block + qk_kv * 16u,
+                s_frag, kv_block, wmma::mem_row_major);
+        }
+        __syncthreads();
+
+        // ======================= online softmax =======================
+        // Each warp owns rows_per_warp = 4 q rows: warp, warp+16, warp+32, warp+48.
+#pragma unroll
+        for (unsigned int rr = 0u; rr < rows_per_warp; ++rr) {
+            const unsigned int row = warp + rr * warps;          // 0..63
+            const unsigned int global_q = global_q_base + row;
+            const bool valid_q = global_q < total_q;
+            const unsigned int visible_len = valid_q
+                ? min(context_len, start_position + global_q + 1u) : 0u;
+            const unsigned int row_min_visible = (window_size > 0u
+                && start_position + global_q + 1u > window_size)
+                ? (start_position + global_q + 1u - window_size) : 0u;
+            const float old_m = scalars[row * 3u + 0u];
+            const float old_l = scalars[row * 3u + 1u];
+            // 32 kv columns, 32 lanes -> each lane handles one column.
+            const unsigned int col = lane;
+            const unsigned int pos = tile_start + col;
+            const float sc = (valid_q && col < tile_count && pos < visible_len
+                              && pos >= row_min_visible)
+                ? s_shared[row * kv_block + col] * scale
+                : neg_inf;
+            float tile_m = aegis_warp_reduce_max(sc);
+            const float new_m = fmaxf(old_m, tile_m);
+            const float w = (sc > -3.0e38f) ? exp2f((sc - new_m) * log2e) : 0.0f;
+            weights_h[row * kv_block + col] = __float2half_rn(w);
+            const float tile_l = aegis_warp_reduce_sum(w);
+            if (lane == 0u) {
+                const float alpha = old_l > 0.0f ? exp2f((old_m - new_m) * log2e) : 1.0f;
+                scalars[row * 3u + 0u] = new_m;
+                scalars[row * 3u + 1u] = old_l * alpha + tile_l;
+                scalars[row * 3u + 2u] = alpha;
+            }
+        }
+        __syncthreads();
+
+        // ======================= rescale O (in registers) =======================
+#pragma unroll
+        for (unsigned int rs = 0u; rs < row_strips; ++rs) {
+#pragma unroll
+            for (unsigned int cf = 0u; cf < o_col_frags; ++cf) {
+                aegis_scale_wmma_accumulator_m16n16_rows(
+                    o_frag[rs * o_col_frags + cf], scalars, rs * 16u);
+            }
+        }
+        __syncthreads();
+
+        // ======================= P*V -> O =======================
+        for (unsigned int sl = 0u; sl < n_slabs; ++sl) {
+            const unsigned int buf = sl & 1u;
+            unsigned short* v_buf = kv_slab + buf * (kv_block * slab);
+            if (sl == 0u) {
+                stage_slab(value_cache, tile_start, 0u, kv_slab, tile_count);
+                cp_commit();
+            }
+            if (sl + 1u < n_slabs) {
+                stage_slab(value_cache, tile_start, sl + 1u,
+                           kv_slab + ((sl + 1u) & 1u) * (kv_block * slab), tile_count);
+                cp_commit();
+                cp_wait_lt1();
+            } else {
+                cp_wait_all();
+            }
+            __syncthreads();
+            if (o_slab == sl) {
+                // O[16q x 32] += P[16q x 32] . V[32 x 32] for this warp's cols.
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> v_frag;
+#pragma unroll
+                for (unsigned int cf = 0u; cf < o_col_frags; ++cf) {
+                    const unsigned int vcol = o_col_base + cf * 16u;
+#pragma unroll
+                    for (unsigned int ks = 0u; ks < kv_strips; ++ks) {
+                        wmma::load_matrix_sync(v_frag,
+                            reinterpret_cast<const half*>(
+                                v_buf + ks * 16u * slab + vcol), slab);
+                        wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> p_frag;
+#pragma unroll
+                        for (unsigned int rs = 0u; rs < row_strips; ++rs) {
+                            wmma::load_matrix_sync(p_frag,
+                                weights_h + rs * 16u * kv_block + ks * 16u, kv_block);
+                            wmma::mma_sync(o_frag[rs * o_col_frags + cf], p_frag, v_frag,
+                                           o_frag[rs * o_col_frags + cf]);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        // Prologue for next iter: stage its K slab 0.
+        if (it + 1u < n_kiters) {
+            const unsigned int next_start = tile_start + kv_block;
+            const unsigned int next_tc = min(kv_block, block_max_visible - next_start);
+            stage_slab(key_cache, next_start, 0u, kv_slab, next_tc);
+            cp_commit();
+            __syncthreads();
+        }
+    }
+
+    // ============================ epilogue ============================
+    __syncthreads();
+    float* warp_scratch = o_scratch + warp * 256u;   // 16 warps * 256 = 16 KiB
+#pragma unroll
+    for (unsigned int rs = 0u; rs < row_strips; ++rs) {
+#pragma unroll
+        for (unsigned int cf = 0u; cf < o_col_frags; ++cf) {
+            wmma::store_matrix_sync(warp_scratch,
+                o_frag[rs * o_col_frags + cf], 16u, wmma::mem_row_major);
+#pragma unroll
+            for (unsigned int e = lane; e < 256u; e += 32u) {
+                const unsigned int r = e >> 4u;          // 0..15
+                const unsigned int c = e & 15u;          // 0..15
+                const unsigned int row = rs * 16u + r;
+                const unsigned int global_q = global_q_base + row;
+                if (global_q >= total_q) continue;
+                const unsigned int dim = o_slab * slab + o_col_base + cf * 16u + c;
+                const float denom = fmaxf(scalars[row * 3u + 1u], 1.0e-20f);
+                output[(size_t(global_q) * num_attention_heads + head) * hdim + dim] =
+                    warp_scratch[e] / denom;
+            }
+        }
+    }
+}
+
 #endif  // __CUDA_ARCH__ >= 800
