@@ -10,6 +10,7 @@ use super::smoke::{
 };
 use super::{Command, parse_args};
 use crate::engine::bench::run_generation_bench;
+use crate::engine::eval_mmlu_pro::{print_eval_summary, run_eval_mmlu_pro};
 use crate::engine::perplexity::compute_perplexity;
 use crate::engine::sample_diversity::run_sample_diversity;
 use crate::engine::{AegisEngine, EngineConfig};
@@ -186,6 +187,10 @@ pub fn run_env() -> Result<()> {
                 let preview: String = text.chars().take(80).collect();
                 println!("  {count:>3}× {preview:?}");
             }
+        }
+        Command::EvalMmluPro(config, request) => {
+            let result = run_eval_mmlu_pro(config, request)?;
+            print_eval_summary(&result);
         }
         Command::Serve(config) => {
             let default_sampling = config.engine.generation;

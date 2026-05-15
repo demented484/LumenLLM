@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use crate::cli::gates::GatesConfig;
 use crate::engine::EngineConfig;
 use crate::engine::bench::BenchGenerateRequest;
+use crate::engine::eval_mmlu_pro::EvalMmluProRequest;
 use crate::engine::perplexity::PerplexityRequest;
 use crate::engine::sample_diversity::SampleDiversityRequest;
 use aegisllm_base::generation::GenerateRequest;
@@ -60,4 +61,9 @@ pub enum Command {
     /// settings (temp=1.0, top-k=50, min-p=0.05) a factual prompt should
     /// concentrate on the right answer but show varied phrasing.
     SampleDiversity(EngineConfig, SampleDiversityRequest),
+    /// Run the MMLU-Pro benchmark (5-shot CoT by default) against the
+    /// loaded model and report overall + per-subject accuracy. Used to
+    /// validate the engine end-to-end against NVIDIA's published number
+    /// and to measure the accuracy cost of FP8 attention/KV quantization.
+    EvalMmluPro(EngineConfig, EvalMmluProRequest),
 }

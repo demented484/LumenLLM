@@ -35,6 +35,7 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("quality-diff") => parse_quality_diff(&args[1..]),
         Some("bench-generate") => parse_bench_generate(&args[1..]),
         Some("perplexity") => parse_perplexity(&args[1..]),
+        Some("eval-mmlu-pro") => parse_eval_mmlu_pro(&args[1..]),
         Some("sample-diversity") => parse_sample_diversity(&args[1..]),
         Some("gates") => parse_gates(&args[1..]),
         Some("--help") | Some("-h") | Some("help") | None => {
@@ -395,6 +396,86 @@ fn parse_perplexity(args: &[String]) -> Result<Command> {
     ))
 }
 
+fn parse_eval_mmlu_pro(args: &[String]) -> Result<Command> {
+    use crate::engine::eval_mmlu_pro::{EvalMmluProRequest, default_max_tokens};
+    let mut dataset_path: Option<PathBuf> = None;
+    let mut subset: Option<usize> = None;
+    let mut subjects: Vec<String> = Vec::new();
+    let mut shots: usize = 5;
+    let mut cot: bool = true;
+    let mut max_tokens: Option<usize> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut progress_every: usize = 25;
+    let mut filtered: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = &args[i];
+        match flag.as_str() {
+            "--dataset-path" => {
+                dataset_path = Some(PathBuf::from(take_value(args, &mut i, flag)?));
+            }
+            "--subset" => subset = Some(parse_value(args, &mut i, flag)?),
+            "--subjects" => {
+                let raw = take_value(args, &mut i, flag)?;
+                subjects = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_lowercase())
+                    .collect();
+            }
+            "--shots" => shots = parse_value(args, &mut i, flag)?,
+            "--cot" => {
+                let raw = take_value(args, &mut i, flag)?;
+                cot = match raw.to_lowercase().as_str() {
+                    "true" | "1" | "on" | "yes" => true,
+                    "false" | "0" | "off" | "no" => false,
+                    other => {
+                        return Err(AegisError::InvalidConfig(format!(
+                            "eval-mmlu-pro: --cot expects true|false, got `{other}`"
+                        )));
+                    }
+                };
+            }
+            "--max-tokens" => max_tokens = Some(parse_value(args, &mut i, flag)?),
+            "--output" => output = Some(PathBuf::from(take_value(args, &mut i, flag)?)),
+            "--progress-every" => progress_every = parse_value(args, &mut i, flag)?,
+            other if is_engine_flag(other) => {
+                filtered.push(args[i].clone());
+                if flag_takes_value(other) {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(AegisError::InvalidConfig(format!(
+                            "eval-mmlu-pro flag `{other}` requires a value"
+                        )));
+                    }
+                    filtered.push(args[i].clone());
+                }
+            }
+            other => {
+                return Err(AegisError::InvalidConfig(format!(
+                    "unknown eval-mmlu-pro flag `{other}`"
+                )));
+            }
+        }
+        i += 1;
+    }
+    let config = parse_engine_flags(&filtered)?.engine_config(true);
+    Ok(Command::EvalMmluPro(
+        config,
+        EvalMmluProRequest {
+            dataset_path,
+            subset,
+            subjects,
+            shots,
+            cot,
+            max_tokens: max_tokens.unwrap_or_else(|| default_max_tokens(cot)),
+            output,
+            progress_every,
+        },
+    ))
+}
+
 fn parse_sample_diversity(args: &[String]) -> Result<Command> {
     use crate::engine::sample_diversity::SampleDiversityRequest;
     let mut prompt: Option<String> = None;
@@ -590,5 +671,5 @@ fn parse_gates(args: &[String]) -> Result<Command> {
 }
 
 fn usage() -> String {
-    "usage:\n  aegisllm inspect-hardware\n  aegisllm serve --config <parameters.json>\n  aegisllm show-plan --config <parameters.json>\n  aegisllm mvp-check --config <parameters.json>\n  aegisllm quality-smoke --config <parameters.json>\n  aegisllm storage-smoke --config <parameters.json>\n  aegisllm cpu-smoke --config <parameters.json>\n  aegisllm cpu-materialize-smoke --config <parameters.json>\n  aegisllm cuda-smoke --config <parameters.json>\n  aegisllm cuda-cutlass-nvfp4-smoke\n  aegisllm cuda-dense-smoke --config <parameters.json>\n  aegisllm cuda-chain-smoke --config <parameters.json>\n  aegisllm cuda-compare --config <parameters.json>\n  aegisllm cuda-prefill-compare --config <parameters.json>\n  aegisllm cuda-prefill-sweep --config <parameters.json>\n  aegisllm show-plan --model <path> [placement flags] [--native-mxfp4-repack] [--native-mxfp4-inference] [--cuda-prefill-attention auto|off|fa2|fa3|fa4|aegis-varlen] [--cuda-prefill-chunk-size N]\n  aegisllm generate --model <path> --prompt <text> [--max-tokens N] [placement flags]\n  aegisllm bench-generate --config <parameters.json> --prompt <text> [--prompt-repeat N] [--max-tokens N] [--temperature T] [--format text|json|csv]\n  aegisllm gates --model <path> [--backend cpu|cuda] [--quick|--full]".into()
+    "usage:\n  aegisllm inspect-hardware\n  aegisllm serve --config <parameters.json>\n  aegisllm show-plan --config <parameters.json>\n  aegisllm mvp-check --config <parameters.json>\n  aegisllm quality-smoke --config <parameters.json>\n  aegisllm storage-smoke --config <parameters.json>\n  aegisllm cpu-smoke --config <parameters.json>\n  aegisllm cpu-materialize-smoke --config <parameters.json>\n  aegisllm cuda-smoke --config <parameters.json>\n  aegisllm cuda-cutlass-nvfp4-smoke\n  aegisllm cuda-dense-smoke --config <parameters.json>\n  aegisllm cuda-chain-smoke --config <parameters.json>\n  aegisllm cuda-compare --config <parameters.json>\n  aegisllm cuda-prefill-compare --config <parameters.json>\n  aegisllm cuda-prefill-sweep --config <parameters.json>\n  aegisllm show-plan --model <path> [placement flags] [--native-mxfp4-repack] [--native-mxfp4-inference] [--cuda-prefill-attention auto|off|fa2|fa3|fa4|aegis-varlen] [--cuda-prefill-chunk-size N]\n  aegisllm generate --model <path> --prompt <text> [--max-tokens N] [placement flags]\n  aegisllm bench-generate --config <parameters.json> --prompt <text> [--prompt-repeat N] [--max-tokens N] [--temperature T] [--format text|json|csv]\n  aegisllm eval-mmlu-pro --config <parameters.json> [--dataset-path <dir>] [--subset N] [--subjects a,b] [--shots N] [--cot true|false] [--max-tokens N] [--output <path>] [--progress-every N]\n  aegisllm gates --model <path> [--backend cpu|cuda] [--quick|--full]".into()
 }
