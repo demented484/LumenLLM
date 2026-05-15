@@ -77,11 +77,32 @@ pub struct AttentionSection {
     pub mechanism: Option<String>,
     pub store: Option<String>,
     pub compute: Option<String>,
-    /// Re-quantize the attention Q/K/V/O projections at load time.
-    /// One of: "bf16" (default), "nvfp4", "fp8", "int8", "int4".
+    /// Re-quantize the attention Q/K/V/O projection **weights** at load
+    /// time. One of: "bf16" (default), "nvfp4", "fp8", "int8", "int4".
     /// Same semantics as `hidden-layers.shared-MLP-quantization`.
+    ///
+    /// NOTE: this is the *weight* quantization. To pick the precision the
+    /// attention KERNEL runs in, use `compute-quantization` below — the two
+    /// are independent knobs.
     #[serde(rename = "attention-quantization")]
     pub attention_quantization: Option<String>,
+    /// Precision the prefill/decode attention KERNEL runs in.
+    /// One of:
+    ///   * "default" — historical dispatch (env gates only); bit-equivalent
+    ///                 to leaving this unset.
+    ///   * "bf16"    — explicit BF16 (half) attention kernels.
+    ///   * "bf16-fa2"— BF16 FlashAttention-2 rewrite (head_dim=512 path);
+    ///                 equivalent to exporting `AEGIS_ATTN_FA2=1`.
+    ///   * "fp8"     — FP8 (E4M3) attention kernels; equivalent to exporting
+    ///                 `AEGIS_ATTN_FP8=1`. Requires the KV cache to be FP8
+    ///                 (`hidden-layers.kv-cache.type-k`/`type-v: fp8`)
+    ///                 because the FP8 kernel reads FP8 K/V directly.
+    ///
+    /// This is the attention *compute* path — distinct from
+    /// `attention-quantization` (weight quant) and from
+    /// `hidden-layers.kv-cache.type-k/type-v` (KV storage dtype).
+    #[serde(rename = "compute-quantization")]
+    pub compute_quantization: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

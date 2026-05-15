@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use aegisllm_cuda::cuda::{CudaPrefillAttentionKernel, CudaRuntimeConfig};
+use aegisllm_cuda::cuda::{AttentionComputeQuant, CudaPrefillAttentionKernel, CudaRuntimeConfig};
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::generation::SamplingConfig;
 use aegisllm_base::planning::placement::{
@@ -161,6 +161,13 @@ impl ParametersFile {
                     ))
                 })?;
             }
+            // `attention.compute-quantization` — precision the attention
+            // KERNEL runs in. Parsed here; the FP8/KV compatibility check
+            // runs after `hidden-layers.kv-cache` is parsed (kv_quantization
+            // is only known at that point).
+            if let Some(q) = attn.compute_quantization.as_deref() {
+                cuda_runtime.attention_compute_quant = AttentionComputeQuant::parse(q)?;
+            }
         }
 
         // ── `hidden-layers` — per-block weights and per-block KV cache.
@@ -299,6 +306,29 @@ impl ParametersFile {
                     }
                 }
             }
+        }
+
+        // ── Cross-section validation: attention compute-quant vs KV cache ──
+        //
+        // The FP8 attention kernel reads FP8 K/V directly from the cache, so
+        // `compute-quantization: fp8` is only coherent when the KV cache is
+        // also FP8. This is a genuine incompatibility (not an executor
+        // limitation), so rejecting it in the parser is correct per the
+        // design principle "reject only genuinely-incompatible configs".
+        //
+        // Any other combination is accepted: `bf16`/`bf16-fa2`/`default`
+        // work with any KV dtype, and an FP8 KV cache with a non-FP8
+        // attention kernel is legal (the kernel dequantizes on read).
+        if cuda_runtime.attention_compute_quant == AttentionComputeQuant::Fp8
+            && policy.kv_quantization != KvCacheQuantization::Fp8
+        {
+            return Err(AegisError::InvalidConfig(format!(
+                "attention.compute-quantization=fp8 requires an FP8 KV cache, but \
+                 hidden-layers.kv-cache resolves to `{}`. The FP8 attention kernel \
+                 reads FP8 K/V directly — set `type-k` (and `type-v`) to `fp8`, or \
+                 use compute-quantization `bf16`/`bf16-fa2`/`default`.",
+                policy.kv_quantization.label()
+            )));
         }
 
         if let Some(layout) = self.linear_layout {
