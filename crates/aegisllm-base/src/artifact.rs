@@ -57,6 +57,12 @@ pub struct HfConfig {
     pub model_type: String,
     pub hidden_size: usize,
     pub intermediate_size: Option<usize>,
+    /// MLP activation, e.g. `"silu"` (Llama/Qwen) or `"gelu_pytorch_tanh"`
+    /// (Gemma). The MoE expert path is wired for Gemma's gelu-tanh; the dense
+    /// MLP path implements SiLU/SwiGLU only — a load-time guard rejects a
+    /// dense model that declares a non-SiLU activation rather than silently
+    /// computing the wrong nonlinearity.
+    pub hidden_activation: Option<String>,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: Option<usize>,

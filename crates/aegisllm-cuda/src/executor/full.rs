@@ -260,6 +260,28 @@ impl CudaLlamaExecutor {
             mb_per_s,
         );
 
+        // Quality guard (audit 2026-05-16): the dense (non-MoE) MLP path
+        // implements SiLU/SwiGLU only. A dense model declaring a non-SiLU
+        // activation (Gemma's `gelu_pytorch_tanh`) would silently get the
+        // wrong nonlinearity. The MoE expert path uses gelu-tanh correctly,
+        // so all-MoE models (Gemma-4-26B-A4B) are unaffected — reject only a
+        // dense layer paired with a non-SiLU activation, loudly, instead of
+        // corrupting output.
+        if let Some(act) = artifact.config.hidden_activation.as_deref() {
+            let act_l = act.to_ascii_lowercase();
+            let is_silu = act_l.contains("silu")
+                || act_l.contains("swish")
+                || act_l.contains("swiglu");
+            if !is_silu && layers.iter().any(|l| l.moe.is_none()) {
+                return Err(AegisError::Unsupported(format!(
+                    "dense MLP path implements SiLU/SwiGLU only, but the model \
+                     declares hidden_activation=`{act}`. gelu-tanh dense MLP is \
+                     not yet wired (the MoE expert path handles gelu-tanh \
+                     correctly). Refusing to silently compute the wrong activation."
+                )));
+            }
+        }
+
         let has_staged_layers = layers.iter().any(|layer| {
             [&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj]
                 .iter().any(|l| l.is_host_resident())
