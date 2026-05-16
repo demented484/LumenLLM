@@ -385,22 +385,35 @@ fn looks_preformatted(prompt: &str) -> bool {
 }
 
 fn extract_eos_token_ids(artifact: &ModelArtifact) -> Vec<usize> {
-    let mut ids = Vec::new();
-    match artifact.config.eos_token_id.as_ref() {
-        Some(serde_json::Value::Number(value)) => {
-            if let Some(id) = value.as_u64() {
-                ids.push(id as usize);
+    fn push_ids(value: Option<&serde_json::Value>, ids: &mut Vec<usize>) {
+        match value {
+            Some(serde_json::Value::Number(value)) => {
+                if let Some(id) = value.as_u64() {
+                    ids.push(id as usize);
+                }
             }
+            Some(serde_json::Value::Array(values)) => {
+                ids.extend(
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_u64().map(|id| id as usize)),
+                );
+            }
+            _ => {}
         }
-        Some(serde_json::Value::Array(values)) => {
-            ids.extend(
-                values
-                    .iter()
-                    .filter_map(|value| value.as_u64().map(|id| id as usize)),
-            );
-        }
-        _ => {}
     }
+    let mut ids = Vec::new();
+    push_ids(artifact.config.eos_token_id.as_ref(), &mut ids);
+    // `generation_config.json` is the HF/vLLM-authoritative source for
+    // generation-time stop tokens and may declare more than `config.json`
+    // (Gemma-4: `[1,106,50]` vs `[1,106]` — token 50 = `<|tool_response|>`).
+    push_ids(
+        artifact
+            .generation_config
+            .as_ref()
+            .and_then(|g| g.eos_token_id.as_ref()),
+        &mut ids,
+    );
     ids.sort_unstable();
     ids.dedup();
     ids

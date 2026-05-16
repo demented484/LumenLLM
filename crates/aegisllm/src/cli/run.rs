@@ -194,7 +194,7 @@ pub fn run_env() -> Result<()> {
             print_eval_summary(&result);
         }
         Command::Serve(config) => {
-            let default_sampling = config.engine.generation;
+            let mut default_sampling = config.engine.generation;
             let engine_config = EngineConfig {
                 model_path: config.engine.model_path,
                 policy: config.engine.policy,
@@ -215,6 +215,25 @@ pub fn run_env() -> Result<()> {
             } else {
                 preview
             };
+            // If the params config left sampling at the greedy default,
+            // adopt the model's own recommended sampling from
+            // generation_config.json. Greedy decode degenerates into
+            // repetition loops on reasoning models (Gemma-4).
+            if default_sampling == aegisllm_base::generation::SamplingConfig::default() {
+                if let Some(recommended) = engine
+                    .artifact
+                    .generation_config
+                    .as_ref()
+                    .and_then(|g| g.recommended_sampling())
+                {
+                    eprintln!(
+                        "sampling: no sampling set in params config — using model's \
+                         generation_config.json (temp={:.2} top_k={} top_p={:.2})",
+                        recommended.temperature, recommended.top_k, recommended.top_p,
+                    );
+                    default_sampling = recommended;
+                }
+            }
             eprintln!("{}", engine.report());
             crate::server::serve_http(
                 config.host,

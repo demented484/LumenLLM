@@ -404,6 +404,7 @@ fn parse_eval_mmlu_pro(args: &[String]) -> Result<Command> {
     let mut subjects: Vec<String> = Vec::new();
     let mut shots: usize = 5;
     let mut cot: bool = true;
+    let mut thinking: bool = true;
     let mut max_tokens: Option<usize> = None;
     let mut output: Option<PathBuf> = None;
     let mut progress_every: usize = 25;
@@ -434,6 +435,18 @@ fn parse_eval_mmlu_pro(args: &[String]) -> Result<Command> {
                     other => {
                         return Err(AegisError::InvalidConfig(format!(
                             "eval-mmlu-pro: --cot expects true|false, got `{other}`"
+                        )));
+                    }
+                };
+            }
+            "--thinking" => {
+                let raw = take_value(args, &mut i, flag)?;
+                thinking = match raw.to_lowercase().as_str() {
+                    "true" | "1" | "on" | "yes" => true,
+                    "false" | "0" | "off" | "no" => false,
+                    other => {
+                        return Err(AegisError::InvalidConfig(format!(
+                            "eval-mmlu-pro: --thinking expects true|false, got `{other}`"
                         )));
                     }
                 };
@@ -470,6 +483,7 @@ fn parse_eval_mmlu_pro(args: &[String]) -> Result<Command> {
             subjects,
             shots,
             cot,
+            thinking,
             max_tokens: max_tokens.unwrap_or_else(|| default_max_tokens(cot)),
             output,
             progress_every,

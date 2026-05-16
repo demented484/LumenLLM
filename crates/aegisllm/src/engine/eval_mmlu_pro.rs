@@ -94,6 +94,10 @@ pub struct EvalMmluProRequest {
     pub shots: usize,
     /// Chain-of-thought on/off. Default on.
     pub cot: bool,
+    /// Native model thinking-channel on/off. Default on — reasoning models
+    /// (Gemma 4) publish benchmark numbers with thinking enabled; disabling it
+    /// pushes the model off-distribution into prompt-steered pseudo-CoT.
+    pub thinking: bool,
     /// Per-question generation cap. Default 4000 (CoT) — see [`default_max_tokens`].
     pub max_tokens: usize,
     /// Per-question results sink (JSON). `None` = no per-question file.
@@ -621,7 +625,18 @@ pub fn run_eval_mmlu_pro(
         AegisError::Unsupported("eval-mmlu-pro: engine was built without executor".into())
     })?;
     let backend = executor.as_primitives();
-    let sampling = SamplingConfig::default(); // greedy: temp=0
+    // Gemma-4's recommended sampling. Reasoning models MUST be sampled, not
+    // run greedy: greedy (temp=0) degenerates into repetition loops on long
+    // reasoning traces — verified against the official Gemma-4 API, which at
+    // temp=0 also looped to MAX_TOKENS (32k thinking tokens, no answer) and at
+    // temp=1.0 concluded cleanly in ~5k. Benchmark numbers (NVIDIA's 84.8%
+    // MMLU-Pro) are sampled, not greedy. The run is therefore stochastic.
+    let sampling = SamplingConfig {
+        temperature: 1.0,
+        top_k: 64,
+        top_p: 0.95,
+        min_p: 0.0,
+    };
 
     // Per-question output sink — written incrementally as JSON Lines so a
     // long run that is interrupted still has partial results on disk.
@@ -671,9 +686,9 @@ pub fn run_eval_mmlu_pro(
                 ..Default::default()
             }],
             None,
-            // enable_thinking off: the MMLU-Pro CoT is steered by the prompt
-            // itself ("Think step by step"), not the model's thinking channel.
-            false,
+            // Native thinking channel — reasoning models are benchmarked with
+            // it ON; OFF forces prompt-steered pseudo-CoT (off-distribution).
+            request.thinking,
         )?;
         let prompt_tokens = backend.encode_text_raw(&rendered)?;
         if prompt_tokens.is_empty() {
@@ -695,6 +710,22 @@ pub fn run_eval_mmlu_pro(
             generated.push(next);
             if generated.len() >= request.max_tokens {
                 break;
+            }
+            // Early stop: in thinking mode the model concludes ("Final Answer:
+            // X") then loops that line to the token cap without ever emitting
+            // EOS. Once a final-answer marker AND a parseable letter are both
+            // present in the recent tail, the answer is locked — stop. Checked
+            // every 32 tokens (decode of a ~220-token tail is cheap).
+            if generated.len() % 32 == 0 {
+                let tail_start = generated.len().saturating_sub(220);
+                let tail = backend
+                    .decode_tokens(&generated[tail_start..])
+                    .unwrap_or_default();
+                if tail.to_lowercase().contains("final answer")
+                    && extract_answer(&tail).is_some()
+                {
+                    break;
+                }
             }
             next = backend.forward_next_token(state.as_mut(), next, &sampling)?;
         }

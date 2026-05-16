@@ -265,7 +265,34 @@ pub struct HfRopeScaling {
 pub struct HfGenerationConfig {
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
     pub do_sample: Option<bool>,
+    /// Authoritative generation-time stop tokens. HuggingFace/vLLM precedence:
+    /// `generation_config.json` overrides `config.json` for generation params.
+    /// Gemma-4 declares `[1, 106, 50]` here vs only `[1, 106]` in config.json —
+    /// token 50 (`<|tool_response|>`) is a real stop token that was being missed.
+    pub eos_token_id: Option<serde_json::Value>,
+}
+
+impl HfGenerationConfig {
+    /// The model's recommended decode-time sampling, from
+    /// `generation_config.json`. `None` when the model recommends greedy
+    /// (`do_sample: false`, or no positive temperature). Reasoning models —
+    /// Gemma-4 declares `do_sample:true, temperature:1.0, top_k:64, top_p:0.95`
+    /// — degenerate into repetition loops under greedy decode, so the model's
+    /// own recommendation is the correct default when nothing else is set.
+    pub fn recommended_sampling(&self) -> Option<crate::generation::SamplingConfig> {
+        if self.do_sample == Some(false) {
+            return None;
+        }
+        let temperature = self.temperature.filter(|t| *t > 0.0)?;
+        Some(crate::generation::SamplingConfig {
+            temperature,
+            top_k: self.top_k.unwrap_or(0),
+            top_p: self.top_p.unwrap_or(1.0),
+            min_p: 0.0,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
