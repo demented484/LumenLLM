@@ -53,6 +53,25 @@ pub fn quality_cases() -> Vec<QualityCase> {
             max_tokens: 24,
             expected_any: &["привет", "здрав", "добро", "добрый"],
         },
+        QualityCase {
+            name: "needle_near",
+            prompt: "The vault combination is 17-42-93. Answer with ONLY the vault \
+                     combination, nothing else.",
+            max_tokens: 24,
+            expected_any: &["17-42-93", "17", "42", "93"],
+        },
+        QualityCase {
+            name: "needle_far",
+            prompt: "Read carefully. The vault combination is 17-42-93. The weather \
+                     today is mild, the quarterly meeting is at noon, the budget \
+                     report is due on Friday, the office printer is out of toner \
+                     again, the plants on the windowsill need watering, and the \
+                     morning train was running twenty minutes behind schedule. \
+                     Now, answer with ONLY the vault combination from the start of \
+                     this message, nothing else.",
+            max_tokens: 24,
+            expected_any: &["17-42-93", "17", "42", "93"],
+        },
     ]
 }
 
