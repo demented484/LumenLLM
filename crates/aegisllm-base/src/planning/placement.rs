@@ -443,25 +443,33 @@ fn transfer_policy(store: StoragePlacement, compute: ComputePlacement) -> Transf
 
 fn estimate_kv_cache_bytes(graph: &ModelGraph, policy: &PlacementPolicy) -> u64 {
     let elem = (policy.kv_quantization.bytes_per_element() * 2.0).ceil() as u64;
-    // Sliding-window layers allocate a ring-buffer of `window_size` slots
-    // (not the full context), so estimate per-layer:
-    //   cap = window_size > 0 ? min(window_size, ctx) : ctx
-    // For Gemma-4-26B-A4B (25 sliding window=1024 + 5 global) at ctx=32k
-    // this drops the planner's KV estimate from ~7.7 GiB to ~1.5 GiB.
-    let mut total_tokens: u64 = 0;
+    // Estimate per-layer, because two things vary by layer:
+    //   * sliding-window layers ring-buffer `window_size` slots, not the
+    //     full context — cap = window_size > 0 ? min(window_size, ctx) : ctx;
+    //   * Gemma-4-style models use a different KV width per layer (global
+    //     layers head_dim 512 / 2 kv-heads, sliding 256 / 8), so head_dim and
+    //     num_kv_heads must come from the layer, not the global graph
+    //     defaults. Using the graph defaults for every layer double-counted
+    //     the 5 global layers (256*8 vs the real 512*2) and inflated the
+    //     estimate ~2x — 10.2 vs the real ~5.2 GiB on Gemma-4-26B at ctx=256k.
+    let mut values: u64 = 0; // total K+V element count summed over layers
     for layer_idx in 0..graph.num_layers {
-        let layer_cap = match graph.layer(layer_idx).map(|m| &m.attention_pattern) {
+        let meta = graph.layer(layer_idx);
+        let layer_cap = match meta.map(|m| &m.attention_pattern) {
             Some(crate::model::AttentionPattern::SlidingWindow { size }) => {
                 (*size).min(policy.context_size)
             }
             _ => policy.context_size,
         };
-        total_tokens = total_tokens.saturating_add(layer_cap as u64);
+        let kv_heads = meta.map(|m| m.num_kv_heads).unwrap_or(graph.num_kv_heads) as u64;
+        let head_dim = meta.map(|m| m.head_dim).unwrap_or(graph.head_dim) as u64;
+        values = values.saturating_add(
+            (layer_cap as u64)
+                .saturating_mul(2) // K and V
+                .saturating_mul(kv_heads)
+                .saturating_mul(head_dim),
+        );
     }
-    let values = total_tokens
-        .saturating_mul(2)
-        .saturating_mul(graph.num_kv_heads as u64)
-        .saturating_mul(graph.head_dim as u64);
     values.saturating_mul(elem).div_ceil(2)
 }
 
