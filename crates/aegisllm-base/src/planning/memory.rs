@@ -2,11 +2,13 @@ use crate::backend::BackendKind;
 use crate::cuda_config::{
     CUDA_PREFILL_CHUNK_MAX, CUDA_PREFILL_DENSE_SPLIT_K_TOKENS, CudaRuntimeConfig,
 };
-use crate::graph::ModelGraph;
+use crate::graph::{GraphRegionKind, ModelGraph};
 use crate::hardware::HardwareInventory;
 use crate::planning::placement::{
-    ComputePlacement, PlacementPolicy, ResolvedPlacement, StoragePlacement, TransferPolicy,
+    ComputePlacement, PlacementPolicy, RegionPlacement, ResolvedPlacement, StoragePlacement,
+    TransferPolicy,
 };
+use crate::tensor::TensorDType;
 use crate::planning::runtime::{KernelFamily, RuntimePlan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,20 +136,64 @@ impl MemoryPlan {
         let mut allocations = Vec::new();
         let mut transfers = Vec::new();
         for region in &placement.region_placements {
-            allocations.push(PlannedAllocation {
-                name: region.region_id.0.clone(),
-                pool: pool_for_store(region.store),
-                bytes: region.weight_bytes,
-                file_backed: matches!(region.store, StoragePlacement::Mmap),
-            });
-            if region.transfer != TransferPolicy::None {
-                transfers.push(PlannedTransfer {
-                    name: region.region_id.0.clone(),
-                    policy: region.transfer,
-                    bytes: region.weight_bytes,
-                    source: region.store,
-                    compute: region.compute,
-                });
+            // The CUDA loader force-VRAMs the BF16 dense sub-weights of a
+            // host-resident (`store=ram`/`mmap`) transformer block —
+            // attention q/k/v/o and the shared-expert gate/up/down — because
+            // there is no streaming-aware BF16 matmul, so they must be
+            // device-resident. Only the NVFP4 routed-expert weights (and
+            // their FP8 scales) actually honour `store`. Model that split so
+            // the VRAM/RAM budget matches reality; without it a `store=ram`
+            // block counts as 100% host and the planner under-counts VRAM by
+            // the BF16 dense bytes (~4 GiB on Gemma-4-26B).
+            match graph.and_then(|g| dense_vram_split(g, region)) {
+                Some(DenseVramSplit { streamed, forced_vram, device }) if forced_vram > 0 => {
+                    allocations.push(PlannedAllocation {
+                        name: region.region_id.0.clone(),
+                        pool: pool_for_store(region.store),
+                        bytes: streamed,
+                        file_backed: matches!(region.store, StoragePlacement::Mmap),
+                    });
+                    allocations.push(PlannedAllocation {
+                        name: format!("{}:dense_vram", region.region_id.0),
+                        pool: AllocationPool::Vram { device },
+                        bytes: forced_vram,
+                        file_backed: false,
+                    });
+                    if region.transfer != TransferPolicy::None && streamed > 0 {
+                        transfers.push(PlannedTransfer {
+                            name: region.region_id.0.clone(),
+                            policy: region.transfer,
+                            bytes: streamed,
+                            source: region.store,
+                            compute: region.compute,
+                        });
+                    }
+                }
+                _ => {
+                    allocations.push(PlannedAllocation {
+                        name: region.region_id.0.clone(),
+                        pool: pool_for_store(region.store),
+                        bytes: region.weight_bytes,
+                        file_backed: matches!(region.store, StoragePlacement::Mmap),
+                    });
+                    // A token-embedding region is read by row-lookup — one
+                    // ~KB row per token is copied straight into the hidden
+                    // buffer, the whole table is never staged — so it must
+                    // not size the staging-buffer footprint. Skip its
+                    // transfer (modelling it whole-tensor put a phantom
+                    // ~1.4 GiB into `peak_*_staging`).
+                    if region.transfer != TransferPolicy::None
+                        && region.kind != GraphRegionKind::TokenEmbedding
+                    {
+                        transfers.push(PlannedTransfer {
+                            name: region.region_id.0.clone(),
+                            policy: region.transfer,
+                            bytes: region.weight_bytes,
+                            source: region.store,
+                            compute: region.compute,
+                        });
+                    }
+                }
             }
         }
         allocations.push(PlannedAllocation {
@@ -367,6 +413,45 @@ fn pool_for_backend_extra(device: BackendKind) -> AllocationPool {
         BackendKind::Cpu | BackendKind::Wgpu { .. } => AllocationPool::Ram,
         BackendKind::Cuda { device } => AllocationPool::Vram { device },
     }
+}
+
+/// How the CUDA loader actually places a host-resident transformer block:
+/// the NVFP4 routed-expert weights stream (`streamed`, honour `store`),
+/// the BF16 dense sub-weights are force-VRAM-resident (`forced_vram`).
+struct DenseVramSplit {
+    streamed: u64,
+    forced_vram: u64,
+    device: usize,
+}
+
+/// Split a host-resident transformer block into streamed (NVFP4) vs
+/// force-VRAM (BF16 dense) bytes by reading per-tensor dtypes from the
+/// graph. Returns `None` when the split does not apply — the region is
+/// already VRAM-resident, is not a transformer block, is not CUDA-computed,
+/// or is absent from the graph.
+fn dense_vram_split(graph: &ModelGraph, region: &RegionPlacement) -> Option<DenseVramSplit> {
+    if region.kind != GraphRegionKind::TransformerBlock
+        || matches!(region.store, StoragePlacement::Vram { .. })
+    {
+        return None;
+    }
+    let ComputePlacement::Cuda { device } = region.compute else {
+        return None;
+    };
+    let g_region = graph.regions.iter().find(|r| r.id == region.region_id)?;
+    let mut split = DenseVramSplit { streamed: 0, forced_vram: 0, device };
+    for tensor in &g_region.tensors {
+        let bytes = tensor.info.data_len_bytes();
+        // BF16 dense weights (attention, shared expert, norms) have no
+        // streaming matmul → force-VRAM. NVFP4 packed weights (U8) and their
+        // FP8 scales stream → honour `store`.
+        if tensor.info.dtype == TensorDType::BF16 {
+            split.forced_vram += bytes;
+        } else {
+            split.streamed += bytes;
+        }
+    }
+    Some(split)
 }
 
 fn pool_for_store(store: StoragePlacement) -> AllocationPool {
