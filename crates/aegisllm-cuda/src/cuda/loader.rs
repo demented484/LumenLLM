@@ -46,6 +46,7 @@ fn alloc_pinned_from_bytes(
 fn read_chunked_par(path: &std::path::Path, file_offset: u64, dst: &mut [u8]) -> Result<()> {
     use rayon::prelude::*;
     use std::os::unix::fs::FileExt;
+    use aegisllm_base::tensor::storage::fadvise_dont_need;
     let len = dst.len();
     if len == 0 {
         return Ok(());
@@ -55,6 +56,13 @@ fn read_chunked_par(path: &std::path::Path, file_offset: u64, dst: &mut [u8]) ->
     if len < 1 << 20 {
         let file = std::fs::File::open(path)?;
         file.read_exact_at(dst, file_offset)?;
+        // Evict the just-read range from the page cache: the bytes are now
+        // in the arena (anonymous RAM), so the file-cache copy is dead
+        // weight. Loading ~12 GiB of experts via pread otherwise balloons
+        // the page cache to ~9 GiB mid-load (it counts against the cgroup
+        // memory limit and inflates `MemoryCurrent`). pread pages are not
+        // mmap-mapped, so POSIX_FADV_DONTNEED evicts them immediately.
+        fadvise_dont_need(&file, file_offset, len as u64);
         return Ok(());
     }
     let chunk_size = len.div_ceil(PREAD_CHUNK_COUNT);
@@ -82,6 +90,15 @@ fn read_chunked_par(path: &std::path::Path, file_offset: u64, dst: &mut [u8]) ->
             file.read_exact_at(chunk_dst, chunk_file_off)?;
             Ok(())
         })?;
+    // One page-cache evict for the whole tensor range, after every chunk
+    // read has completed. The bytes are in the arena (anonymous RAM) now,
+    // so the file-cache copy is dead weight; loading ~12 GiB of experts
+    // via pread otherwise balloons the page cache to ~9 GiB mid-load
+    // (it counts against the cgroup memory limit). One fadvise per tensor
+    // — not per chunk — keeps it off the concurrent-read critical path.
+    if let Ok(file) = std::fs::File::open(path) {
+        fadvise_dont_need(&file, file_offset, len as u64);
+    }
     Ok(())
 }
 
