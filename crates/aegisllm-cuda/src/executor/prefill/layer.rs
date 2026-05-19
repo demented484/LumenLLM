@@ -503,48 +503,76 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         )?;
     } else {
         use crate::executor::state::KvBuffer;
-        // For FP8 KV: we maintain an auxiliary f16 cache for prefill (prefill
-        // attention kernels are templated on u16 cache lines). The f16 cache
-        // is read/written by the existing rope_kv_store + prefill attention
-        // kernels. After the f16 store, we additionally write the now-RoPE'd
-        // f32 K/V tile into the persistent FP8 cache via
-        // `store_kv_fp8_slots_batched_device`. Decode then reads FP8 only.
+        // For FP8 KV: we still RoPE the K tile via the proven
+        // `store_kv_slots_batched_rope_key_device` kernel (it applies RoPE
+        // in-place to `prefill.up` AND writes an f16 KV cache line). After the
+        // RoPE store, we mirror the now-RoPE'd K/V into the persistent FP8
+        // cache. Decode and (Stage C.1) global prefill attention then read
+        // FP8 directly.
+        //
+        // The f16 cache target depends on the layer:
+        //   * GLOBAL (window_size==0): the full-context f16 aux is NOT
+        //     allocated (Stage C.3 — it OOMs at 262144). The RoPE store writes
+        //     into a small per-chunk throwaway scratch
+        //     (`prefill_global_kv_f16_scratch_{k,v}`); its contents are never
+        //     read (every global prefill chunk reads FP8 directly — Stage C.1).
+        //   * SLIDING (window_size>0): the small windowed f16 aux is kept and
+        //     used by the compat attention kernel, exactly as before.
         let is_fp8 = matches!(layer_state.kv.keys, KvBuffer::Fp8(_));
-        let (keys_f16_mut, values_f16_mut): (&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>) = if is_fp8 {
-            // SAFETY: prefill_f16_keys/values are Some when quant=Fp8 (allocated in CudaKvCache::dense).
-            let pk = layer_state.kv.prefill_f16_keys.as_mut().ok_or_else(|| {
-                aegisllm_base::error::AegisError::InvalidPlan(
-                    "FP8 KV cache missing prefill_f16_keys scratch (allocator bug)".into(),
-                )
-            })?;
-            let pv = layer_state.kv.prefill_f16_values.as_mut().ok_or_else(|| {
-                aegisllm_base::error::AegisError::InvalidPlan(
-                    "FP8 KV cache missing prefill_f16_values scratch (allocator bug)".into(),
-                )
-            })?;
-            (pk, pv)
+        let is_global = layer.window_size == 0;
+        if is_fp8 && is_global {
+            // Borrow throwaway scratch (disjoint fields of `prefill`).
+            runtime.store_kv_slots_batched_rope_key_device(
+                &mut prefill.prefill_global_kv_f16_scratch_k,
+                &mut prefill.prefill_global_kv_f16_scratch_v,
+                &mut prefill.up,
+                &prefill.v,
+                &prefill.positions,
+                &prefill.slot_mapping,
+                params.batch,
+                layer.layer_num_kv_heads,
+                layer.layer_head_dim,
+                params.kv_context_size,
+                params.dense_metadata,
+                layer.rope,
+            )?;
         } else {
-            match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
-                (KvBuffer::F16(k), KvBuffer::F16(v)) => (k, v),
-                _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
-                    "KV cache dtype mismatch in prefill dispatch".into(),
-                )),
-            }
-        };
-        runtime.store_kv_slots_batched_rope_key_device(
-            keys_f16_mut,
-            values_f16_mut,
-            &mut prefill.up,
-            &prefill.v,
-            &prefill.positions,
-            &prefill.slot_mapping,
-            params.batch,
-            layer.layer_num_kv_heads,
-            layer.layer_head_dim,
-            params.kv_context_size,
-            params.dense_metadata,
-            layer.rope,
-        )?;
+            let (keys_f16_mut, values_f16_mut): (&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>) = if is_fp8 {
+                // Sliding FP8 layer: small windowed aux (still allocated).
+                let pk = layer_state.kv.prefill_f16_keys.as_mut().ok_or_else(|| {
+                    aegisllm_base::error::AegisError::InvalidPlan(
+                        "FP8 sliding KV cache missing prefill_f16_keys scratch (allocator bug)".into(),
+                    )
+                })?;
+                let pv = layer_state.kv.prefill_f16_values.as_mut().ok_or_else(|| {
+                    aegisllm_base::error::AegisError::InvalidPlan(
+                        "FP8 sliding KV cache missing prefill_f16_values scratch (allocator bug)".into(),
+                    )
+                })?;
+                (pk, pv)
+            } else {
+                match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
+                    (KvBuffer::F16(k), KvBuffer::F16(v)) => (k, v),
+                    _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
+                        "KV cache dtype mismatch in prefill dispatch".into(),
+                    )),
+                }
+            };
+            runtime.store_kv_slots_batched_rope_key_device(
+                keys_f16_mut,
+                values_f16_mut,
+                &mut prefill.up,
+                &prefill.v,
+                &prefill.positions,
+                &prefill.slot_mapping,
+                params.batch,
+                layer.layer_num_kv_heads,
+                layer.layer_head_dim,
+                params.kv_context_size,
+                params.dense_metadata,
+                layer.rope,
+            )?;
+        }
         // FP8 mirror write: prefill.up now holds RoPE'd K (the rope_kv_store
         // kernel applies RoPE in-place). Push the same tile into the FP8
         // persistent cache. Uses the non-RoPE FP8 slot store (it just casts
@@ -575,21 +603,43 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         })?;
 
         let attention_start = Instant::now();
-        // FP8 prefill attention fast path. Opt-in via `AEGIS_ATTN_FP8=1`,
-        // active only for head_dim=512 layers when the KV cache is FP8.
-        // Reads the persistent e4m3 cache directly (halving KV HBM traffic),
-        // dequants e4m3->half in shared memory, runs the FA-2 BF16 WMMA math.
-        // Default OFF -> falls through to the BF16-aux-cache compat path,
-        // which is bit-equivalent to main. The query (prefill.q_half) is
-        // already RoPE'd half from the rope step above. Output goes to
-        // prefill.qkv, exactly as the compat path does.
-        let use_fp8_attn = is_fp8
-            && layer.layer_head_dim == 512
-            && params.batch >= 16
-            && params.num_sequences == 1
-            // Converged gate: `AEGIS_ATTN_FP8=1` env OR `compute-quantization: fp8`.
-            && runtime.config().attention_fp8_enabled();
-        if use_fp8_attn {
+        // FP8 GLOBAL (head_dim=512) prefill attention. Stage C.1: when the KV
+        // cache is FP8 and the layer is global, EVERY prefill chunk reads the
+        // persistent e4m3 KV cache DIRECTLY — the f16 global aux no longer
+        // exists (Stage C.3 dropped it; reading it would deref a None buffer).
+        //
+        // Kernel choice:
+        //   * fp8 attention COMPUTE on  -> native FP8-MMA kernel (K/V stay
+        //     e4m3 in shared, fed straight into the SM120 `kind::f8f6f4`
+        //     tensor-core MMA; ~42.5 KiB shared -> 2 blocks/SM). The
+        //     `AEGIS_ATTN_FP8_OPTION_B=1` env still forces the option-b kernel.
+        //   * fp8 attention COMPUTE off (FP8 KV storage, bf16 attention math)
+        //     -> option-b `_fp8` kernel: reads e4m3 KV, dequants e4m3->half in
+        //     shared, runs the BF16 WMMA math. This is the path that lets a
+        //     bf16-compute FP8-KV config still avoid the f16 aux entirely.
+        //
+        // Neither FP8 kernel has a structural minimum batch: the grid is
+        // ceil(batch / q_block) and every Q row is guarded by
+        // `global_q < total_q` (zero-padded, output-masked), so a partial last
+        // prefill chunk (batch < 16 / < q_block=32) is correct. The old
+        // `batch >= 16` gate was a perf heuristic; it is removed so the global
+        // FP8-direct path covers 100% of global prefill chunks.
+        //
+        // The query (prefill.q_half) is already RoPE'd half from the rope step
+        // above. Output goes to prefill.qkv, exactly as the compat path does.
+        let is_global_fp8 = is_fp8 && layer.layer_head_dim == 512;
+        if is_global_fp8 {
+            // SAFETY INVARIANT (Stage C): a global FP8 layer has NO f16 aux.
+            // The dense chunked-prefill path is always single-sequence
+            // (`num_sequences == 1`, hardwired in CudaPrefillBatch); if that
+            // ever changes, fail loudly rather than fall to the aux-reading
+            // compat path (which would deref a None buffer).
+            if params.num_sequences != 1 {
+                return Err(aegisllm_base::error::AegisError::Unsupported(
+                    "FP8 global prefill attention requires single-sequence \
+                     dense prefill (no f16 aux exists for multi-sequence)".into(),
+                ));
+            }
             let (fp8_keys, fp8_values) =
                 match (&layer_state.kv.keys, &layer_state.kv.values) {
                     (KvBuffer::Fp8(k), KvBuffer::Fp8(v)) => (k, v),
@@ -597,15 +647,11 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
                         "FP8 prefill attention: keys/values not both Fp8".into(),
                     )),
                 };
-            // Two FP8 prefill kernels exist for head_dim=512:
-            //   * the native FP8-MMA kernel (default) — K/V stay e4m3 in shared
-            //     and feed the SM120 `kind::f8f6f4.m16n8k32` tensor-core MMA
-            //     directly; ~42.5 KiB shared -> 2 blocks/SM.
-            //   * the option-b `_fp8` kernel — dequants e4m3->half in shared
-            //     and runs BF16 WMMA; ~76 KiB shared -> 1 block/SM. Kept as a
-            //     fallback, selected by `AEGIS_ATTN_FP8_OPTION_B=1`.
-            let use_option_b =
-                std::env::var("AEGIS_ATTN_FP8_OPTION_B").as_deref() == Ok("1");
+            // fp8-compute on -> MMA kernel (unless option-b env override);
+            // fp8-compute off -> option-b dequant kernel (still FP8-KV-direct).
+            let fp8_compute = runtime.config().attention_fp8_enabled();
+            let use_option_b = !fp8_compute
+                || std::env::var("AEGIS_ATTN_FP8_OPTION_B").as_deref() == Ok("1");
             if use_option_b {
                 runtime.attention_prefill_dense_fa2_hdim512_fp8_device(
                     fp8_keys,
@@ -634,14 +680,26 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
                 )?;
             }
         } else {
-            // Prefill attention reads from the f16 cache (auxiliary when FP8,
-            // primary when F16/BF16). Re-borrow immutably here since the FP8
-            // mirror write above needed a mutable borrow on layer_state.kv.
+            // Compat attention reads the f16 cache. Reached by:
+            //   * F16/BF16 KV (any layer) -> primary f16 KV cache.
+            //   * SLIDING FP8 layers (head_dim != 512) -> the small windowed
+            //     f16 aux, still allocated (out of Stage C scope).
+            // GLOBAL FP8 layers never reach here (handled above) — they have
+            // no f16 aux, so reading `prefill_f16_keys` here would be a None
+            // deref. The `is_fp8` arm below is therefore sliding-FP8 only.
             let (keys_f16_ref, values_f16_ref): (&DeviceBuffer<u16>, &DeviceBuffer<u16>) =
                 if is_fp8 {
                     (
-                        layer_state.kv.prefill_f16_keys.as_ref().expect("checked above"),
-                        layer_state.kv.prefill_f16_values.as_ref().expect("checked above"),
+                        layer_state.kv.prefill_f16_keys.as_ref().ok_or_else(|| {
+                            aegisllm_base::error::AegisError::InvalidPlan(
+                                "sliding FP8 layer missing prefill_f16_keys aux".into(),
+                            )
+                        })?,
+                        layer_state.kv.prefill_f16_values.as_ref().ok_or_else(|| {
+                            aegisllm_base::error::AegisError::InvalidPlan(
+                                "sliding FP8 layer missing prefill_f16_values aux".into(),
+                            )
+                        })?,
                     )
                 } else {
                     (

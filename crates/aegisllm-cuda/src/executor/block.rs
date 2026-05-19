@@ -204,6 +204,9 @@ impl CudaLayerBlockExecutor {
                                 kv_width,
                                 aegisllm_base::tensor::quant::KvCacheQuantization::F16,
                                 self.kv_context_size,
+                                // F16 quant -> no aux cache allocated regardless;
+                                // this block path uses full-context capacity.
+                                false,
                             )?,
                         },
                     ))

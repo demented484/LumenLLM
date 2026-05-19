@@ -384,6 +384,7 @@ impl CudaKvCache {
         kv_width: usize,
         quantization: aegisllm_base::tensor::quant::KvCacheQuantization,
         effective_capacity: usize,
+        is_sliding: bool,
     ) -> aegisllm_base::error::Result<Self> {
         use aegisllm_base::error::AegisError;
         use aegisllm_base::tensor::quant::KvCacheQuantization;
@@ -404,17 +405,34 @@ impl CudaKvCache {
                 None,
                 None,
             ),
-            KvCacheQuantization::Fp8 => (
-                KvBuffer::Fp8(runtime.alloc_u8(len)?),
-                KvBuffer::Fp8(runtime.alloc_u8(len)?),
-                // Auxiliary f16 cache for prefill attention. Same effective
-                // capacity as the FP8 cache. Costs 2 bytes/element vs FP8's 1
-                // byte/element; total KV memory is 1.5× pure-FP8 but the
-                // prefill kernels remain unchanged (they only know how to
-                // read u16 K/V cache lines).
-                Some(runtime.alloc_u16(len)?),
-                Some(runtime.alloc_u16(len)?),
-            ),
+            KvCacheQuantization::Fp8 => {
+                // Auxiliary f16 cache for prefill attention. Kept ONLY for
+                // SLIDING (windowed) layers, where `effective_capacity` is the
+                // small window (~1024 slots) so the 2 B/elem cost is tiny and
+                // the non-FP8-fast-path compat attention kernel still reads it.
+                //
+                // GLOBAL (full-attention, head_dim=512) layers have
+                // `effective_capacity == context_size` (262144 at long ctx) ->
+                // a full f16 KV cache on top of the FP8 one, the source of the
+                // 262144 OOM. Stage C.1 routes EVERY global prefill chunk
+                // through an FP8-KV-reading kernel (the FP8-MMA kernel under
+                // fp8 compute, the option-b dequant kernel under bf16 compute),
+                // so the global aux is never read -> not allocated here.
+                let (aux_k, aux_v) = if is_sliding {
+                    (
+                        Some(runtime.alloc_u16(len)?),
+                        Some(runtime.alloc_u16(len)?),
+                    )
+                } else {
+                    (None, None)
+                };
+                (
+                    KvBuffer::Fp8(runtime.alloc_u8(len)?),
+                    KvBuffer::Fp8(runtime.alloc_u8(len)?),
+                    aux_k,
+                    aux_v,
+                )
+            }
             other => return Err(AegisError::Unsupported(format!(
                 "kv-cache quantization {other:?} not yet wired into CUDA executor; supported: f16, bf16, fp8"
             ))),
@@ -583,6 +601,18 @@ pub(super) struct CudaPrefillScratch {
     pub(super) fp8_dequant_scratch: DeviceBuffer<u16>,
     /// MoE prefill scratch (allocated only when the model has MoE layers).
     pub(super) moe: Option<Box<CudaMoEPrefillScratch>>,
+    /// Throwaway f16 KV target for GLOBAL (head_dim=512) layers under FP8 KV.
+    /// Stage C drops the full-context `prefill_f16_keys/values` aux for global
+    /// layers, but the proven `store_kv_slots_batched_rope_key_device` kernel
+    /// applies RoPE in-place to the K tile AND writes an f16 cache line in one
+    /// pass. We keep using it for the in-place RoPE and redirect its f16 cache
+    /// writes here — a `chunk_size * kv_width` buffer (one chunk, not the full
+    /// 262144-token context). The kernel's `slot % cache_capacity` wrap keeps
+    /// every write in-bounds; the contents are never read (the FP8 mirror
+    /// store + the FP8-direct attention kernels carry the real K/V). Sized
+    /// `chunk_size * max_kv_width` each; zero-length (stub) for non-FP8 configs.
+    pub(super) prefill_global_kv_f16_scratch_k: DeviceBuffer<u16>,
+    pub(super) prefill_global_kv_f16_scratch_v: DeviceBuffer<u16>,
 }
 
 /// Per-chunk scratch for chunked MoE prefill. Sized for `chunk_size` tokens.

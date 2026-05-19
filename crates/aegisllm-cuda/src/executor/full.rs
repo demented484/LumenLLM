@@ -851,6 +851,28 @@ impl CudaLlamaExecutor {
                 } else {
                     None
                 },
+                // Throwaway f16 KV target for global (head_dim=512) layers
+                // under FP8 KV. One chunk worth of slots — the global
+                // full-context f16 aux is dropped in Stage C.3. Stub for
+                // non-FP8 configs (those keep their primary f16 KV cache).
+                prefill_global_kv_f16_scratch_k: {
+                    use aegisllm_base::tensor::quant::KvCacheQuantization;
+                    if matches!(self.kv_quantization, KvCacheQuantization::Fp8) {
+                        self.runtime
+                            .alloc_u16(self.prefill_chunk_size * max_kv_width)?
+                    } else {
+                        self.runtime.alloc_u16(1)?
+                    }
+                },
+                prefill_global_kv_f16_scratch_v: {
+                    use aegisllm_base::tensor::quant::KvCacheQuantization;
+                    if matches!(self.kv_quantization, KvCacheQuantization::Fp8) {
+                        self.runtime
+                            .alloc_u16(self.prefill_chunk_size * max_kv_width)?
+                    } else {
+                        self.runtime.alloc_u16(1)?
+                    }
+                },
             })
         } else {
             None
@@ -896,6 +918,7 @@ impl CudaLlamaExecutor {
                                 layer_kv_width,
                                 self.kv_quantization,
                                 layer_kv_capacity,
+                                layer.window_size > 0,
                             )?
                         }
                         StoragePlacement::Ram | StoragePlacement::Mmap => {
