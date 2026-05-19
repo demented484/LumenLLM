@@ -9,6 +9,7 @@ aegisllm-cpu = { path = "../aegisllm-cpu" }
 aegisllm-cuda = { path = "../aegisllm-cuda" }
 aegisllm-wgpu = { path = "../aegisllm-wgpu" }
 cudarc.workspace = true
+half.workspace = true
 libc.workspace = true
 memmap2.workspace = true
 rayon.workspace = true

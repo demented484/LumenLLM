@@ -226,6 +226,11 @@ impl CudaRuntime {
             CudaPrefillAttentionKernel::Auto
                 | CudaPrefillAttentionKernel::AegisVarlen
                 | CudaPrefillAttentionKernel::WarpFlash
+                // FA-2 / FP8 pin the head_dim=512 compute precision; the
+                // FA-2 / FP8 / BF16 split inside the dense kernel itself is
+                // driven by the unified `resolve_attention_backend` gate.
+                | CudaPrefillAttentionKernel::FlashAttention2
+                | CudaPrefillAttentionKernel::Fp8
         ) && head_dim == 512
             && batch >= DENSE_WARP_TILE_Q_BLOCK
         {
@@ -264,6 +269,10 @@ impl CudaRuntime {
             CudaPrefillAttentionKernel::Auto
                 | CudaPrefillAttentionKernel::AegisVarlen
                 | CudaPrefillAttentionKernel::WarpFlash
+                // FA-2 / FP8 fall back to the BF16 WMMA path for non-512
+                // (sliding) layers — they only pin the head_dim=512 kernel.
+                | CudaPrefillAttentionKernel::FlashAttention2
+                | CudaPrefillAttentionKernel::Fp8
         ) && head_dim == 256
             && batch >= DENSE_WARP_TILE_Q_BLOCK
         {
@@ -298,6 +307,9 @@ impl CudaRuntime {
             CudaPrefillAttentionKernel::Auto
                 | CudaPrefillAttentionKernel::AegisVarlen
                 | CudaPrefillAttentionKernel::WarpFlash
+                // FA-2 / FP8 fall back to the BF16 WMMA path for head_dim=128.
+                | CudaPrefillAttentionKernel::FlashAttention2
+                | CudaPrefillAttentionKernel::Fp8
         ) && head_dim == 128
             && batch >= DENSE_WARP_TILE_Q_BLOCK
         {
@@ -481,6 +493,10 @@ impl CudaRuntime {
             CudaPrefillAttentionKernel::Auto
                 | CudaPrefillAttentionKernel::AegisVarlen
                 | CudaPrefillAttentionKernel::WarpFlash
+                // FA-2 / FP8 fall back to the BF16 batched path for the short
+                // first-chunk non-512 case.
+                | CudaPrefillAttentionKernel::FlashAttention2
+                | CudaPrefillAttentionKernel::Fp8
         ) && start_position == 0
             && head_dim.is_multiple_of(32)
             && head_dim <= 256
@@ -812,10 +828,21 @@ impl CudaRuntime {
         //   ctx~15k  : 7387405 -> 5348320   (-27.6%),  1674 -> 1863 tps
         // quality-smoke output bit-identical to the legacy kernel on both
         // english_hello and russian_greeting. Keep opt-in until promoted.
-        // FA-2 is enabled if EITHER the `AEGIS_ATTN_FA2=1` env override is set
-        // OR `attention.compute-quantization: bf16-fa2` was given in the config
-        // (`CudaRuntimeConfig::attention_fa2_enabled` is the convergence point).
-        let use_fa2 = head_dim == 512 && self.config.attention_fa2_enabled();
+        // FA-2 is the resolved default for hdim=512 (`attention_fa2_enabled`,
+        // the unified `resolve_attention_backend` gate). CONTEXT-GATED: only
+        // chunks whose effective context (`start_position + batch`) reaches
+        // `FA2_MIN_CONTEXT_TOKENS` use FA-2. Below that the legacy WMMA kernel
+        // runs — bit-identical to pre-Stage-B behavior — so short prefills
+        // (<=16k, where attention is a minority of layer time and FA-2's
+        // per-call overhead is not amortized) cannot regress. FA-2's measured
+        // win (+16/+25/+32% at 64k/128k/256k) is on the long-context chunks,
+        // which all clear this gate. Long prefills spend almost all their time
+        // in >=16k chunks, so the gate keeps the win while removing any
+        // short-context risk.
+        const FA2_MIN_CONTEXT_TOKENS: usize = 16384;
+        let use_fa2 = head_dim == 512
+            && context_len >= FA2_MIN_CONTEXT_TOKENS
+            && self.config.attention_fa2_enabled();
         // ── FP8 attention dispatch hook (for the feat/fp8-attention merge) ──
         // The FP8 prefill attention kernel is built on a parallel branch.
         // When that branch merges, gate the FP8 kernel here with:

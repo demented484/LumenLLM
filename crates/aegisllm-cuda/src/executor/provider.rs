@@ -91,10 +91,31 @@ impl CudaExecutorProvider {
             CudaPrefillAttentionKernel::Reference => {
                 "CUDA prefill attention uses the reference scalar kernel".into()
             }
+            CudaPrefillAttentionKernel::Fp8 => {
+                "CUDA prefill attention requests the FP8 native-MMA backend (requires an FP8 KV cache)".into()
+            }
             CudaPrefillAttentionKernel::Continuation => {
                 "CUDA prefill attention uses the varlen continuation kernel with bounded shared memory".into()
             }
         };
+        // `--cuda-prefill-attention fp8` (CLI) and `attention.compute-quantization:
+        // fp8` (config) both resolve to the FP8 attention backend, which reads
+        // FP8 K/V directly. The config-field path is validated in the params
+        // parser; the CLI flag is applied after parsing, so re-check here that
+        // an FP8 attention backend has an FP8 KV cache and reject cleanly if not.
+        if cuda_config.resolve_attention_backend()
+            == aegisllm_base::cuda_config::AttentionComputeBackend::Fp8
+            && placement.kv_cache.quantization
+                != aegisllm_base::tensor::quant::KvCacheQuantization::Fp8
+        {
+            return Err(AegisError::InvalidConfig(format!(
+                "FP8 prefill attention was selected (--cuda-prefill-attention fp8 or \
+                 attention.compute-quantization=fp8 / AEGIS_ATTN_FP8=1), but the KV cache \
+                 resolves to `{}`. The FP8 attention kernel reads FP8 K/V directly — set \
+                 the KV cache `type-k`/`type-v` to `fp8`, or use a non-FP8 attention backend.",
+                placement.kv_cache.quantization.label()
+            )));
+        }
         let t0 = std::time::Instant::now();
         let cuda_executor = CudaLlamaExecutor::from_artifact(
             artifact,

@@ -211,6 +211,195 @@ fn cuda_prefill_compare_one_chunk(config: EngineConfig, configured_chunk: usize)
     Ok(())
 }
 
+/// Stage A.3 correctness oracle. Prefills a fixed short prompt twice on the
+/// real model — run 1 with the `reference_kernel` backend (default
+/// `CudaPrefillAttentionKernel::Reference`, the f32 oracle; selectable via
+/// `--reference`), run 2 with a chosen fast backend (the engine config's
+/// `prefill_attention`, default = Auto, selectable via
+/// `--cuda-prefill-attention`) — and reports per-layer post-attention
+/// hidden-state diffs plus a final-logits diff.
+///
+/// The default reference path is the scalar f32 online-softmax prefill kernel
+/// (`aegis_attention_prefill_batched` in attention_prefill_dense_wmma.cu),
+/// reached because `prefill_attention=Reference` makes every fast-path branch
+/// in `attention_prefill_dense_compat_device` fall through to
+/// `attention_prefill_batched_device`. It is correct for short prompts: at
+/// context < the sliding window (1024) full causal attention equals windowed
+/// attention, so the absence of a window mask in the reference kernel is a
+/// no-op.
+///
+/// Passing `--reference auto` (or another fast backend) makes run 1 use the
+/// DEFAULT WMMA dispatch instead — this isolates a fast backend's own
+/// algorithmic divergence from the f32-scalar-vs-bf16-tensor-core precision
+/// difference, because both runs then share the same bf16 precision regime.
+pub(super) fn cuda_attn_compare(
+    config: EngineConfig,
+    prompt: Option<String>,
+    reference_kernel: aegisllm_cuda::cuda::CudaPrefillAttentionKernel,
+) -> Result<()> {
+    // A short, fixed default prompt — long enough to exercise attention but
+    // small enough that the whole compare finishes in seconds.
+    let prompt = prompt.unwrap_or_else(|| {
+        "The capital of France is Paris, a city on the river Seine.".to_string()
+    });
+
+    let fast_kernel = config.cuda.prefill_attention;
+    println!(
+        "cuda-attn-compare: prompt={prompt:?} reference={} fast={}",
+        reference_kernel.canonical_name(),
+        fast_kernel.canonical_name(),
+    );
+
+    // Run 1: the chosen reference backend (default = f32 reference oracle).
+    let mut ref_config = config.clone();
+    ref_config.cuda.prefill_attention = reference_kernel;
+    let (ref_layers, ref_logits) = run_attn_compare_prefill(ref_config, &prompt)?;
+
+    // Run 2: the chosen fast backend (engine default unless overridden).
+    let (fast_layers, fast_logits) = run_attn_compare_prefill(config, &prompt)?;
+
+    if ref_layers.len() != fast_layers.len() {
+        return Err(AegisError::InvalidPlan(format!(
+            "cuda-attn-compare: layer count mismatch: reference={} fast={}",
+            ref_layers.len(),
+            fast_layers.len()
+        )));
+    }
+    if ref_layers.is_empty() {
+        return Err(AegisError::InvalidPlan(
+            "cuda-attn-compare: no per-layer hidden states captured — \
+             prefill did not run through the chunked CUDA path".into(),
+        ));
+    }
+
+    println!(
+        "  {:>5}  {:>14}  {:>14}  {:>12}",
+        "layer", "max_abs_diff", "mean_abs_diff", "cosine_sim",
+    );
+    let mut worst_max = 0.0_f32;
+    let mut worst_cos = 1.0_f32;
+    for (idx, (r, f)) in ref_layers.iter().zip(fast_layers.iter()).enumerate() {
+        let (max_abs, mean_abs, cos) = diff_stats(r, f);
+        worst_max = worst_max.max(max_abs);
+        worst_cos = worst_cos.min(cos);
+        println!(
+            "  {idx:>5}  {max_abs:>14.6e}  {mean_abs:>14.6e}  {cos:>12.8}",
+        );
+    }
+    let (logit_max, logit_mean, logit_cos) = diff_stats(&ref_logits, &fast_logits);
+    println!(
+        "  final logits: len={} max_abs_diff={logit_max:.6e} mean_abs_diff={logit_mean:.6e} cosine_sim={logit_cos:.8}",
+        ref_logits.len(),
+    );
+    let ref_argmax = argmax(&ref_logits);
+    let fast_argmax = argmax(&fast_logits);
+    println!(
+        "  argmax: reference[{}]={ref_argmax} fast[{}]={fast_argmax} match={}",
+        reference_kernel.canonical_name(),
+        fast_kernel.canonical_name(),
+        ref_argmax == fast_argmax,
+    );
+    println!(
+        "cuda-attn-compare: layers={} worst_max_abs_diff={worst_max:.6e} worst_cosine_sim={worst_cos:.8}",
+        ref_layers.len(),
+    );
+    Ok(())
+}
+
+/// Prefill `prompt` on a freshly built engine and return
+/// `(per_layer_post_attn_hidden, final_logits)`. The per-layer hidden states
+/// are the row-0 post-attention residual for each transformer layer; the
+/// final logits are for the position after the last prompt token.
+fn run_attn_compare_prefill(
+    mut config: EngineConfig,
+    prompt: &str,
+) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+    // Use a prefill chunk large enough that any short compare prompt fits in
+    // a single chunk (so each layer's capture hook fires exactly once), but
+    // small enough that the prefill scratch buffers stay modest — sizing
+    // scratch for CUDA_PREFILL_CHUNK_MAX would OOM a second engine build.
+    const ATTN_COMPARE_CHUNK: usize = 512;
+    config.cuda.prefill_chunk_size = Some(ATTN_COMPARE_CHUNK);
+    let engine = AegisEngine::build(config)?;
+    let executor = engine.executor().ok_or_else(|| {
+        AegisError::Unsupported("cuda-attn-compare: engine built without executor".into())
+    })?;
+    let backend = executor.as_primitives();
+
+    let tokens = backend.encode_prompt(prompt)?;
+    if tokens.len() < 2 {
+        return Err(AegisError::InvalidPlan(format!(
+            "cuda-attn-compare: prompt tokenizes to {} token(s); need ≥2",
+            tokens.len()
+        )));
+    }
+    if tokens.len() > ATTN_COMPARE_CHUNK {
+        return Err(AegisError::InvalidPlan(format!(
+            "cuda-attn-compare: prompt tokenizes to {} tokens, exceeding the \
+             single-chunk limit of {ATTN_COMPARE_CHUNK}; use a shorter prompt",
+            tokens.len()
+        )));
+    }
+    let (&last, prefix) = tokens.split_last().expect("len ≥ 2 checked above");
+
+    let greedy = aegisllm_base::generation::SamplingConfig {
+        temperature: 0.0,
+        top_k: 1,
+        top_p: 1.0,
+        min_p: 0.0,
+    };
+    let mut state = backend.new_sequence_state()?;
+
+    // Arm per-layer capture only around the prefill so unrelated thread-local
+    // state stays clean. `prefill_prompt` runs the chunked CUDA prefill which
+    // invokes the capture hook once per layer.
+    aegisllm_cuda::layer_capture::arm();
+    let prefill_result = backend.prefill_prompt(state.as_mut(), prefix, &greedy);
+    let layers = aegisllm_cuda::layer_capture::take();
+    aegisllm_cuda::layer_capture::disarm();
+    prefill_result?;
+
+    // Logits for the position after the full prompt.
+    let logits = backend.forward_logits(state.as_mut(), last)?;
+    Ok((layers, logits))
+}
+
+/// `(max_abs_diff, mean_abs_diff, cosine_similarity)` between two vectors.
+fn diff_stats(a: &[f32], b: &[f32]) -> (f32, f32, f32) {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return (0.0, 0.0, 1.0);
+    }
+    let mut max_abs = 0.0_f32;
+    let mut sum_abs = 0.0_f64;
+    let mut dot = 0.0_f64;
+    let mut norm_a = 0.0_f64;
+    let mut norm_b = 0.0_f64;
+    for i in 0..n {
+        let (x, y) = (a[i], b[i]);
+        let d = (x - y).abs();
+        max_abs = max_abs.max(d);
+        sum_abs += d as f64;
+        dot += (x as f64) * (y as f64);
+        norm_a += (x as f64) * (x as f64);
+        norm_b += (y as f64) * (y as f64);
+    }
+    let cos = if norm_a > 0.0 && norm_b > 0.0 {
+        (dot / (norm_a.sqrt() * norm_b.sqrt())) as f32
+    } else {
+        1.0
+    };
+    (max_abs, (sum_abs / n as f64) as f32, cos)
+}
+
+fn argmax(v: &[f32]) -> usize {
+    v.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
 fn ensure_prefill_match(
     prompt: &str,
     token_output: &GenerateOutput,
@@ -880,6 +1069,150 @@ pub(super) fn cuda_attn_fp8_smoke() -> Result<()> {
         eprintln!("cuda-attn-fp8-smoke: FAIL");
         Err(AegisError::Unsupported(
             "cuda-attn-fp8-smoke failed: at least one stage below its cos_sim bar".into(),
+        ))
+    }
+}
+
+/// Standalone correctness check for the GPU f32 reference attention kernel
+/// (`aegis_attention_prefill_batched`). Validates it against the INDEPENDENT
+/// CPU f32 reference (`reference_attention_prefill_f32_into`) on identical
+/// synthetic Q/K/V inputs — no model load.
+///
+/// The GPU reference reads a full-f32 query but reads K/V as f16 bits (the KV
+/// cache dtype). To make the comparison a pure algorithm check (not a
+/// precision check) we round the synthetic K/V to f16 FIRST, then feed those
+/// f16-exact values to BOTH references: the GPU kernel reads the f16 bits,
+/// the CPU reference reads the same values widened back to f32. Q is f32 for
+/// both. With identical numeric inputs, any output divergence is an algorithm
+/// bug (wrong GQA mapping, causal range, head_dim handling), not rounding.
+///
+/// Acceptance: cosine ≥ 0.9999 and a tiny max-abs diff on every case.
+pub(super) fn cuda_attn_ref_check() -> Result<()> {
+    use aegisllm_base::cuda_config::{CudaPrefillAttentionKernel, CudaRuntimeConfig};
+    use aegisllm_cpu::{ReferenceAttentionPrefillRequest, reference_attention_prefill_f32_into};
+    use half::f16;
+
+    // Force the GPU reference kernel: `prefill_attention = Reference` +
+    // `start_position = 0` routes `attention_prefill_batched_device` to the
+    // `CacheOnly` path = `aegis_attention_prefill_batched`, the kernel under
+    // test. (Auto would pick the Warp kernel for head_dim <= 256.)
+    let mut config = CudaRuntimeConfig::from_env();
+    config.prefill_attention = CudaPrefillAttentionKernel::Reference;
+    let runtime = aegisllm_cuda::cuda::CudaRuntime::new_with_config(0, config)?;
+
+    // Deterministic pseudo-random generator (small magnitudes so f16 rounding
+    // of K/V stays well-conditioned and softmax does not overflow).
+    let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut next = || -> f32 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let bits = (seed >> 33) as u32;
+        (bits as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+
+    // (label, q_heads, kv_heads, head_dim, batch). Covers GQA groups 1/4/8
+    // and head_dim 256 + 512, causal multi-token batches.
+    let cases: &[(&str, usize, usize, usize, usize)] = &[
+        ("hdim256 gqa1", 4, 4, 256, 17),
+        ("hdim256 gqa4", 8, 2, 256, 33),
+        ("hdim512 gqa1", 2, 2, 512, 19),
+        ("hdim512 gqa4", 8, 2, 512, 40),
+        ("hdim512 gqa8", 8, 1, 512, 48),
+    ];
+
+    println!("cuda-attn-ref-check: device={} GPU-f32-ref vs CPU-f32-ref", runtime.device_index());
+    println!(
+        "  {:<16} {:>7} {:>8} {:>9} {:>6}  {:>14} {:>14} {:>12}  verdict",
+        "case", "q_heads", "kv_heads", "head_dim", "batch", "max_abs_diff", "mean_abs_diff",
+        "cosine_sim",
+    );
+
+    const COS_BAR: f32 = 0.9999;
+    let mut all_pass = true;
+
+    for &(label, q_heads, kv_heads, head_dim, batch) in cases {
+        let q_width = q_heads * head_dim;
+        let kv_width = kv_heads * head_dim;
+
+        // Synthetic query (f32) and K/V (rounded to f16, then widened to f32
+        // so both references consume bit-identical numeric values).
+        let query: Vec<f32> = (0..batch * q_width).map(|_| next()).collect();
+        let keys_f16: Vec<u16> = (0..batch * kv_width)
+            .map(|_| f16::from_f32(next()).to_bits())
+            .collect();
+        let values_f16: Vec<u16> = (0..batch * kv_width)
+            .map(|_| f16::from_f32(next()).to_bits())
+            .collect();
+        let keys_f32: Vec<f32> = keys_f16
+            .iter()
+            .map(|&b| f16::from_bits(b).to_f32())
+            .collect();
+        let values_f32: Vec<f32> = values_f16
+            .iter()
+            .map(|&b| f16::from_bits(b).to_f32())
+            .collect();
+
+        // --- CPU reference ---
+        let mut cpu_out = vec![0.0_f32; batch * q_width];
+        reference_attention_prefill_f32_into(
+            ReferenceAttentionPrefillRequest {
+                keys: &keys_f32,
+                values: &values_f32,
+                start_position: 0,
+                batch,
+                query: &query,
+                num_attention_heads: q_heads,
+                num_kv_heads: kv_heads,
+                head_dim,
+            },
+            &mut cpu_out,
+        )?;
+
+        // --- GPU reference ---
+        let d_keys = runtime.upload_u16(&keys_f16)?;
+        let d_values = runtime.upload_u16(&values_f16)?;
+        let d_query = runtime.upload_f32(&query)?;
+        // CacheOnly path ignores key_chunk/value_chunk but the shape check
+        // still requires them to be at least `batch * kv_width` long.
+        let d_key_chunk = runtime.upload_f32(&vec![0.0_f32; batch * kv_width])?;
+        let d_value_chunk = runtime.upload_f32(&vec![0.0_f32; batch * kv_width])?;
+        let mut d_out = runtime.alloc_f32(batch * q_width)?;
+        runtime.attention_prefill_batched_device(
+            &d_keys,
+            &d_values,
+            &d_key_chunk,
+            &d_value_chunk,
+            &d_query,
+            0,
+            batch,
+            q_heads,
+            kv_heads,
+            head_dim,
+            &mut d_out,
+        )?;
+        runtime.synchronize()?;
+        let gpu_out = runtime.download_f32(&d_out)?;
+
+        let (max_abs, mean_abs, cos) = diff_stats(&cpu_out, &gpu_out);
+        let pass = cos >= COS_BAR && max_abs < 1.0e-2;
+        all_pass &= pass;
+        println!(
+            "  {label:<16} {q_heads:>7} {kv_heads:>8} {head_dim:>9} {batch:>6}  \
+             {max_abs:>14.6e} {mean_abs:>14.6e} {cos:>12.8}  {}",
+            if pass { "PASS" } else { "FAIL" },
+        );
+    }
+
+    if all_pass {
+        println!(
+            "cuda-attn-ref-check: PASS — GPU f32 reference is algorithmically correct \
+             (cosine >= {COS_BAR} on every case)"
+        );
+        Ok(())
+    } else {
+        eprintln!("cuda-attn-ref-check: FAIL — GPU f32 reference diverges from CPU f32 reference");
+        Err(AegisError::Unsupported(
+            "cuda-attn-ref-check failed: GPU f32 reference attention disagrees with the CPU \
+             f32 reference on identical inputs".into(),
         ))
     }
 }

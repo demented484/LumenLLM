@@ -141,6 +141,17 @@ impl CudaRuntime {
         })
     }
 
+    /// Upload a u16 slice (used for f16-bits KV caches) to a fresh device
+    /// buffer. Used by the attention-reference correctness smoke.
+    pub fn upload_u16(&self, values: &[u16]) -> Result<DeviceBuffer<u16>> {
+        Ok(DeviceBuffer {
+            slice: self
+                .stream
+                .clone_htod(values)
+                .map_err(map_cuda_err("htod u16 buffer"))?,
+        })
+    }
+
     pub fn copy_u32_to_device(&self, values: &[u32], buffer: &mut DeviceBuffer<u32>) -> Result<()> {
         self.stream
             .memcpy_htod(values, &mut buffer.slice)

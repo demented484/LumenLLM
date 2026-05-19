@@ -12,6 +12,7 @@ dependencies = [
  "aegisllm-wgpu",
  "bytemuck",
  "cudarc",
+ "half",
  "libc",
  "memmap2",
  "pollster",

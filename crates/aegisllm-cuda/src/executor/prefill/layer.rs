@@ -775,6 +775,27 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.input_normed, batch_hidden)?;
     }
 
+    // Per-layer post-attention hidden capture for the `cuda-attn-compare`
+    // correctness gate (Stage A.3). `prefill.hidden` now holds this layer's
+    // post-attention residual, laid out row-major `[batch, hidden_size]`.
+    //
+    // We capture the LAST token of the chunk, not token 0. Token 0 attends
+    // to a single KV element, so its post-attention softmax is bit-identical
+    // across every backend (no accumulation-order or online-softmax drift) —
+    // capturing it would make the diff table uniformly zero and hide a real
+    // FA-2/FP8 divergence. The last token attends to the full context, so it
+    // is where any per-layer accumulation drift actually surfaces.
+    //
+    // The hook is a single relaxed atomic load when capture is disarmed
+    // (every production run), so it is perf-neutral for production paths.
+    if crate::executor::layer_capture::is_armed() {
+        let h = runtime.download_f32(&prefill.hidden)?;
+        let last = params.batch.saturating_sub(1);
+        let start = (last * hidden_size).min(h.len());
+        let end = (start + hidden_size).min(h.len());
+        crate::executor::layer_capture::capture_post_attn(&h[start..end]);
+    }
+
     if let Ok(layer_str) = std::env::var("AEGIS_DUMP_LAYER") {
         if let Ok(target_layer) = layer_str.parse::<usize>() {
             let tag = std::env::var("AEGIS_DUMP_TAG").unwrap_or_else(|_| "?".into());

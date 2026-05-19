@@ -5,7 +5,8 @@ pub mod cpu;
 pub mod materialization;
 
 pub use attention::{
-    ReferenceAttentionDecodeRequest, reference_attention_decode_f32_into,
+    ReferenceAttentionDecodeRequest, ReferenceAttentionPrefillRequest,
+    reference_attention_decode_f32_into, reference_attention_prefill_f32_into,
 };
 pub use cpu::{CpuNvfp4Linear, CpuReferenceExecutor, CpuRuntime};
 pub use materialization::{

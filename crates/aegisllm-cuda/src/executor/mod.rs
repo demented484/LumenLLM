@@ -3,6 +3,7 @@ pub mod block;
 mod cache_cleanup;
 mod forward;
 mod full;
+pub mod layer_capture;
 mod linear_ops;
 mod load_progress;
 mod loader;

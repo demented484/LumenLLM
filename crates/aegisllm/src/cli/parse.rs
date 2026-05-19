@@ -27,11 +27,13 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("cuda-smoke") => parse_cuda_smoke(&args[1..]),
         Some("cuda-cutlass-nvfp4-smoke") => Ok(Command::CudaCutlassNvfp4Smoke),
         Some("cuda-attn-fp8-smoke") => Ok(Command::CudaAttnFp8Smoke),
+        Some("cuda-attn-ref-check") => Ok(Command::CudaAttnRefCheck),
         Some("cuda-dense-smoke") => parse_cuda_dense_smoke(&args[1..]),
         Some("cuda-chain-smoke") => parse_cuda_chain_smoke(&args[1..]),
         Some("cuda-compare") => parse_cuda_compare(&args[1..]),
         Some("cuda-prefill-compare") => parse_cuda_prefill_compare(&args[1..]),
         Some("cuda-prefill-sweep") => parse_cuda_prefill_sweep(&args[1..]),
+        Some("cuda-attn-compare") => parse_cuda_attn_compare(&args[1..]),
         Some("generate") => parse_generate(&args[1..]),
         Some("quality-diff") => parse_quality_diff(&args[1..]),
         Some("bench-generate") => parse_bench_generate(&args[1..]),
@@ -113,6 +115,52 @@ fn parse_cuda_prefill_sweep(args: &[String]) -> Result<Command> {
     Ok(Command::CudaPrefillSweep(
         parse_engine_flags(args)?.engine_config(true),
     ))
+}
+
+fn parse_cuda_attn_compare(args: &[String]) -> Result<Command> {
+    use aegisllm_base::cuda_config::CudaPrefillAttentionKernel;
+
+    // `--prompt <text>` is the optional short prompt; `--reference <backend>`
+    // selects the run-1 reference backend (default `reference`, the f32
+    // oracle); everything else is an engine flag (notably `--config` and
+    // `--cuda-prefill-attention`, which selects the run-2 fast backend that
+    // the reference run is compared against). `--reference` accepts the same
+    // backend values as `--cuda-prefill-attention`.
+    let mut prompt: Option<String> = None;
+    let mut reference = CudaPrefillAttentionKernel::Reference;
+    let mut filtered: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = &args[i];
+        match flag.as_str() {
+            "--prompt" => {
+                prompt = Some(take_value(args, &mut i, flag)?);
+            }
+            "--reference" => {
+                reference = CudaPrefillAttentionKernel::parse(&take_value(args, &mut i, flag)?)?;
+            }
+            other if is_engine_flag(other) => {
+                filtered.push(args[i].clone());
+                if flag_takes_value(other) {
+                    i += 1;
+                    if i >= args.len() {
+                        return Err(AegisError::InvalidConfig(format!(
+                            "cuda-attn-compare flag `{other}` requires a value"
+                        )));
+                    }
+                    filtered.push(args[i].clone());
+                }
+            }
+            other => {
+                return Err(AegisError::InvalidConfig(format!(
+                    "unknown cuda-attn-compare flag `{other}`"
+                )));
+            }
+        }
+        i += 1;
+    }
+    let config = parse_engine_flags(&filtered)?.engine_config(true);
+    Ok(Command::CudaAttnCompare(config, prompt, reference))
 }
 
 fn parse_show_plan(args: &[String]) -> Result<Command> {
@@ -686,5 +734,5 @@ fn parse_gates(args: &[String]) -> Result<Command> {
 }
 
 fn usage() -> String {
-    "usage:\n  aegisllm inspect-hardware\n  aegisllm serve --config <parameters.json>\n  aegisllm show-plan --config <parameters.json>\n  aegisllm mvp-check --config <parameters.json>\n  aegisllm quality-smoke --config <parameters.json>\n  aegisllm storage-smoke --config <parameters.json>\n  aegisllm cpu-smoke --config <parameters.json>\n  aegisllm cpu-materialize-smoke --config <parameters.json>\n  aegisllm cuda-smoke --config <parameters.json>\n  aegisllm cuda-cutlass-nvfp4-smoke\n  aegisllm cuda-attn-fp8-smoke\n  aegisllm cuda-dense-smoke --config <parameters.json>\n  aegisllm cuda-chain-smoke --config <parameters.json>\n  aegisllm cuda-compare --config <parameters.json>\n  aegisllm cuda-prefill-compare --config <parameters.json>\n  aegisllm cuda-prefill-sweep --config <parameters.json>\n  aegisllm show-plan --model <path> [placement flags] [--native-mxfp4-repack] [--native-mxfp4-inference] [--cuda-prefill-attention auto|off|fa2|fa3|fa4|aegis-varlen] [--cuda-prefill-chunk-size N]\n  aegisllm generate --model <path> --prompt <text> [--max-tokens N] [placement flags]\n  aegisllm bench-generate --config <parameters.json> --prompt <text> [--prompt-repeat N] [--max-tokens N] [--temperature T] [--format text|json|csv]\n  aegisllm eval-mmlu-pro --config <parameters.json> [--dataset-path <dir>] [--subset N] [--subjects a,b] [--shots N] [--cot true|false] [--max-tokens N] [--output <path>] [--progress-every N]\n  aegisllm gates --model <path> [--backend cpu|cuda] [--quick|--full]".into()
+    "usage:\n  aegisllm inspect-hardware\n  aegisllm serve --config <parameters.json>\n  aegisllm show-plan --config <parameters.json>\n  aegisllm mvp-check --config <parameters.json>\n  aegisllm quality-smoke --config <parameters.json>\n  aegisllm storage-smoke --config <parameters.json>\n  aegisllm cpu-smoke --config <parameters.json>\n  aegisllm cpu-materialize-smoke --config <parameters.json>\n  aegisllm cuda-smoke --config <parameters.json>\n  aegisllm cuda-cutlass-nvfp4-smoke\n  aegisllm cuda-attn-fp8-smoke\n  aegisllm cuda-attn-ref-check\n  aegisllm cuda-dense-smoke --config <parameters.json>\n  aegisllm cuda-chain-smoke --config <parameters.json>\n  aegisllm cuda-compare --config <parameters.json>\n  aegisllm cuda-prefill-compare --config <parameters.json>\n  aegisllm cuda-prefill-sweep --config <parameters.json>\n  aegisllm cuda-attn-compare --config <parameters.json> [--prompt <text>] [--reference auto|reference|fa2|fp8|...] [--cuda-prefill-attention auto|aegis-varlen|...]\n  aegisllm show-plan --model <path> [placement flags] [--native-mxfp4-repack] [--native-mxfp4-inference] [--cuda-prefill-attention auto|off|fa2|fa3|fa4|aegis-varlen] [--cuda-prefill-chunk-size N]\n  aegisllm generate --model <path> --prompt <text> [--max-tokens N] [placement flags]\n  aegisllm bench-generate --config <parameters.json> --prompt <text> [--prompt-repeat N] [--max-tokens N] [--temperature T] [--format text|json|csv]\n  aegisllm eval-mmlu-pro --config <parameters.json> [--dataset-path <dir>] [--subset N] [--subjects a,b] [--shots N] [--cot true|false] [--max-tokens N] [--output <path>] [--progress-every N]\n  aegisllm gates --model <path> [--backend cpu|cuda] [--quick|--full]".into()
 }

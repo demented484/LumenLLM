@@ -4,9 +4,10 @@ use std::path::Path;
 use super::gates::run_gates;
 use super::generate::{print_generate_bench, print_generate_bench_sweep};
 use super::smoke::{
-    cpu_materialize_smoke, cpu_smoke, cuda_attn_fp8_smoke, cuda_chain_smoke, cuda_compare,
-    cuda_cutlass_nvfp4_smoke, cuda_dense_smoke, cuda_prefill_compare, cuda_prefill_sweep,
-    cuda_smoke, inspect_hardware, mvp_check, quality_smoke, storage_smoke,
+    cpu_materialize_smoke, cpu_smoke, cuda_attn_compare, cuda_attn_fp8_smoke, cuda_attn_ref_check,
+    cuda_chain_smoke, cuda_compare, cuda_cutlass_nvfp4_smoke, cuda_dense_smoke,
+    cuda_prefill_compare, cuda_prefill_sweep, cuda_smoke, inspect_hardware, mvp_check,
+    quality_smoke, storage_smoke,
 };
 use super::{Command, parse_args};
 use crate::engine::bench::run_generation_bench;
@@ -104,11 +105,15 @@ pub fn run_env() -> Result<()> {
         Command::CudaSmoke(config) => cuda_smoke(config)?,
         Command::CudaCutlassNvfp4Smoke => cuda_cutlass_nvfp4_smoke()?,
         Command::CudaAttnFp8Smoke => cuda_attn_fp8_smoke()?,
+        Command::CudaAttnRefCheck => cuda_attn_ref_check()?,
         Command::CudaDenseSmoke(config) => cuda_dense_smoke(config)?,
         Command::CudaChainSmoke(config) => cuda_chain_smoke(config)?,
         Command::CudaCompare(config) => cuda_compare(config)?,
         Command::CudaPrefillCompare(config) => cuda_prefill_compare(config)?,
         Command::CudaPrefillSweep(config) => cuda_prefill_sweep(config)?,
+        Command::CudaAttnCompare(config, prompt, reference) => {
+            cuda_attn_compare(config, prompt, reference)?
+        }
         Command::Gates(config, gates) => run_gates(config, gates)?,
         Command::Generate(config, request) => {
             let engine = AegisEngine::build(config)?;

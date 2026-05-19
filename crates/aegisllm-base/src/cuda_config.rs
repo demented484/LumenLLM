@@ -91,10 +91,45 @@ pub enum CudaPrefillAttentionKernel {
     FlashAttention2,
     FlashAttention3,
     FlashAttention4,
+    /// FP8 (E4M3) native-MMA prefill attention. Routes the head_dim=512 path
+    /// through the `attention_prefill_fa2_fp8_mma` kernels. Requires an FP8 KV
+    /// cache — selecting this without an FP8 config is rejected at engine build.
+    Fp8,
     AegisVarlen,
     Reference,
     WarpFlash,
     Continuation,
+}
+
+/// The single, resolved top-level attention compute backend for a whole
+/// prefill. This is the output of [`CudaRuntimeConfig::resolve_attention_backend`]
+/// — the ONE decision point that unifies the `CudaPrefillAttentionKernel` enum
+/// (`--cuda-prefill-attention`) with the `AEGIS_ATTN_FA2` / `AEGIS_ATTN_FP8`
+/// env shortcuts. Every site that used to consult `attention_fa2_enabled()` /
+/// `attention_fp8_enabled()` independently now funnels through this so an
+/// explicit enum value (especially `Reference`) always wins over the env vars.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionComputeBackend {
+    /// f32 scalar reference oracle — forced for ALL layers, env overrides
+    /// suppressed. A `reference` run is a true oracle.
+    Reference,
+    /// The historical default WMMA half-precision dispatch (env-neutral).
+    Bf16,
+    /// BF16 FlashAttention-2 rewrite (head_dim=512 `attention_prefill_dense_fa2_*`).
+    Fa2,
+    /// FP8 (E4M3) native-MMA prefill attention (`attention_prefill_fa2_fp8_mma`).
+    Fp8,
+}
+
+impl AttentionComputeBackend {
+    pub fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Reference => "reference",
+            Self::Bf16 => "bf16",
+            Self::Fa2 => "fa2",
+            Self::Fp8 => "fp8",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,19 +191,82 @@ impl CudaRuntimeConfig {
         }
     }
 
-    /// Effective FP8-attention decision: config requests FP8 OR the
-    /// `AEGIS_ATTN_FP8=1` env override is set. This is the single
-    /// convergence point for the config path and the env gate.
-    pub fn attention_fp8_enabled(self) -> bool {
-        self.attention_compute_quant.wants_fp8()
-            || std::env::var("AEGIS_ATTN_FP8").as_deref() == Ok("1")
+    /// THE single top-level attention-backend decision point.
+    ///
+    /// Unifies the two historically independent mechanisms:
+    ///   * the `CudaPrefillAttentionKernel` enum (`--cuda-prefill-attention`),
+    ///   * the `AEGIS_ATTN_FA2` / `AEGIS_ATTN_FP8` env shortcuts (and the
+    ///     equivalent `attention.compute-quantization` config field).
+    ///
+    /// Resolution order — an explicit enum value ALWAYS wins over the env
+    /// shortcuts, so `reference` is a true oracle even with `AEGIS_ATTN_FA2=1`
+    /// exported:
+    ///   * `Reference` / `Off`  → [`AttentionComputeBackend::Reference`]
+    ///     (env FA-2/FP8 overrides SUPPRESSED).
+    ///   * `FlashAttention2`    → [`AttentionComputeBackend::Fa2`].
+    ///   * `Fp8`                → [`AttentionComputeBackend::Fp8`].
+    ///   * `Auto` (and the other enum values that don't pin a compute
+    ///     precision) → FP8 if requested (`compute-quantization: fp8` /
+    ///     `AEGIS_ATTN_FP8`); else legacy [`AttentionComputeBackend::Bf16`] if
+    ///     explicitly opted in (`compute-quantization: bf16`); else the
+    ///     DEFAULT [`AttentionComputeBackend::Fa2`] (FA-2 for hdim=512).
+    ///
+    /// `prefill_dense.rs` and `layer.rs` both consult this; nothing reads the
+    /// `AEGIS_ATTN_*` env vars or `compute_quant` directly any more.
+    pub fn resolve_attention_backend(self) -> AttentionComputeBackend {
+        match self.prefill_attention {
+            // Explicit enum values pin the backend and suppress the env vars.
+            CudaPrefillAttentionKernel::Reference | CudaPrefillAttentionKernel::Off => {
+                AttentionComputeBackend::Reference
+            }
+            CudaPrefillAttentionKernel::FlashAttention2 => AttentionComputeBackend::Fa2,
+            CudaPrefillAttentionKernel::Fp8 => AttentionComputeBackend::Fp8,
+            // Auto / AegisVarlen / WarpFlash / Continuation / FA3 / FA4 do not
+            // pin a compute precision: the env shortcuts (and the equivalent
+            // config field) are honored here, funnelled through this one site.
+            _ => {
+                let env_fp8 = std::env::var("AEGIS_ATTN_FP8").as_deref() == Ok("1");
+                if self.attention_compute_quant.wants_fp8() || env_fp8 {
+                    AttentionComputeBackend::Fp8
+                } else if matches!(self.attention_compute_quant, AttentionComputeQuant::Bf16) {
+                    // Explicit opt-out (`compute-quantization: bf16`) → the
+                    // legacy WMMA hdim-512 kernel.
+                    AttentionComputeBackend::Bf16
+                } else {
+                    // DEFAULT: FA-2 for hdim=512 — validated equal-accuracy to
+                    // the legacy WMMA kernel (per-layer cosine in-band, greedy
+                    // output character-identical via quality-smoke, GPU f32
+                    // reference oracle confirmed correct) and +32% prefill
+                    // @256k. hdim 256/128 are unaffected: the downstream
+                    // `use_fa2` gate is `head_dim == 512`. `AEGIS_ATTN_FA2` and
+                    // the `bf16-fa2` config value are now redundant (still
+                    // accepted — they resolve here too).
+                    AttentionComputeBackend::Fa2
+                }
+            }
+        }
     }
 
-    /// Effective BF16 FlashAttention-2 decision: config requests it OR the
-    /// `AEGIS_ATTN_FA2=1` env override is set.
+    /// Effective FP8-attention decision. Delegates to the single
+    /// [`resolve_attention_backend`](Self::resolve_attention_backend) gate so
+    /// `reference`/`fa2`/explicit-enum selections override the env shortcut.
+    pub fn attention_fp8_enabled(self) -> bool {
+        matches!(self.resolve_attention_backend(), AttentionComputeBackend::Fp8)
+    }
+
+    /// Effective BF16 FlashAttention-2 decision. Delegates to the single
+    /// [`resolve_attention_backend`](Self::resolve_attention_backend) gate.
     pub fn attention_fa2_enabled(self) -> bool {
-        self.attention_compute_quant.wants_fa2()
-            || std::env::var("AEGIS_ATTN_FA2").as_deref() == Ok("1")
+        matches!(self.resolve_attention_backend(), AttentionComputeBackend::Fa2)
+    }
+
+    /// Whether the resolved backend forces the f32 reference oracle for all
+    /// layers. When true, the FA-2/FP8 env shortcuts are SUPPRESSED.
+    pub fn attention_reference_forced(self) -> bool {
+        matches!(
+            self.resolve_attention_backend(),
+            AttentionComputeBackend::Reference
+        )
     }
 
     pub fn prefill_attention_selection(
@@ -199,6 +297,7 @@ impl CudaPrefillAttentionKernel {
             "fa2" | "flash2" | "flash-attention-2" | "flashattention2" => Ok(Self::FlashAttention2),
             "fa3" | "flash3" | "flash-attention-3" | "flashattention3" => Ok(Self::FlashAttention3),
             "fa4" | "flash4" | "flash-attention-4" | "flashattention4" => Ok(Self::FlashAttention4),
+            "fp8" | "f8" | "fp8-e4m3" | "fp8_e4m3" | "fp8-mma" => Ok(Self::Fp8),
             "aegis-varlen" | "aegis-paged" | "paged-online" | "paged-varlen" | "flash-varlen"
             | "fa-varlen" | "flash-varlen-paged" | "varlen" => Ok(Self::AegisVarlen),
             "warp" | "warp-flash" | "flash" | "flash-attention" | "on" | "true" => {
@@ -218,6 +317,7 @@ impl CudaPrefillAttentionKernel {
             Self::FlashAttention2 => "fa2",
             Self::FlashAttention3 => "fa3",
             Self::FlashAttention4 => "fa4",
+            Self::Fp8 => "fp8",
             Self::AegisVarlen => "aegis-varlen",
             Self::Reference => "reference",
             Self::WarpFlash => "warp-flash",
@@ -467,8 +567,15 @@ impl CudaPrefillAttentionSelection {
                 requested,
                 auto_target: None,
                 logical_backend: CudaAttentionBackend::FlashAttention2,
-                effective_path: CudaAttentionEffectivePath::AegisPagedVarlen,
-                reason: "fa2 frontend is reserved; runtime reports unsupported before launch",
+                effective_path: CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline,
+                reason: "fa2 requested explicitly; head_dim=512 routes through the FA-2 dense rewrite",
+            },
+            CudaPrefillAttentionKernel::Fp8 => Self {
+                requested,
+                auto_target: None,
+                logical_backend: CudaAttentionBackend::AegisVarlen,
+                effective_path: CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline,
+                reason: "fp8 requested explicitly; head_dim=512 routes through the FP8 native-MMA dense path",
             },
             CudaPrefillAttentionKernel::FlashAttention3 => Self {
                 requested,
@@ -558,7 +665,14 @@ mod tests {
             ..CudaRuntimeConfig::default()
         };
         assert!(cfg.attention_fa2_enabled());
-        assert!(!CudaRuntimeConfig::default().attention_fa2_enabled());
+        // Since Stage B, FA-2 is the resolved default (hdim=512 prefill is
+        // context-gated downstream). The explicit `bf16` opt-out disables it.
+        assert!(CudaRuntimeConfig::default().attention_fa2_enabled());
+        let cfg_bf16 = CudaRuntimeConfig {
+            attention_compute_quant: AttentionComputeQuant::Bf16,
+            ..CudaRuntimeConfig::default()
+        };
+        assert!(!cfg_bf16.attention_fa2_enabled());
     }
 
     #[test]
@@ -651,6 +765,76 @@ mod tests {
             selection.effective_path,
             CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline
         );
+    }
+
+    #[test]
+    fn resolve_backend_explicit_enum_overrides_env() {
+        use super::AttentionComputeBackend;
+        // `Reference` resolves to Reference regardless of the compute-quant
+        // field — the unified gate makes an explicit enum win. (Env vars are
+        // not exercised here to keep the test parallel-safe; the runtime
+        // gates #4/#5 verify the env-suppression end to end.)
+        let cfg_ref = CudaRuntimeConfig {
+            prefill_attention: CudaPrefillAttentionKernel::Reference,
+            attention_compute_quant: AttentionComputeQuant::Bf16Fa2,
+            ..CudaRuntimeConfig::default()
+        };
+        assert_eq!(
+            cfg_ref.resolve_attention_backend(),
+            AttentionComputeBackend::Reference
+        );
+        assert!(!cfg_ref.attention_fa2_enabled());
+        assert!(cfg_ref.attention_reference_forced());
+
+        // `FlashAttention2` enum pins Fa2 even when the compute-quant field
+        // asks for FP8 — the enum is the top-level override.
+        let cfg_fa2 = CudaRuntimeConfig {
+            prefill_attention: CudaPrefillAttentionKernel::FlashAttention2,
+            attention_compute_quant: AttentionComputeQuant::Fp8,
+            ..CudaRuntimeConfig::default()
+        };
+        assert_eq!(
+            cfg_fa2.resolve_attention_backend(),
+            AttentionComputeBackend::Fa2
+        );
+
+        // `Fp8` enum pins Fp8.
+        let cfg_fp8 = CudaRuntimeConfig {
+            prefill_attention: CudaPrefillAttentionKernel::Fp8,
+            ..CudaRuntimeConfig::default()
+        };
+        assert_eq!(
+            cfg_fp8.resolve_attention_backend(),
+            AttentionComputeBackend::Fp8
+        );
+
+        // Auto + default compute-quant + no env → Fa2 (FA-2 is the default
+        // prefill attention for hdim=512 since Stage B).
+        let cfg_auto = CudaRuntimeConfig::default();
+        assert_eq!(
+            cfg_auto.resolve_attention_backend(),
+            AttentionComputeBackend::Fa2
+        );
+        // `compute-quantization: bf16` is the explicit opt-out to the legacy
+        // WMMA hdim-512 kernel.
+        let cfg_bf16 = CudaRuntimeConfig {
+            attention_compute_quant: AttentionComputeQuant::Bf16,
+            ..CudaRuntimeConfig::default()
+        };
+        assert_eq!(
+            cfg_bf16.resolve_attention_backend(),
+            AttentionComputeBackend::Bf16
+        );
+    }
+
+    #[test]
+    fn fp8_kernel_alias_parses() {
+        for alias in ["fp8", "f8", "fp8-e4m3", "fp8-mma"] {
+            assert_eq!(
+                CudaPrefillAttentionKernel::parse(alias).unwrap(),
+                CudaPrefillAttentionKernel::Fp8
+            );
+        }
     }
 
     #[test]

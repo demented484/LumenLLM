@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use aegisllm_base::cuda_config::CudaPrefillAttentionKernel;
+
 use crate::cli::gates::GatesConfig;
 use crate::engine::EngineConfig;
 use crate::engine::bench::BenchGenerateRequest;
@@ -28,11 +30,26 @@ pub enum Command {
     CudaSmoke(EngineConfig),
     CudaCutlassNvfp4Smoke,
     CudaAttnFp8Smoke,
+    /// Standalone correctness check (Stage A.3 / B.1): validates the GPU f32
+    /// reference attention kernel (`aegis_attention_prefill_batched`) against
+    /// the independent CPU f32 reference on identical synthetic Q/K/V inputs,
+    /// across GQA groups and head_dim 256 + 512. No model load. Same inputs,
+    /// so any divergence is an algorithm bug, not precision noise.
+    CudaAttnRefCheck,
     CudaDenseSmoke(EngineConfig),
     CudaChainSmoke(EngineConfig),
     CudaCompare(EngineConfig),
     CudaPrefillCompare(EngineConfig),
     CudaPrefillSweep(EngineConfig),
+    /// Correctness oracle for the attention-backend rewrite (Stage A.3).
+    /// Prefills a fixed short prompt twice on the real model — run 1 with the
+    /// `--reference <backend>` backend (default `reference`, the f32 oracle),
+    /// run 2 with the `--cuda-prefill-attention <backend>` fast backend
+    /// (default = engine default) — and reports per-layer post-attention
+    /// hidden-state diffs (max-abs / mean-abs / cosine) plus a final-logits
+    /// diff summary. `String` is the optional prompt override; the kernel is
+    /// the run-1 reference backend.
+    CudaAttnCompare(EngineConfig, Option<String>, CudaPrefillAttentionKernel),
     Generate(EngineConfig, GenerateRequest),
     /// Greedy generation + character-level diff against a reference text.
     /// If the reference file doesn't exist yet, the current generation is saved
