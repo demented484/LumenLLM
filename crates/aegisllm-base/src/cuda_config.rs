@@ -95,6 +95,12 @@ pub enum CudaPrefillAttentionKernel {
     /// through the `attention_prefill_fa2_fp8_mma` kernels. Requires an FP8 KV
     /// cache — selecting this without an FP8 config is rejected at engine build.
     Fp8,
+    /// Stage D.1 hand-tuned `mma.sync` BF16 prefill attention kernel for
+    /// head_dim=512 (Gemma-4 global layers). Selected via
+    /// `--cuda-prefill-attention mma` (or the `mma-sync` /
+    /// `flash-attention-mma` aliases); resolves to
+    /// [`AttentionComputeBackend::Mma`].
+    Mma,
     AegisVarlen,
     Reference,
     WarpFlash,
@@ -119,6 +125,11 @@ pub enum AttentionComputeBackend {
     Fa2,
     /// FP8 (E4M3) native-MMA prefill attention (`attention_prefill_fa2_fp8_mma`).
     Fp8,
+    /// Stage D.1 hand-tuned `mma.sync` BF16 prefill attention kernel
+    /// (head_dim=512). Always opt-in via the
+    /// [`CudaPrefillAttentionKernel::Mma`] enum value — never resolved from
+    /// `Auto` so the default path is untouched.
+    Mma,
 }
 
 impl AttentionComputeBackend {
@@ -128,6 +139,7 @@ impl AttentionComputeBackend {
             Self::Bf16 => "bf16",
             Self::Fa2 => "fa2",
             Self::Fp8 => "fp8",
+            Self::Mma => "mma",
         }
     }
 }
@@ -221,6 +233,7 @@ impl CudaRuntimeConfig {
             }
             CudaPrefillAttentionKernel::FlashAttention2 => AttentionComputeBackend::Fa2,
             CudaPrefillAttentionKernel::Fp8 => AttentionComputeBackend::Fp8,
+            CudaPrefillAttentionKernel::Mma => AttentionComputeBackend::Mma,
             // Auto / AegisVarlen / WarpFlash / Continuation / FA3 / FA4 do not
             // pin a compute precision: the env shortcuts (and the equivalent
             // config field) are honored here, funnelled through this one site.
@@ -258,6 +271,15 @@ impl CudaRuntimeConfig {
     /// [`resolve_attention_backend`](Self::resolve_attention_backend) gate.
     pub fn attention_fa2_enabled(self) -> bool {
         matches!(self.resolve_attention_backend(), AttentionComputeBackend::Fa2)
+    }
+
+    /// Effective Stage D.1 `mma.sync` decision. True iff the resolved backend
+    /// is [`AttentionComputeBackend::Mma`] — i.e. the user passed
+    /// `--cuda-prefill-attention mma` (or an alias). Never enabled by
+    /// default; the new hand-tuned hdim=512 kernel is strictly opt-in until
+    /// it ships with measured wins vs FA-2.
+    pub fn attention_mma_enabled(self) -> bool {
+        matches!(self.resolve_attention_backend(), AttentionComputeBackend::Mma)
     }
 
     /// Whether the resolved backend forces the f32 reference oracle for all
@@ -298,6 +320,7 @@ impl CudaPrefillAttentionKernel {
             "fa3" | "flash3" | "flash-attention-3" | "flashattention3" => Ok(Self::FlashAttention3),
             "fa4" | "flash4" | "flash-attention-4" | "flashattention4" => Ok(Self::FlashAttention4),
             "fp8" | "f8" | "fp8-e4m3" | "fp8_e4m3" | "fp8-mma" => Ok(Self::Fp8),
+            "mma" | "mma-sync" | "mma_sync" | "flash-attention-mma" => Ok(Self::Mma),
             "aegis-varlen" | "aegis-paged" | "paged-online" | "paged-varlen" | "flash-varlen"
             | "fa-varlen" | "flash-varlen-paged" | "varlen" => Ok(Self::AegisVarlen),
             "warp" | "warp-flash" | "flash" | "flash-attention" | "on" | "true" => {
@@ -318,6 +341,7 @@ impl CudaPrefillAttentionKernel {
             Self::FlashAttention3 => "fa3",
             Self::FlashAttention4 => "fa4",
             Self::Fp8 => "fp8",
+            Self::Mma => "mma",
             Self::AegisVarlen => "aegis-varlen",
             Self::Reference => "reference",
             Self::WarpFlash => "warp-flash",
@@ -577,6 +601,19 @@ impl CudaPrefillAttentionSelection {
                 effective_path: CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline,
                 reason: "fp8 requested explicitly; head_dim=512 routes through the FP8 native-MMA dense path",
             },
+            CudaPrefillAttentionKernel::Mma => Self {
+                requested,
+                auto_target: None,
+                // Stage D.1 lives under the FA-2 logical-backend bucket — it is
+                // a sibling BF16 prefill kernel that supersedes the wmma path
+                // when the `Mma` enum value is requested. The effective path
+                // stays the dense WMMA-FA pipeline label (no new variant
+                // needed yet — D.2 may split it out once the kernel beats
+                // FA-2).
+                logical_backend: CudaAttentionBackend::FlashAttention2,
+                effective_path: CudaAttentionEffectivePath::AegisDenseWmmaFaPipeline,
+                reason: "mma requested explicitly; head_dim=512 routes through the Stage D.1 hand-tuned mma.sync BF16 kernel",
+            },
             CudaPrefillAttentionKernel::FlashAttention3 => Self {
                 requested,
                 auto_target: None,
@@ -824,6 +861,43 @@ mod tests {
         assert_eq!(
             cfg_bf16.resolve_attention_backend(),
             AttentionComputeBackend::Bf16
+        );
+    }
+
+    #[test]
+    fn mma_kernel_alias_parses_and_resolves() {
+        for alias in ["mma", "mma-sync", "mma_sync", "flash-attention-mma"] {
+            assert_eq!(
+                CudaPrefillAttentionKernel::parse(alias).unwrap(),
+                CudaPrefillAttentionKernel::Mma,
+                "alias `{alias}` should parse to Mma"
+            );
+        }
+        use super::AttentionComputeBackend;
+        let cfg_mma = CudaRuntimeConfig {
+            prefill_attention: CudaPrefillAttentionKernel::Mma,
+            ..CudaRuntimeConfig::default()
+        };
+        assert_eq!(
+            cfg_mma.resolve_attention_backend(),
+            AttentionComputeBackend::Mma
+        );
+        assert!(cfg_mma.attention_mma_enabled());
+        // Default config does NOT enable mma — the new kernel is strictly
+        // opt-in.
+        assert!(!CudaRuntimeConfig::default().attention_mma_enabled());
+        // Selector reports the explicit-mma reason.
+        let selection = CudaPrefillAttentionSelection::select(
+            CudaPrefillAttentionKernel::Mma,
+            Some("12.0"),
+            65536,
+            512,
+            32,
+            8,
+        );
+        assert_eq!(
+            selection.logical_backend,
+            CudaAttentionBackend::FlashAttention2
         );
     }
 

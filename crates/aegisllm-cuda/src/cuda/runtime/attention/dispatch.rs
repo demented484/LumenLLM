@@ -38,7 +38,14 @@ impl CudaRuntime {
             // they fall back to the same selection `Auto` would make so the
             // whole prefill stays coherent. The 512 layers never reach this
             // dispatch — they return early from the dense path.
-            CudaPrefillAttentionKernel::FlashAttention2 | CudaPrefillAttentionKernel::Fp8 => {
+            CudaPrefillAttentionKernel::FlashAttention2
+            | CudaPrefillAttentionKernel::Fp8
+            | CudaPrefillAttentionKernel::Mma => {
+                // FA-2 / FP8 / Mma pin the head_dim=512 compute precision but
+                // for non-512 layers and the paged-varlen ABI they fall back
+                // to the same selection `Auto` would make. The head_dim=512
+                // layers never reach this dispatch — they return early from
+                // the dense path.
                 let target = CudaAttentionBackend::auto_target_for_compute_capability(
                     self.compute_capability(),
                 );

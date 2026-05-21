@@ -132,6 +132,14 @@ pub(crate) struct CudaKernelFunctions {
     // cp.async double-buffering. Opt-in via `AEGIS_ATTN_FA2=1`.
     pub(crate) attention_prefill_dense_fa2_hdim512: CudaFunction,
     pub(crate) attention_prefill_dense_fa2_hdim512_q64: CudaFunction,
+    // ===================================================================
+    // Stage D.1: hand-tuned mma.sync BF16 prefill kernel for head_dim=512.
+    // Same tile / shared-memory shape as the FA-2 q32 kernel above, but the
+    // mainloop is hand-issued m16n8k16.row.col.f32.bf16.bf16.f32 PTX (no
+    // nvcuda::wmma). Selected via `--cuda-prefill-attention mma` (or any of
+    // the `mma-sync` / `flash-attention-mma` aliases) which resolves through
+    // the unified backend selector to `AttentionComputeBackend::Mma`.
+    pub(crate) attention_prefill_dense_mma_hdim512: CudaFunction,
     // FP8-E4M3 KV-cache variant of the FA-2 hdim=512 q32 kernel. Reads the
     // persistent e4m3 cache directly (half the KV HBM traffic), dequants
     // e4m3->half in shared, runs the identical BF16 WMMA math. Opt-in via
@@ -522,6 +530,30 @@ impl CudaKernelFunctions {
                 )
                 .map_err(|e| AegisError::Unsupported(format!(
                     "set max dynamic shared mem on fa2_hdim512_q64 kernel: {e:?}"
+                )))?;
+                f
+            },
+            // ===================================================================
+            attention_prefill_dense_mma_hdim512: {
+                let f = load(
+                    &module,
+                    "aegis_attention_prefill_dense_mma_hdim512",
+                )?;
+                // Stage D.1 hand-tuned mma.sync BF16 hdim=512 prefill kernel.
+                // Shared mem layout matches the FA-2 q32 kernel exactly
+                // (q_shared 32 KiB + kv_slab[2] 32 KiB + s_shared 8 KiB +
+                // weights_bf16 4 KiB + scalars 0.4 KiB = ~76.4 KiB). Use
+                // sm_120's 96 KiB opt-in dynamic-shared cap. 1 block/SM
+                // expected (the per-lane f32 O accumulator is 32 regs/lane —
+                // 8 frags x 4 elements — plus a 4-reg s_acc, fits the
+                // 255-reg per-thread budget with headroom).
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on mma_hdim512 kernel: {e:?}"
                 )))?;
                 f
             },

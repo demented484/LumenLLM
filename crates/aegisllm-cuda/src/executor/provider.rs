@@ -94,6 +94,9 @@ impl CudaExecutorProvider {
             CudaPrefillAttentionKernel::Fp8 => {
                 "CUDA prefill attention requests the FP8 native-MMA backend (requires an FP8 KV cache)".into()
             }
+            CudaPrefillAttentionKernel::Mma => {
+                "CUDA prefill attention requests the Stage D.1 hand-tuned mma.sync BF16 backend (head_dim=512)".into()
+            }
             CudaPrefillAttentionKernel::Continuation => {
                 "CUDA prefill attention uses the varlen continuation kernel with bounded shared memory".into()
             }
