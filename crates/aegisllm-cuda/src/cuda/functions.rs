@@ -101,6 +101,8 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) attention: CudaFunction,
     pub(crate) attention_ptr: CudaFunction,
     pub(crate) attention_decode_ptr_split: CudaFunction,
+    pub(crate) attention_decode_ptr_split_hdpart: CudaFunction,
+    pub(crate) attention_decode_ptr_split_hdpart_fp8: CudaFunction,
     pub(crate) attention_decode_ptr_combine: CudaFunction,
     pub(crate) attention_decode_streaming: CudaFunction,
     pub(crate) attention_prefill_batched: CudaFunction,
@@ -351,6 +353,12 @@ impl CudaKernelFunctions {
                 )))?;
                 f
             },
+            // Stage G head-dim-partitioned single-pass decode kernels. Tiny
+            // shared (KQ[128]+scratch, <1 KiB) so no opt-in cap needed.
+            attention_decode_ptr_split_hdpart:
+                load(&module, "aegis_attention_decode_ptr_split_hdpart")?,
+            attention_decode_ptr_split_hdpart_fp8:
+                load(&module, "aegis_attention_decode_ptr_split_hdpart_fp8")?,
             attention_decode_ptr_combine: load(&module, "aegis_attention_decode_ptr_combine")?,
             attention_decode_streaming: load(&module, "aegis_attention_decode_streaming")?,
             attention_prefill_batched: load(&module, "aegis_attention_prefill_batched")?,

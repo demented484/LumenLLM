@@ -26,6 +26,31 @@ extern "C" __global__ void aegis_attention_decode_ptr_split(
         partial_acc, partial_m, partial_l);
 }
 
+// Stage G head-dim-partitioned single-pass variant (f16 KV). Opt-in via
+// AEGIS_DECODE_HDPART=1; tiny shared (KQ[128]+scratch) for high occupancy.
+extern "C" __global__ void aegis_attention_decode_ptr_split_hdpart(
+    const unsigned short* __restrict__ key_cache,
+    const unsigned short* __restrict__ value_cache,
+    const float*          __restrict__ query,
+    const unsigned int*   __restrict__ p_seq_len,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int split_k,
+    const unsigned int max_chunk_len,
+    const unsigned int window_size,
+    const unsigned int cache_capacity,
+    float* __restrict__ partial_acc,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l
+) {
+    decode_split_attn_hdpart_impl<unsigned short>(
+        key_cache, value_cache, query, p_seq_len,
+        num_attention_heads, num_kv_heads, head_dim, split_k,
+        max_chunk_len, window_size, cache_capacity,
+        partial_acc, partial_m, partial_l);
+}
+
 
 // Combine DECODE_SPLIT_K partial flash-decode results into a single output head vector.
 // Grid: (num_attention_heads, 1).  Block: (128, 1).  No shared memory.

@@ -352,3 +352,200 @@ __device__ void decode_split_attn_impl(
                                   + vsum[3u * head_dim + d];
     }
 }
+
+// ----------------------------------------------------------------------------
+// Stage G: head-dim-partitioned single-pass decode attention (high occupancy).
+//
+// Replaces the 2-pass `decode_split_attn_impl` for the same (head, chunk) split-K
+// work, but restructured to slash shared memory so many blocks co-reside per SM:
+//
+//   * NO `scores[chunk_len]` array — scores for a 128-position TILE live in a
+//     tiny `KQ[TILE]` shared buffer (512 B), reused per tile. Online softmax
+//     across tiles keeps running (m, l) and rescales the accumulator.
+//   * NO `vsum[4*head_dim]` cross-warp combine — each THREAD owns a disjoint
+//     slice of the output head_dim (d = tid + blockDim*i), so the per-thread
+//     register accumulator `acc[]` needs no cross-warp reduction.
+//   * NO cp.async kv_pipe — K/V are read straight from global and dequantized
+//     inline. The 256k global decode kernel is COMPUTE-bound (ncu: 56% SM,
+//     13.5% DRAM) at 33% occupancy capped by shared, so trading the pipe for
+//     occupancy is the win; load latency is hidden by the extra resident warps.
+//
+// Shared total ≈ KQ[TILE] (512 B) + tiny block-reduce scratch ≈ <1 KiB, so
+// occupancy is no longer shared-limited (was Block Limit Shared = 4 → 33%).
+//
+// Output contract is identical to `decode_split_attn_impl`: writes the
+// UN-normalized numerator sum_p exp(s_p - m)·V_p to partial_acc, the running
+// max to partial_m, and the running denom sum to partial_l; the existing
+// `aegis_attention_decode_ptr_combine` merges across split-K chunks.
+// ----------------------------------------------------------------------------
+
+template<typename CacheElem>
+__device__ void decode_split_attn_hdpart_impl(
+    const CacheElem* __restrict__ key_cache,
+    const CacheElem* __restrict__ value_cache,
+    const float*     __restrict__ query,
+    const unsigned int* __restrict__ p_seq_len,
+    const unsigned int num_attention_heads,
+    const unsigned int num_kv_heads,
+    const unsigned int head_dim,
+    const unsigned int split_k,
+    const unsigned int max_chunk_len,   /* unused here; kept for ABI symmetry */
+    const unsigned int window_size,
+    const unsigned int cache_capacity,
+    float* __restrict__ partial_acc,
+    float* __restrict__ partial_m,
+    float* __restrict__ partial_l
+) {
+    (void)max_chunk_len;
+    constexpr unsigned int TILE = 128u;          // KV positions per tile
+    constexpr unsigned int MAX_D_PER_THREAD = 4u; // head_dim<=512, blockDim>=128
+
+    const unsigned int seq_len   = *p_seq_len;
+    const unsigned int head      = blockIdx.x;
+    const unsigned int chunk_idx = blockIdx.y;
+    const unsigned int tid       = threadIdx.x;
+    const unsigned int warp_id   = tid >> 5u;
+    const unsigned int lane      = tid & 31u;
+    const unsigned int bd        = blockDim.x;   // 128
+    if (head >= num_attention_heads) return;
+
+    const unsigned int window_start = (window_size > 0u && seq_len > window_size)
+                                      ? seq_len - window_size : 0u;
+    const unsigned int chunk_size  = (seq_len + split_k - 1u) / split_k;
+    const unsigned int chunk_start = chunk_idx * chunk_size;
+    const unsigned int out_idx     = head * split_k + chunk_idx;
+    const unsigned int out_base    = out_idx * head_dim;
+
+    const unsigned int d_per_thread = head_dim / bd;  // 512/128=4, 256/128=2, 128/128=1
+
+    if (chunk_start >= seq_len ||
+        (window_size > 0u && chunk_start + chunk_size <= window_start)) {
+        if (tid == 0u) {
+            partial_m[out_idx] = -3.402823466e38f;
+            partial_l[out_idx] = 0.0f;
+        }
+        for (unsigned int d = tid; d < head_dim; d += bd)
+            partial_acc[out_base + d] = 0.0f;
+        return;
+    }
+    const unsigned int chunk_end = (chunk_start + chunk_size < seq_len)
+                                   ? chunk_start + chunk_size : seq_len;
+    const unsigned int chunk_len = chunk_end - chunk_start;
+
+    extern __shared__ __align__(16) unsigned char smem_bytes[];
+    float* KQ    = reinterpret_cast<float*>(smem_bytes);     // [TILE]
+    float* redux = KQ + TILE;                                // [bd/32] warp scratch
+
+    const unsigned int group   = num_attention_heads / num_kv_heads;
+    const unsigned int kv_head = head / group;
+    const float* q             = query + (size_t)head * head_dim;
+    const float  scale         = rsqrtf((float)head_dim);
+
+    // Per-thread running state.
+    float m = -3.402823466e38f;
+    float l = 0.0f;
+    float acc[MAX_D_PER_THREAD];
+#pragma unroll
+    for (unsigned int i = 0u; i < MAX_D_PER_THREAD; ++i) acc[i] = 0.0f;
+
+    for (unsigned int t0 = 0u; t0 < chunk_len; t0 += TILE) {
+        const unsigned int tile_n = (chunk_len - t0 < TILE) ? (chunk_len - t0) : TILE;
+
+        // ---- score phase: 4 warps split the tile's positions ----
+        for (unsigned int pp = warp_id; pp < tile_n; pp += (bd >> 5u)) {
+            const unsigned int abs_pos = chunk_start + t0 + pp;
+            float score;
+            if (abs_pos >= window_start) {
+                const unsigned int slot = (cache_capacity > 0u) ? (abs_pos % cache_capacity) : abs_pos;
+                const CacheElem* k = key_cache +
+                    ((size_t)slot * num_kv_heads + kv_head) * head_dim;
+                float partial = 0.0f;
+                for (unsigned int d = lane; d < head_dim; d += 32u)
+                    partial += q[d] * dequant_cache<CacheElem>(k[d]);
+                partial += __shfl_xor_sync(0xFFFFFFFFu, partial, 16u);
+                partial += __shfl_xor_sync(0xFFFFFFFFu, partial, 8u);
+                partial += __shfl_xor_sync(0xFFFFFFFFu, partial, 4u);
+                partial += __shfl_xor_sync(0xFFFFFFFFu, partial, 2u);
+                partial += __shfl_xor_sync(0xFFFFFFFFu, partial, 1u);
+                score = partial * scale;
+            } else {
+                score = -3.402823466e38f;
+            }
+            if (lane == 0u) KQ[pp] = score;
+        }
+        __syncthreads();
+
+        // ---- block-wide tile max ----
+        float tmax = -3.402823466e38f;
+        for (unsigned int i = tid; i < tile_n; i += bd) tmax = fmaxf(tmax, KQ[i]);
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 16u));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 8u));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 4u));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 2u));
+        tmax = fmaxf(tmax, __shfl_xor_sync(0xFFFFFFFFu, tmax, 1u));
+        if (lane == 0u) redux[warp_id] = tmax;
+        __syncthreads();
+        if (tid == 0u) {
+            float bm = redux[0];
+            for (unsigned int w = 1u; w < (bd >> 5u); ++w) bm = fmaxf(bm, redux[w]);
+            redux[0] = bm;
+        }
+        __syncthreads();
+        const float tile_max = redux[0];
+
+        const float m_new = fmaxf(m, tile_max);
+        const float alpha = (m > -3.0e38f) ? __expf(m - m_new) : 0.0f;
+
+        // ---- weights into KQ + tile denom ----
+        float tl = 0.0f;
+        for (unsigned int i = tid; i < tile_n; i += bd) {
+            const float w = (KQ[i] > -3.0e38f) ? __expf(KQ[i] - m_new) : 0.0f;
+            KQ[i] = w;
+            tl += w;
+        }
+        tl += __shfl_xor_sync(0xFFFFFFFFu, tl, 16u);
+        tl += __shfl_xor_sync(0xFFFFFFFFu, tl, 8u);
+        tl += __shfl_xor_sync(0xFFFFFFFFu, tl, 4u);
+        tl += __shfl_xor_sync(0xFFFFFFFFu, tl, 2u);
+        tl += __shfl_xor_sync(0xFFFFFFFFu, tl, 1u);
+        if (lane == 0u) redux[warp_id] = tl;
+        __syncthreads();
+        float tile_l = 0.0f;
+        for (unsigned int w = 0u; w < (bd >> 5u); ++w) tile_l += redux[w];
+
+        // rescale running denom + accumulator by alpha, fold in this tile
+        l = l * alpha + tile_l;
+#pragma unroll
+        for (unsigned int i = 0u; i < MAX_D_PER_THREAD; ++i) acc[i] *= alpha;
+
+        // ---- V phase: each thread owns d = tid + bd*i across ALL positions ----
+        for (unsigned int p = 0u; p < tile_n; ++p) {
+            const float w = KQ[p];
+            if (w == 0.0f) continue;             // masked / underflow — skip load
+            const unsigned int abs_pos = chunk_start + t0 + p;
+            const unsigned int slot = (cache_capacity > 0u) ? (abs_pos % cache_capacity) : abs_pos;
+            const CacheElem* v = value_cache +
+                ((size_t)slot * num_kv_heads + kv_head) * head_dim;
+#pragma unroll
+            for (unsigned int i = 0u; i < MAX_D_PER_THREAD; ++i) {
+                const unsigned int d = tid + bd * i;
+                if (i < d_per_thread)
+                    acc[i] += w * dequant_cache<CacheElem>(v[d]);
+            }
+        }
+        m = m_new;
+        __syncthreads();   // KQ reused next tile
+    }
+
+    // ---- write partials (un-normalized numerator + m + l) ----
+#pragma unroll
+    for (unsigned int i = 0u; i < MAX_D_PER_THREAD; ++i) {
+        const unsigned int d = tid + bd * i;
+        if (i < d_per_thread)
+            partial_acc[out_base + d] = acc[i];
+    }
+    if (tid == 0u) {
+        partial_m[out_idx] = m;
+        partial_l[out_idx] = l;
+    }
+}

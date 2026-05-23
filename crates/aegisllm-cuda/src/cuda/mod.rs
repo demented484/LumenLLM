@@ -44,6 +44,16 @@ pub(crate) const DECODE_TARGET_CHUNK_LEN: usize = 512;
 /// split_k=16). Used to size shared-mem in the captured kernel; eager-path
 /// long ctx widens dynamically via split_k.
 pub(crate) const DECODE_MAX_CHUNK_LEN: usize = CUDA_GRAPH_ATTN_MAX_SEQ_LEN / DECODE_SPLIT_K;
+/// Stage G: auto-select the head-dim-partitioned single-pass decode kernel
+/// (`..._hdpart`) at/above this context. Below 64k the 2-pass kernel's
+/// scores[chunk_len]+vsum shared is small (chunk_len<=head_dim) and its
+/// cp.async pipeline wins; at/above 64k split_k caps at 128 so chunk_len grows,
+/// the 2-pass shared bloats and caps occupancy at 33%, while hdpart's <1 KiB
+/// shared sustains higher occupancy. Measured A/B @256k: hdpart +~9% decode;
+/// @16k hdpart is -5% (kept on the 2-pass kernel). Bit-equivalent precision
+/// (greedy output identical at 9.5k ctx), so auto-selection changes no quality.
+/// Force on at any context with AEGIS_DECODE_HDPART=1.
+pub(crate) const DECODE_HDPART_MIN_CONTEXT: usize = 65536;
 pub use types::{
     CudaAttentionRequest, CudaAttentionSplitScratch,
     DensePrefillMetadataProof, DeviceBf16Matrix, DeviceBuffer,

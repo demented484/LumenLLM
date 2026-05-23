@@ -5,8 +5,8 @@ use crate::cuda::DeviceBuffer;
 use aegisllm_base::error::{AegisError, Result};
 
 use crate::cuda::{
-    CUDA_GRAPH_ATTN_MAX_SEQ_LEN, DECODE_MAX_CHUNK_LEN, DECODE_SPLIT_K, DECODE_SPLIT_K_MAX,
-    DECODE_TARGET_CHUNK_LEN,
+    CUDA_GRAPH_ATTN_MAX_SEQ_LEN, DECODE_HDPART_MIN_CONTEXT, DECODE_MAX_CHUNK_LEN, DECODE_SPLIT_K,
+    DECODE_SPLIT_K_MAX, DECODE_TARGET_CHUNK_LEN,
 };
 
 impl CudaRuntime {
@@ -182,10 +182,21 @@ impl CudaRuntime {
         //   vsum[4 * head_dim]                 (f32)
         //   kv_pipe[4 warps * 2 bufs * head_dim] (half) — cp.async K/V staging
         // Capped at the kernel's MAX_DYNAMIC_SHARED_SIZE_BYTES opt-in (96 KiB).
+        // Stage G: head-dim-partitioned single-pass kernel (opt-in
+        // AEGIS_DECODE_HDPART=1). Tiny shared (KQ[128] + warp-reduce scratch)
+        // → high occupancy. The 2-pass kernel's scores[chunk_len] + vsum are
+        // gone, so shared no longer caps occupancy. Combine kernel is shared.
+        let hdpart = (seq_len_hint >= DECODE_HDPART_MIN_CONTEXT
+            || std::env::var("AEGIS_DECODE_HDPART").as_deref() == Ok("1"))
+            && head_dim % (block_dim as usize) == 0;
         let kv_pipe_bytes = 4 * 2 * head_dim * std::mem::size_of::<u16>();
-        let split_shared_bytes_usize =
+        let split_shared_bytes_usize = if hdpart {
+            // KQ[TILE=128] + redux[block_dim/32] floats.
+            (128 + (block_dim as usize / 32)) * std::mem::size_of::<f32>()
+        } else {
             (effective_max_chunk_len + 4 + 4 * head_dim) * std::mem::size_of::<f32>()
-            + kv_pipe_bytes;
+                + kv_pipe_bytes
+        };
         let split_shared_bytes = super::validate_dynamic_shared_bytes_with_cap(
             "attention_decode_ptr_split",
             split_shared_bytes_usize,
@@ -196,9 +207,14 @@ impl CudaRuntime {
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: split_shared_bytes,
         };
+        let split_kernel = if hdpart {
+            &self.kernels.attention_decode_ptr_split_hdpart
+        } else {
+            &self.kernels.attention_decode_ptr_split
+        };
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.attention_decode_ptr_split)
+                .launch_builder(split_kernel)
                 .arg(&key_cache.slice)
                 .arg(&value_cache.slice)
                 .arg(&query.slice)
@@ -370,10 +386,16 @@ impl CudaRuntime {
         // Shared layout mirrors the f16 path; kv_pipe is sized in u8 here
         // (half the bytes vs the u16 f16 cache → 4 * head_dim bytes added
         // vs 8 * head_dim for f16).
+        let hdpart = (seq_len_hint >= DECODE_HDPART_MIN_CONTEXT
+            || std::env::var("AEGIS_DECODE_HDPART").as_deref() == Ok("1"))
+            && head_dim % (block_dim as usize) == 0;
         let kv_pipe_bytes = 4 * 2 * head_dim * std::mem::size_of::<u8>();
-        let split_shared_bytes_usize =
+        let split_shared_bytes_usize = if hdpart {
+            (128 + (block_dim as usize / 32)) * std::mem::size_of::<f32>()
+        } else {
             (effective_max_chunk_len + 4 + 4 * head_dim) * std::mem::size_of::<f32>()
-            + kv_pipe_bytes;
+                + kv_pipe_bytes
+        };
         let split_shared_bytes = super::validate_dynamic_shared_bytes_with_cap(
             "attention_decode_ptr_split_fp8",
             split_shared_bytes_usize,
@@ -384,9 +406,14 @@ impl CudaRuntime {
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: split_shared_bytes,
         };
+        let split_kernel = if hdpart {
+            &self.kernels.attention_decode_ptr_split_hdpart_fp8
+        } else {
+            &self.kernels.attention_decode_ptr_split_fp8
+        };
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.attention_decode_ptr_split_fp8)
+                .launch_builder(split_kernel)
                 .arg(&key_cache.slice)
                 .arg(&value_cache.slice)
                 .arg(&query.slice)
