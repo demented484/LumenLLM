@@ -1873,10 +1873,18 @@ impl CudaRuntime {
         const HEAD_DIM: usize = 512;
         const Q_BLOCK: usize = 32;
         // Stage H.1b: opt-in 8-warp / 32-KV + f16-accum re-tile (AEGIS_MMA2=1).
-        let mma2 = std::env::var("AEGIS_MMA2").as_deref() == Ok("1");
+        // Stage H.2: opt-in GQA-packed 2-head kernel (AEGIS_GQA2=1, group==2).
+        // gqa2 packs HP=2 consecutive q-heads/block sharing one kv-head; needs
+        // group (q/kv ratio) even. Gemma-4 global hd512 = group 8 (16 q / 2 kv).
+        let group = num_attention_heads / num_kv_heads.max(1);
+        let gqa2 = std::env::var("AEGIS_GQA2").as_deref() == Ok("1")
+            && group % 2 == 0
+            && num_attention_heads.is_multiple_of(2);
+        let mma2 = gqa2 || std::env::var("AEGIS_MMA2").as_deref() == Ok("1");
         let kv_block: usize = if mma2 { 32 } else { 64 };
         let warps: usize = if mma2 { 8 } else { 16 };
         let kv_buffers: usize = if mma2 { 1 } else { 2 };
+        let head_pack: usize = if gqa2 { 2 } else { 1 };
         let q_width = checked_len("dense mma q width", num_attention_heads, HEAD_DIM)?;
         let q_tokens = checked_len("dense mma q tokens", batch, q_width)?;
         let kv_width = checked_len("dense mma kv width", num_kv_heads, HEAD_DIM)?;
@@ -1915,15 +1923,19 @@ impl CudaRuntime {
         //                                                  --------
         //                                                  ~76.4 KiB
         const SLAB: usize = 128;
-        let half_values = Q_BLOCK * HEAD_DIM         // q_shared
-            + kv_buffers * kv_block * SLAB           // kv_slab (mma2: 1×, else 2×)
-            + Q_BLOCK * kv_block;                    // weights_f16
-        let float_values = Q_BLOCK * kv_block        // s_shared
-            + Q_BLOCK * 3;                           // scalars
+        // gqa2 packs `head_pack` q-heads/block: Q, S, weights, scalars all ×HP;
+        // kv_slab stays single (shared across the packed heads).
+        let half_values = head_pack * Q_BLOCK * HEAD_DIM   // q_shared[HP]
+            + kv_buffers * kv_block * SLAB                 // kv_slab
+            + head_pack * Q_BLOCK * kv_block;              // weights_f16[HP]
+        let float_values = head_pack * Q_BLOCK * kv_block  // s_shared[HP]
+            + head_pack * Q_BLOCK * 3;                     // scalars[HP]
         let block_threads: u32 = (warps * 32) as u32;
+        // gqa2: each block does HP=2 consecutive q-heads → grid over q-head pairs.
+        let grid_heads = if gqa2 { num_attention_heads / head_pack } else { num_attention_heads };
         let cfg = LaunchConfig {
             grid_dim: (
-                u32_arg("num_attention_heads", num_attention_heads)?,
+                u32_arg("grid heads", grid_heads)?,
                 u32_arg("dense mma q blocks", batch.div_ceil(Q_BLOCK))?,
                 1,
             ),
@@ -1945,7 +1957,9 @@ impl CudaRuntime {
             "cache_capacity",
             key_cache.len() / (num_kv_heads as usize * HEAD_DIM),
         )?;
-        let mma_kernel = if mma2 {
+        let mma_kernel = if gqa2 {
+            &self.kernels.attention_prefill_dense_gqa2_hdim512
+        } else if mma2 {
             &self.kernels.attention_prefill_dense_mma2_hdim512
         } else {
             &self.kernels.attention_prefill_dense_mma_hdim512
