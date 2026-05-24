@@ -100,25 +100,6 @@ __device__ __forceinline__ void aegis_mma2_m16n8k16_f16acc(
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 
-// ldmatrix.x4 load of the m16k16 A operand (row-major in shared) → the 4
-// canonical m16n8k16 A registers (a0=A[r,0:8], a1=A[r+8,0:8], a2=A[r,8:16],
-// a3=A[r+8,8:16] with r=lane/4). One warp-collective shared load vs the manual
-// helper's 8 scalar loads/lane — fixes the MIO/shared-load throttle. `src` must
-// be 16-byte aligned (it is: col bases are multiples of 16 halfs). Lane address:
-// base + (lane%16)*stride + (lane/16)*8  (in halfs).
-__device__ __forceinline__ void aegis_mma2_load_a_ldm(
-    unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
-    const unsigned short* __restrict__ src, unsigned int stride
-) {
-    const unsigned int lane = threadIdx.x & 31u;
-    const unsigned int smem = aegis_mma_cvta_smem(
-        src + (lane & 15u) * stride + (lane >> 4) * 8u);
-    asm volatile(
-        "ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
-        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-        : "r"(smem));
-}
-
 // Multiply a packed-half2 accumulator register by a scalar (the online-softmax
 // alpha for its row).
 __device__ __forceinline__ unsigned aegis_h2_scale(unsigned packed, float a) {
@@ -321,7 +302,7 @@ void aegis_attention_prefill_dense_mma2_hdim512(
                 // shared, causing CUDA_ERROR_ILLEGAL_ADDRESS for sl>0.)
                 const unsigned int b_col_base = kk * 16u;
                 unsigned int a0, a1, a2, a3, b0, b1;
-                aegis_mma2_load_a_ldm(a0, a1, a2, a3,
+                aegis_mma_load_a_m16k16(a0, a1, a2, a3,
                     q_shared + a_row_base * hdim + a_col_base, hdim);
                 aegis_mma_load_b_n8k16_from_nk(b0, b1,
                     k_buf + b_row_base * slab + b_col_base, slab);
@@ -482,7 +463,7 @@ void aegis_attention_prefill_dense_mma2_hdim512(
                             const unsigned int p_row_base = rs * 16u;
                             const unsigned int p_col_base = ks * 16u;
                             unsigned int p0, p1, p2, p3;
-                            aegis_mma2_load_a_ldm(p0, p1, p2, p3,
+                            aegis_mma_load_a_m16k16(p0, p1, p2, p3,
                                 weights_f16 + p_row_base * kv_block + p_col_base, kv_block);
                             unsigned* d = o_acc[rs * o_col_frags + cf];
                             aegis_mma2_m16n8k16_f16acc(
