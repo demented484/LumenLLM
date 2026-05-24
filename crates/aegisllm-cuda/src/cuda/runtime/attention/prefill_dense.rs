@@ -1872,7 +1872,11 @@ impl CudaRuntime {
     ) -> Result<()> {
         const HEAD_DIM: usize = 512;
         const Q_BLOCK: usize = 32;
-        const KV_BLOCK: usize = 64;
+        // Stage H.1b: opt-in 8-warp / 32-KV + f16-accum re-tile (AEGIS_MMA2=1).
+        let mma2 = std::env::var("AEGIS_MMA2").as_deref() == Ok("1");
+        let kv_block: usize = if mma2 { 32 } else { 64 };
+        let warps: usize = if mma2 { 8 } else { 16 };
+        let kv_buffers: usize = if mma2 { 1 } else { 2 };
         let q_width = checked_len("dense mma q width", num_attention_heads, HEAD_DIM)?;
         let q_tokens = checked_len("dense mma q tokens", batch, q_width)?;
         let kv_width = checked_len("dense mma kv width", num_kv_heads, HEAD_DIM)?;
@@ -1912,11 +1916,11 @@ impl CudaRuntime {
         //                                                  ~76.4 KiB
         const SLAB: usize = 128;
         let half_values = Q_BLOCK * HEAD_DIM         // q_shared
-            + 2 * KV_BLOCK * SLAB                    // kv_slab[2]
-            + Q_BLOCK * KV_BLOCK;                    // weights_bf16
-        let float_values = Q_BLOCK * KV_BLOCK        // s_shared
+            + kv_buffers * kv_block * SLAB           // kv_slab (mma2: 1×, else 2×)
+            + Q_BLOCK * kv_block;                    // weights_f16
+        let float_values = Q_BLOCK * kv_block        // s_shared
             + Q_BLOCK * 3;                           // scalars
-        let block_threads: u32 = 16 * 32;            // 16 warps
+        let block_threads: u32 = (warps * 32) as u32;
         let cfg = LaunchConfig {
             grid_dim: (
                 u32_arg("num_attention_heads", num_attention_heads)?,
@@ -1941,9 +1945,14 @@ impl CudaRuntime {
             "cache_capacity",
             key_cache.len() / (num_kv_heads as usize * HEAD_DIM),
         )?;
+        let mma_kernel = if mma2 {
+            &self.kernels.attention_prefill_dense_mma2_hdim512
+        } else {
+            &self.kernels.attention_prefill_dense_mma_hdim512
+        };
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.attention_prefill_dense_mma_hdim512)
+                .launch_builder(mma_kernel)
                 .arg(&key_cache.slice)
                 .arg(&value_cache.slice)
                 .arg(&query_half.slice)

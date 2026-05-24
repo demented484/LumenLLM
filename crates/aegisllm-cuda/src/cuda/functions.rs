@@ -142,6 +142,8 @@ pub(crate) struct CudaKernelFunctions {
     // the `mma-sync` / `flash-attention-mma` aliases) which resolves through
     // the unified backend selector to `AttentionComputeBackend::Mma`.
     pub(crate) attention_prefill_dense_mma_hdim512: CudaFunction,
+    // Stage H.1b: 8-warp / 32-KV + f16-accum re-tile (opt-in AEGIS_MMA2=1).
+    pub(crate) attention_prefill_dense_mma2_hdim512: CudaFunction,
     // FP8-E4M3 KV-cache variant of the FA-2 hdim=512 q32 kernel. Reads the
     // persistent e4m3 cache directly (half the KV HBM traffic), dequants
     // e4m3->half in shared, runs the identical BF16 WMMA math. Opt-in via
@@ -562,6 +564,20 @@ impl CudaKernelFunctions {
                 )
                 .map_err(|e| AegisError::Unsupported(format!(
                     "set max dynamic shared mem on mma_hdim512 kernel: {e:?}"
+                )))?;
+                f
+            },
+            // Stage H.1b: 8-warp/32-KV + f16-accum re-tile (opt-in AEGIS_MMA2=1).
+            // ~46 KiB single-buffered shared; uses the 96 KiB opt-in cap.
+            attention_prefill_dense_mma2_hdim512: {
+                let f = load(&module, "aegis_attention_prefill_dense_mma2_hdim512")?;
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on mma2_hdim512 kernel: {e:?}"
                 )))?;
                 f
             },
