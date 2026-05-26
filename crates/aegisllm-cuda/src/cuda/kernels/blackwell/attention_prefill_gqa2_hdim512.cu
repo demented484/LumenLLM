@@ -28,6 +28,41 @@
 
 #if __CUDA_ARCH__ >= 800
 
+// ldmatrix.x4 → canonical m16n8k16 A operand (a0..a3). Lane addr =
+// base + (lane%16)*stride + (lane/16)*8 halfs. Replaces the 8-scalar-load
+// manual A-fill. In this 1-block/SM-by-design kernel (occupancy=1 forced by
+// shared+regs), the ~37-reg cost of ldmatrix is FREE (we have 93 reg headroom
+// to the 255/thread hardware limit); it cost mma2 a block but cannot here.
+__device__ __forceinline__ void aegis_gqa2_load_a_ldm(
+    unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3,
+    const unsigned short* __restrict__ src, unsigned int stride
+) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int smem = aegis_mma_cvta_smem(
+        src + (lane & 15u) * stride + (lane >> 4) * 8u);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+        : "r"(smem));
+}
+
+// ldmatrix.x2.TRANS → m16n8k16 B operand for V (16 kv × 8 hdim, kv-major in
+// shared with row-stride = `stride` halfs). Reads 8 contiguous hdim halfs per
+// row addr and TRANSPOSES → delivers the (k-adjacent, fixed-n) packing the B
+// fragment needs. Eliminates the 4 strided scalar loads/lane (the MIO/shared
+// throttle source — V packs at stride=slab=128 halfs apart).
+__device__ __forceinline__ void aegis_gqa2_load_b_v_ldm_trans(
+    unsigned& b0, unsigned& b1,
+    const unsigned short* __restrict__ base, unsigned int stride
+) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int smem = aegis_mma_cvta_smem(base + (lane & 15u) * stride);
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];"
+        : "=r"(b0), "=r"(b1)
+        : "r"(smem));
+}
+
 extern "C" __global__
 __launch_bounds__(256, 1)
 void aegis_attention_prefill_dense_gqa2_hdim512(
@@ -214,7 +249,7 @@ void aegis_attention_prefill_dense_gqa2_hdim512(
 #pragma unroll
                 for (unsigned int hp = 0u; hp < HP; ++hp) {
                     unsigned int a0, a1, a2, a3;
-                    aegis_mma_load_a_m16k16(a0, a1, a2, a3,
+                    aegis_gqa2_load_a_ldm(a0, a1, a2, a3,
                         q_shared + hp * (q_block * hdim) + a_row_base * hdim + a_col_base, hdim);
                     aegis_mma_m16n8k16_f16(
                         s_acc[hp][0], s_acc[hp][1], s_acc[hp][2], s_acc[hp][3],
@@ -334,17 +369,11 @@ void aegis_attention_prefill_dense_gqa2_hdim512(
                     for (unsigned int cf = 0u; cf < o_col_frags; ++cf) {
                         const unsigned int v_row_base = ks * 16u;
                         const unsigned int v_col_base = o_col_base + cf * 8u;
-                        // V fragment computed ONCE, reused across both q-heads.
-                        const unsigned int n_idx = (lane >> 2);
-                        const unsigned int k_lo  = (lane & 3u) << 1;
-                        const unsigned int k_hi  = k_lo + 8u;
-                        const unsigned short* src_v = v_buf + v_row_base * slab + v_col_base;
-                        const unsigned int v0 = aegis_pack_f16x2(
-                            src_v[(k_lo + 0u) * slab + n_idx],
-                            src_v[(k_lo + 1u) * slab + n_idx]);
-                        const unsigned int v1 = aegis_pack_f16x2(
-                            src_v[(k_hi + 0u) * slab + n_idx],
-                            src_v[(k_hi + 1u) * slab + n_idx]);
+                        // V fragment loaded ONCE via ldmatrix.x2.trans (B operand
+                        // transposed in hardware), reused across both q-heads.
+                        unsigned int v0, v1;
+                        aegis_gqa2_load_b_v_ldm_trans(
+                            v0, v1, v_buf + v_row_base * slab + v_col_base, slab);
 #pragma unroll
                         for (unsigned int hp = 0u; hp < HP; ++hp) {
                             unsigned short* w_ = weights_f16 + hp * (q_block * kv_block);
@@ -353,7 +382,7 @@ void aegis_attention_prefill_dense_gqa2_hdim512(
                                 const unsigned int p_row_base = rs * 16u;
                                 const unsigned int p_col_base = ks * 16u;
                                 unsigned int p0, p1, p2, p3;
-                                aegis_mma_load_a_m16k16(p0, p1, p2, p3,
+                                aegis_gqa2_load_a_ldm(p0, p1, p2, p3,
                                     w_ + p_row_base * kv_block + p_col_base, kv_block);
                                 unsigned* d = o_acc[hp][rs * o_col_frags + cf];
                                 aegis_mma2_m16n8k16_f16acc(
