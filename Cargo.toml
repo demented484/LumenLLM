@@ -9,6 +9,9 @@ edition = "2024"
 [workspace.dependencies]
 cudarc = { version = "0.19.4", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublaslt", "f16", "cuda-version-from-build-system", "fallback-dynamic-loading"] }
 half = "2"
+# Vision pipeline (Stage I): PNG/JPEG decoding + tensor preprocessing.
+# default-features=false strips unused codecs.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 memmap2 = "0.9"
 libc = "0.2"
 rayon = "1.11"

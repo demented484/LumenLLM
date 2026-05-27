@@ -46,6 +46,14 @@ pub struct ParametersFile {
     /// Per-layer attention (Q/K/V/O) placement override; takes effect inside
     /// each `layer.N` region independently of the layer's MLP/expert weights.
     pub attention: Option<AttentionSection>,
+    /// Vision encoder + multimodal projector placement (Stage I).
+    /// When present, the engine loads a vision tower (SigLIP / CLIP / InternViT
+    /// family per the model artifact) and the projector that maps its outputs
+    /// into the LLM text-embedding space. Absent → image input disabled.
+    /// Independent from `hidden-layers` because the vision tower is its own
+    /// stack (different depth, hidden_size, patch_size).
+    #[serde(rename = "vision-layer")]
+    pub vision_layer: Option<VisionLayerSection>,
     #[serde(rename = "hidden-layers")]
     pub hidden_layers: Option<HiddenLayersSection>,
     #[serde(rename = "linear-layout")]
@@ -67,6 +75,27 @@ pub struct InputLayerSection {
 pub struct OutputLayerSection {
     pub store: Option<String>,
     pub compute: Option<String>,
+}
+
+/// Vision encoder + multimodal projector placement (Stage I).
+///
+/// `mmproj-path` — filesystem path to the multimodal projector weights. The
+/// engine accepts safetensors-format projector + vision-tower weights produced
+/// from the source model export. (Initial Stage I.1 also accepts the
+/// `*.mmproj-F16.gguf` artifact emitted by `convert_hf_to_gguf.py --mmproj`.)
+///
+/// `compute` / `store` follow the same placement vocabulary as the other
+/// sections (`cuda:0`, `cpu`, `vram`, `ram`). Defaults to inheriting the
+/// model section's compute/store when unset.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VisionLayerSection {
+    /// Compute device for the vision tower (ViT) and the embed_vision
+    /// projector. Defaults to the model section's `compute` when unset.
+    pub compute: Option<String>,
+    /// Storage tier for the vision-tower + projector weights. Defaults to
+    /// the model section's `store` when unset.
+    pub store: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

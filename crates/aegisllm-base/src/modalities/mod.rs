@@ -9,6 +9,7 @@
 /// The public types and trait surface are stable; kernels land in Phase 8.x.
 pub mod audio;
 pub mod fusion;
+pub mod image_preprocess;
 pub mod video;
 pub mod vision;
 
