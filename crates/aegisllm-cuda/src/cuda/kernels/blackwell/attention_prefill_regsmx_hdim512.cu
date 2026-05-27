@@ -208,25 +208,101 @@ void aegis_attention_prefill_dense_regsmx_hdim512(
     }
     __syncthreads();
 
+    // ---- cp.async slab staging (K/V into tile_K/tile_V, single-buffered) ----
+    // KV cache element layout: cache[slot, kv_head, hdim_col] (row-major).
+    // tile dest layout: tile[kv_row in [0, nbatch_fa), k_half2 in [0, slab/2)]
+    // stored with stride = stride_tile_K (or stride_tile_V) half2 per kv_row.
+    // Each cp.async issues 16 bytes (= 8 halfs = 4 half2). nbatch_fa * (slab/8)
+    // total chunks = 32 * 16 = 512 chunks → 256 threads × 2 chunks each.
+    auto stage_slab = [&] (const unsigned short* __restrict__ cache,
+                           unsigned short* __restrict__ tile_dst,
+                           unsigned int   stride_tile_dst_h2,
+                           unsigned int   slab_h2_base,    // k_half2 base of this slab
+                           unsigned int   slab_h2_width,   // k_half2 width of this slab
+                           unsigned int   tile_start,
+                           unsigned int   tile_count) {
+        constexpr unsigned int halfs_per_chunk  = 8u;
+        const unsigned int chunks_per_row       = (slab_h2_width * 2u) / halfs_per_chunk;
+        const unsigned int passes               = (nbatch_fa * chunks_per_row + nthreads - 1u) / nthreads;
+#pragma unroll 2
+        for (unsigned int p = 0u; p < passes; ++p) {
+            const unsigned int chunk = p * nthreads + tid;
+            if (chunk >= nbatch_fa * chunks_per_row) break;
+            const unsigned int row  = chunk / chunks_per_row;
+            const unsigned int hoff = (chunk % chunks_per_row) * halfs_per_chunk;
+            const bool         ok   = row < tile_count;
+            const unsigned int pos  = tile_start + row;
+            // Destination in tile_dst (halfs). stride is half2; convert to halfs (*2).
+            unsigned short* dst_h = tile_dst + row * (stride_tile_dst_h2 * 2u) + hoff;
+            unsigned int dst_smem = aegis_mma_cvta_smem(dst_h);
+            if (ok) {
+                const size_t off =
+                    (size_t(kv_slot(pos, cache_capacity)) * num_kv_heads + kv_head) * DKQ
+                    + slab_h2_base * 2u + hoff;
+                aegis_mma_cp_async_16(dst_smem, cache + off);
+            } else {
+                aegis_mma_cp_async_zero_16(dst_smem);
+            }
+        }
+    };
+
+    // Number of KV-block iterations covering [block_min_tile_start, block_max_visible).
+    const unsigned int n_kiters = (block_max_visible > block_min_tile_start)
+        ? ((block_max_visible - block_min_tile_start + nbatch_fa - 1u) / nbatch_fa)
+        : 0u;
+    if (n_kiters == 0u) {
+        // (Output zeros handled in PHASE 4 epilogue; for the scaffold-only state
+        // we have no output to write yet — guard added when the epilogue lands.)
+        return;
+    }
+
+    // ---- persistent register state across iters (foundation declaration) ----
+    // Each warp owns a per-warp-partition slice of (q-cols × kv-positions). The
+    // exact slice (cols_per_warp=16 q-cols × nbatch_fa/np=16 kv) and the per-
+    // lane fragment layout of KQ_C will be derived in the Phase 2 implementation
+    // alongside the load_ldmatrix(tile<16,8>) primitives. This scaffold declares
+    // the running scalars only — `KQ_max[cols_per_thread]` and
+    // `KQ_rowsum[cols_per_thread]` per thread (cols_per_thread=2 for Turing/
+    // Ampere wide), seeded with -inf / 0, updated each iter by the softmax.
+    constexpr float neg_inf = -3.402823466e38f;
+    float KQ_max   [cols_per_thread] = { neg_inf, neg_inf };
+    float KQ_rowsum[cols_per_thread] = { 0.0f, 0.0f };
+    // (VKQ_C[] register accumulator declared in Phase 4 once its size derived
+    // from T_C_VKQ::ne is fixed.)
+
     // ============================================================
-    // PHASE 2: K-block iter loop with register-resident KQ_C
-    // PHASE 3: register softmax via __shfl_xor_sync (no s_shared bounce)
-    // PHASE 4: P·V → VKQ_C register accumulator
-    // EPILOGUE: VKQ_C / KQ_rowsum → output[2 heads × q_block × DV]
+    // PHASE 2: K-block iter loop (cp.async-prologue + iter body with Q·K → KQ_C)
+    //   Pseudo:
+    //     stage K slab 0 (cp.async); cp_commit;
+    //     for it in 0..n_kiters:
+    //       cp_wait_all(); __syncthreads();          # K slab 0 ready
+    //       for k0_start in DKQ/2-nbatch_K2 down to 0 step nbatch_K2:   # MLA reverse
+    //         if next slab valid: stage K next slab (cp.async); cp_commit;
+    //         load_ldmatrix(Q tile<16,8,half2>);
+    //         load_ldmatrix(K tile<16,8,half2>);
+    //         mma(KQ_C, Q, K);                       # f32-acc m16n8k16
+    //         cp_wait_all(); __syncthreads();        # next slab ready (if any)
     //
-    // STATUS: not yet implemented. Multi-session build planned. Foundation
-    // (constants, geometry, shared layout, Q load) is in place above; the
-    // remaining body is the careful per-lane MMA/shuffle/PV work that needs
-    // dedicated focused sessions with cuda-attn-compare gates at each step.
-    // The kernel is currently unused (launcher does not wire it in until the
-    // full body lands and clears the parity gate vs FA-2).
+    // PHASE 3: register softmax with __shfl_xor_sync row reductions + tiny
+    //          cross-warp shared array (np=2 warps per q-col-group exchange
+    //          their partial maxes/sums for a few hundred bytes).
+    //
+    // PHASE 4: P·V — load V via load_ldmatrix_trans (V as transposed-A operand),
+    //          MMA the just-softmaxed register KQ_C as the B operand, accumulate
+    //          into VKQ_C register array.
+    //
+    // EPILOGUE: VKQ_C / KQ_rowsum → output (per packed head & q_row).
+    //
+    // STATUS: PHASE 2 BODY remains to write. Required primitives not yet
+    // vendored: load_ldmatrix(tile<16,8,half2>) variants (mma.cuh:790-798),
+    // mma(tile<16,8,float>, tile<16,8,half2>, tile<8,8,half2>) (mma.cuh:1066+).
+    // These get added in the next focused session, then the body fills in.
     // ============================================================
 
-    // Suppress unused-var diagnostics for the foundation-only scaffold.
-    (void)key_cache; (void)value_cache; (void)start_position;
-    (void)kv_head; (void)cache_capacity; (void)output;
-    (void)block_min_tile_start; (void)lane; (void)cols_per_thread;
-    (void)stride_tile_K;
+    // Suppress unused-var diagnostics for the (still-incomplete) scaffold.
+    (void)start_position; (void)warp_group; (void)warp_in_np;
+    (void)output; (void)lane; (void)KQ_max; (void)KQ_rowsum;
+    (void)stride_tile_K; (void)stride_tile_V; (void)stage_slab; (void)tile_V;
 }
 
 #endif  // __CUDA_ARCH__ >= 800
