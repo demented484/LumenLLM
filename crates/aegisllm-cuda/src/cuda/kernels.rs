@@ -25,6 +25,8 @@ pub(crate) const BLACKWELL_FP4_KERNEL_SRC: &str = concat!(
     "\n",
     include_str!("kernels/blackwell/attention_prefill_mma2_hdim512.cu"),
     "\n",
+    include_str!("kernels/blackwell/attention_prefill_mma4_hdim512.cu"),
+    "\n",
     include_str!("kernels/blackwell/attention_prefill_gqa2_hdim512.cu"),
     "\n",
     include_str!("kernels/blackwell/aegis_mma_tile.cuh"),

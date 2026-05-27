@@ -1880,7 +1880,9 @@ impl CudaRuntime {
         let gqa2 = std::env::var("AEGIS_GQA2").as_deref() == Ok("1")
             && group % 2 == 0
             && num_attention_heads.is_multiple_of(2);
-        let mma2 = gqa2 || std::env::var("AEGIS_MMA2").as_deref() == Ok("1");
+        // Stage H.4 MMA4: mma2 with register-resident softmax (no s_shared spill).
+        let mma4 = std::env::var("AEGIS_MMA4").as_deref() == Ok("1");
+        let mma2 = mma4 || gqa2 || std::env::var("AEGIS_MMA2").as_deref() == Ok("1");
         let kv_block: usize = if mma2 { 32 } else { 64 };
         let warps: usize = if mma2 { 8 } else { 16 };
         let kv_buffers: usize = if mma2 { 1 } else { 2 };
@@ -1928,8 +1930,16 @@ impl CudaRuntime {
         let half_values = head_pack * Q_BLOCK * HEAD_DIM   // q_shared[HP]
             + kv_buffers * kv_block * SLAB                 // kv_slab
             + head_pack * Q_BLOCK * kv_block;              // weights_f16[HP]
-        let float_values = head_pack * Q_BLOCK * kv_block  // s_shared[HP]
-            + head_pack * Q_BLOCK * 3;                     // scalars[HP]
+        // mma4 drops s_shared (q_block * kv_block) and adds xwarp_max/sum
+        // (q_block * kv_strips * 2). kv_strips = kv_block/8 = 4 for mma4.
+        let kv_strips = kv_block / 8;
+        let float_values = if mma4 {
+            Q_BLOCK * kv_strips * 2  // xwarp_max[Q_BLOCK*kv_strips] + xwarp_sum[...]
+            + head_pack * Q_BLOCK * 3                       // scalars
+        } else {
+            head_pack * Q_BLOCK * kv_block                  // s_shared[HP]
+            + head_pack * Q_BLOCK * 3                       // scalars[HP]
+        };
         let block_threads: u32 = (warps * 32) as u32;
         // gqa2: each block does HP=2 consecutive q-heads → grid over q-head pairs.
         let grid_heads = if gqa2 { num_attention_heads / head_pack } else { num_attention_heads };
@@ -1959,6 +1969,8 @@ impl CudaRuntime {
         )?;
         let mma_kernel = if gqa2 {
             &self.kernels.attention_prefill_dense_gqa2_hdim512
+        } else if mma4 {
+            &self.kernels.attention_prefill_dense_mma4_hdim512
         } else if mma2 {
             &self.kernels.attention_prefill_dense_mma2_hdim512
         } else {
