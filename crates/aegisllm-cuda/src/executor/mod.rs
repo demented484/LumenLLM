@@ -14,6 +14,7 @@ pub mod prefix_cache;
 mod provider;
 mod rope;
 mod state;
+pub mod vision;
 
 pub use planning::cuda_kernel_limitations;
 pub use provider::CudaExecutorProvider;
