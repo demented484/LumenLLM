@@ -856,15 +856,29 @@ impl CudaRuntime {
         // in >=16k chunks, so the gate keeps the win while removing any
         // short-context risk.
         const FA2_MIN_CONTEXT_TOKENS: usize = 16384;
-        // Stage D.1 — hand-tuned mma.sync BF16 kernel for hdim=512. Opt-in via
-        // `--cuda-prefill-attention mma` (resolves to
-        // `AttentionComputeBackend::Mma`). Checked BEFORE the FA-2 gate so the
-        // explicit selection wins on the same head_dim/context shape. No
-        // context-gate yet — the kernel is new code and we want measurements
-        // at every prompt length when the user opts in.
-        let use_mma = head_dim == 512 && self.config.attention_mma_enabled();
-        if use_mma {
-            return self.attention_prefill_dense_mma_hdim512_device(
+        // Stage H.4 (mma4): register-resident-softmax hd=512 kernel. Same
+        // 8-warp/32-KV tile as FA-2's mma successor but kills the per-iter
+        // s_shared full-S spill — softmax runs on the per-warp s_acc[4] f32
+        // register tile via __shfl_xor_sync + a 1 KiB cross-warp xwarp_max/sum
+        // exchange. Measured Gemma-4 global hd512 prefill (Trial avg of 2):
+        //   ctx=16k  FA-2 1942  mma4 2158  +11.1%   ← strong win
+        //   ctx=32k  FA-2 1837  mma4 1897   +3.3%
+        //   ctx=64k  FA-2 1457  mma4 1480   +1.6%
+        //   ctx=128k FA-2 1045  mma4 1033   -1.1%   ← crossover
+        // Auto-default for ctx ∈ [16k, 64k]. Above 64k FA-2 still wins.
+        // Force on/off with AEGIS_MMA4=1 / AEGIS_MMA4=0.
+        const MMA4_MAX_CONTEXT_TOKENS: usize = 65536;
+        let mma4_force = std::env::var("AEGIS_MMA4").ok();
+        let use_mma4 = head_dim == 512
+            && match mma4_force.as_deref() {
+                Some("1") => true,
+                Some("0") => false,
+                _ => context_len >= FA2_MIN_CONTEXT_TOKENS
+                    && context_len <= MMA4_MAX_CONTEXT_TOKENS
+                    && self.config.attention_fa2_enabled(),
+            };
+        if use_mma4 {
+            return self.attention_prefill_dense_mma4_hdim512_device(
                 key_cache,
                 value_cache,
                 query_half,
@@ -1849,15 +1863,18 @@ impl CudaRuntime {
         Ok(())
     }
 
-    /// Stage D.1 hand-tuned `mma.sync` BF16 hdim=512 prefill kernel.
-    /// Shared-memory budget is identical to the FA-2 q32 kernel above (~76.4
-    /// KiB inside the 96 KiB sm_120 cap) so the launch config is parallel —
-    /// only the kernel handle differs. Selected via the
-    /// `CudaPrefillAttentionKernel::Mma` enum (or the `--cuda-prefill-attention
-    /// mma` CLI alias), which resolves through `resolve_attention_backend`
-    /// to `AttentionComputeBackend::Mma`.
+    /// Stage H.4 register-softmax mma.sync hdim=512 prefill kernel (mma4).
+    /// 8-warp/32-KV tile with f16 O-accumulator and register-resident online
+    /// softmax (no s_shared full-S spill — softmax runs directly on the per-warp
+    /// s_acc[4] f32 register tile via __shfl_xor_sync + a 1 KiB cross-warp
+    /// xwarp_max/sum exchange). Auto-default for hd512 ctx ∈ [16k, 64k]; FA-2
+    /// preferred above 64k. Measured curve (Gemma-4 global hd512):
+    ///   ctx=16k  +11.1% vs FA-2
+    ///   ctx=32k  +3.3%
+    ///   ctx=64k  +1.6%
+    ///   ctx=128k -1.1% (crossover)
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn attention_prefill_dense_mma_hdim512_device(
+    pub(super) fn attention_prefill_dense_mma4_hdim512_device(
         &self,
         key_cache: &DeviceBuffer<u16>,
         value_cache: &DeviceBuffer<u16>,
@@ -1872,32 +1889,16 @@ impl CudaRuntime {
     ) -> Result<()> {
         const HEAD_DIM: usize = 512;
         const Q_BLOCK: usize = 32;
-        // Stage H.1b: opt-in 8-warp / 32-KV + f16-accum re-tile (AEGIS_MMA2=1).
-        // Stage H.2: opt-in GQA-packed 2-head kernel (AEGIS_GQA2=1, group==2).
-        // gqa2 packs HP=2 consecutive q-heads/block sharing one kv-head; needs
-        // group (q/kv ratio) even. Gemma-4 global hd512 = group 8 (16 q / 2 kv).
-        let group = num_attention_heads / num_kv_heads.max(1);
-        let gqa2 = std::env::var("AEGIS_GQA2").as_deref() == Ok("1")
-            && group % 2 == 0
-            && num_attention_heads.is_multiple_of(2);
-        // Stage H.4 MMA4: mma2 with register-resident softmax (no s_shared spill).
-        // Opt-in via AEGIS_MMA4=1. Measured win on Gemma-4 global hd512 prefill:
-        //   +3.3% @32k, +1.0% @64k, ~0% @128k, -1.5% @256k.
-        // Crossover with FA-2 is around ~100k context. Best for short-to-medium
-        // prefill workloads; FA-2 stays preferred for very-long-ctx prefill.
-        let mma4 = std::env::var("AEGIS_MMA4").as_deref() == Ok("1");
-        let mma2 = mma4 || gqa2 || std::env::var("AEGIS_MMA2").as_deref() == Ok("1");
-        let kv_block: usize = if mma2 { 32 } else { 64 };
-        let warps: usize = if mma2 { 8 } else { 16 };
-        let kv_buffers: usize = if mma2 { 1 } else { 2 };
-        let head_pack: usize = if gqa2 { 2 } else { 1 };
-        let q_width = checked_len("dense mma q width", num_attention_heads, HEAD_DIM)?;
-        let q_tokens = checked_len("dense mma q tokens", batch, q_width)?;
-        let kv_width = checked_len("dense mma kv width", num_kv_heads, HEAD_DIM)?;
-        let cache_len = checked_len("dense mma kv cache", context_len, kv_width)?;
+        const KV_BLOCK: usize = 32;
+        const WARPS: usize = 8;
+        const SLAB: usize = 128;
+        let q_width = checked_len("mma4 q width", num_attention_heads, HEAD_DIM)?;
+        let q_tokens = checked_len("mma4 q tokens", batch, q_width)?;
+        let kv_width = checked_len("mma4 kv width", num_kv_heads, HEAD_DIM)?;
+        let cache_len = checked_len("mma4 kv cache", context_len, kv_width)?;
         if query_half.len() < q_tokens || output.len() < q_tokens {
             return Err(AegisError::InvalidPlan(format!(
-                "dense mma attention q/output shape mismatch: query_half={} output={} required={}",
+                "mma4 attention q/output shape mismatch: query_half={} output={} required={}",
                 query_half.len(),
                 output.len(),
                 q_tokens
@@ -1909,7 +1910,7 @@ impl CudaRuntime {
             || key_cache.is_empty()
         {
             return Err(AegisError::InvalidPlan(format!(
-                "dense mma attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
+                "mma4 attention kv cache shape mismatch: key_cache={} value_cache={} required={}",
                 key_cache.len(),
                 value_cache.len(),
                 cache_len
@@ -1917,45 +1918,33 @@ impl CudaRuntime {
         }
         if !num_attention_heads.is_multiple_of(num_kv_heads) {
             return Err(AegisError::InvalidPlan(
-                "dense mma attention heads must be divisible by kv heads".into(),
+                "mma4 attention heads must be divisible by kv heads".into(),
             ));
         }
-        // Shared-mem layout (identical to the FA-2 q32 kernel):
-        //   q_shared    = Q_BLOCK * HEAD_DIM       bf16    = 32 KiB
-        //   kv_slab[2]  = 2 * KV_BLOCK * 128       bf16    = 32 KiB
-        //   s_shared    = Q_BLOCK * KV_BLOCK       floats  =  8 KiB
-        //   weights_bf16= Q_BLOCK * KV_BLOCK       bf16    =  4 KiB
-        //   scalars     = Q_BLOCK * 3              floats  =  0.4 KiB
-        //                                                  --------
-        //                                                  ~76.4 KiB
-        const SLAB: usize = 128;
-        // gqa2 packs `head_pack` q-heads/block: Q, S, weights, scalars all ×HP;
-        // kv_slab stays single (shared across the packed heads).
-        let half_values = head_pack * Q_BLOCK * HEAD_DIM   // q_shared[HP]
-            + kv_buffers * kv_block * SLAB                 // kv_slab
-            + head_pack * Q_BLOCK * kv_block;              // weights_f16[HP]
-        // mma4 drops s_shared (q_block * kv_block) and adds xwarp_max/sum
-        // (q_block * kv_strips * 2). kv_strips = kv_block/8 = 4 for mma4.
-        let kv_strips = kv_block / 8;
-        let float_values = if mma4 {
-            Q_BLOCK * kv_strips * 2  // xwarp_max[Q_BLOCK*kv_strips] + xwarp_sum[...]
-            + head_pack * Q_BLOCK * 3                       // scalars
-        } else {
-            head_pack * Q_BLOCK * kv_block                  // s_shared[HP]
-            + head_pack * Q_BLOCK * 3                       // scalars[HP]
-        };
-        let block_threads: u32 = (warps * 32) as u32;
-        // gqa2: each block does HP=2 consecutive q-heads → grid over q-head pairs.
-        let grid_heads = if gqa2 { num_attention_heads / head_pack } else { num_attention_heads };
+        // Shared budget (1× KV slab, no full-S spill, tiny xwarp_max/sum):
+        //   q_shared    Q_BLOCK*HEAD_DIM     bf16  = 32 KiB
+        //   kv_slab     KV_BLOCK*SLAB        bf16  =  8 KiB
+        //   weights_f16 Q_BLOCK*KV_BLOCK     bf16  =  2 KiB
+        //   scalars     Q_BLOCK*3            f32   =  0.4 KiB
+        //   xwarp_max   Q_BLOCK*kv_strips    f32   =  0.5 KiB  (kv_strips=4)
+        //   xwarp_sum   Q_BLOCK*kv_strips    f32   =  0.5 KiB
+        //                                          ~43 KiB
+        let kv_strips = KV_BLOCK / 8;
+        let half_values = Q_BLOCK * HEAD_DIM            // q_shared
+            + KV_BLOCK * SLAB                            // kv_slab
+            + Q_BLOCK * KV_BLOCK;                        // weights_f16
+        let float_values = Q_BLOCK * kv_strips * 2       // xwarp_max + xwarp_sum
+            + Q_BLOCK * 3;                               // scalars
+        let block_threads: u32 = (WARPS * 32) as u32;
         let cfg = LaunchConfig {
             grid_dim: (
-                u32_arg("grid heads", grid_heads)?,
-                u32_arg("dense mma q blocks", batch.div_ceil(Q_BLOCK))?,
+                u32_arg("num_attention_heads", num_attention_heads)?,
+                u32_arg("mma4 q blocks", batch.div_ceil(Q_BLOCK))?,
                 1,
             ),
             block_dim: (block_threads, 1, 1),
             shared_mem_bytes: super::validate_dynamic_shared_bytes_with_cap(
-                "prefill_dense_mma_hdim512",
+                "prefill_dense_mma4_hdim512",
                 half_values * std::mem::size_of::<u16>()
                     + float_values * std::mem::size_of::<f32>(),
                 96 * 1024,
@@ -1971,18 +1960,9 @@ impl CudaRuntime {
             "cache_capacity",
             key_cache.len() / (num_kv_heads as usize * HEAD_DIM),
         )?;
-        let mma_kernel = if gqa2 {
-            &self.kernels.attention_prefill_dense_gqa2_hdim512
-        } else if mma4 {
-            &self.kernels.attention_prefill_dense_mma4_hdim512
-        } else if mma2 {
-            &self.kernels.attention_prefill_dense_mma2_hdim512
-        } else {
-            &self.kernels.attention_prefill_dense_mma_hdim512
-        };
         unsafe {
             self.stream
-                .launch_builder(mma_kernel)
+                .launch_builder(&self.kernels.attention_prefill_dense_mma4_hdim512)
                 .arg(&key_cache.slice)
                 .arg(&value_cache.slice)
                 .arg(&query_half.slice)
@@ -1997,7 +1977,7 @@ impl CudaRuntime {
                 .arg(&mut output.slice)
                 .launch(cfg)
         }
-        .map_err(map_cuda_err("launch dense mma hdim512 prefill attention"))?;
+        .map_err(map_cuda_err("launch mma4 hdim512 prefill attention"))?;
         Ok(())
     }
 

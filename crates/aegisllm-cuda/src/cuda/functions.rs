@@ -135,20 +135,10 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) attention_prefill_dense_fa2_hdim512: CudaFunction,
     pub(crate) attention_prefill_dense_fa2_hdim512_q64: CudaFunction,
     // ===================================================================
-    // Stage D.1: hand-tuned mma.sync BF16 prefill kernel for head_dim=512.
-    // Same tile / shared-memory shape as the FA-2 q32 kernel above, but the
-    // mainloop is hand-issued m16n8k16.row.col.f32.bf16.bf16.f32 PTX (no
-    // nvcuda::wmma). Selected via `--cuda-prefill-attention mma` (or any of
-    // the `mma-sync` / `flash-attention-mma` aliases) which resolves through
-    // the unified backend selector to `AttentionComputeBackend::Mma`.
-    pub(crate) attention_prefill_dense_mma_hdim512: CudaFunction,
-    // Stage H.1b: 8-warp / 32-KV + f16-accum re-tile (opt-in AEGIS_MMA2=1).
-    pub(crate) attention_prefill_dense_mma2_hdim512: CudaFunction,
-    // Stage H.4 MMA4: mma2 + register-resident softmax (no s_shared spill, tiny
-    // cross-warp max/sum exchange). Opt-in via AEGIS_MMA4=1.
+    // Stage H.4 mma4: register-softmax 8-warp/32-KV hd=512 prefill kernel.
+    // Auto-default for ctx ∈ [16k, 64k] (FA-2 takes ctx > 64k). Force on/off
+    // with AEGIS_MMA4=1 / AEGIS_MMA4=0.
     pub(crate) attention_prefill_dense_mma4_hdim512: CudaFunction,
-    // Stage H.2: GQA-packed (2 q-heads/block, group==2) variant (AEGIS_GQA2=1).
-    pub(crate) attention_prefill_dense_gqa2_hdim512: CudaFunction,
     // FP8-E4M3 KV-cache variant of the FA-2 hdim=512 q32 kernel. Reads the
     // persistent e4m3 cache directly (half the KV HBM traffic), dequants
     // e4m3->half in shared, runs the identical BF16 WMMA math. Opt-in via
@@ -548,46 +538,9 @@ impl CudaKernelFunctions {
                 )))?;
                 f
             },
-            // ===================================================================
-            attention_prefill_dense_mma_hdim512: {
-                let f = load(
-                    &module,
-                    "aegis_attention_prefill_dense_mma_hdim512",
-                )?;
-                // Stage D.1 hand-tuned mma.sync BF16 hdim=512 prefill kernel.
-                // Shared mem layout matches the FA-2 q32 kernel exactly
-                // (q_shared 32 KiB + kv_slab[2] 32 KiB + s_shared 8 KiB +
-                // weights_bf16 4 KiB + scalars 0.4 KiB = ~76.4 KiB). Use
-                // sm_120's 96 KiB opt-in dynamic-shared cap. 1 block/SM
-                // expected (the per-lane f32 O accumulator is 32 regs/lane —
-                // 8 frags x 4 elements — plus a 4-reg s_acc, fits the
-                // 255-reg per-thread budget with headroom).
-                f.set_attribute(
-                    cudarc::driver::sys::CUfunction_attribute_enum
-                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    96 * 1024,
-                )
-                .map_err(|e| AegisError::Unsupported(format!(
-                    "set max dynamic shared mem on mma_hdim512 kernel: {e:?}"
-                )))?;
-                f
-            },
-            // Stage H.1b: 8-warp/32-KV + f16-accum re-tile (opt-in AEGIS_MMA2=1).
-            // ~46 KiB single-buffered shared; uses the 96 KiB opt-in cap.
-            attention_prefill_dense_mma2_hdim512: {
-                let f = load(&module, "aegis_attention_prefill_dense_mma2_hdim512")?;
-                f.set_attribute(
-                    cudarc::driver::sys::CUfunction_attribute_enum
-                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    96 * 1024,
-                )
-                .map_err(|e| AegisError::Unsupported(format!(
-                    "set max dynamic shared mem on mma2_hdim512 kernel: {e:?}"
-                )))?;
-                f
-            },
-            // Stage H.4 MMA4: mma2 + register-resident softmax (opt-in AEGIS_MMA4=1).
+            // Stage H.4 mma4: register-softmax 8-warp/32-KV hd=512 prefill.
             // ~43 KiB shared (no s_shared S spill; tiny xwarp_max/sum buffers).
+            // Uses sm_120's 96 KiB opt-in dynamic-shared cap.
             attention_prefill_dense_mma4_hdim512: {
                 let f = load(&module, "aegis_attention_prefill_dense_mma4_hdim512")?;
                 f.set_attribute(
@@ -597,20 +550,6 @@ impl CudaKernelFunctions {
                 )
                 .map_err(|e| AegisError::Unsupported(format!(
                     "set max dynamic shared mem on mma4_hdim512 kernel: {e:?}"
-                )))?;
-                f
-            },
-            // Stage H.2: GQA-packed 2-head kernel (opt-in AEGIS_GQA2=1). ~93 KiB
-            // shared (2 Q tiles + 2 S/weights); uses the 96 KiB opt-in cap.
-            attention_prefill_dense_gqa2_hdim512: {
-                let f = load(&module, "aegis_attention_prefill_dense_gqa2_hdim512")?;
-                f.set_attribute(
-                    cudarc::driver::sys::CUfunction_attribute_enum
-                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    96 * 1024,
-                )
-                .map_err(|e| AegisError::Unsupported(format!(
-                    "set max dynamic shared mem on gqa2_hdim512 kernel: {e:?}"
                 )))?;
                 f
             },

@@ -84,7 +84,128 @@
 
 #if __CUDA_ARCH__ >= 800
 
-// Stage H.1b: 8-warp / 32-KV re-tile + f16 O-accumulator + single-buffered KV.
+// =============================================================================
+// MMA / cp.async helpers (consolidated here as the only hd512 prefill kernel).
+// =============================================================================
+
+// 16 B cp.async load (HBM -> shared, .ca cache policy).
+__device__ __forceinline__ void aegis_mma_cp_async_16(unsigned int dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                 :: "r"(dst), "l"(src));
+}
+
+// 16 B cp.async ZERO fill (zero-pads OOB rows of the KV tile so the MMA reads
+// well-defined zeros at the tail of the final KV block — no mask needed).
+__device__ __forceinline__ void aegis_mma_cp_async_zero_16(unsigned int dst) {
+    const unsigned long long z = 0ULL;
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16, 0;\n"
+                 :: "r"(dst), "l"((const void*)&z));
+}
+
+__device__ __forceinline__ void aegis_mma_cp_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ __forceinline__ void aegis_mma_cp_wait_all() {
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+// Convert a generic pointer to a shared-memory address (.shared u32).
+__device__ __forceinline__ unsigned int aegis_mma_cvta_smem(const void* p) {
+    unsigned int s;
+    asm volatile("{ .reg .u64 t; cvta.to.shared.u64 t, %1; cvt.u32.u64 %0, t; }\n"
+                 : "=r"(s) : "l"(p));
+    return s;
+}
+
+// mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 — issue ONE MMA.
+//   D[16,8] = A[16,16] * B[16,8] + D[16,8]
+// (B is K-major in PTX semantics, i.e. B[k,n].)
+__device__ __forceinline__ void aegis_mma_m16n8k16_f16(
+    float& d0, float& d1, float& d2, float& d3,
+    unsigned int a0, unsigned int a1, unsigned int a2, unsigned int a3,
+    unsigned int b0, unsigned int b1
+) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+        : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// f16-accumulator MMA: mma.sync m16n8k16 with .f16.f16.f16.f16. The D/C
+// fragment is 2 registers (each a packed half2) vs 4 f32 — halves O-accumulator
+// register pressure, which is what lets the 8-warp config fit two blocks/SM.
+__device__ __forceinline__ void aegis_mma2_m16n8k16_f16acc(
+    unsigned& c0, unsigned& c1,
+    unsigned a0, unsigned a1, unsigned a2, unsigned a3,
+    unsigned b0, unsigned b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+        "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+        : "+r"(c0), "+r"(c1)
+        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// Pack two adjacent FP16 elements into one u32 (low half = lo, high half = hi).
+__device__ __forceinline__ unsigned int aegis_pack_f16x2(
+    unsigned short lo, unsigned short hi
+) {
+    return (unsigned int)lo | ((unsigned int)hi << 16);
+}
+
+// Multiply a packed-half2 accumulator register by a scalar (online-softmax
+// alpha rescale).
+__device__ __forceinline__ unsigned aegis_h2_scale(unsigned packed, float a) {
+    __half2 v = *reinterpret_cast<const __half2*>(&packed);
+    v = __hmul2(v, __float2half2_rn(a));
+    unsigned out;
+    *reinterpret_cast<__half2*>(&out) = v;
+    return out;
+}
+
+// Load the A operand (m16k16 FP16) from a row-major [M=16, K] source in shared.
+//   reg 0 = pack(A[r0, c0+0], A[r0, c0+1])   r0 = lane/4
+//   reg 1 = pack(A[r1, c0+0], A[r1, c0+1])   r1 = lane/4 + 8
+//   reg 2 = pack(A[r0, c8+0], A[r0, c8+1])   c8 = c0 + 8
+//   reg 3 = pack(A[r1, c8+0], A[r1, c8+1])
+//   c0 = (lane%4)*2
+__device__ __forceinline__ void aegis_mma_load_a_m16k16(
+    unsigned int& r0, unsigned int& r1, unsigned int& r2, unsigned int& r3,
+    const unsigned short* __restrict__ src, unsigned int stride
+) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int row_upper = (lane >> 2);
+    const unsigned int row_lower = row_upper + 8u;
+    const unsigned int col_lo    = (lane & 3u) << 1;
+    const unsigned int col_hi    = col_lo + 8u;
+    const unsigned short* p_upper = src + row_upper * stride;
+    const unsigned short* p_lower = src + row_lower * stride;
+    r0 = aegis_pack_f16x2(p_upper[col_lo],     p_upper[col_lo + 1u]);
+    r1 = aegis_pack_f16x2(p_lower[col_lo],     p_lower[col_lo + 1u]);
+    r2 = aegis_pack_f16x2(p_upper[col_hi],     p_upper[col_hi + 1u]);
+    r3 = aegis_pack_f16x2(p_lower[col_hi],     p_lower[col_hi + 1u]);
+}
+
+// Load the B operand (n8k16 FP16) from a source memory layout [N=8, K=16]
+// row-major. PTX B-fragment is col-major B[k,n].
+//   reg 0 = pack(B[k0+0, n], B[k0+1, n])    n  = lane/4
+//   reg 1 = pack(B[k8+0, n], B[k8+1, n])    k0 = (lane%4)*2
+__device__ __forceinline__ void aegis_mma_load_b_n8k16_from_nk(
+    unsigned int& r0, unsigned int& r1,
+    const unsigned short* __restrict__ src, unsigned int stride
+) {
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int n_idx = (lane >> 2);
+    const unsigned int k_lo  = (lane & 3u) << 1;
+    const unsigned int k_hi  = k_lo + 8u;
+    const unsigned short* p_n = src + n_idx * stride;
+    r0 = aegis_pack_f16x2(p_n[k_lo],     p_n[k_lo + 1u]);
+    r1 = aegis_pack_f16x2(p_n[k_hi],     p_n[k_hi + 1u]);
+}
+
+// =============================================================================
+// Stage H.4 hd=512 prefill kernel: 8-warp / 32-KV with register-resident
+// online softmax. Auto-default for ctx ∈ [16k, 64k]; FA-2 takes ctx > 64k.
 // ncu showed the 16-warp FA-2/D.1 kernels are BARRIER-BOUND (32.6% of cycles at
 // __syncthreads, SM 20%). llama.cpp's fattn-mma wins at LOWER occupancy (8 warps,
 // 1 block/SM) via per-warp efficiency: f16 accum (fewer regs → more ILP to hide
