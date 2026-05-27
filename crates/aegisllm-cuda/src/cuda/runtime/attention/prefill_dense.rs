@@ -1881,6 +1881,10 @@ impl CudaRuntime {
             && group % 2 == 0
             && num_attention_heads.is_multiple_of(2);
         // Stage H.4 MMA4: mma2 with register-resident softmax (no s_shared spill).
+        // Opt-in via AEGIS_MMA4=1. Measured win on Gemma-4 global hd512 prefill:
+        //   +3.3% @32k, +1.0% @64k, ~0% @128k, -1.5% @256k.
+        // Crossover with FA-2 is around ~100k context. Best for short-to-medium
+        // prefill workloads; FA-2 stays preferred for very-long-ctx prefill.
         let mma4 = std::env::var("AEGIS_MMA4").as_deref() == Ok("1");
         let mma2 = mma4 || gqa2 || std::env::var("AEGIS_MMA2").as_deref() == Ok("1");
         let kv_block: usize = if mma2 { 32 } else { 64 };
