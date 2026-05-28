@@ -303,6 +303,12 @@ impl DeviceBf16Matrix {
     pub fn is_host_resident(&self) -> bool {
         self.host_values.is_some()
     }
+    /// VRAM-resident u16 slice (BF16 bit-pattern), for callers that need to
+    /// DMA the raw matrix bytes back to host (e.g. downloading the
+    /// position-embedding table for CPU-side interpolation in the vision tower).
+    pub fn values_u16(&self) -> &CudaSlice<u16> {
+        &self.values
+    }
 }
 
 /// Standalone FP8 E4M3 linear weight, produced by the load-time

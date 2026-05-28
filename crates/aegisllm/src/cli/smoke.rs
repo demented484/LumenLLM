@@ -746,6 +746,8 @@ fn first_cuda_device(engine: &AegisEngine, command_name: &'static str) -> Result
 pub(super) fn vision_load_smoke(config: EngineConfig) -> Result<()> {
     use aegisllm_cuda::executor::vision::{VisionEncoderShape, VisionTower};
     use aegisllm_base::tensor::storage::TensorStorageLoader;
+    use aegisllm_base::modalities::image_preprocess::ImageProcessor;
+    use std::path::Path;
 
     let cuda_config = config.cuda;
     let engine = AegisEngine::build(EngineConfig {
@@ -795,6 +797,46 @@ pub(super) fn vision_load_smoke(config: EngineConfig) -> Result<()> {
         "  projector:      {}x{}  (vision_hidden -> text_hidden)",
         tower.projector.rows, tower.projector.cols
     );
+
+    // ── Optional forward pass smoke: if AEGIS_VISION_IMAGE is set, load that
+    // image and run the full vision-tower forward, report output token count
+    // + a few projected embedding values.
+    if let Ok(path) = std::env::var("AEGIS_VISION_IMAGE") {
+        eprintln!("\nvision-load-smoke: running FORWARD on {path}");
+        let processor = ImageProcessor::gemma4();
+        let img = processor.load(Path::new(&path))?;
+        eprintln!(
+            "  preprocessed:   {}x{} → {} patches ({}x{}) → {} tokens ({}x{})",
+            img.height, img.width,
+            img.num_patches(), img.num_patches_h, img.num_patches_w,
+            img.num_tokens(), img.num_tokens_h, img.num_tokens_w
+        );
+        let t1 = std::time::Instant::now();
+        let embeds = tower.forward(&cuda, &img.patches, img.num_patches_h, img.num_patches_w)?;
+        let dt1 = t1.elapsed();
+        let text_hidden = tower.projector.rows;
+        let n_tokens = img.num_tokens();
+        let expected = n_tokens * text_hidden;
+        if embeds.len() != expected {
+            return Err(aegisllm_base::error::AegisError::InvalidPlan(format!(
+                "vision forward produced {} f32, expected {}", embeds.len(), expected
+            )));
+        }
+        let sum: f32 = embeds.iter().sum();
+        let mean = sum / embeds.len() as f32;
+        let mut max = f32::MIN;
+        let mut min = f32::MAX;
+        for &x in &embeds {
+            if x > max { max = x; }
+            if x < min { min = x; }
+        }
+        eprintln!(
+            "  forward OK:     {:.2}s  output [{}, {}] mean={:.4} min={:.4} max={:.4}",
+            dt1.as_secs_f64(), n_tokens, text_hidden, mean, min, max
+        );
+        eprintln!("  embeds[0][0..8]: {:?}", &embeds[..8.min(embeds.len())]);
+    }
+
     println!("vision-load-smoke: PASS");
     Ok(())
 }

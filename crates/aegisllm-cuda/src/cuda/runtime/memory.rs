@@ -223,6 +223,19 @@ impl CudaRuntime {
             .map_err(map_cuda_err("dtoh u8 buffer"))
     }
 
+    /// Download a raw u16 `CudaSlice` (e.g. the BF16 bit-pattern of a
+    /// `DeviceBf16Matrix::values_u16()`) into a host `Vec`. Used by the
+    /// vision tower forward to read the position-embedding table for
+    /// CPU-side interpolation.
+    pub fn download_u16_slice(
+        &self,
+        slice: &cudarc::driver::CudaSlice<u16>,
+    ) -> Result<Vec<u16>> {
+        self.stream
+            .clone_dtoh(slice)
+            .map_err(map_cuda_err("dtoh u16 slice"))
+    }
+
     pub fn upload_u8_slice_to_device(
         &self,
         values: &[u8],
