@@ -307,6 +307,14 @@ pub(super) struct CudaLayer {
     pub(super) layer_num_kv_heads: usize,
     /// Per-layer PLE weights (E4B / E2B). `None` when the model has no PLE.
     pub(super) ple: Option<PleLayer>,
+    /// KV-cache sharing (Gemma-4 E4B / E2B): when `Some(parent_idx)`, this
+    /// layer's K/V projections + cache writes are skipped at runtime; the
+    /// attention kernel reads K/V from `layers[parent_idx].kv` instead. The
+    /// parent is selected at load time as the most recent layer of the same
+    /// `layer_type` (sliding vs full) before the shared-layer boundary
+    /// `num_hidden_layers - num_kv_shared_layers`. E4B: layers 24..41 are
+    /// shared; layers 22 (sliding) and 23 (full) are the parents.
+    pub(super) kv_shared_from: Option<usize>,
 }
 
 #[derive(Debug)]

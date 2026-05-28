@@ -96,12 +96,22 @@ impl CudaLlamaExecutor {
             params.staging_slot_idx = staging_slot_idx;
 
             let layer = &self.layers[layer_idx];
-            let layer_state = &mut layers[layer_idx];
+            // Split-borrow `layers` so we can hand `forward_attention_device`
+            // a mutable borrow of layer N's state AND an immutable borrow of
+            // the parent layer's KV cache (when KV-share is active for this
+            // layer). split_at_mut returns disjoint halves; the parent index
+            // lives in `left` (it's strictly less than this layer's index by
+            // construction in `load_cuda_layer`'s post-load pass).
+            let (left, right) = layers.split_at_mut(layer_idx);
+            let layer_state = &mut right[0];
+            let kv_shared_override = layer.kv_shared_from
+                .and_then(|parent_idx| left.get(parent_idx).map(|s| &s.kv));
             let lt_attn = std::time::Instant::now();
             super::attention::forward_attention_device(
                 &self.runtime,
                 layer,
                 layer_state,
+                kv_shared_override,
                 hidden,
                 scratch,
                 decode_position,
@@ -550,10 +560,12 @@ pub(super) fn forward_cuda_layer_device(
 ) -> Result<()> {
     // Per-layer head_dim and num_kv_heads override model-wide params
     // (e.g. Gemma 4 global layers use head_dim=512, num_kv_heads=2).
+    // Block-level executor: no KV-share (single-layer unit tests).
     forward_attention_device(
         runtime,
         layer,
         layer_state,
+        None,
         hidden,
         scratch,
         p_position,

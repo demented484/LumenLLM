@@ -307,6 +307,10 @@ pub(super) fn load_cuda_layer(
         layer_head_dim,
         layer_num_kv_heads,
         ple: load_ple_layer(cuda, artifact, &prefix, placement.store, residency, loader)?,
+        // kv_shared_from is filled in by a post-load pass that has access to
+        // the full layer list (and thus per-layer `layer_type`s for parent
+        // resolution).
+        kv_shared_from: None,
         dense_activation: {
             // Pick activation from the architecture descriptor: `silu` (Llama
             // / Qwen) → SwiGLU; `gelu_pytorch_tanh` (Gemma-4 E4B / 26B-A4B

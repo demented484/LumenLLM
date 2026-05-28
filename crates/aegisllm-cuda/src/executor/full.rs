@@ -257,6 +257,46 @@ impl CudaLlamaExecutor {
             stage_t(&format!("layer {layer}"), t0);
             progress.step(&format!("layer {layer}"));
         }
+        // Post-load pass: compute `kv_shared_from` for Gemma-4 E4B / E2B.
+        // Layers ≥ `num_hidden_layers - num_kv_shared_layers` read K/V from
+        // the most recent layer of matching `layer_type` strictly BEFORE the
+        // boundary. Sliding ↔ sliding, full ↔ full. For models without
+        // `num_kv_shared_layers` (Llama, Qwen, 26B-A4B) the field stays None
+        // and the attention path runs as before.
+        if let Some(n_shared) = artifact.config.num_kv_shared_layers {
+            if n_shared > 0 && n_shared < layers.len() {
+                let first_shared = layers.len() - n_shared;
+                // Resolve per-layer attention type from the same source the
+                // attention path uses (`is_global_layer` on the architecture
+                // descriptor), so the parent type matches the runtime classification.
+                let arch = aegisllm_base::model::detect_architecture(&artifact.config)?;
+                use aegisllm_base::model::AttentionPattern;
+                let layer_is_global: Vec<bool> = (0..layers.len())
+                    .map(|i| matches!(
+                        arch.attention_pattern(i, &artifact.config),
+                        AttentionPattern::FullCausal
+                    ))
+                    .collect();
+                for li in first_shared..layers.len() {
+                    let need_global = layer_is_global[li];
+                    // Walk backwards from first_shared - 1 looking for a
+                    // pre-boundary layer of matching attention type.
+                    let parent = (0..first_shared)
+                        .rev()
+                        .find(|&k| layer_is_global[k] == need_global);
+                    if let Some(p) = parent {
+                        layers[li].kv_shared_from = Some(p);
+                    } else {
+                        return Err(AegisError::InvalidPlan(format!(
+                            "KV-share: no pre-boundary parent of {} type for layer {} \
+                             (first_shared={}, n_shared={})",
+                            if need_global { "global" } else { "sliding" },
+                            li, first_shared, n_shared,
+                        )));
+                    }
+                }
+            }
+        }
         let weights_elapsed = load_start.elapsed().as_secs_f64();
         let total_bytes_loaded: u64 = artifact
             .tensors

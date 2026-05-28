@@ -19,6 +19,11 @@ pub(super) fn forward_attention_device(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
     layer_state: &mut CudaLayerState,
+    // KV-cache override (Gemma-4 E4B / E2B shared layers). When Some,
+    // this layer's K/V projections, K-RoPE, and cache writes are skipped;
+    // attention reads K/V from the override (parent layer's cache slot).
+    // None for every existing target model — full attention pipeline runs.
+    kv_shared_override: Option<&crate::executor::state::CudaKvCache>,
     hidden: &DeviceBuffer<f32>,
     scratch: &mut CudaScratch,
     p_position: &DeviceBuffer<u32>,
@@ -112,12 +117,19 @@ pub(super) fn forward_attention_device(
         matvec_cuda_linear_with_scratch(runtime, &layer.q_proj, &scratch.input_normed,
             &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut scratch.q,
             scratch.staging_pool.as_deref_mut())?;
-        matvec_cuda_linear_with_scratch(runtime, &layer.k_proj, &scratch.input_normed,
-            &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut scratch.k,
-            scratch.staging_pool.as_deref_mut())?;
-        matvec_cuda_linear_with_scratch(runtime, &layer.v_proj, &scratch.input_normed,
-            &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut scratch.v,
-            scratch.staging_pool.as_deref_mut())?;
+        // Shared layers (Gemma-4 E4B last 18 of 42) skip K/V projection +
+        // norm + RoPE + cache write — their attention reads K/V from the
+        // parent layer's cache slot via `kv_shared_override`. Q is still
+        // computed and normed/RoPE'd normally so the shared layer can
+        // attend with its own query against the parent's keys/values.
+        if kv_shared_override.is_none() {
+            matvec_cuda_linear_with_scratch(runtime, &layer.k_proj, &scratch.input_normed,
+                &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut scratch.k,
+                scratch.staging_pool.as_deref_mut())?;
+            matvec_cuda_linear_with_scratch(runtime, &layer.v_proj, &scratch.input_normed,
+                &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut scratch.v,
+                scratch.staging_pool.as_deref_mut())?;
+        }
     }
     // Gemma 4: per-head RMS norm on Q and K, applied between projection and RoPE.
     // The norm weight has length `head_dim`; the kernel processes `num_heads` rows in parallel.
@@ -138,7 +150,8 @@ pub(super) fn forward_attention_device(
             num_attention_heads * head_dim,
         )?;
     }
-    if let Some(ref knw) = layer.k_norm_weight {
+    if kv_shared_override.is_none() && layer.k_norm_weight.is_some() {
+        let knw = layer.k_norm_weight.as_ref().unwrap();
         runtime.rms_norm_batched_device(
             &scratch.k,
             knw,
@@ -154,7 +167,7 @@ pub(super) fn forward_attention_device(
     }
     // Gemma 4: V is RMS-normed per-head with NO learned weight (with_scale=False).
     // This applies whenever `q_norm` is present (Gemma 4 always pairs q/k/v norms).
-    if layer.q_norm_weight.is_some() {
+    if kv_shared_override.is_none() && layer.q_norm_weight.is_some() {
         runtime.rms_norm_batched_no_weight_device(
             &scratch.v,
             num_kv_heads,
@@ -183,7 +196,9 @@ pub(super) fn forward_attention_device(
         head_dim,
         rope,
     )?;
-    runtime.apply_rope_ptr_device(&mut scratch.k, p_position, num_kv_heads, head_dim, rope)?;
+    if kv_shared_override.is_none() {
+        runtime.apply_rope_ptr_device(&mut scratch.k, p_position, num_kv_heads, head_dim, rope)?;
+    }
     if let Ok(tag) = std::env::var("AEGIS_DUMP_QROPE") {
         thread_local! { static C: std::cell::RefCell<usize> = std::cell::RefCell::new(0); }
         let idx = C.with(|c| { let v = *c.borrow(); *c.borrow_mut() = v + 1; v });
@@ -236,6 +251,35 @@ pub(super) fn forward_attention_device(
             &mut scratch.attn_split_l,
             &mut scratch.attn_context,
         )?;
+    } else if let Some(parent_kv) = kv_shared_override {
+        // Shared-layer attention: skip store_kv (parent already wrote at
+        // this position); read directly from parent's KV cache.
+        use crate::executor::state::KvBuffer;
+        match (&parent_kv.keys, &parent_kv.values) {
+            (KvBuffer::F16(keys), KvBuffer::F16(values)) => {
+                runtime.attention_decode_split_ptr_device(
+                    keys, values, &scratch.q, p_seq_len, num_attention_heads, num_kv_heads,
+                    head_dim, layer.window_size, _seq_len,
+                    &mut scratch.attn_split_acc,
+                    &mut scratch.attn_split_m,
+                    &mut scratch.attn_split_l,
+                    &mut scratch.attn_context,
+                )?;
+            }
+            (KvBuffer::Fp8(keys), KvBuffer::Fp8(values)) => {
+                runtime.attention_decode_split_ptr_fp8_device(
+                    keys, values, &scratch.q, p_seq_len, num_attention_heads, num_kv_heads,
+                    head_dim, layer.window_size, _seq_len,
+                    &mut scratch.attn_split_acc,
+                    &mut scratch.attn_split_m,
+                    &mut scratch.attn_split_l,
+                    &mut scratch.attn_context,
+                )?;
+            }
+            _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
+                "KV-share: parent KV keys/values dtype mismatch".into(),
+            )),
+        }
     } else {
         use crate::executor::state::KvBuffer;
         // Branch on KV cache dtype: F16/BF16 (u16-backed) → existing kernels;
