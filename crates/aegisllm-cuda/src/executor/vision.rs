@@ -227,7 +227,12 @@ impl VisionTower {
         // produces `[n_patches, hidden]` directly. matmul_bf16_cublaslt
         // computes  out[i,j] = sum_k weight[j,k] * input[i,k]  (where
         // weight.rows = out_dim, weight.cols = in_dim, batch = n_patches).
-        let patches_f32 = runtime.upload_f32(patches)?;
+        // HF Gemma4VisionPatchEmbedder.forward: pixel_values = 2 * (pixel_values - 0.5)
+        // i.e. remap [0, 1] (post-rescale) → [-1, 1] BEFORE the patch_embed linear.
+        // (The preprocessor only rescales by 1/255, doesn't normalize; the [-1,1]
+        // mapping happens inside the model.)
+        let patches_rescaled: Vec<f32> = patches.iter().map(|&x| 2.0 * (x - 0.5)).collect();
+        let patches_f32 = runtime.upload_f32(&patches_rescaled)?;
         let mut patches_bf16 = runtime.alloc_u16(patches.len())?;
         runtime.f32_to_bf16_device(&patches_f32, patches.len(), &mut patches_bf16)?;
 
@@ -261,19 +266,28 @@ impl VisionTower {
             }).collect::<Vec<f32>>()
         };
 
+        // HF Gemma4VisionPatchEmbedder._position_embeddings: patches are
+        // indexed by their (x_grid, y_grid) position directly into the
+        // 2-bank position_embedding_table [2, N, H]. Bank 0 = x-positions,
+        // bank 1 = y-positions; the two are SUMMED per patch.
+        // Patch order in HF processor is "xy" meshgrid: (x, y) iterates
+        // x fastest, then y. We patchify in (ph, pw) order with pw fastest.
+        // In HF position_ids each row of `stacked_grid.reshape(N, 2)` is
+        // (x, y) = (pw, ph) — i.e. column-first reading of the patches.
+        // OUR patches[] is in (ph, pw) row-major order (row-first); to match
+        // the position_id ordering we just need (x, y) = (pw, ph) per token.
         let mut hidden_host = runtime.download_f32(&hidden_f32)?;
         for ph in 0..n_patches_h {
-            let r_idx = (ph as f32 / n_patches_h.max(1) as f32 * n_table as f32) as usize;
-            let r_idx = r_idx.min(n_table - 1);
             for pw in 0..n_patches_w {
-                let c_idx = (pw as f32 / n_patches_w.max(1) as f32 * n_table as f32) as usize;
-                let c_idx = c_idx.min(n_table - 1);
                 let tok = ph * n_patches_w + pw;
+                let x_idx = (pw.min(n_table - 1)) as usize;
+                let y_idx = (ph.min(n_table - 1)) as usize;
+                // bank 0 = x table; bank 1 = y table (offset by n_table rows)
+                let x_off = x_idx * s.hidden_size;
+                let y_off = (n_table + y_idx) * s.hidden_size;
                 for k in 0..s.hidden_size {
-                    let row_emb = pos_table_f32[r_idx * s.hidden_size + k];
-                    // slot 1 starts at n_table rows
-                    let col_emb = pos_table_f32[(n_table + c_idx) * s.hidden_size + k];
-                    hidden_host[tok * s.hidden_size + k] += row_emb + col_emb;
+                    hidden_host[tok * s.hidden_size + k] +=
+                        pos_table_f32[x_off + k] + pos_table_f32[y_off + k];
                 }
             }
         }
@@ -287,6 +301,78 @@ impl VisionTower {
         let h  = s.hidden_size;
         let i  = s.intermediate_size;
         let eps = s.rms_norm_eps;
+
+        // ── Precompute 2D RoPE cos/sin tables (per HF Gemma4VisionRotaryEmbedding).
+        // ndim = 2 spatial dims, head_dim split into half per dim (36 each).
+        // For each dim: inv_freq = 1 / theta^(arange(0, spatial_dim, 2) / spatial_dim)
+        //   spatial_dim = head_dim / 2 = 36, so arange(0,36,2) = 18 freqs.
+        // For each token & dim: freqs = pos_id_for_dim * inv_freq → [n_patches, 18].
+        // emb_for_dim = cat([freqs, freqs], dim=-1) → [n_patches, 36].
+        // cos_full = cat([cos_x, cos_y], dim=-1) → [n_patches, head_dim=72].
+        // (Identical for sin.) Then apply_multidimensional_rope splits x into
+        // 2 chunks of size 36 and rotates each with that dim's (cos, sin).
+        let spatial_dim = hd / 2;
+        let n_freqs = spatial_dim / 2;
+        let mut inv_freq = Vec::with_capacity(n_freqs);
+        for i_f in 0..n_freqs {
+            let exponent = (2 * i_f) as f32 / spatial_dim as f32;
+            inv_freq.push(1.0 / s.rope_theta.powf(exponent));
+        }
+        let mut cos_table = vec![0f32; n_patches * hd];
+        let mut sin_table = vec![0f32; n_patches * hd];
+        for ph in 0..n_patches_h {
+            for pw in 0..n_patches_w {
+                let tok = ph * n_patches_w + pw;
+                let pos_x = pw as f32;
+                let pos_y = ph as f32;
+                // x-dim freqs (first spatial_dim entries of cos/sin).
+                for i_f in 0..n_freqs {
+                    let f = pos_x * inv_freq[i_f];
+                    cos_table[tok * hd + i_f] = f.cos();
+                    cos_table[tok * hd + n_freqs + i_f] = f.cos();
+                    sin_table[tok * hd + i_f] = f.sin();
+                    sin_table[tok * hd + n_freqs + i_f] = f.sin();
+                }
+                // y-dim freqs (next spatial_dim entries).
+                for i_f in 0..n_freqs {
+                    let f = pos_y * inv_freq[i_f];
+                    cos_table[tok * hd + spatial_dim + i_f] = f.cos();
+                    cos_table[tok * hd + spatial_dim + n_freqs + i_f] = f.cos();
+                    sin_table[tok * hd + spatial_dim + i_f] = f.sin();
+                    sin_table[tok * hd + spatial_dim + n_freqs + i_f] = f.sin();
+                }
+            }
+        }
+        // Helper: apply 2D RoPE to a per-token [hd] slice. Out-of-place to
+        // avoid the in-place rotate-half overlap bug.
+        // num_rotated_channels_per_dim = 2 * (hd // (2*ndim)) = 36 for hd=72.
+        // Split [hd] into 2 chunks of 36 (x-dim, y-dim); within each chunk,
+        // rotate_half(chunk)[k] = -chunk[k+18] if k<18, else chunk[k-18].
+        // Apply: out[k] = chunk[k]*cos[k] + rotate_half(chunk)[k]*sin[k].
+        let apply_rope = |x: &[f32]| -> Vec<f32> {
+            let mut out = vec![0f32; x.len()];
+            for tok in 0..n_patches {
+                let cb = tok * hd;
+                for head in 0..nh {
+                    let base = tok * h + head * hd;
+                    // Chunk x-dim (indices 0..spatial_dim) and Chunk y-dim
+                    // (indices spatial_dim..hd) are independent rotations.
+                    for chunk_start in [0usize, spatial_dim] {
+                        for k in 0..spatial_dim {
+                            let i_in = base + chunk_start + k;
+                            let pair_k = if k < n_freqs { k + n_freqs } else { k - n_freqs };
+                            let pair_in = base + chunk_start + pair_k;
+                            let rot = if k < n_freqs { -x[pair_in] } else { x[pair_in] };
+                            let cos_k = cos_table[cb + chunk_start + k];
+                            let sin_k = sin_table[cb + chunk_start + k];
+                            out[i_in] = x[i_in] * cos_k + rot * sin_k;
+                        }
+                    }
+                }
+            }
+            out
+        };
+
 
         let log_progress = std::env::var("AEGIS_VISION_PROGRESS").is_ok();
         for li in 0..s.num_layers {
@@ -317,31 +403,39 @@ impl VisionTower {
             let k = proj_attn(&layer.k_proj)?;
             let v = proj_attn(&layer.v_proj)?;
 
-            // Per-head QK-norm.
-            // Download q_norm/k_norm weights once (shape [head_dim] each).
+            // Per-head QK-norm + V-norm (no-scale per HF: v_norm has with_scale=False).
+            // RMSNorm: x * rsqrt(mean(x²) + eps) [* weight]
             let qn_w = runtime.download_f32(&layer.q_norm)?;
             let kn_w = runtime.download_f32(&layer.k_norm)?;
             let mut q_n = vec![0f32; q.len()];
             let mut k_n = vec![0f32; k.len()];
+            let mut v_n = vec![0f32; v.len()];
             for t in 0..n_patches {
                 for head in 0..nh {
-                    // Compute RMS over head_dim.
                     let mut q_sum = 0f32;
                     let mut k_sum = 0f32;
+                    let mut v_sum = 0f32;
                     for d in 0..hd {
                         let off = t * h + head * hd + d;
                         q_sum += q[off] * q[off];
                         k_sum += k[off] * k[off];
+                        v_sum += v[off] * v[off];
                     }
                     let q_rms = 1.0 / ((q_sum / hd as f32) + eps).sqrt();
                     let k_rms = 1.0 / ((k_sum / hd as f32) + eps).sqrt();
+                    let v_rms = 1.0 / ((v_sum / hd as f32) + eps).sqrt();
                     for d in 0..hd {
                         let off = t * h + head * hd + d;
                         q_n[off] = q[off] * q_rms * qn_w[d];
                         k_n[off] = k[off] * k_rms * kn_w[d];
+                        v_n[off] = v[off] * v_rms;  // no scale
                     }
                 }
             }
+            let v = v_n;  // use normed V for the attention
+            // Apply 2D RoPE to Q and K (V does NOT get RoPE).
+            let q_n = apply_rope(&q_n);
+            let k_n = apply_rope(&k_n);
 
             // Bidirectional attention. Per-head parallel via rayon — heads are
             // independent. Each head's work is O(n²·hd) ≈ 0.4M·72 = 30M FMAs
@@ -454,24 +548,27 @@ impl VisionTower {
             }
         }
 
-        // ── Final standardization: state = std_scale * state + std_bias
-        // (per-channel affine, NOT RMSNorm — it's a learned scale+bias
-        // applied without any normalization).
+        // ── Final standardization (per HF Gemma4VisionModel.config.standardize):
+        // hidden_states = (hidden_states - std_bias) * std_scale
+        // NOTE the order: subtract bias FIRST, then multiply by scale.
         let std_scale = runtime.download_f32(&self.std_scale)?;
         let std_bias  = runtime.download_f32(&self.std_bias)?;
         for t in 0..n_patches {
             for c in 0..h {
                 let v = state[t * h + c];
-                state[t * h + c] = v * std_scale[c] + std_bias[c];
+                state[t * h + c] = (v - std_bias[c]) * std_scale[c];
             }
         }
 
         // ── 3×3 average pool over the patch grid (stride 3, no overlap).
+        // Per HF Gemma4VisionPooler: pooled = avg_pool(hidden) * sqrt(hidden_size).
         let pool = s.pooling_kernel_size;
         let n_tok_h = n_patches_h / pool;
         let n_tok_w = n_patches_w / pool;
         let n_tokens = n_tok_h * n_tok_w;
         let mut pooled = vec![0f32; n_tokens * h];
+        let pool_norm = 1.0 / (pool * pool) as f32;
+        let root_h = (h as f32).sqrt();
         for th in 0..n_tok_h {
             for tw in 0..n_tok_w {
                 for c in 0..h {
@@ -483,7 +580,7 @@ impl VisionTower {
                             sum += state[(ph * n_patches_w + pw) * h + c];
                         }
                     }
-                    pooled[(th * n_tok_w + tw) * h + c] = sum / (pool * pool) as f32;
+                    pooled[(th * n_tok_w + tw) * h + c] = sum * pool_norm * root_h;
                 }
             }
         }
