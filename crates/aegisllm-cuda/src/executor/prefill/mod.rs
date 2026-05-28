@@ -132,6 +132,7 @@ impl CudaLlamaExecutor {
                 )?;
                 let mut hidden_host = self.runtime.download_f32(&prefill.hidden)?;
                 let mut img_row_idx = 0usize;
+                let mut slot_positions: Vec<usize> = Vec::new();
                 for (slot, &tok) in chunk.iter().enumerate() {
                     if tok as u32 != img_tok_id { continue; }
                     let src_row = img_row_idx % n_img;
@@ -140,6 +141,35 @@ impl CudaLlamaExecutor {
                     let dst_off = slot * h;
                     hidden_host[dst_off..dst_off + h]
                         .copy_from_slice(&img_data[src_off..src_off + h]);
+                    slot_positions.push(slot);
+                }
+                if std::env::var("AEGIS_DEBUG_INJECT").is_ok() {
+                    eprintln!(
+                        "[inject] chunk_len={} n_img={} injected_rows={}",
+                        chunk.len(), n_img, img_row_idx
+                    );
+                    eprintln!(
+                        "[inject] first slots: {:?}, last slots: {:?}",
+                        &slot_positions[..slot_positions.len().min(5)],
+                        &slot_positions[slot_positions.len().saturating_sub(5)..]
+                    );
+                    // Sample pre/at/post values to verify injection: hidden[slot_positions[0]][0..6]
+                    if !slot_positions.is_empty() {
+                        let s0 = slot_positions[0];
+                        let pre = if s0 > 0 { s0 - 1 } else { 0 };
+                        eprintln!(
+                            "[inject] pre-slot {} hidden[0..6] = {:?}",
+                            pre, &hidden_host[pre * h..pre * h + 6]
+                        );
+                        eprintln!(
+                            "[inject] img-slot {} hidden[0..6] = {:?}",
+                            s0, &hidden_host[s0 * h..s0 * h + 6]
+                        );
+                        eprintln!(
+                            "[inject] img_data row 0[0..6]  = {:?}",
+                            &img_data[..6]
+                        );
+                    }
                 }
                 self.runtime.upload_f32_slice_to_device(&hidden_host, &mut prefill.hidden)?;
             }

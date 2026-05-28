@@ -603,12 +603,27 @@ impl VisionTower {
         let i_  = s.intermediate_size;
         let eps = s.rms_norm_eps;
         let log_progress = std::env::var("AEGIS_VISION_PROGRESS").is_ok();
+        let dump_prefix = std::env::var("AEGIS_VISION_DUMP").ok();
+        let dump = |stage: &str, buf: &crate::cuda::DeviceBuffer<f32>| -> Result<()> {
+            if let Some(ref p) = dump_prefix {
+                let v = runtime.download_f32(buf)?;
+                let path = format!("{}.{}.bin", p, stage);
+                let bytes: Vec<u8> = v.iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect();
+                std::fs::write(&path, bytes)
+                    .map_err(|e| AegisError::InvalidPlan(format!("dump write {path}: {e}")))?;
+                eprintln!("  dump {stage}: {} f32 → {path}", v.len());
+            }
+            Ok(())
+        };
 
         // ── Phase 1: pixel rescale + patch_embed.
         // Upload patches (already in [0, 1] from preprocess), rescale on GPU
         // to [-1, 1] per HF Gemma4VisionPatchEmbedder.
         let mut patches_f32 = runtime.upload_f32(patches)?;
         runtime.vision_pixel_rescale_device(&mut patches_f32, patches.len())?;
+        dump("after_rescale", &patches_f32)?;
         let mut patches_bf16 = runtime.alloc_u16(patches.len())?;
         runtime.f32_to_bf16_device(&patches_f32, patches.len(), &mut patches_bf16)?;
 
@@ -619,6 +634,7 @@ impl VisionTower {
             &self.patch_embed, &patches_bf16, n_patches,
             &mut hidden_bf16, &mut state,
         )?;
+        dump("after_patch_embed", &state)?;
 
         // ── Phase 2: add 2D-axial position embeddings (GPU kernel).
         runtime.vision_pos_embed_add_device(
@@ -628,6 +644,7 @@ impl VisionTower {
             s.position_embedding_size,
             h,
         )?;
+        dump("after_pos_embed", &state)?;
 
         // ── Phase 3: 27 transformer layers, all on GPU.
         // Scratch buffers reused across layers (allocate once).
@@ -653,7 +670,26 @@ impl VisionTower {
         let mut down_bf16 = runtime.alloc_u16(n_patches * h)?;
         let mut down_f32 = runtime.alloc_f32(n_patches * h)?;
         let mut post_ff = runtime.alloc_f32(n_patches * h)?;
-        let scale = 1.0_f32 / (hd as f32).sqrt();
+        // HF Gemma4VisionAttention sets `self.scaling = 1.0` and passes that
+        // directly into eager_attention_forward — no `/sqrt(head_dim)` factor.
+        // Q/K already pass through per-head RMSNorm so their magnitudes are
+        // bounded, but the attention logits still get the raw QK^T scale.
+        let scale = 1.0_f32;
+
+        // Optional fast attention path: replaces the naive `vision_bidi_attn`
+        // kernel (one block per (head, q_row), bandwidth-bound at large n_tok)
+        // with two cuBLASLt strided-batched F32 GEMMs around a row-softmax.
+        // Q-tiled (Bq = 128) so the scores chunk is `nh × Bq × n_tok × 4 B`
+        // (~71 MB at 8694 tok × 16 heads, vs ~4.8 GB for a single un-tiled
+        // call) — fits alongside the 262K-context KV cache pre-reservation.
+        let fast_attn = std::env::var("AEGIS_VISION_FAST_ATTN").is_ok();
+        let bq: usize = std::env::var("AEGIS_VISION_ATTN_Q_TILE")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
+        let mut scores_buf = if fast_attn {
+            runtime.alloc_f32(nh * bq * n_patches)?
+        } else {
+            runtime.alloc_f32(1)?
+        };
 
         for li in 0..s.num_layers {
             let t_layer = std::time::Instant::now();
@@ -688,12 +724,64 @@ impl VisionTower {
             runtime.vision_rope_2d_device(
                 &mut k_buf, n_patches, n_patches_w, nh, hd, s.rope_theta)?;
 
-            // Bidirectional attention: softmax(Q·K^T * scale) · V.
-            runtime.vision_bidi_attn_device(
-                &q_buf, &k_buf, &v_buf,
-                n_patches, nh, hd, scale,
-                &mut attn_out,
-            )?;
+            if fast_attn {
+                // Q-tiled cuBLASLt batched attention. Loop over Q in chunks
+                // of `bq` rows; per chunk compute scores[h, i in q_chunk, j] =
+                // Q[i,h,:]·K[j,h,:] via batched F32 GEMM (TF32 TC), then
+                // row-softmax, then out[i,h,d] = scores · V via batched F32
+                // GEMM. Scores chunk is `nh * bq * n_patches × 4 B` (~71 MB
+                // at bq=128, n_patches=8694, nh=16) — fits with KV cache.
+                let mut q_start = 0usize;
+                while q_start < n_patches {
+                    let q_end = (q_start + bq).min(n_patches);
+                    let q_len = q_end - q_start;
+                    // QK^T: per head h, scores_chunk[h, i, j] = Q[i+q_start, h, :] · K[j, h, :]
+                    // A=K (per head offset h*hd, lda=nh*hd, stride_a=hd) — covers all n_patches K rows.
+                    // B=Q chunk (per head offset q_start*nh*hd + h*hd, ldb=nh*hd, stride_b=hd) — q_len rows.
+                    // C=scores_chunk (per head [q_len, n_patches] tight, ldc=n_patches, stride_c=q_len*n_patches).
+                    runtime.f32_strided_batched_gemm_device(
+                        &k_buf, 0, n_patches * nh * hd,
+                        &q_buf, q_start * nh * hd, q_len * nh * hd,
+                        &mut scores_buf, 0, nh * q_len * n_patches,
+                        /* transa */ true, /* transb */ false,
+                        /* m */ n_patches, /* n */ q_len, /* k */ hd,
+                        /* lda */ nh * hd, /* ldb */ nh * hd,
+                        /* ldc */ n_patches,
+                        /* stride_a */ hd, /* stride_b */ hd,
+                        /* stride_c */ q_len * n_patches,
+                        /* batch */ nh, /* alpha */ scale, /* beta */ 0.0,
+                    )?;
+                    // Row-softmax over [nh*q_len, n_patches] in place.
+                    runtime.vision_row_softmax_device(
+                        &mut scores_buf, nh * q_len, n_patches, 1.0,
+                    )?;
+                    // PV: per head h, out_chunk[i, h, d] = sum_j scores_chunk[h, i, j] * V[j, h, d]
+                    // A=V (per head offset h*hd, lda=nh*hd, stride_a=hd).
+                    // B=scores_chunk per head [q_len, n_patches] (ldb=n_patches, stride_b=q_len*n_patches).
+                    // C=attn_out chunk (q_start*nh*hd + h*hd, ldc=nh*hd, stride_c=hd).
+                    runtime.f32_strided_batched_gemm_device(
+                        &v_buf, 0, n_patches * nh * hd,
+                        &scores_buf, 0, nh * q_len * n_patches,
+                        &mut attn_out, q_start * nh * hd, q_len * nh * hd,
+                        /* transa */ false, /* transb */ false,
+                        /* m */ hd, /* n */ q_len, /* k */ n_patches,
+                        /* lda */ nh * hd, /* ldb */ n_patches,
+                        /* ldc */ nh * hd,
+                        /* stride_a */ hd,
+                        /* stride_b */ q_len * n_patches,
+                        /* stride_c */ hd,
+                        /* batch */ nh, /* alpha */ 1.0, /* beta */ 0.0,
+                    )?;
+                    q_start = q_end;
+                }
+            } else {
+                // Naive fused kernel (correct, but bandwidth-bound past ~3k tok).
+                runtime.vision_bidi_attn_device(
+                    &q_buf, &k_buf, &v_buf,
+                    n_patches, nh, hd, scale,
+                    &mut attn_out,
+                )?;
+            }
 
             // o_proj: attn_out @ o_proj.T → o_out.
             runtime.f32_to_bf16_device(&attn_out, n_patches * h, &mut attn_bf16)?;
@@ -736,14 +824,18 @@ impl VisionTower {
                     li + 1, s.num_layers, t_layer.elapsed().as_secs_f64()
                 );
             }
+            if li == 0 {
+                dump("after_layer0", &state)?;
+            }
         }
-
-        // ── Final standardization on GPU: state = (state - std_bias) * std_scale.
-        runtime.vision_standardize_device(
-            &mut state, &self.std_scale, &self.std_bias, n_patches, h,
-        )?;
+        dump("after_all_layers", &state)?;
 
         // ── 3×3 average pool + sqrt(hidden) pooler scale on GPU.
+        // Order matches HF `Gemma4VisionModel.forward` EXACTLY:
+        //   encoder → pool*sqrt(hidden) → standardize → projector(RMSNorm+linear).
+        // We previously had standardize BEFORE pool which produced a bias
+        // term off by `sqrt(hidden) ≈ 34×` and degraded after_projector
+        // cosine vs HF (visible as cos=0.84 at after_all_layers compounding).
         let pool = s.pooling_kernel_size;
         let n_th = n_patches_h / pool;
         let n_tw = n_patches_w / pool;
@@ -755,10 +847,15 @@ impl VisionTower {
             n_patches_h, n_patches_w, n_th, n_tw,
             h, pool, pooler_scale,
         )?;
+        dump("after_pool", &pooled)?;
+
+        // ── Final standardization on the POOLED tokens (n_tokens, h).
+        runtime.vision_standardize_device(
+            &mut pooled, &self.std_scale, &self.std_bias, n_tokens, h,
+        )?;
+        dump("after_std", &pooled)?;
 
         // ── Multimodal embedder: RMSNorm-no-scale then projector.
-        // RMS-norm in-place over [n_tokens, h]. The existing
-        // rms_norm_batched_no_weight_device fits exactly.
         let mut pooled_normed = runtime.alloc_f32(n_tokens * h)?;
         runtime.rms_norm_batched_no_weight_device(
             &pooled, n_tokens, h, eps, &mut pooled_normed,
@@ -774,6 +871,7 @@ impl VisionTower {
             &self.projector, &pooled_bf16, n_tokens,
             &mut out_bf16, &mut out_f32,
         )?;
+        dump("after_projector", &out_f32)?;
 
         runtime.download_f32(&out_f32)
     }

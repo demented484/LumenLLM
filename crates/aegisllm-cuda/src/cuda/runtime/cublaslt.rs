@@ -361,6 +361,94 @@ impl CudaRuntime {
         self.bf16_to_f32_device(output_bf16, out_len, output)?;
         Ok(())
     }
+
+    /// Strided-batched F32 GEMM via cuBLASLt (TF32 tensor cores on SM_120).
+    /// Used by the vision tower's bidirectional attention to compute
+    /// `scores = Q @ K^T` and `out = scores @ V` as two batched GEMMs across
+    /// `n_heads`, replacing the naive per-(head, q_row) `aegis_vision_bidi_attn`
+    /// kernel that was bandwidth-bound at large `n_tok`.
+    ///
+    /// `*_offset` / `*_len` define a window into each buffer so callers can
+    /// tile over Q-rows without slicing the full buffer (cudarc slices
+    /// require non-overlapping mutable borrows — tiling logic is cleaner
+    /// with explicit element offsets). All matrices are F32. cuBLASLt views
+    /// memory column-major; the caller provides `lda/ldb/ldc` and `stride_*`
+    /// in the column-major sense and chooses `transa/transb` so the
+    /// effective math is the desired row-major operation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn f32_strided_batched_gemm_device(
+        &self,
+        a: &DeviceBuffer<f32>,
+        a_offset: usize,
+        a_len: usize,
+        b: &DeviceBuffer<f32>,
+        b_offset: usize,
+        b_len: usize,
+        c: &mut DeviceBuffer<f32>,
+        c_offset: usize,
+        c_len: usize,
+        transa: bool,
+        transb: bool,
+        m: usize,
+        n: usize,
+        k: usize,
+        lda: usize,
+        ldb: usize,
+        ldc: usize,
+        stride_a: usize,
+        stride_b: usize,
+        stride_c: usize,
+        batch_size: usize,
+        alpha: f32,
+        beta: f32,
+    ) -> Result<()> {
+        let cfg = MatmulConfig {
+            transa,
+            transb,
+            transc: false,
+            m: m as u64,
+            n: n as u64,
+            k: k as u64,
+            alpha,
+            lda: lda as i64,
+            ldb: ldb as i64,
+            beta,
+            ldc: ldc as i64,
+            stride_a: Some(stride_a as i64),
+            stride_b: Some(stride_b as i64),
+            stride_c: Some(stride_c as i64),
+            stride_bias: None,
+            batch_size: Some(batch_size as i32),
+        };
+        let a_view = a.slice.try_slice(a_offset..a_offset + a_len)
+            .ok_or_else(|| AegisError::InvalidPlan(format!(
+                "f32 batched gemm: a slice [{a_offset}..{}] OOB (len={})",
+                a_offset + a_len, a.slice.len()
+            )))?;
+        let b_view = b.slice.try_slice(b_offset..b_offset + b_len)
+            .ok_or_else(|| AegisError::InvalidPlan(format!(
+                "f32 batched gemm: b slice [{b_offset}..{}] OOB (len={})",
+                b_offset + b_len, b.slice.len()
+            )))?;
+        let c_total = c.slice.len();
+        let mut c_view = c.slice.try_slice_mut(c_offset..c_offset + c_len)
+            .ok_or_else(|| AegisError::InvalidPlan(format!(
+                "f32 batched gemm: c slice [{c_offset}..{}] OOB (len={c_total})",
+                c_offset + c_len
+            )))?;
+        unsafe {
+            self.cublas_lt
+                .matmul(cfg, &a_view, &b_view, &mut c_view, None, None)
+        }
+        .map_err(|e| {
+            AegisError::Unsupported(format!(
+                "cuBLASLt F32 strided-batched matmul failed (m={m} n={n} k={k} \
+                 lda={lda} ldb={ldb} ldc={ldc} stride_a={stride_a} stride_b={stride_b} \
+                 stride_c={stride_c} batch={batch_size}): {e:?}"
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 #[allow(dead_code)]

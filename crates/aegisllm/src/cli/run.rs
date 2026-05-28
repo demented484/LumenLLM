@@ -134,12 +134,25 @@ pub fn run_env() -> Result<()> {
                 // the single marker with N copies BEFORE tokenization, so
                 // the prompt has N=image_n_tokens placeholder positions
                 // matching the N image-embedding rows we produce.
+                // Gemma-4 image block format (matches HF Gemma4Processor):
+                //   `<|image>` (id 255999, opening) + N × `<|image|>` (id
+                //   258880, soft tokens) + `<image|>` (id 258882, closing).
+                // The N soft tokens are where the vision tower output rows
+                // get spliced in; the opening/closing delimiters frame them
+                // for the language model and are required for correct
+                // behavior (without them the model treats the soft tokens
+                // as garbage text).
                 let marker = "<|image|>";
                 if request.prompt.contains(marker) {
-                    let replacement = marker.repeat(injection.n_tokens);
-                    request.prompt = request.prompt.replacen(marker, &replacement, 1);
+                    let mut block = String::with_capacity(
+                        "<|image>".len() + marker.len() * injection.n_tokens + "<image|>".len()
+                    );
+                    block.push_str("<|image>");
+                    for _ in 0..injection.n_tokens { block.push_str(marker); }
+                    block.push_str("<image|>");
+                    request.prompt = request.prompt.replacen(marker, &block, 1);
                     eprintln!(
-                        "vision: expanded `<|image|>` to {} markers in prompt",
+                        "vision: expanded `<|image|>` to <|image>{}×<|image|><image|> block",
                         injection.n_tokens
                     );
                 }
@@ -320,13 +333,36 @@ fn compute_image_injection(
         img.height, img.width, img.num_patches(), img.num_tokens()
     );
 
-    eprintln!("vision: running tower forward (~55s)...");
-    let t0 = std::time::Instant::now();
-    let embeds = tower.forward_gpu(&cuda, &img.patches, img.num_patches_h, img.num_patches_w)?;
-    let dt = t0.elapsed();
     let text_hidden = tower.projector.rows;
     let n_tokens = img.num_tokens();
-    eprintln!("vision: forward done in {:.2}s", dt.as_secs_f64());
+
+    // Diagnostic: when AEGIS_INJECT_FROM_FILE is set, load that .bin (f32,
+    // shape [n_tokens, text_hidden]) instead of running the vision tower.
+    // Lets us validate the injection mechanism with a known-good reference
+    // (e.g. HF Gemma4 projector dump).
+    let embeds = if let Ok(path) = std::env::var("AEGIS_INJECT_FROM_FILE") {
+        eprintln!("vision: loading embeds from {path} (bypassing tower forward)");
+        let bytes = std::fs::read(&path)
+            .map_err(|e| AegisError::InvalidPlan(format!("read {path}: {e}")))?;
+        let expected = n_tokens * text_hidden * 4;
+        if bytes.len() != expected {
+            return Err(AegisError::InvalidPlan(format!(
+                "inject-from-file: got {} bytes, expected {} ({}×{}×4)",
+                bytes.len(), expected, n_tokens, text_hidden
+            )));
+        }
+        let mut v = vec![0.0_f32; n_tokens * text_hidden];
+        for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+            v[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        v
+    } else {
+        eprintln!("vision: running tower forward (~55s)...");
+        let t0 = std::time::Instant::now();
+        let e = tower.forward_gpu(&cuda, &img.patches, img.num_patches_h, img.num_patches_w)?;
+        eprintln!("vision: forward done in {:.2}s", t0.elapsed().as_secs_f64());
+        e
+    };
 
     Ok(aegisllm_base::generation::ImageInjection {
         data: embeds,

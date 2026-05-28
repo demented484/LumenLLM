@@ -67,13 +67,21 @@ impl ImageProcessor {
     /// max 280 post-pool tokens (= 2520 pre-pool patches @ pool=3), patch=16,
     /// rescale=1/255, no mean/std normalization.
     pub fn gemma4() -> Self {
+        // Pre-pool patch budget = max_soft_tokens × pooling². Gemma-4 native
+        // spec is max_soft_tokens=280, pooling=3 → 2520. For OCR-heavy
+        // inputs, llama.cpp's `--image-max-tokens` lifts this cap by feeding
+        // a higher-resolution resize (the trained projector tolerates more
+        // tokens, the position table goes to 10240). We match that lever via
+        // `AEGIS_VISION_MAX_PATCHES` (e.g. 9000 ≈ 1000 soft tokens).
+        let max_patches = std::env::var("AEGIS_VISION_MAX_PATCHES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2520);
         Self {
             patch_size: 16,
             pooling_kernel_size: 3,
             resize: ResizeStrategy::AspectPreserving {
-                // Pre-pool patch budget = max_soft_tokens × pooling².
-                // Gemma-4 spec: max_soft_tokens=280, pooling=3 → 2520.
-                max_patches: 2520,
+                max_patches,
                 side_multiple: 48, // pooling * patch = 3 * 16
             },
             rescale_factor: 1.0 / 255.0,
@@ -210,14 +218,19 @@ impl ImageProcessor {
         let n_patches = num_patches_h * num_patches_w;
         let patch_dim = 3 * p * p;
         let mut patches = vec![0.0_f32; n_patches * patch_dim];
+        // Patch layout: HWC (height, width, channel) — innermost channel.
+        // This matches HuggingFace `Gemma4ImageProcessor` and the trained
+        // patch_embed weight `[hidden, P*P*3]` whose 768 input columns are
+        // laid out as `(py, px, c)`. Earlier we used CHW here, which broke
+        // semantic fidelity (model saw abstract patterns, not the scene).
         for ph in 0..num_patches_h {
             for pw in 0..num_patches_w {
                 let patch_idx = ph * num_patches_w + pw;
-                for c in 0..3 {
-                    for py in 0..p {
-                        for px in 0..p {
+                for py in 0..p {
+                    for px in 0..p {
+                        for c in 0..3 {
                             let src_off = c * plane + (ph * p + py) * w + (pw * p + px);
-                            let dst_off = patch_idx * patch_dim + c * p * p + py * p + px;
+                            let dst_off = patch_idx * patch_dim + py * p * 3 + px * 3 + c;
                             patches[dst_off] = pixels[src_off];
                         }
                     }
