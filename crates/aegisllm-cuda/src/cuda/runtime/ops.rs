@@ -1606,6 +1606,228 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Stage I.4 vision pixel rescale: in-place x = 2*(x - 0.5) on a flat buffer.
+    pub fn vision_pixel_rescale_device(
+        &self,
+        pixels: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<()> {
+        let n_u = u32_arg("n", n)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(n_u, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_pixel_rescale)
+                .arg(&mut pixels.slice)
+                .arg(&n_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_pixel_rescale"))?;
+        Ok(())
+    }
+
+    /// Stage I.4 vision position-embedding add. Adds 2D-axial positional
+    /// embeddings (bank 0 = x, bank 1 = y from a [2*N, hidden] BF16 table)
+    /// into `hidden_buf` shape `[n_patches, hidden_size]` row-major.
+    /// `position_table` is a raw u16 CudaSlice — the caller passes the raw
+    /// slice from `DeviceBf16Matrix::values_u16()` rather than wrapping it.
+    pub fn vision_pos_embed_add_device(
+        &self,
+        hidden_buf: &mut DeviceBuffer<f32>,
+        position_table: &cudarc::driver::CudaSlice<u16>,
+        n_patches_h: usize,
+        n_patches_w: usize,
+        n_table_rows: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        let n_patches = n_patches_h * n_patches_w;
+        if hidden_buf.len() < n_patches * hidden_size {
+            return Err(AegisError::InvalidPlan(format!(
+                "vision_pos_embed_add: hidden_buf too small {} need {}",
+                hidden_buf.len(), n_patches * hidden_size
+            )));
+        }
+        let n_patches_h_u = u32_arg("n_patches_h", n_patches_h)?;
+        let n_patches_w_u = u32_arg("n_patches_w", n_patches_w)?;
+        let n_table_u = u32_arg("n_table_rows", n_table_rows)?;
+        let hidden_u = u32_arg("hidden_size", hidden_size)?;
+        let cfg = LaunchConfig {
+            grid_dim: (n_patches as u32, ceil_div(hidden_u, 256), 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_pos_embed_add)
+                .arg(&mut hidden_buf.slice)
+                .arg(position_table)
+                .arg(&n_patches_h_u)
+                .arg(&n_patches_w_u)
+                .arg(&n_table_u)
+                .arg(&hidden_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_pos_embed_add"))?;
+        Ok(())
+    }
+
+    /// Stage I.4 per-head RMSNorm of `x` shape `[n_tok, n_heads, head_dim]`.
+    /// Pass `Some(weight)` for Q/K (with scale); pass `None` for V (no scale).
+    /// In-place.
+    pub fn vision_head_rmsnorm_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        weight: Option<&DeviceBuffer<f32>>,
+        n_tok: usize,
+        n_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        if head_dim == 0 || head_dim > 1024 {
+            return Err(AegisError::InvalidPlan(format!(
+                "vision_head_rmsnorm: head_dim={} out of range (1..=1024)",
+                head_dim
+            )));
+        }
+        let with_weight: u32 = if weight.is_some() { 1 } else { 0 };
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_tok", n_tok)?, u32_arg("n_heads", n_heads)?, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: std::mem::size_of::<f32>() as u32,
+        };
+        let n_heads_u = n_heads as u32;
+        let head_dim_u = head_dim as u32;
+        // When weight is None, pass the x buffer itself as a placeholder
+        // (kernel won't read it because with_weight=0). Avoids a fresh
+        // allocation.
+        let dummy_weight = x.slice.clone();
+        let weight_arg = match weight {
+            Some(w) => &w.slice,
+            None => &dummy_weight,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_head_rmsnorm)
+                .arg(&mut x.slice)
+                .arg(weight_arg)
+                .arg(&n_heads_u)
+                .arg(&head_dim_u)
+                .arg(&eps)
+                .arg(&with_weight)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_head_rmsnorm"))?;
+        Ok(())
+    }
+
+    /// Stage I.4 2D multidimensional RoPE on Q or K, in-place. Splits
+    /// head_dim into 2 spatial halves (x-dim, y-dim); each half does
+    /// rotate-half RoPE with frequencies from `rope_theta` and per-token
+    /// positions derived from (ph, pw) ↔ token index.
+    pub fn vision_rope_2d_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        n_tok: usize,
+        n_patches_w: usize,
+        n_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+    ) -> Result<()> {
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_tok", n_tok)?, u32_arg("n_heads", n_heads)?, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_patches_w_u = n_patches_w as u32;
+        let n_heads_u = n_heads as u32;
+        let head_dim_u = head_dim as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_rope_2d)
+                .arg(&mut x.slice)
+                .arg(&n_patches_w_u)
+                .arg(&n_heads_u)
+                .arg(&head_dim_u)
+                .arg(&rope_theta)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_rope_2d"))?;
+        Ok(())
+    }
+
+    /// Stage I.4 per-channel affine standardization: x = (x - bias) * scale.
+    /// In-place over `[n_rows, hidden_size]` row-major.
+    pub fn vision_standardize_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        scale: &DeviceBuffer<f32>,
+        bias: &DeviceBuffer<f32>,
+        n_rows: usize,
+        hidden_size: usize,
+    ) -> Result<()> {
+        let hidden_u = u32_arg("hidden_size", hidden_size)?;
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_rows", n_rows)?, ceil_div(hidden_u, 256), 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_standardize)
+                .arg(&mut x.slice)
+                .arg(&scale.slice)
+                .arg(&bias.slice)
+                .arg(&hidden_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_standardize"))?;
+        Ok(())
+    }
+
+    /// Stage I.4 3×3 average pool (stride 3, no overlap) with per-element
+    /// scale factor (caller passes sqrt(hidden) / pool²).
+    pub fn vision_pool3x3_scale_device(
+        &self,
+        src: &DeviceBuffer<f32>,
+        dst: &mut DeviceBuffer<f32>,
+        n_ph: usize,
+        n_pw: usize,
+        n_th: usize,
+        n_tw: usize,
+        hidden_size: usize,
+        pool: usize,
+        out_scale: f32,
+    ) -> Result<()> {
+        let hidden_u = u32_arg("hidden_size", hidden_size)?;
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_tokens", n_th * n_tw)?, ceil_div(hidden_u, 256), 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_ph_u = n_ph as u32;
+        let n_pw_u = n_pw as u32;
+        let n_tw_u = n_tw as u32;
+        let pool_u = pool as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_pool3x3_scale)
+                .arg(&src.slice)
+                .arg(&mut dst.slice)
+                .arg(&n_ph_u)
+                .arg(&n_pw_u)
+                .arg(&n_tw_u)
+                .arg(&hidden_u)
+                .arg(&pool_u)
+                .arg(&out_scale)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_pool3x3_scale"))?;
+        Ok(())
+    }
+
     /// Stage I.3 fused bidirectional vision attention. One launch computes
     /// softmax(Q·K^T * scale) · V over the whole [n_tok, n_heads] grid.
     /// Inputs / output: f32 row-major `[n_tok, n_heads, head_dim]`.

@@ -575,4 +575,206 @@ impl VisionTower {
 
         runtime.download_f32(&out_f32)
     }
+
+    /// GPU-only forward pass (Stage I.4). Same math as `forward()` but every
+    /// op (pixel rescale, position embedding add, QK/V norm, 2D RoPE, attention,
+    /// residual adds, std-norm, 3×3 avg pool, projector) executes on the GPU.
+    /// One upload of raw patches, one download of the projected output. The
+    /// per-layer download/upload round-trips in the CPU forward are gone.
+    pub fn forward_gpu(
+        &self,
+        runtime: &crate::cuda::CudaRuntime,
+        patches: &[f32],
+        n_patches_h: usize,
+        n_patches_w: usize,
+    ) -> Result<Vec<f32>> {
+        let s = &self.shape;
+        let n_patches = n_patches_h * n_patches_w;
+        let patch_dim = 3 * s.patch_size * s.patch_size;
+        if patches.len() != n_patches * patch_dim {
+            return Err(AegisError::InvalidPlan(format!(
+                "vision forward_gpu: patches len={} != n_patches({}) * patch_dim({}) = {}",
+                patches.len(), n_patches, patch_dim, n_patches * patch_dim
+            )));
+        }
+        let h  = s.hidden_size;
+        let nh = s.num_attention_heads;
+        let hd = s.head_dim;
+        let i_  = s.intermediate_size;
+        let eps = s.rms_norm_eps;
+        let log_progress = std::env::var("AEGIS_VISION_PROGRESS").is_ok();
+
+        // ── Phase 1: pixel rescale + patch_embed.
+        // Upload patches (already in [0, 1] from preprocess), rescale on GPU
+        // to [-1, 1] per HF Gemma4VisionPatchEmbedder.
+        let mut patches_f32 = runtime.upload_f32(patches)?;
+        runtime.vision_pixel_rescale_device(&mut patches_f32, patches.len())?;
+        let mut patches_bf16 = runtime.alloc_u16(patches.len())?;
+        runtime.f32_to_bf16_device(&patches_f32, patches.len(), &mut patches_bf16)?;
+
+        // patch_embed: [n_patches, P²·3] @ patch_embed.T → [n_patches, hidden].
+        let mut hidden_bf16 = runtime.alloc_u16(n_patches * h)?;
+        let mut state = runtime.alloc_f32(n_patches * h)?;
+        runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+            &self.patch_embed, &patches_bf16, n_patches,
+            &mut hidden_bf16, &mut state,
+        )?;
+
+        // ── Phase 2: add 2D-axial position embeddings (GPU kernel).
+        runtime.vision_pos_embed_add_device(
+            &mut state,
+            self.position_table.values_u16(),
+            n_patches_h, n_patches_w,
+            s.position_embedding_size,
+            h,
+        )?;
+
+        // ── Phase 3: 27 transformer layers, all on GPU.
+        // Scratch buffers reused across layers (allocate once).
+        let mut normed = runtime.alloc_f32(n_patches * h)?;
+        let mut normed_bf16 = runtime.alloc_u16(n_patches * h)?;
+        let mut q_buf = runtime.alloc_f32(n_patches * h)?;
+        let mut k_buf = runtime.alloc_f32(n_patches * h)?;
+        let mut v_buf = runtime.alloc_f32(n_patches * h)?;
+        let mut qkv_bf16 = runtime.alloc_u16(n_patches * h)?;
+        let mut attn_out = runtime.alloc_f32(n_patches * h)?;
+        let mut attn_bf16 = runtime.alloc_u16(n_patches * h)?;
+        let mut o_out_bf16 = runtime.alloc_u16(n_patches * h)?;
+        let mut o_out = runtime.alloc_f32(n_patches * h)?;
+        let mut o_post = runtime.alloc_f32(n_patches * h)?;
+        let mut pre_ff = runtime.alloc_f32(n_patches * h)?;
+        let mut pre_ff_bf16 = runtime.alloc_u16(n_patches * h)?;
+        let mut gate_bf16 = runtime.alloc_u16(n_patches * i_)?;
+        let mut gate_f32 = runtime.alloc_f32(n_patches * i_)?;
+        let mut up_bf16 = runtime.alloc_u16(n_patches * i_)?;
+        let mut up_f32 = runtime.alloc_f32(n_patches * i_)?;
+        let mut act_f32 = runtime.alloc_f32(n_patches * i_)?;
+        let mut act_bf16 = runtime.alloc_u16(n_patches * i_)?;
+        let mut down_bf16 = runtime.alloc_u16(n_patches * h)?;
+        let mut down_f32 = runtime.alloc_f32(n_patches * h)?;
+        let mut post_ff = runtime.alloc_f32(n_patches * h)?;
+        let scale = 1.0_f32 / (hd as f32).sqrt();
+
+        for li in 0..s.num_layers {
+            let t_layer = std::time::Instant::now();
+            let layer = &self.layers[li];
+
+            // input_layernorm(state) → normed
+            runtime.rms_norm_batched_device(
+                &state, &layer.input_layernorm, n_patches, eps, &mut normed)?;
+            runtime.f32_to_bf16_device(&normed, n_patches * h, &mut normed_bf16)?;
+
+            // Q/K/V projections.
+            let mut proj = |w: &crate::cuda::DeviceBf16Matrix, out: &mut crate::cuda::DeviceBuffer<f32>| -> Result<()> {
+                runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+                    w, &normed_bf16, n_patches, &mut qkv_bf16, out)?;
+                Ok(())
+            };
+            proj(&layer.q_proj, &mut q_buf)?;
+            proj(&layer.k_proj, &mut k_buf)?;
+            proj(&layer.v_proj, &mut v_buf)?;
+
+            // Per-head Q-norm, K-norm (with weight), V-norm (no weight).
+            runtime.vision_head_rmsnorm_device(
+                &mut q_buf, Some(&layer.q_norm), n_patches, nh, hd, eps)?;
+            runtime.vision_head_rmsnorm_device(
+                &mut k_buf, Some(&layer.k_norm), n_patches, nh, hd, eps)?;
+            runtime.vision_head_rmsnorm_device(
+                &mut v_buf, None, n_patches, nh, hd, eps)?;
+
+            // 2D RoPE on Q and K (V does NOT get RoPE).
+            runtime.vision_rope_2d_device(
+                &mut q_buf, n_patches, n_patches_w, nh, hd, s.rope_theta)?;
+            runtime.vision_rope_2d_device(
+                &mut k_buf, n_patches, n_patches_w, nh, hd, s.rope_theta)?;
+
+            // Bidirectional attention: softmax(Q·K^T * scale) · V.
+            runtime.vision_bidi_attn_device(
+                &q_buf, &k_buf, &v_buf,
+                n_patches, nh, hd, scale,
+                &mut attn_out,
+            )?;
+
+            // o_proj: attn_out @ o_proj.T → o_out.
+            runtime.f32_to_bf16_device(&attn_out, n_patches * h, &mut attn_bf16)?;
+            runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+                &layer.o_proj, &attn_bf16, n_patches,
+                &mut o_out_bf16, &mut o_out,
+            )?;
+
+            // post_attention_layernorm(o_out) → o_post; then state += o_post.
+            runtime.rms_norm_batched_device(
+                &o_out, &layer.post_attention_layernorm, n_patches, eps, &mut o_post)?;
+            runtime.add_inplace_device_len(&mut state, &o_post, n_patches * h)?;
+
+            // pre_feedforward_layernorm(state) → pre_ff.
+            runtime.rms_norm_batched_device(
+                &state, &layer.pre_feedforward_layernorm, n_patches, eps, &mut pre_ff)?;
+            runtime.f32_to_bf16_device(&pre_ff, n_patches * h, &mut pre_ff_bf16)?;
+            // gate, up.
+            runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+                &layer.mlp_gate, &pre_ff_bf16, n_patches,
+                &mut gate_bf16, &mut gate_f32)?;
+            runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+                &layer.mlp_up, &pre_ff_bf16, n_patches,
+                &mut up_bf16, &mut up_f32)?;
+            // swiglu(gate, up) → activated.
+            runtime.swiglu_device(&gate_f32, &up_f32, &mut act_f32)?;
+            // down: act @ down_proj.T → down_f32.
+            runtime.f32_to_bf16_device(&act_f32, n_patches * i_, &mut act_bf16)?;
+            runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+                &layer.mlp_down, &act_bf16, n_patches,
+                &mut down_bf16, &mut down_f32)?;
+            // post_feedforward_layernorm(down) → post_ff; state += post_ff.
+            runtime.rms_norm_batched_device(
+                &down_f32, &layer.post_feedforward_layernorm, n_patches, eps, &mut post_ff)?;
+            runtime.add_inplace_device_len(&mut state, &post_ff, n_patches * h)?;
+
+            if log_progress {
+                eprintln!(
+                    "  vision-gpu layer {:>2}/{}: {:.3}s",
+                    li + 1, s.num_layers, t_layer.elapsed().as_secs_f64()
+                );
+            }
+        }
+
+        // ── Final standardization on GPU: state = (state - std_bias) * std_scale.
+        runtime.vision_standardize_device(
+            &mut state, &self.std_scale, &self.std_bias, n_patches, h,
+        )?;
+
+        // ── 3×3 average pool + sqrt(hidden) pooler scale on GPU.
+        let pool = s.pooling_kernel_size;
+        let n_th = n_patches_h / pool;
+        let n_tw = n_patches_w / pool;
+        let n_tokens = n_th * n_tw;
+        let pooler_scale = (h as f32).sqrt() / (pool * pool) as f32;
+        let mut pooled = runtime.alloc_f32(n_tokens * h)?;
+        runtime.vision_pool3x3_scale_device(
+            &state, &mut pooled,
+            n_patches_h, n_patches_w, n_th, n_tw,
+            h, pool, pooler_scale,
+        )?;
+
+        // ── Multimodal embedder: RMSNorm-no-scale then projector.
+        // RMS-norm in-place over [n_tokens, h]. The existing
+        // rms_norm_batched_no_weight_device fits exactly.
+        let mut pooled_normed = runtime.alloc_f32(n_tokens * h)?;
+        runtime.rms_norm_batched_no_weight_device(
+            &pooled, n_tokens, h, eps, &mut pooled_normed,
+        )?;
+        let mut pooled_bf16 = runtime.alloc_u16(n_tokens * h)?;
+        runtime.f32_to_bf16_device(&pooled_normed, n_tokens * h, &mut pooled_bf16)?;
+
+        // Projector: pooled @ projector.T → [n_tokens, text_hidden].
+        let text_hidden = self.projector.rows;
+        let mut out_bf16 = runtime.alloc_u16(n_tokens * text_hidden)?;
+        let mut out_f32 = runtime.alloc_f32(n_tokens * text_hidden)?;
+        runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+            &self.projector, &pooled_bf16, n_tokens,
+            &mut out_bf16, &mut out_f32,
+        )?;
+
+        runtime.download_f32(&out_f32)
+    }
 }

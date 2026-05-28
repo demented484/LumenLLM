@@ -813,7 +813,7 @@ pub(super) fn vision_load_smoke(config: EngineConfig) -> Result<()> {
             img.num_tokens(), img.num_tokens_h, img.num_tokens_w
         );
         let t1 = std::time::Instant::now();
-        let embeds = tower.forward(&cuda, &img.patches, img.num_patches_h, img.num_patches_w)?;
+        let embeds = tower.forward_gpu(&cuda, &img.patches, img.num_patches_h, img.num_patches_w)?;
         let dt1 = t1.elapsed();
         let text_hidden = tower.projector.rows;
         let n_tokens = img.num_tokens();

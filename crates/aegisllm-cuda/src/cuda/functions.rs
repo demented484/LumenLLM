@@ -80,6 +80,13 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) vision_row_softmax: CudaFunction,
     /// Stage I.3 fused bidirectional vision attention (QK·softmax·PV in one launch).
     pub(crate) vision_bidi_attn: CudaFunction,
+    /// Stage I.4 GPU-only vision forward kernels.
+    pub(crate) vision_pixel_rescale: CudaFunction,
+    pub(crate) vision_pos_embed_add: CudaFunction,
+    pub(crate) vision_head_rmsnorm: CudaFunction,
+    pub(crate) vision_rope_2d: CudaFunction,
+    pub(crate) vision_standardize: CudaFunction,
+    pub(crate) vision_pool3x3_scale: CudaFunction,
     pub(crate) router_softmax_topk_packed: CudaFunction,
     pub(crate) router_zero_expert_counts: CudaFunction,
     pub(crate) router_bucket_sort: CudaFunction,
@@ -314,6 +321,12 @@ impl CudaKernelFunctions {
                 )))?;
                 f
             },
+            vision_pixel_rescale: load(&module, "aegis_vision_pixel_rescale")?,
+            vision_pos_embed_add: load(&module, "aegis_vision_pos_embed_add")?,
+            vision_head_rmsnorm: load(&module, "aegis_vision_head_rmsnorm")?,
+            vision_rope_2d: load(&module, "aegis_vision_rope_2d")?,
+            vision_standardize: load(&module, "aegis_vision_standardize")?,
+            vision_pool3x3_scale: load(&module, "aegis_vision_pool3x3_scale")?,
             router_softmax_topk_packed: load(&module, "aegis_router_softmax_topk_packed")?,
             router_zero_expert_counts: load(&module, "aegis_router_zero_expert_counts")?,
             router_bucket_sort: load(&module, "aegis_router_bucket_sort")?,

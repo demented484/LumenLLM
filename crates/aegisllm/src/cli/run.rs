@@ -322,7 +322,7 @@ fn compute_image_injection(
 
     eprintln!("vision: running tower forward (~55s)...");
     let t0 = std::time::Instant::now();
-    let embeds = tower.forward(&cuda, &img.patches, img.num_patches_h, img.num_patches_w)?;
+    let embeds = tower.forward_gpu(&cuda, &img.patches, img.num_patches_h, img.num_patches_w)?;
     let dt = t0.elapsed();
     let text_hidden = tower.projector.rows;
     let n_tokens = img.num_tokens();
