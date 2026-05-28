@@ -1605,4 +1605,95 @@ impl CudaRuntime {
         .map_err(map_cuda_err("launch mul_vec_inplace_f32"))?;
         Ok(())
     }
+
+    /// Stage I.3 fused bidirectional vision attention. One launch computes
+    /// softmax(Q·K^T * scale) · V over the whole [n_tok, n_heads] grid.
+    /// Inputs / output: f32 row-major `[n_tok, n_heads, head_dim]`.
+    /// Dynamic shared: `(n_tok + 8 + head_dim) * 4` bytes; with n_tok≤2376
+    /// and head_dim=72 that's ~9.7 KiB.
+    pub fn vision_bidi_attn_device(
+        &self,
+        q: &DeviceBuffer<f32>,
+        k: &DeviceBuffer<f32>,
+        v: &DeviceBuffer<f32>,
+        n_tok: usize,
+        n_heads: usize,
+        head_dim: usize,
+        scale: f32,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let total = n_tok.saturating_mul(n_heads).saturating_mul(head_dim);
+        if q.len() < total || k.len() < total || v.len() < total || out.len() < total {
+            return Err(AegisError::InvalidPlan(format!(
+                "vision_bidi_attn: q/k/v/out len mismatch (need {total}, got q={} k={} v={} out={})",
+                q.len(), k.len(), v.len(), out.len(),
+            )));
+        }
+        let shared_bytes = ((n_tok + 8 + head_dim) * std::mem::size_of::<f32>()) as u32;
+        if shared_bytes > 96 * 1024 {
+            return Err(AegisError::Unsupported(format!(
+                "vision_bidi_attn: n_tok={n_tok} head_dim={head_dim} needs {shared_bytes}B shared > 96KiB cap"
+            )));
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_heads", n_heads)?, u32_arg("n_tok", n_tok)?, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: shared_bytes,
+        };
+        let n_tok_u = n_tok as u32;
+        let n_heads_u = n_heads as u32;
+        let head_dim_u = head_dim as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_bidi_attn)
+                .arg(&q.slice)
+                .arg(&k.slice)
+                .arg(&v.slice)
+                .arg(&n_tok_u)
+                .arg(&n_heads_u)
+                .arg(&head_dim_u)
+                .arg(&scale)
+                .arg(&mut out.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_bidi_attn"))?;
+        Ok(())
+    }
+
+    /// Stage I.2 vision row-softmax. In-place: for each of `n_rows` rows of
+    /// `scores` (shape `[n_rows, n_cols]` row-major), pre-multiply by `scale`
+    /// then apply numerically-stable softmax along the row. Used by the
+    /// vision tower's bidirectional attention.
+    pub fn vision_row_softmax_device(
+        &self,
+        scores: &mut DeviceBuffer<f32>,
+        n_rows: usize,
+        n_cols: usize,
+        scale: f32,
+    ) -> Result<()> {
+        if scores.len() < n_rows * n_cols {
+            return Err(AegisError::InvalidPlan(format!(
+                "vision_row_softmax: scores len={} < n_rows({}) * n_cols({}) = {}",
+                scores.len(), n_rows, n_cols, n_rows * n_cols,
+            )));
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_rows", n_rows)?, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_rows_u = n_rows as u32;
+        let n_cols_u = n_cols as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_row_softmax)
+                .arg(&mut scores.slice)
+                .arg(&n_rows_u)
+                .arg(&n_cols_u)
+                .arg(&scale)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_row_softmax"))?;
+        Ok(())
+    }
 }

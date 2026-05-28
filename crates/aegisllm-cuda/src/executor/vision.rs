@@ -437,61 +437,20 @@ impl VisionTower {
             let q_n = apply_rope(&q_n);
             let k_n = apply_rope(&k_n);
 
-            // Bidirectional attention. Per-head parallel via rayon — heads are
-            // independent. Each head's work is O(n²·hd) ≈ 0.4M·72 = 30M FMAs
-            // for the score grid, identical for the V-sum. With 16 heads
-            // running in parallel across ~16 cores this brings the 27-layer
-            // wall from minutes to seconds even with CPU softmax.
+            // Bidirectional attention on GPU via aegis_vision_bidi_attn kernel.
+            // Uploads normed Q/K/V to VRAM, runs the fused QK·softmax·PV
+            // kernel, downloads the [n_patches, h] result.
             let scale = 1.0 / (hd as f32).sqrt();
-            let q_n_ref = &q_n;
-            let k_n_ref = &k_n;
-            let v_ref   = &v;
-            let head_outputs: Vec<Vec<f32>> = (0..nh).into_par_iter().map(|head| {
-                // Slice per-head views (just indices into the [n_patches, h] arrays).
-                let mut scores = vec![0f32; n_patches * n_patches];
-                // Q·K^T scaled.
-                for ti in 0..n_patches {
-                    let q_off = ti * h + head * hd;
-                    for tj in 0..n_patches {
-                        let k_off = tj * h + head * hd;
-                        let mut s_ij = 0f32;
-                        for d in 0..hd {
-                            s_ij += q_n_ref[q_off + d] * k_n_ref[k_off + d];
-                        }
-                        scores[ti * n_patches + tj] = s_ij * scale;
-                    }
-                }
-                // Row-softmax.
-                for ti in 0..n_patches {
-                    let row = &mut scores[ti * n_patches .. (ti + 1) * n_patches];
-                    let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0f32;
-                    for x in row.iter_mut() { *x = (*x - mx).exp(); sum += *x; }
-                    let inv = 1.0 / sum;
-                    for x in row.iter_mut() { *x *= inv; }
-                }
-                // P·V: per-head output [n_patches, hd].
-                let mut head_out = vec![0f32; n_patches * hd];
-                for ti in 0..n_patches {
-                    for d in 0..hd {
-                        let mut acc = 0f32;
-                        for tj in 0..n_patches {
-                            acc += scores[ti * n_patches + tj] * v_ref[tj * h + head * hd + d];
-                        }
-                        head_out[ti * hd + d] = acc;
-                    }
-                }
-                head_out
-            }).collect();
-            // Scatter heads back into [n_patches, h].
-            let mut attn_out = vec![0f32; n_patches * h];
-            for (head, head_out) in head_outputs.iter().enumerate() {
-                for ti in 0..n_patches {
-                    for d in 0..hd {
-                        attn_out[ti * h + head * hd + d] = head_out[ti * hd + d];
-                    }
-                }
-            }
+            let q_gpu = runtime.upload_f32(&q_n)?;
+            let k_gpu = runtime.upload_f32(&k_n)?;
+            let v_gpu = runtime.upload_f32(&v)?;
+            let mut attn_gpu = runtime.alloc_f32(n_patches * h)?;
+            runtime.vision_bidi_attn_device(
+                &q_gpu, &k_gpu, &v_gpu,
+                n_patches, nh, hd, scale,
+                &mut attn_gpu,
+            )?;
+            let attn_out = runtime.download_f32(&attn_gpu)?;
 
             // o_proj: attn_out @ o_proj.T → [n_patches, h].
             let attn_f32 = runtime.upload_f32(&attn_out)?;

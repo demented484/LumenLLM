@@ -76,6 +76,10 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) f32_to_bf16: CudaFunction,
     pub(crate) bf16_to_f32: CudaFunction,
     pub(crate) router_softmax_topk: CudaFunction,
+    /// Stage I.2 vision row-softmax (bidirectional attention's softmax pass).
+    pub(crate) vision_row_softmax: CudaFunction,
+    /// Stage I.3 fused bidirectional vision attention (QK·softmax·PV in one launch).
+    pub(crate) vision_bidi_attn: CudaFunction,
     pub(crate) router_softmax_topk_packed: CudaFunction,
     pub(crate) router_zero_expert_counts: CudaFunction,
     pub(crate) router_bucket_sort: CudaFunction,
@@ -295,6 +299,21 @@ impl CudaKernelFunctions {
             f32_to_bf16: load(&module, "aegis_f32_to_bf16")?,
             bf16_to_f32: load(&module, "aegis_bf16_to_f32")?,
             router_softmax_topk: load(&module, "aegis_router_softmax_topk")?,
+            vision_row_softmax: load(&module, "aegis_vision_row_softmax")?,
+            vision_bidi_attn: {
+                // Needs dynamic shared scaled by max n_tok in flight. We use
+                // 96 KiB cap which fits scores[n_tok≤2376] + 8 warpred + Q[hd].
+                let f = load(&module, "aegis_vision_bidi_attn")?;
+                f.set_attribute(
+                    cudarc::driver::sys::CUfunction_attribute_enum
+                        ::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    96 * 1024,
+                )
+                .map_err(|e| AegisError::Unsupported(format!(
+                    "set max dynamic shared mem on vision_bidi_attn: {e:?}"
+                )))?;
+                f
+            },
             router_softmax_topk_packed: load(&module, "aegis_router_softmax_topk_packed")?,
             router_zero_expert_counts: load(&module, "aegis_router_zero_expert_counts")?,
             router_bucket_sort: load(&module, "aegis_router_bucket_sort")?,
