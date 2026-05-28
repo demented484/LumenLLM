@@ -2,33 +2,35 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-/// Top-level schema for `parameters.*.json` files.
+/// Top-level schema for `parameters.*.json` files (schema v2).
 ///
-/// Layout (post-rename):
+/// All model + placement config lives under `model`. Optional modality towers
+/// are top-level: present → load that tower (if the checkpoint has one) and
+/// enable that input; absent → the tower is NOT loaded even when the checkpoint
+/// contains one (saves VRAM/load time).
 /// ```jsonc
 /// {
 ///   "model": {
 ///     "path": "...",
 ///     "store": "vram",      // default tier for non-block weights (embed, lm_head, final_norm);
 ///                           // also fallback for hidden-layers.{weights,kv-cache} when not overridden
-///     "compute": "cuda:0"
+///     "compute": "cuda:0",
+///     "input-layer":     { ... },
+///     "output-layer":    { ... },
+///     "attention":       { ... },
+///     "hidden-layers":   { "compute": ..., "weights": {...}, "kv-cache": {...} },
+///     "linear-layout":   { ... },
+///     "other-parameters":{ ... }
 ///   },
-///   "hidden-layers": {
-///     "compute": "cuda:0",  // optional default compute for both sub-sections
-///     "weights":  { "number": ..., "store": ..., "compute": ...,
-///                   "fallback-store": ..., "fallback-compute": ... },
-///     "kv-cache": { "number": ..., "context-size": ...,
-///                   "store": ..., "fallback-store": ...,
-///                   "type-k": ..., "type-v": ... }
-///   },
-///   "linear-layout":   { ... },
-///   "other-parameters":{ ... },
-///   "cuda":            { ... }
+///   "vision": { "compute": "cuda:0", "store": "vram" },   // omit -> vision NOT loaded
+///   "audio":  { "compute": "cuda:0", "store": "vram" },   // omit -> audio NOT loaded
+///   "cuda":   { ... }
 /// }
 /// ```
 ///
-/// Old top-level `layers` / `kv-cache` keys are rejected by `deny_unknown_fields`
-/// to produce a clear error pointing users at the new path.
+/// `deny_unknown_fields` rejects the old flat layout (top-level `input-layer`,
+/// `hidden-layers`, etc.) with a clear error so users migrate to nesting under
+/// `model`. Migrated configs live under the repo; pre-v2 backups in .configbak_pre_v2/.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ParametersFile {
@@ -36,31 +38,36 @@ pub struct ParametersFile {
     pub server_bin: Option<ServerBinSection>,
     #[serde(rename = "server-parameters")]
     pub server: Option<ServerSection>,
+    /// Everything that describes the *text model* and its placement lives under
+    /// `model` (schema v2): the path, the model-wide store/compute defaults, and
+    /// the per-section placement overrides (input-layer, output-layer, attention,
+    /// hidden-layers, linear-layout, other-parameters).
     pub model: ModelSection,
-    /// Embed-tokens placement override (per-tensor, applies before layers load).
-    #[serde(rename = "input-layer")]
-    pub input_layer: Option<InputLayerSection>,
-    /// LM-head placement override (per-tensor, applies before layers load).
-    #[serde(rename = "output-layer")]
-    pub output_layer: Option<OutputLayerSection>,
-    /// Per-layer attention (Q/K/V/O) placement override; takes effect inside
-    /// each `layer.N` region independently of the layer's MLP/expert weights.
-    pub attention: Option<AttentionSection>,
-    /// Vision encoder + multimodal projector placement (Stage I).
-    /// When present, the engine loads a vision tower (SigLIP / CLIP / InternViT
-    /// family per the model artifact) and the projector that maps its outputs
-    /// into the LLM text-embedding space. Absent → image input disabled.
-    /// Independent from `hidden-layers` because the vision tower is its own
-    /// stack (different depth, hidden_size, patch_size).
-    #[serde(rename = "vision-layer")]
-    pub vision_layer: Option<VisionLayerSection>,
-    #[serde(rename = "hidden-layers")]
-    pub hidden_layers: Option<HiddenLayersSection>,
-    #[serde(rename = "linear-layout")]
-    pub linear_layout: Option<LinearLayoutSection>,
-    #[serde(rename = "other-parameters")]
-    pub other: Option<OtherSection>,
+    /// Vision encoder + multimodal projector placement. Schema v2: top-level,
+    /// optional. PRESENT → load the vision tower (if the model artifact supplies
+    /// one) and enable image input. ABSENT → the vision tower is NOT loaded even
+    /// when the checkpoint contains one (saves VRAM/load time). `{compute,store}`
+    /// default to the model section's values when unset.
+    pub vision: Option<ModalitySection>,
+    /// Audio encoder placement. Schema v2: top-level, optional. PRESENT → load
+    /// the audio tower (if the model artifact supplies one) and enable audio
+    /// input. ABSENT → the audio tower is NOT loaded even when the checkpoint
+    /// contains one. `{compute,store}` default to the model section's values.
+    pub audio: Option<ModalitySection>,
     pub cuda: Option<CudaSection>,
+}
+
+/// Placement for an optional modality tower (vision / audio). Mere presence of
+/// the section enables loading that modality; absence disables it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModalitySection {
+    /// Compute device for the modality tower + its projector. Defaults to the
+    /// model section's `compute` when unset.
+    pub compute: Option<String>,
+    /// Storage tier for the modality tower + projector weights. Defaults to the
+    /// model section's `store` when unset.
+    pub store: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -77,26 +84,6 @@ pub struct OutputLayerSection {
     pub compute: Option<String>,
 }
 
-/// Vision encoder + multimodal projector placement (Stage I).
-///
-/// `mmproj-path` — filesystem path to the multimodal projector weights. The
-/// engine accepts safetensors-format projector + vision-tower weights produced
-/// from the source model export. (Initial Stage I.1 also accepts the
-/// `*.mmproj-F16.gguf` artifact emitted by `convert_hf_to_gguf.py --mmproj`.)
-///
-/// `compute` / `store` follow the same placement vocabulary as the other
-/// sections (`cuda:0`, `cpu`, `vram`, `ram`). Defaults to inheriting the
-/// model section's compute/store when unset.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct VisionLayerSection {
-    /// Compute device for the vision tower (ViT) and the embed_vision
-    /// projector. Defaults to the model section's `compute` when unset.
-    pub compute: Option<String>,
-    /// Storage tier for the vision-tower + projector weights. Defaults to
-    /// the model section's `store` when unset.
-    pub store: Option<String>,
-}
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -156,6 +143,21 @@ pub struct ModelSection {
     pub store: Option<String>,
     pub compute: Option<String>,
     pub mmap: Option<bool>,
+    /// Embed-tokens placement override (per-tensor, applies before layers load).
+    #[serde(rename = "input-layer")]
+    pub input_layer: Option<InputLayerSection>,
+    /// LM-head placement override (per-tensor, applies before layers load).
+    #[serde(rename = "output-layer")]
+    pub output_layer: Option<OutputLayerSection>,
+    /// Per-layer attention (Q/K/V/O) placement override; takes effect inside
+    /// each `layer.N` region independently of the layer's MLP/expert weights.
+    pub attention: Option<AttentionSection>,
+    #[serde(rename = "hidden-layers")]
+    pub hidden_layers: Option<HiddenLayersSection>,
+    #[serde(rename = "linear-layout")]
+    pub linear_layout: Option<LinearLayoutSection>,
+    #[serde(rename = "other-parameters")]
+    pub other: Option<OtherSection>,
 }
 
 /// Wrapper for the two sub-sections that together describe per-hidden-layer placement.

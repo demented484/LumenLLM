@@ -102,7 +102,7 @@ impl ParametersFile {
 
         // ── `input-layer` — embed_tokens placement override. Embed is a row
         //    lookup, so RAM placement is cheap (no matmul to stage).
-        if let Some(input) = self.input_layer {
+        if let Some(input) = self.model.input_layer {
             let store = input.store.as_deref()
                 .map(|s| parse_storage(s, cuda_device)).transpose()?;
             let compute = input.compute.as_deref()
@@ -123,7 +123,7 @@ impl ParametersFile {
         // which is ~30ms/token vs ~1ms VRAM. Acceptable trade for 1 GiB
         // VRAM saved on memory-constrained configs; if you want faster
         // decode keep `output-layer.store = vram`.
-        if let Some(output) = self.output_layer {
+        if let Some(output) = self.model.output_layer {
             let store = output.store.as_deref()
                 .map(|s| parse_storage(s, cuda_device)).transpose()?;
             let compute = output.compute.as_deref()
@@ -141,7 +141,7 @@ impl ParametersFile {
         //    the policy as a separate `attention_store_override`; the loader
         //    consults it before deciding to force-VRAM the BF16 attention
         //    weights. `mechanism` maps to `cuda.prefill_attention`.
-        if let Some(attn) = self.attention {
+        if let Some(attn) = self.model.attention {
             if let Some(mech) = attn.mechanism.as_deref() {
                 cuda_runtime.prefill_attention =
                     CudaPrefillAttentionKernel::parse(mech)?;
@@ -171,7 +171,7 @@ impl ParametersFile {
         }
 
         // ── `hidden-layers` — per-block weights and per-block KV cache.
-        if let Some(hidden_layers) = self.hidden_layers {
+        if let Some(hidden_layers) = self.model.hidden_layers {
             let parent_compute: Option<ComputePlacement> = hidden_layers.compute
                 .as_deref()
                 .map(|c| parse_compute(c, cuda_device))
@@ -331,10 +331,10 @@ impl ParametersFile {
             )));
         }
 
-        if let Some(layout) = self.linear_layout {
+        if let Some(layout) = self.model.linear_layout {
             apply_linear_layout_section(&mut policy.linear_layout, layout)?;
         }
-        if let Some(other) = &self.other {
+        if let Some(other) = &self.model.other {
             if let Some(value) = other.cpu_linear_layout.as_deref() {
                 policy.linear_layout.cpu = LinearLayoutChoice::parse(value)?;
             }
@@ -356,7 +356,7 @@ impl ParametersFile {
             }
         }
         let mut generation = SamplingConfig::default();
-        if let Some(other) = &self.other {
+        if let Some(other) = &self.model.other {
             if let Some(value) = other.temperature {
                 generation.temperature = value;
             }

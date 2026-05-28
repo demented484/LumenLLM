@@ -233,12 +233,12 @@ mod tests {
             file,
             r#"{{
                 "model": {{
-                    "path": "/tmp/model"
-                }},
-                "other-parameters": {{
-                    "temperature": 0.42,
-                    "top-p": 0.7,
-                    "top-k": 9
+                    "path": "/tmp/model",
+                    "other-parameters": {{
+                        "temperature": 0.42,
+                        "top-p": 0.7,
+                        "top-k": 9
+                    }}
                 }}
             }}"#
         )
@@ -255,7 +255,7 @@ mod tests {
         ])
         .expect("generate should parse config sampling defaults");
 
-        let Command::Generate(_, request) = command else {
+        let Command::Generate(_, request, _, _) = command else {
             panic!("expected generate command");
         };
         assert_eq!(request.sampling.temperature, 0.42);

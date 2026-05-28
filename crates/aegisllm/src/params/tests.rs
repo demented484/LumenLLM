@@ -45,10 +45,10 @@
     fn legacy_flash_attention_flag_controls_cuda_prefill_attention() {
         let params: ParametersFile = serde_json::from_value(serde_json::json!({
             "model": {
-                "path": "/tmp/model"
-            },
-            "other-parameters": {
-                "flash-attention": false
+                "path": "/tmp/model",
+                "other-parameters": {
+                    "flash-attention": false
+                }
             }
         }))
         .expect("parameters should parse");
@@ -67,13 +67,13 @@
     fn explicit_cuda_prefill_attention_wins_over_legacy_flash_attention_flag() {
         let params: ParametersFile = serde_json::from_value(serde_json::json!({
             "model": {
-                "path": "/tmp/model"
+                "path": "/tmp/model",
+                "other-parameters": {
+                    "flash-attention": true
+                }
             },
             "cuda": {
                 "prefill-attention": "reference"
-            },
-            "other-parameters": {
-                "flash-attention": true
             }
         }))
         .expect("parameters should parse");
@@ -142,8 +142,10 @@
     #[test]
     fn attention_compute_quant_bf16_fa2_parses() {
         let params: ParametersFile = serde_json::from_value(serde_json::json!({
-            "model": { "path": "/tmp/model" },
-            "attention": { "compute-quantization": "bf16-fa2" }
+            "model": {
+                "path": "/tmp/model",
+                "attention": { "compute-quantization": "bf16-fa2" }
+            }
         }))
         .expect("parameters should parse");
 
@@ -162,10 +164,12 @@
         // `compute-quantization` and `attention-quantization` are independent
         // knobs: one selects the kernel precision, the other the weight quant.
         let params: ParametersFile = serde_json::from_value(serde_json::json!({
-            "model": { "path": "/tmp/model" },
-            "attention": {
-                "compute-quantization": "bf16",
-                "attention-quantization": "fp8"
+            "model": {
+                "path": "/tmp/model",
+                "attention": {
+                    "compute-quantization": "bf16",
+                    "attention-quantization": "fp8"
+                }
             }
         }))
         .expect("parameters should parse");
@@ -191,8 +195,10 @@
         // compute-quantization=fp8 with a non-FP8 KV cache is a genuine
         // incompatibility — the parser must reject it with a clear message.
         let params: ParametersFile = serde_json::from_value(serde_json::json!({
-            "model": { "path": "/tmp/model" },
-            "attention": { "compute-quantization": "fp8" }
+            "model": {
+                "path": "/tmp/model",
+                "attention": { "compute-quantization": "fp8" }
+            }
         }))
         .expect("parameters should parse");
 
@@ -207,10 +213,12 @@
     #[test]
     fn attention_compute_quant_fp8_accepted_with_fp8_kv_cache() {
         let params: ParametersFile = serde_json::from_value(serde_json::json!({
-            "model": { "path": "/tmp/model" },
-            "attention": { "compute-quantization": "fp8" },
-            "hidden-layers": {
-                "kv-cache": { "type-k": "fp8", "type-v": "fp8" }
+            "model": {
+                "path": "/tmp/model",
+                "attention": { "compute-quantization": "fp8" },
+                "hidden-layers": {
+                    "kv-cache": { "type-k": "fp8", "type-v": "fp8" }
+                }
             }
         }))
         .expect("parameters should parse");
@@ -229,8 +237,10 @@
     #[test]
     fn attention_compute_quant_rejects_unknown_value() {
         let params: ParametersFile = serde_json::from_value(serde_json::json!({
-            "model": { "path": "/tmp/model" },
-            "attention": { "compute-quantization": "int3" }
+            "model": {
+                "path": "/tmp/model",
+                "attention": { "compute-quantization": "int3" }
+            }
         }))
         .expect("parameters should parse");
 
@@ -245,9 +255,11 @@
         // An FP8 KV cache with a non-FP8 (default) attention kernel is legal:
         // the kernel dequantizes on read. The parser must NOT reject this.
         let params: ParametersFile = serde_json::from_value(serde_json::json!({
-            "model": { "path": "/tmp/model" },
-            "hidden-layers": {
-                "kv-cache": { "type-k": "fp8" }
+            "model": {
+                "path": "/tmp/model",
+                "hidden-layers": {
+                    "kv-cache": { "type-k": "fp8" }
+                }
             }
         }))
         .expect("parameters should parse");
