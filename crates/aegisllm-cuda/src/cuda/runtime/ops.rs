@@ -2135,6 +2135,11 @@ impl CudaRuntime {
     }
 
     /// Clamp a flat f32 buffer in place to `[-c, c]` (HF gradient clipping).
+    ///
+    /// NOTE: the current `AudioTower::forward` does the gradient clamp on the
+    /// CPU (the threshold is 1e10, effectively inert), so this GPU kernel is
+    /// defined+registered but not yet on the hot path. Kept for the future
+    /// fused-GPU Conformer pass. Same applies to `audio_add_bias_rows_device`.
     pub fn audio_clamp_inplace_device(
         &self,
         x: &mut DeviceBuffer<f32>,

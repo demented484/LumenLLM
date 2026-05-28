@@ -428,6 +428,11 @@ impl AudioTower {
         let log = std::env::var("AEGIS_AUDIO_PROGRESS").is_ok();
 
         // q_scale = head_dim^-0.5 / softplus(0).  softplus(0) = ln(2).
+        // TODO(gpu-verify): confirm the query pre-scale is
+        // `head_dim^-0.5 / softplus(0)` (Gemma-3n divides the standard
+        // 1/sqrt(head_dim) by softplus(0) so that softplus(per_dim_scale)
+        // recenters around 1). Verify both the exponent and the softplus(0)
+        // divisor against the HF reference.
         let q_scale = (s.head_dim as f32).powf(-0.5) / (2.0f32.ln());
 
         for li in 0..s.num_layers {
@@ -623,6 +628,11 @@ impl AudioTower {
         // pre_layer_norm.
         let normed = self.rms_norm_to(runtime, state, batch, &ff.pre_layer_norm, eps)?;
         // linear1 → SiLU → linear2.
+        // TODO(gpu-verify): the Conformer Macaron FFN activation is assumed to
+        // be SiLU (x*sigmoid(x)) applied to the full linear1 output (a plain
+        // ungated FFN, NOT a SwiGLU/GLU split). Confirm against HF
+        // `modeling_gemma3n.py` — if the FFN is gated, ffw_layer_1 would emit
+        // 2*intermediate and this must become a half-split GLU instead.
         let h1 = self.clip_linear_host(runtime, &normed, batch, &ff.ffw_layer_1)?;
         // SiLU on GPU.
         let mut h1_dev = runtime.upload_f32(&h1)?;
@@ -632,6 +642,11 @@ impl AudioTower {
         // post_layer_norm.
         let post = self.rms_norm_to(runtime, &ff_out, batch, &ff.post_layer_norm, eps)?;
         // residual + out * residual_weight.
+        // TODO(gpu-verify): Macaron half-step residual scaling — the FFN branch
+        // is blended as `state += residual_weight * post` (residual_weight=0.5
+        // for Gemma-4). Confirm the scale multiplies the FFN output only (not
+        // the residual) and that the attention/lconv branches are NOT scaled by
+        // residual_weight (this impl scales FFN only).
         let rw = self.shape.residual_weight;
         for t in 0..batch {
             for c in 0..h {
@@ -769,6 +784,11 @@ impl AudioTower {
                         dot += q[i * h + head * hd + d] * k[j * h + head * hd + d];
                     }
                     // tanh logit softcap: cap * tanh(score / cap).
+                    // TODO(gpu-verify): confirm the softcap is applied to the
+                    // RAW dot product BEFORE adding the (currently missing)
+                    // rel-pos bias term_bd and before the max-subtract softmax,
+                    // and that cap = attention_logit_cap (=50). HF applies
+                    // softcap to (term_ac + term_bd); here term_bd is omitted.
                     let capped = if cap > 0.0 {
                         cap * (dot / cap).tanh()
                     } else {
@@ -800,6 +820,10 @@ impl AudioTower {
         // post projection (clipped linear, [hidden, hidden]).
         let post = self.clip_linear_host(runtime, &attn_out, batch, &attn.post)?;
         // norm_post_attn then residual add.
+        // TODO(gpu-verify): the attention branch residual is added with weight
+        // 1.0 (NOT residual_weight) — only the two Macaron FFN branches use the
+        // 0.5 half-step scale. Confirm the post-attn block is `state += norm_post
+        // _attn(post)` (no extra scale) against the HF reference.
         let post_n = self.rms_norm_to(runtime, &post, batch, &layer.norm_post_attn, eps)?;
         for i in 0..batch * h {
             state[i] += post_n[i];

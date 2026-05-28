@@ -11,8 +11,9 @@
 //   * GLU (split-half gate) activation
 //   * per_dim_scale application to the attention query (q * q_scale * softplus(s))
 //   * gradient clipping (clamp ±C) used between Conformer sub-blocks
-//   * SiLU in-place (for the LightConv1d post-conv activation; FFN uses the
-//     shared aegis_swiglu kernel instead)
+//   * SiLU in-place — used both for the LightConv1d post-conv activation AND
+//     for the ungated Macaron-FFN activation (see audio.rs::feed_forward).
+//     TODO(gpu-verify): confirm the FFN is ungated SiLU and not a SwiGLU split.
 //
 // All buffers are f32 row-major unless stated otherwise. SM_120 (Blackwell)
 // target; guarded for arch >= 800.
@@ -132,7 +133,8 @@ void aegis_audio_clamp_inplace(
 
 // ─────────────────────────────────────────────────────────────────────────
 // SiLU in place: x = x * sigmoid(x). Used for the LightConv1d post-conv
-// activation (FFN GLU uses aegis_swiglu). Flat f32 buffer of length n.
+// activation AND the (assumed ungated) Macaron-FFN activation. Flat f32
+// buffer of length n.
 // Launch: grid = ceil(n/256), block = 256.
 // ─────────────────────────────────────────────────────────────────────────
 extern "C" __global__

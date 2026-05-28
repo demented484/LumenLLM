@@ -190,6 +190,11 @@ impl CudaLlamaExecutor {
                 let aud_data = self.runtime.download_f32(
                     state.audio_embeds.as_ref().unwrap()
                 )?;
+                // TODO(gpu-verify): this copies `h = hidden_size` floats per row
+                // and assumes the audio embeddings were produced with stride
+                // `hidden_size` (i.e. embed_audio.rows == model hidden_size,
+                // 2560 for E4B). If the projector's output width differs from
+                // hidden_size the row stride here is wrong — guard/assert on GPU.
                 let mut hidden_host = self.runtime.download_f32(&prefill.hidden)?;
                 let mut aud_row_idx = 0usize;
                 for (slot, &tok) in chunk.iter().enumerate() {
