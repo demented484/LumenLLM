@@ -128,32 +128,36 @@ pub fn run_env() -> Result<()> {
                     "vision: {} tokens × {} hidden",
                     injection.n_tokens, injection.hidden
                 );
-                // The chat template emits a single `<|image|>` marker; HF's
-                // processor expands that into N image_soft_tokens in the
-                // tokenized prompt. We replicate that here by replacing
-                // the single marker with N copies BEFORE tokenization, so
-                // the prompt has N=image_n_tokens placeholder positions
-                // matching the N image-embedding rows we produce.
-                // Gemma-4 image block format (matches HF Gemma4Processor):
-                //   `<|image>` (id 255999, opening) + N × `<|image|>` (id
-                //   258880, soft tokens) + `<image|>` (id 258882, closing).
-                // The N soft tokens are where the vision tower output rows
-                // get spliced in; the opening/closing delimiters frame them
-                // for the language model and are required for correct
-                // behavior (without them the model treats the soft tokens
-                // as garbage text).
-                let marker = "<|image|>";
-                if request.prompt.contains(marker) {
+                // The chat template emits a single image marker; HF's
+                // image processor expands that into the multimodal
+                // image-block: BOI + N × image_soft_token + EOI. We mirror
+                // that expansion here, reading every token string from the
+                // tokenizer (via the model's config-declared token IDs) so
+                // the same code works for any vision-capable checkpoint —
+                // no hardcoded `<|image>` / `<image|>` literals.
+                let cfg = &engine.artifact.config;
+                let text = aegisllm_base::text::TextProcessor::from_artifact(&engine.artifact)?;
+                let img_tok_u32 = injection.image_token_id as u32;
+                let image_marker = text.token_string(img_tok_u32)
+                    .ok_or_else(|| AegisError::InvalidPlan(format!(
+                        "vision: tokenizer has no string for image_token_id={}",
+                        img_tok_u32
+                    )))?;
+                let boi = cfg.boi_token_id.and_then(|id| text.token_string(id));
+                let eoi = cfg.eoi_token_id.and_then(|id| text.token_string(id));
+                if request.prompt.contains(&image_marker) {
+                    let boi_s = boi.as_deref().unwrap_or("");
+                    let eoi_s = eoi.as_deref().unwrap_or("");
                     let mut block = String::with_capacity(
-                        "<|image>".len() + marker.len() * injection.n_tokens + "<image|>".len()
+                        boi_s.len() + image_marker.len() * injection.n_tokens + eoi_s.len()
                     );
-                    block.push_str("<|image>");
-                    for _ in 0..injection.n_tokens { block.push_str(marker); }
-                    block.push_str("<image|>");
-                    request.prompt = request.prompt.replacen(marker, &block, 1);
+                    block.push_str(boi_s);
+                    for _ in 0..injection.n_tokens { block.push_str(&image_marker); }
+                    block.push_str(eoi_s);
+                    request.prompt = request.prompt.replacen(&image_marker, &block, 1);
                     eprintln!(
-                        "vision: expanded `<|image|>` to <|image>{}×<|image|><image|> block",
-                        injection.n_tokens
+                        "vision: expanded `{}` to {}{}×{}{} block",
+                        image_marker, boi_s, injection.n_tokens, image_marker, eoi_s,
                     );
                 }
                 request.image_injection = Some(injection);
@@ -294,9 +298,11 @@ pub fn run_env() -> Result<()> {
     Ok(())
 }
 
-/// Stage I.2 helper: load an image, preprocess, run the vision tower, and
-/// return an `ImageInjection` ready to splice into the prompt's embedding
-/// stream. Currently hard-coded to Gemma-4 (image_token_id=258880).
+/// Load an image, preprocess, run the vision tower, return an
+/// `ImageInjection` ready to splice into the prompt's embedding stream.
+/// Every model-specific value (vision arch, soft-token budget, image_token_id,
+/// boi/eoi markers) is read from the artifact's parsed config.json — no
+/// per-model hardcodes in this function.
 fn compute_image_injection(
     engine: &AegisEngine,
     image_path: &Path,
@@ -316,17 +322,21 @@ fn compute_image_injection(
     let cuda_weights = cuda.weight_loader();
     let mut loader = TensorStorageLoader::new();
 
-    eprintln!("vision: loading tower...");
+    let shape = VisionEncoderShape::from_artifact(&engine.artifact)?;
+    eprintln!("vision: loading tower ({}L hidden={} head_dim={} standardize={})...",
+        shape.num_layers, shape.hidden_size, shape.head_dim, shape.standardize);
     let tower = VisionTower::from_artifact(
-        &engine.artifact,
-        VisionEncoderShape::gemma4(),
-        &cuda_weights,
-        device,
-        &mut loader,
+        &engine.artifact, shape, &cuda_weights, device, &mut loader,
     )?;
 
     eprintln!("vision: preprocessing {image_path:?}...");
-    let processor = ImageProcessor::gemma4();
+    let vision_cfg = engine.artifact.config.vision_config.as_ref()
+        .ok_or_else(|| AegisError::InvalidPlan("vision: config.json missing vision_config".into()))?;
+    let max_soft_tokens = engine.artifact.config.vision_soft_tokens_per_image
+        .ok_or_else(|| AegisError::InvalidPlan(
+            "vision: config.json missing `vision_soft_tokens_per_image` (top-level key)".into()
+        ))?;
+    let processor = ImageProcessor::from_artifact_vision(vision_cfg, max_soft_tokens);
     let img = processor.load(image_path)?;
     eprintln!(
         "vision: {}x{} → {} patches → {} soft tokens",
@@ -364,10 +374,15 @@ fn compute_image_injection(
         e
     };
 
+    let image_token_id = engine.artifact.config.image_token_id.ok_or_else(|| {
+        AegisError::InvalidPlan(
+            "vision: config.json missing `image_token_id` (top-level)".into(),
+        )
+    })?;
     Ok(aegisllm_base::generation::ImageInjection {
         data: embeds,
         n_tokens,
         hidden: text_hidden,
-        image_token_id: 258880, // Gemma-4 `<|image|>`
+        image_token_id: image_token_id as usize,
     })
 }

@@ -40,7 +40,8 @@ use crate::cuda::{DeviceBf16Matrix, DeviceBuffer};
 use aegisllm_base::planning::placement::StoragePlacement;
 
 /// Configuration for one vision encoder, derived from the model's
-/// `vision_config` (config.json).
+/// `vision_config` (config.json). All values come from the artifact's
+/// parsed `HfVisionConfig`; no model-specific defaults baked in here.
 #[derive(Debug, Clone)]
 pub struct VisionEncoderShape {
     pub hidden_size: usize,
@@ -53,23 +54,41 @@ pub struct VisionEncoderShape {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub position_embedding_size: usize,
+    /// When false, skip the final `(x - std_bias) * std_scale` step AND
+    /// skip loading the `std_bias / std_scale` checkpoint tensors (they
+    /// are absent in checkpoints with `standardize=false`, e.g. Gemma-4
+    /// E4B). When true, both tensors are required.
+    pub standardize: bool,
 }
 
 impl VisionEncoderShape {
-    /// Hard-coded Gemma-4 vision config (matches config.json["vision_config"]).
-    pub fn gemma4() -> Self {
-        Self {
-            hidden_size: 1152,
-            intermediate_size: 4304,
-            num_layers: 27,
-            num_attention_heads: 16,
-            head_dim: 72,
-            patch_size: 16,
-            pooling_kernel_size: 3,
-            rms_norm_eps: 1.0e-6,
-            rope_theta: 100.0,
-            position_embedding_size: 10240,
-        }
+    /// Construct from the artifact's parsed `vision_config` section.
+    /// Returns Err if the model has no vision_config (text-only checkpoint).
+    pub fn from_artifact(artifact: &ModelArtifact) -> Result<Self> {
+        let vc = artifact.config.vision_config.as_ref().ok_or_else(|| {
+            AegisError::InvalidPlan(
+                "vision tower requested but config.json has no `vision_config` section".into()
+            )
+        })?;
+        // rope_theta is nested under rope_parameters in HF schema; if the
+        // model omits the nested struct (older checkpoints) we still need
+        // a value — use 10000.0 as the universal RoPE base default.
+        let rope_theta = vc.rope_parameters.as_ref()
+            .map(|rp| rp.rope_theta as f32)
+            .unwrap_or(10000.0);
+        Ok(Self {
+            hidden_size: vc.hidden_size,
+            intermediate_size: vc.intermediate_size,
+            num_layers: vc.num_hidden_layers,
+            num_attention_heads: vc.num_attention_heads,
+            head_dim: vc.head_dim,
+            patch_size: vc.patch_size,
+            pooling_kernel_size: vc.pooling_kernel_size,
+            rms_norm_eps: vc.rms_norm_eps as f32,
+            rope_theta,
+            position_embedding_size: vc.position_embedding_size,
+            standardize: vc.standardize,
+        })
     }
 }
 
@@ -95,10 +114,17 @@ pub struct VisionTower {
     pub shape: VisionEncoderShape,
     pub patch_embed: DeviceBf16Matrix,
     pub position_table: DeviceBf16Matrix,
-    pub std_scale: DeviceBuffer<f32>,
-    pub std_bias: DeviceBuffer<f32>,
+    /// `std_scale` / `std_bias` are only present when
+    /// `vision_config.standardize == true` (Gemma-4 26B-A4B). E4B sets it
+    /// false and these tensors are absent from the checkpoint.
+    pub std: Option<VisionStandardize>,
     pub layers: Vec<VisionLayerWeights>,
     pub projector: DeviceBf16Matrix,
+}
+
+pub struct VisionStandardize {
+    pub scale: DeviceBuffer<f32>,
+    pub bias: DeviceBuffer<f32>,
 }
 
 impl VisionTower {
@@ -131,12 +157,17 @@ impl VisionTower {
             get("model.vision_tower.patch_embedder.position_embedding_table")?,
             store, residency.clone(), loader,
         )?;
-        let std_scale = cuda_weights.load_dense_vector_with_store(
-            get("model.vision_tower.std_scale")?, store, loader,
-        )?;
-        let std_bias = cuda_weights.load_dense_vector_with_store(
-            get("model.vision_tower.std_bias")?, store, loader,
-        )?;
+        let std = if shape.standardize {
+            let scale = cuda_weights.load_dense_vector_with_store(
+                get("model.vision_tower.std_scale")?, store, loader,
+            )?;
+            let bias = cuda_weights.load_dense_vector_with_store(
+                get("model.vision_tower.std_bias")?, store, loader,
+            )?;
+            Some(VisionStandardize { scale, bias })
+        } else {
+            None
+        };
 
         let mut layers = Vec::with_capacity(shape.num_layers);
         for li in 0..shape.num_layers {
@@ -184,7 +215,7 @@ impl VisionTower {
             store, residency.clone(), loader,
         )?;
 
-        Ok(Self { shape, patch_embed, position_table, std_scale, std_bias, layers, projector })
+        Ok(Self { shape, patch_embed, position_table, std, layers, projector })
     }
 
     /// Forward pass: preprocessed image pixels → image-soft-token embeddings
@@ -507,15 +538,18 @@ impl VisionTower {
             }
         }
 
-        // ── Final standardization (per HF Gemma4VisionModel.config.standardize):
+        // ── Final standardization (gated by vision_config.standardize):
         // hidden_states = (hidden_states - std_bias) * std_scale
         // NOTE the order: subtract bias FIRST, then multiply by scale.
-        let std_scale = runtime.download_f32(&self.std_scale)?;
-        let std_bias  = runtime.download_f32(&self.std_bias)?;
-        for t in 0..n_patches {
-            for c in 0..h {
-                let v = state[t * h + c];
-                state[t * h + c] = (v - std_bias[c]) * std_scale[c];
+        // Skipped entirely for checkpoints with standardize=false (E4B).
+        if let Some(ref std) = self.std {
+            let std_scale = runtime.download_f32(&std.scale)?;
+            let std_bias  = runtime.download_f32(&std.bias)?;
+            for t in 0..n_patches {
+                for c in 0..h {
+                    let v = state[t * h + c];
+                    state[t * h + c] = (v - std_bias[c]) * std_scale[c];
+                }
             }
         }
 
@@ -872,10 +906,13 @@ impl VisionTower {
         )?;
         dump("after_pool", &pooled)?;
 
-        // ── Final standardization on the POOLED tokens (n_tokens, h).
-        runtime.vision_standardize_device(
-            &mut pooled, &self.std_scale, &self.std_bias, n_tokens, h,
-        )?;
+        // ── Final standardization on the POOLED tokens (n_tokens, h),
+        // gated by vision_config.standardize.
+        if let Some(ref std) = self.std {
+            runtime.vision_standardize_device(
+                &mut pooled, &std.scale, &std.bias, n_tokens, h,
+            )?;
+        }
         dump("after_std", &pooled)?;
 
         // ── Multimodal embedder: RMSNorm-no-scale then projector.

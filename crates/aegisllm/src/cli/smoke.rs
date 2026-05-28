@@ -761,12 +761,14 @@ pub(super) fn vision_load_smoke(config: EngineConfig) -> Result<()> {
     let mut loader = TensorStorageLoader::new();
 
     let t0 = std::time::Instant::now();
-    let shape = VisionEncoderShape::gemma4();
+    let shape = VisionEncoderShape::from_artifact(&engine.artifact)?;
     eprintln!(
-        "vision-load-smoke: arch=Gemma-4 vision\n  hidden={} intermediate={} layers={} heads={} head_dim={}\n  patch={} pool={} pos_table={}\n  loading vision tower (356 BF16 tensors)...",
+        "vision-load-smoke: arch={} vision\n  hidden={} intermediate={} layers={} heads={} head_dim={}\n  patch={} pool={} pos_table={} standardize={}\n  loading vision tower...",
+        engine.artifact.config.model_type,
         shape.hidden_size, shape.intermediate_size, shape.num_layers,
         shape.num_attention_heads, shape.head_dim,
         shape.patch_size, shape.pooling_kernel_size, shape.position_embedding_size,
+        shape.standardize,
     );
     let tower = VisionTower::from_artifact(
         &engine.artifact, shape, &cuda_weights, device, &mut loader,
@@ -784,10 +786,14 @@ pub(super) fn vision_load_smoke(config: EngineConfig) -> Result<()> {
         "  position_table: {}x{}",
         tower.position_table.rows, tower.position_table.cols
     );
-    eprintln!(
-        "  std_scale:      len={}     std_bias: len={}",
-        tower.std_scale.len(), tower.std_bias.len()
-    );
+    if let Some(ref std) = tower.std {
+        eprintln!(
+            "  std_scale:      len={}     std_bias: len={}",
+            std.scale.len(), std.bias.len()
+        );
+    } else {
+        eprintln!("  std:            (omitted — vision_config.standardize=false)");
+    }
     eprintln!("  layers:         {} loaded", tower.layers.len());
     eprintln!(
         "  layer[0]:       q_proj={}x{} mlp_gate={}x{}",
@@ -804,7 +810,15 @@ pub(super) fn vision_load_smoke(config: EngineConfig) -> Result<()> {
     // + a few projected embedding values.
     if let Ok(path) = std::env::var("AEGIS_VISION_IMAGE") {
         eprintln!("\nvision-load-smoke: running FORWARD on {path}");
-        let processor = ImageProcessor::gemma4();
+        let vc = engine.artifact.config.vision_config.as_ref()
+            .ok_or_else(|| aegisllm_base::error::AegisError::InvalidPlan(
+                "vision-load-smoke: config.json missing vision_config".into()
+            ))?;
+        let max_soft = engine.artifact.config.vision_soft_tokens_per_image
+            .ok_or_else(|| aegisllm_base::error::AegisError::InvalidPlan(
+                "vision-load-smoke: config.json missing vision_soft_tokens_per_image".into()
+            ))?;
+        let processor = ImageProcessor::from_artifact_vision(vc, max_soft);
         let img = processor.load(Path::new(&path))?;
         eprintln!(
             "  preprocessed:   {}x{} → {} patches ({}x{}) → {} tokens ({}x{})",

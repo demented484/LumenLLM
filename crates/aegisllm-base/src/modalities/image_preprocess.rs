@@ -63,27 +63,68 @@ pub struct ImageProcessor {
 }
 
 impl ImageProcessor {
-    /// Builder for Gemma-4-it / Gemma-4-vision: aspect-preserving resize with
-    /// max 280 post-pool tokens (= 2520 pre-pool patches @ pool=3), patch=16,
-    /// rescale=1/255, no mean/std normalization.
-    pub fn gemma4() -> Self {
-        // Pre-pool patch budget = max_soft_tokens × pooling². Gemma-4 native
-        // spec is max_soft_tokens=280, pooling=3 → 2520. For OCR-heavy
-        // inputs, llama.cpp's `--image-max-tokens` lifts this cap by feeding
-        // a higher-resolution resize (the trained projector tolerates more
-        // tokens, the position table goes to 10240). We match that lever via
-        // `AEGIS_VISION_MAX_PATCHES` (e.g. 9000 ≈ 1000 soft tokens).
+    /// Build the processor from the artifact's `vision_config`. All shape
+    /// parameters (patch_size, pooling_kernel_size, max-soft-tokens budget)
+    /// come from the model checkpoint — never hardcoded per-model here. The
+    /// engine supports any Gemma-style aspect-preserving + patchify pipeline
+    /// that the checkpoint advertises.
+    ///
+    /// Pre-pool patch budget = `vision_soft_tokens_per_image * pool²`
+    /// (Gemma-4 native: 280 * 9 = 2520). `side_multiple = pool * patch_size`
+    /// (Gemma-4: 3 * 16 = 48) ensures every resize produces a clean
+    /// patch+pool tiling with no tail rows.
+    ///
+    /// `AEGIS_VISION_MAX_PATCHES` env var overrides the budget for OCR
+    /// (matches llama.cpp's `--image-max-tokens` lever). The model's
+    /// `position_embedding_size` (10240 for Gemma-4) is the hard upper bound.
+    /// Construct directly from parameters — for tests / examples / engine
+    /// callers that already have the values. Production callers should use
+    /// `from_artifact_vision` to ensure the values match the loaded model.
+    pub fn with_params(
+        patch_size: usize,
+        pooling_kernel_size: usize,
+        max_soft_tokens: usize,
+    ) -> Self {
+        let computed_budget = max_soft_tokens
+            .checked_mul(pooling_kernel_size * pooling_kernel_size)
+            .expect("vision: max_soft_tokens × pool² overflow");
         let max_patches = std::env::var("AEGIS_VISION_MAX_PATCHES")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(2520);
+            .unwrap_or(computed_budget);
         Self {
-            patch_size: 16,
-            pooling_kernel_size: 3,
+            patch_size,
+            pooling_kernel_size,
             resize: ResizeStrategy::AspectPreserving {
                 max_patches,
-                side_multiple: 48, // pooling * patch = 3 * 16
+                side_multiple: pooling_kernel_size * patch_size,
             },
+            rescale_factor: 1.0 / 255.0,
+            mean: [0.0, 0.0, 0.0],
+            std: [1.0, 1.0, 1.0],
+        }
+    }
+
+    pub fn from_artifact_vision(cfg: &crate::artifact::HfVisionConfig, max_soft_tokens: usize) -> Self {
+        let pool = cfg.pooling_kernel_size;
+        let patch = cfg.patch_size;
+        let computed_budget = max_soft_tokens
+            .checked_mul(pool * pool)
+            .expect("vision: max_soft_tokens × pool² overflow");
+        let max_patches = std::env::var("AEGIS_VISION_MAX_PATCHES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(computed_budget);
+        Self {
+            patch_size: patch,
+            pooling_kernel_size: pool,
+            resize: ResizeStrategy::AspectPreserving {
+                max_patches,
+                side_multiple: pool * patch,
+            },
+            // HF Gemma-4 image processor: rescale `1/255` to [0,1], then
+            // `2*(x-0.5)` to [-1,1] inside the patch-embed kernel. We do
+            // the same here; mean/std normalization is a no-op for Gemma-4.
             rescale_factor: 1.0 / 255.0,
             mean: [0.0, 0.0, 0.0],
             std: [1.0, 1.0, 1.0],
@@ -257,7 +298,8 @@ mod tests {
 
     #[test]
     fn gemma4_landscape_resize() {
-        let p = ImageProcessor::gemma4();
+        // Mirror Gemma-4 vision-config: patch=16, pool=3, max 280 soft tokens.
+        let p = ImageProcessor::with_params(16, 3, 280);
         let (h, w) = p.target_size(1080, 1920).unwrap();
         assert_eq!(h % 48, 0);
         assert_eq!(w % 48, 0);
@@ -273,7 +315,7 @@ mod tests {
 
     #[test]
     fn rejects_zero_dim() {
-        let p = ImageProcessor::gemma4();
+        let p = ImageProcessor::with_params(16, 3, 280);
         assert!(p.target_size(0, 10).is_err());
     }
 }

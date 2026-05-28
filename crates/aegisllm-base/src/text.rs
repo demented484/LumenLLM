@@ -110,6 +110,15 @@ impl TextProcessor {
         self.eos_token_ids.contains(&token_id)
     }
 
+    /// Return the literal string for a single token id (including structural
+    /// markers such as `<|image|>`, `<|image>`, `<image|>`). Used by the
+    /// multimodal splice path to expand a placeholder marker into the
+    /// model-specific begin/N-soft/end token block without hardcoding the
+    /// strings.
+    pub fn token_string(&self, token_id: u32) -> Option<String> {
+        self.tokenizer.id_to_token(token_id)
+    }
+
     /// Render a sequence of chat messages (with optional tool definitions)
     /// using the model's actual chat_template.jinja. Used by the HTTP server
     /// to honor OpenAI/Anthropic chat-completions semantics.

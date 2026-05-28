@@ -186,7 +186,106 @@ pub struct HfConfig {
     // ── Qwen-specific ────────────────────────────────────────────────────
     /// Number of attention layers when using hybrid GDN model.
     pub num_attention_heads_per_layer: Option<Vec<usize>>,
+
+    // ── Multimodal sub-configs (verbatim from HF config.json) ────────────
+    /// Vision-tower architecture parameters. Present on every multimodal
+    /// checkpoint (Gemma-4 26B-A4B has 27L/1152/72; E4B has 16L/768/64).
+    /// Engine reads these instead of hardcoding per-model defaults.
+    #[serde(default)]
+    pub vision_config: Option<HfVisionConfig>,
+    /// Audio-encoder architecture parameters (Gemma-4 E4B, future Nemotron
+    /// Omni audio path).
+    #[serde(default)]
+    pub audio_config: Option<HfAudioConfig>,
+
+    // ── Multimodal soft-token IDs (verbatim) ─────────────────────────────
+    /// Image soft-token id (`<|image|>` in Gemma-4 = 258880); engine splices
+    /// vision-tower embeds at these positions in the prompt.
+    #[serde(default)]
+    pub image_token_id: Option<u32>,
+    /// Begin-of-image delimiter id (`<|image>` = 255999 in Gemma-4).
+    #[serde(default)]
+    pub boi_token_id: Option<u32>,
+    /// End-of-image delimiter id (`<image|>` = 258882 in Gemma-4).
+    #[serde(default)]
+    pub eoi_token_id: Option<u32>,
+    /// Audio soft-token id (`<|audio|>` = 258881 in Gemma-4).
+    #[serde(default)]
+    pub audio_token_id: Option<u32>,
+    /// Begin-of-audio delimiter id.
+    #[serde(default)]
+    pub boa_token_id: Option<u32>,
+    /// End-of-audio delimiter id.
+    #[serde(default)]
+    pub eoa_token_id: Option<u32>,
+    /// Video soft-token id.
+    #[serde(default)]
+    pub video_token_id: Option<u32>,
+    /// Max soft tokens per image (Gemma-4: 280 post-pool); the image
+    /// processor's patch budget = `vision_soft_tokens_per_image *
+    /// pooling_kernel_size²`.
+    #[serde(default)]
+    pub vision_soft_tokens_per_image: Option<usize>,
 }
+
+/// Vision-tower architecture sub-config (Gemma-4 26B & E4B both expose
+/// this under `config.json["vision_config"]`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct HfVisionConfig {
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub head_dim: usize,
+    pub patch_size: usize,
+    pub pooling_kernel_size: usize,
+    pub rms_norm_eps: f64,
+    pub position_embedding_size: usize,
+    /// When false (E4B), skip the final `(x - std_bias) * std_scale` step
+    /// and the corresponding `std_bias/std_scale` checkpoint tensors.
+    #[serde(default = "default_true")]
+    pub standardize: bool,
+    /// Per-axis RoPE base; nested under `rope_parameters.rope_theta`.
+    #[serde(default)]
+    pub rope_parameters: Option<HfVisionRopeParameters>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct HfVisionRopeParameters {
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub rope_type: Option<String>,
+}
+
+/// Audio-encoder sub-config (Gemma-4 E4B).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct HfAudioConfig {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub rms_norm_eps: f64,
+    /// Output projection target (1536 for Gemma-4 E4B).
+    pub output_proj_dims: usize,
+    /// Subsampling 1-D conv stack channel sizes (Gemma-4: `[128, 32]`).
+    pub subsampling_conv_channels: Vec<usize>,
+    pub conv_kernel_size: usize,
+    /// Chunked local-attention window: each token attends to its own chunk
+    /// plus `attention_context_left` frames left and `attention_context_right`
+    /// frames right. Gemma-4: chunk=12, left=13, right=0.
+    pub attention_chunk_size: usize,
+    pub attention_context_left: usize,
+    pub attention_context_right: usize,
+    /// Cap on attention logits before softmax (Gemma-4: 50).
+    pub attention_logit_cap: f32,
+    pub attention_invalid_logits_value: f32,
+    /// Residual blend weight between layers (Gemma-4: 0.5).
+    pub residual_weight: f32,
+    /// When true, linear outputs get clamped to a learned range before activation.
+    #[serde(default)]
+    pub use_clipped_linears: bool,
+}
+
+fn default_true() -> bool { true }
 
 /// Effective dimensions for a MatFormer-style nested-param checkpoint.
 ///
