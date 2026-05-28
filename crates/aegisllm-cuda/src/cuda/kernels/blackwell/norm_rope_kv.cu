@@ -324,6 +324,23 @@ extern "C" __global__ void aegis_swiglu(
     }
 }
 
+// In-place single-tensor gelu_pytorch_tanh (Gemma-4 E4B PLE gate path: the
+// `per_layer_input_gate` Linear output goes through gelu_tanh BEFORE the
+// elementwise multiply, not after — so this is NOT a gate*up activation).
+extern "C" __global__ void aegis_gelu_tanh_inplace_f32(
+    float* x,
+    const unsigned int len
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        const float v = x[idx];
+        const float k = 0.7978845608028654f;  // sqrt(2/pi)
+        const float k2 = 0.044715f;
+        const float inner = k * (v + k2 * v * v * v);
+        x[idx] = 0.5f * v * (1.0f + tanhf(inner));
+    }
+}
+
 // gelu_pytorch_tanh approx, same form as PyTorch's nn.functional.gelu(x, approximate="tanh"):
 //   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
 // Used by Gemma 3/4 where hidden_activation == "gelu_pytorch_tanh".

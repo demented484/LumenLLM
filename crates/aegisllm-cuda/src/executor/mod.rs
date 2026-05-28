@@ -9,6 +9,7 @@ mod load_progress;
 mod loader;
 mod mlp;
 mod planning;
+mod ple;
 mod prefill;
 pub mod prefix_cache;
 mod provider;

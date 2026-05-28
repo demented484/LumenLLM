@@ -867,28 +867,36 @@ pub(super) fn load_ple_global(
 
 /// Load per-layer PLE weights (gate / projection / post_norm). Returns
 /// `None` when the model has no PLE config, mirroring `load_ple_global`.
+///
+/// PLE per-layer linears are tiny (256×2560 BF16 = 1.3 MB each × 3 × 42
+/// layers ≈ 160 MB total at E4B), so they're forced VRAM-resident regardless
+/// of the enclosing `hidden-layers.store` config — host-resident BF16 GEMM
+/// would route through the CPU rayon path which is far too slow for the
+/// per-layer / per-decode-step call pattern.
 pub(super) fn load_ple_layer(
     cuda: &CudaWeightLoader<'_>,
     artifact: &ModelArtifact,
     prefix: &str,
-    store: StoragePlacement,
-    residency: TensorResidencyPlan,
+    _layer_store: StoragePlacement,
+    _layer_residency: TensorResidencyPlan,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<Option<PleLayer>> {
     if artifact.config.hidden_size_per_layer_input.unwrap_or(0) == 0 {
         return Ok(None);
     }
+    let vram_store = StoragePlacement::Vram { device: cuda.device_index() };
+    let vram_residency = cuda_residency_for_store(vram_store, cuda.device_index())?;
     let input_gate = cuda.load_bf16_matrix_with_store(
         require_tensor(artifact, &format!("{prefix}.per_layer_input_gate.weight"))?,
-        store, residency.clone(), loader,
+        vram_store, vram_residency.clone(), loader,
     )?;
     let projection = cuda.load_bf16_matrix_with_store(
         require_tensor(artifact, &format!("{prefix}.per_layer_projection.weight"))?,
-        store, residency, loader,
+        vram_store, vram_residency, loader,
     )?;
     let post_norm = cuda.load_dense_vector_with_store(
         require_tensor(artifact, &format!("{prefix}.post_per_layer_input_norm.weight"))?,
-        store, loader,
+        vram_store, loader,
     )?;
     Ok(Some(PleLayer { input_gate, projection, post_norm }))
 }

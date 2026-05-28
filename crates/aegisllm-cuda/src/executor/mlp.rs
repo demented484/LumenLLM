@@ -10,6 +10,8 @@ use aegisllm_base::error::{AegisError, Result};
 pub(super) fn forward_mlp_device(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
+    layer_idx: usize,
+    ple_global: Option<&crate::executor::state::PleGlobal>,
     scratch: &mut CudaScratch,
     rms_norm_eps: f32,
 ) -> Result<()> {
@@ -47,7 +49,9 @@ pub(super) fn forward_mlp_device(
         .zip(layer.up_proj.as_nvfp4())
         .zip(layer.down_proj.as_nvfp4());
     if nvfp4_triple.is_none() {
-        return forward_dense_mlp_non_nvfp4_device(runtime, layer, scratch, rms_norm_eps);
+        return forward_dense_mlp_non_nvfp4_device(
+            runtime, layer, layer_idx, ple_global, scratch, rms_norm_eps,
+        );
     }
     let (gate_proj_nvfp4, up_proj_nvfp4, down_proj_nvfp4) = {
         let ((g, u), d) = nvfp4_triple.unwrap();
@@ -207,6 +211,15 @@ pub(super) fn forward_mlp_device(
     } else {
         runtime.add_device(&scratch.residual, &scratch.mlp_out, &mut scratch.hidden_out)?;
     }
+    // PLE per-layer additive contribution — applied BEFORE layer_scalar to
+    // match HF Gemma4DecoderLayer.forward (gemma4.py:739-752). No-op for
+    // non-PLE models (layer.ple is None) and when the global apparatus
+    // wasn't loaded (Gemma-4-26B-A4B et al.).
+    if let Some(ple_g) = ple_global {
+        crate::executor::ple::apply_ple_contribution_decode(
+            runtime, layer, ple_g, layer_idx, scratch, rms_norm_eps,
+        )?;
+    }
     if let Some(scalar) = layer.layer_scalar {
         runtime.scale_f32_device(scalar, &mut scratch.hidden_out)?;
     }
@@ -225,6 +238,8 @@ pub(super) fn forward_mlp_device(
 fn forward_dense_mlp_non_nvfp4_device(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
+    layer_idx: usize,
+    ple_global: Option<&crate::executor::state::PleGlobal>,
     scratch: &mut CudaScratch,
     rms_norm_eps: f32,
 ) -> Result<()> {
@@ -305,6 +320,15 @@ fn forward_dense_mlp_non_nvfp4_device(
         runtime.add_device(&scratch.residual, &scratch.post_normed, &mut scratch.hidden_out)?;
     } else {
         runtime.add_device(&scratch.residual, &scratch.mlp_out, &mut scratch.hidden_out)?;
+    }
+    // PLE per-layer additive contribution — applied BEFORE layer_scalar to
+    // match HF Gemma4DecoderLayer.forward (gemma4.py:739-752). No-op for
+    // non-PLE models (layer.ple is None) and when the global apparatus
+    // wasn't loaded (Gemma-4-26B-A4B et al.).
+    if let Some(ple_g) = ple_global {
+        crate::executor::ple::apply_ple_contribution_decode(
+            runtime, layer, ple_g, layer_idx, scratch, rms_norm_eps,
+        )?;
     }
     if let Some(scalar) = layer.layer_scalar {
         runtime.scale_f32_device(scalar, &mut scratch.hidden_out)?;

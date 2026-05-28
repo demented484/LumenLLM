@@ -309,6 +309,15 @@ impl DeviceBf16Matrix {
     pub fn values_u16(&self) -> &CudaSlice<u16> {
         &self.values
     }
+
+    /// Borrow the host-resident BF16 bytes (as `&[u16]`) for a
+    /// `StagedHostToDevice` matrix. Returns `None` for VRAM-resident matrices.
+    /// Used by the PLE token-entry path to look up
+    /// `embed_tokens_per_layer[token_id, :]` without staging the entire 5.4 GiB
+    /// table to VRAM.
+    pub fn host_values_u16(&self) -> Option<&[u16]> {
+        self.host_values.as_ref().map(|h| h.values())
+    }
 }
 
 /// Standalone FP8 E4M3 linear weight, produced by the load-time

@@ -131,7 +131,9 @@ impl CudaLlamaExecutor {
                 }
             }
             let lt_mlp = std::time::Instant::now();
-            super::mlp::forward_mlp_device(&self.runtime, layer, scratch, params.rms_norm_eps)?;
+            super::mlp::forward_mlp_device(
+                &self.runtime, layer, layer_idx, self.ple.as_ref(), scratch, params.rms_norm_eps,
+            )?;
             let lt_mlp_done = lt_mlp.elapsed().as_secs_f64() * 1000.0;
             std::mem::swap(hidden, &mut scratch.hidden_out);
             if prof {
@@ -193,6 +195,16 @@ impl CudaLlamaExecutor {
         if let Ok(tag) = std::env::var("AEGIS_DUMP_EMBED") {
             let h = self.runtime.download_f32(&state.hidden)?;
             eprintln!("[DUMP {tag} EMBED tok={}] first8={:?}", token_id, &h[0..8.min(h.len())]);
+        }
+        // PLE token-entry compute (Gemma-4 E4B/E2B): combines the
+        // `embed_tokens_per_layer` lookup with the `per_layer_model_projection`
+        // of `hidden`, then RMSNorm-combined into `state.scratch.per_layer_inputs`.
+        // No-op for non-PLE models.
+        if let Some(ple) = &self.ple {
+            crate::executor::ple::compute_per_layer_inputs_decode(
+                &self.runtime, ple, token_id, &state.hidden, self.layers.len(),
+                &mut state.scratch, self.rms_norm_eps,
+            )?;
         }
 
         let seq_len = state.position + 1;
@@ -562,7 +574,10 @@ pub(super) fn forward_cuda_layer_device(
             });
         }
     }
-    forward_mlp_device(runtime, layer, scratch, params.rms_norm_eps)?;
+    // Block-level path (unit tests). PLE is wired only on the full-model
+    // executor (`CudaLlamaExecutor::forward_hidden`); this path always
+    // passes None and layer_idx=0.
+    forward_mlp_device(runtime, layer, 0, None, scratch, params.rms_norm_eps)?;
     std::mem::swap(hidden, &mut scratch.hidden_out);
     Ok(())
 }

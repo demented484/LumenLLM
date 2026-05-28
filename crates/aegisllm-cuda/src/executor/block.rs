@@ -260,6 +260,12 @@ impl CudaLayerBlockExecutor {
                 moe: None,
                 staging_pool: None,
                 kv_staging: None,
+                // Block-level executor is for unit tests; no PLE used here.
+                per_layer_inputs: self.runtime.alloc_f32(1)?,
+                ple_gate: self.runtime.alloc_f32(1)?,
+                ple_contrib: self.runtime.alloc_f32(1)?,
+                ple_bf16_in: self.runtime.alloc_u16(1)?,
+                ple_bf16_out: self.runtime.alloc_u16(1)?,
             },
             p_position: self.runtime.alloc_u32(1)?,
             p_seq_len: self.runtime.alloc_u32(1)?,

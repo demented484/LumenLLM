@@ -601,6 +601,21 @@ pub(super) struct CudaScratch {
     /// `context_size × kv_width` each, used in ping-pong to overlap async H2D
     /// (next layer) with compute (current layer) via the dedicated transfer stream.
     pub(super) kv_staging: Option<Box<KvStagingPool>>,
+    /// PLE per-layer feed: `[num_layers, ple_dim]` f32. Computed once per
+    /// decode step (at token entry) by combining `embed_tokens_per_layer`
+    /// lookup with the `per_layer_model_projection` of the current hidden
+    /// state, then consumed inside each layer's MLP forward to produce the
+    /// per-layer additive contribution. Sized 1 when the model has no PLE.
+    pub(super) per_layer_inputs: DeviceBuffer<f32>,
+    /// PLE gate-projection output `[ple_dim]` — per-layer scratch consumed
+    /// inside the decoder block's PLE additive contribution.
+    pub(super) ple_gate: DeviceBuffer<f32>,
+    /// PLE projection output `[hidden]` — per-layer scratch.
+    pub(super) ple_contrib: DeviceBuffer<f32>,
+    /// PLE BF16 staging for the lookup row + projection input.
+    pub(super) ple_bf16_in: DeviceBuffer<u16>,
+    /// PLE BF16 GEMM output staging.
+    pub(super) ple_bf16_out: DeviceBuffer<u16>,
 }
 
 #[derive(Debug)]

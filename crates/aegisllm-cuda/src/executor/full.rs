@@ -1029,6 +1029,23 @@ impl CudaLlamaExecutor {
                 } else {
                     None
                 },
+                // PLE scratch — sized only when the model has PLE (Gemma-4 E4B/E2B).
+                // `per_layer_inputs` holds `[num_layers, ple_dim]` post-combine.
+                // `ple_gate / ple_contrib` are per-layer scratch slots. The BF16
+                // staging is shared between the lookup row (num_layers*ple_dim
+                // u16 = 21.5 KB at E4B) and the projection GEMM input/output.
+                per_layer_inputs: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|p| self.layers.len() * p.ple_dim).unwrap_or(1))?,
+                ple_gate: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|p| p.ple_dim).unwrap_or(1))?,
+                ple_contrib: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|_| self.hidden_size).unwrap_or(1))?,
+                ple_bf16_in: self.runtime.alloc_u16(self.ple.as_ref()
+                    .map(|p| (self.layers.len() * p.ple_dim).max(self.hidden_size))
+                    .unwrap_or(1))?,
+                ple_bf16_out: self.runtime.alloc_u16(self.ple.as_ref()
+                    .map(|p| (self.layers.len() * p.ple_dim).max(self.hidden_size))
+                    .unwrap_or(1))?,
                 moe: if moe_intermediate > 0 {
                     let max_input = self.hidden_size.max(max_expert_intermediate);
                     let max_num_experts = self

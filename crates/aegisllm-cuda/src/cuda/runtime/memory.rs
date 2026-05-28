@@ -143,6 +143,30 @@ impl CudaRuntime {
 
     /// Upload a u16 slice (used for f16-bits KV caches) to a fresh device
     /// buffer. Used by the attention-reference correctness smoke.
+    /// Copy a host u16 slice into an existing device buffer (used for PLE
+    /// per-token BF16 row staging — avoids allocating a fresh u16 device
+    /// buffer on every decode step).
+    pub fn upload_u16_slice_to_device(
+        &self,
+        values: &[u16],
+        target: &mut DeviceBuffer<u16>,
+    ) -> Result<()> {
+        if values.len() > target.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "upload_u16_slice_to_device: host len={} > device cap={}",
+                values.len(), target.len()
+            )));
+        }
+        // The transmute is sound — u16 and half::bf16 have identical layout.
+        let mut view = target.slice.try_slice_mut(0..values.len())
+            .ok_or_else(|| AegisError::InvalidPlan(
+                "upload_u16_slice_to_device: slice view failed".into()
+            ))?;
+        self.stream.memcpy_htod(values, &mut view)
+            .map_err(map_cuda_err("upload u16 slice"))?;
+        Ok(())
+    }
+
     pub fn upload_u16(&self, values: &[u16]) -> Result<DeviceBuffer<u16>> {
         Ok(DeviceBuffer {
             slice: self

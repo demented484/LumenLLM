@@ -1573,6 +1573,83 @@ impl CudaRuntime {
     }
 
     /// Element-wise multiply in-place: `out[i] *= scale[i]`. Lengths must match.
+    /// Single-tensor in-place `gelu_pytorch_tanh` — used by the Gemma-4 E4B
+    /// PLE gate before the elementwise multiply with per-layer inputs.
+    pub fn gelu_tanh_inplace_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        len: usize,
+    ) -> Result<()> {
+        if x.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "gelu_tanh_inplace: buf len={} < requested {}",
+                x.len(), len
+            )));
+        }
+        let len_u = u32_arg("len", len)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len_u, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.gelu_tanh_inplace_f32)
+                .arg(&mut x.slice)
+                .arg(&len_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch gelu_tanh_inplace_f32"))?;
+        Ok(())
+    }
+
+    /// Multiply `out[i] *= src[src_offset + i]` for `i in 0..len`, on a
+    /// sliced view of `src`. Used by the PLE per-layer additive: the
+    /// per-layer-feed slice for layer `li` lives at
+    /// `per_layer_inputs[li * ple_dim .. (li+1) * ple_dim]`.
+    pub fn mul_vec_inplace_slice_device(
+        &self,
+        out: &mut DeviceBuffer<f32>,
+        src: &DeviceBuffer<f32>,
+        src_offset: usize,
+        len: usize,
+    ) -> Result<()> {
+        if out.len() < len {
+            return Err(AegisError::InvalidPlan(format!(
+                "mul_vec_inplace_slice: out len={} < requested {}",
+                out.len(), len
+            )));
+        }
+        if src_offset + len > src.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "mul_vec_inplace_slice: src[{src_offset}..{}] OOB (len={})",
+                src_offset + len, src.len()
+            )));
+        }
+        let src_view = src.slice.try_slice(src_offset..src_offset + len)
+            .ok_or_else(|| AegisError::InvalidPlan(
+                "mul_vec_inplace_slice: src slice view failed".into()))?;
+        let mut out_view = out.slice.try_slice_mut(0..len)
+            .ok_or_else(|| AegisError::InvalidPlan(
+                "mul_vec_inplace_slice: out slice view failed".into()))?;
+        let len_u = u32_arg("len", len)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len_u, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.mul_vec_inplace_f32)
+                .arg(&mut out_view)
+                .arg(&src_view)
+                .arg(&len_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch mul_vec_inplace_slice"))?;
+        Ok(())
+    }
+
     pub fn mul_vec_inplace_device(
         &self,
         out: &mut DeviceBuffer<f32>,
