@@ -47,6 +47,20 @@ impl CudaExecutorProvider {
         runtime: &RuntimePlan,
         cuda_config: CudaRuntimeConfig,
     ) -> Result<Self> {
+        Self::from_artifact_with_draft(artifact, graph, placement, runtime, cuda_config, None)
+    }
+
+    /// Like `from_artifact` but optionally attaches an EAGLE/MTP speculative
+    /// decoding draft model (`(draft_model_path, num_draft_tokens)`). When the
+    /// draft is `None`, behaves identically to `from_artifact`.
+    pub fn from_artifact_with_draft(
+        artifact: &ModelArtifact,
+        graph: &ModelGraph,
+        placement: &ResolvedPlacement,
+        runtime: &RuntimePlan,
+        cuda_config: CudaRuntimeConfig,
+        draft: Option<(&std::path::Path, usize)>,
+    ) -> Result<Self> {
         let plan = Self::plan(placement, runtime).ok_or_else(|| {
             AegisError::InvalidPlan("CUDA executor requested for non-CUDA placement".into())
         })?;
@@ -120,7 +134,7 @@ impl CudaExecutorProvider {
             )));
         }
         let t0 = std::time::Instant::now();
-        let cuda_executor = CudaLlamaExecutor::from_artifact(
+        let mut cuda_executor = CudaLlamaExecutor::from_artifact(
             artifact,
             graph,
             placement,
@@ -132,12 +146,24 @@ impl CudaExecutorProvider {
             "load-timing: from_artifact total     {:>6.2}s",
             t0.elapsed().as_secs_f64()
         );
+        // Attach the EAGLE/MTP speculative-decoding draft model, if requested.
+        // ~135 MiB extra VRAM; shares the target's KV cache (no duplication).
+        if let Some((draft_path, num_draft_tokens)) = draft {
+            let td = std::time::Instant::now();
+            cuda_executor.attach_draft_model(draft_path, num_draft_tokens)?;
+            eprintln!(
+                "load-timing: draft model attach      {:>6.2}s  (num_draft_tokens={})",
+                td.elapsed().as_secs_f64(),
+                num_draft_tokens,
+            );
+        }
         // Pre-allocate the per-sequence state (KV cache, scratch, sampled-token
         // buffer, etc.) so the first prompt doesn't pay for a ~10 GiB cudaMalloc
         // on its critical path. Cached in `prepared_state` and consumed by the
         // first `new_sequence_state()` caller; later callers allocate fresh.
+        // When a draft is attached this also allocates the (tiny) draft scratch.
         let t1 = std::time::Instant::now();
-        let warmed = cuda_executor.new_state()?;
+        let warmed = cuda_executor.new_spec_state()?;
         eprintln!(
             "load-timing: warmed new_state        {:>6.2}s",
             t1.elapsed().as_secs_f64()
@@ -166,6 +192,39 @@ impl CudaExecutorProvider {
             info,
             runnable: limitations.is_empty(),
             limitations,
+        })
+    }
+
+    /// Speculative-decoding generate (greedy). Encodes the prompt, allocates a
+    /// spec-decode state, runs the draft-propose / target-verify loop, and
+    /// decodes the accepted tokens. Used only when a draft model is attached.
+    fn generate_speculative(
+        &self,
+        request: &aegisllm_base::generation::GenerateRequest,
+    ) -> Result<aegisllm_base::generation::GenerateOutput> {
+        let cuda = self.cuda.as_ref().ok_or_else(|| {
+            AegisError::Unsupported("CUDA executor not initialized for spec-decode".into())
+        })?;
+        let prompt_tokens = self.encode_prompt(&request.prompt)?;
+        if prompt_tokens.is_empty() {
+            return Err(AegisError::InvalidConfig("prompt produced no tokens".into()));
+        }
+        let mut state = self.new_sequence_state()?;
+        if let Some(ref injection) = request.image_injection {
+            self.set_image_injection(state.as_mut(), injection)?;
+        }
+        let cuda_state = cuda_state_mut(state.as_mut())?;
+        let generated = cuda.generate_speculative_greedy(
+            cuda_state,
+            &prompt_tokens,
+            request,
+            &|t| self.is_eos(t),
+        )?;
+        Ok(aegisllm_base::generation::GenerateOutput {
+            text: self.decode_tokens(&generated)?,
+            prompt_tokens: prompt_tokens.len(),
+            completion_tokens: generated.len(),
+            finish_reason: "length".into(),
         })
     }
 }
@@ -225,7 +284,9 @@ impl GenerationBackendPrimitives for CudaExecutorProvider {
         {
             return Ok(Box::new(prepared));
         }
-        Ok(Box::new(cuda.new_state()?))
+        // When a draft is attached, allocate the spec-decode state (includes the
+        // draft scratch); otherwise the plain state.
+        Ok(Box::new(cuda.new_spec_state()?))
     }
 
     fn forward_hidden(&self, state: &mut dyn GenerationState, token_id: usize) -> Result<()> {
@@ -308,6 +369,39 @@ impl GenerationBackendPrimitives for CudaExecutorProvider {
 impl ModelExecutorBackend for CudaExecutorProvider {
     fn info(&self) -> ExecutorBackendInfo {
         cuda_backend_info(self.device, self.limitations.clone())
+    }
+
+    /// Route through the speculative-decoding loop when a draft model is
+    /// attached; otherwise fall back to the default generic decode loop.
+    fn generate(
+        &self,
+        request: &aegisllm_base::generation::GenerateRequest,
+    ) -> Result<aegisllm_base::generation::GenerateOutput> {
+        if self.cuda.as_ref().is_some_and(|c| c.has_draft()) {
+            return self.generate_speculative(request);
+        }
+        aegisllm_base::executor::generation::generate_with_backend(self, request)
+    }
+
+    fn generate_timed(
+        &self,
+        request: &aegisllm_base::generation::GenerateRequest,
+    ) -> Result<aegisllm_base::generation::TimedGenerateOutput> {
+        if self.cuda.as_ref().is_some_and(|c| c.has_draft()) {
+            // Spec-decode timing is not yet split into prefill/decode buckets;
+            // report the whole run as decode. TODO(gpu-verify): proper timing.
+            let start = std::time::Instant::now();
+            let output = self.generate_speculative(request)?;
+            return Ok(aegisllm_base::generation::TimedGenerateOutput {
+                output,
+                tokenize_elapsed: std::time::Duration::ZERO,
+                prefill_elapsed: std::time::Duration::ZERO,
+                decode_elapsed: start.elapsed(),
+                total_elapsed: start.elapsed(),
+                prefill_stage_timings: None,
+            });
+        }
+        aegisllm_base::executor::generation::generate_with_backend_timed(self, request)
     }
 
     fn probe(&self) -> Result<()> {

@@ -27,6 +27,10 @@ pub struct EngineConfig {
     pub policy: PlacementPolicy,
     pub enable_executor: bool,
     pub cuda: CudaRuntimeConfig,
+    /// EAGLE/MTP speculative-decoding draft model path. `None` = no spec-decode.
+    pub draft_model: Option<PathBuf>,
+    /// Tokens proposed per spec-decode round (default 4).
+    pub num_draft_tokens: usize,
 }
 
 #[derive(Debug)]
@@ -40,6 +44,10 @@ pub struct AegisEngine {
     pub runtime: RuntimePlan,
     pub storage: StoragePlan,
     pub cuda: CudaRuntimeConfig,
+    /// EAGLE/MTP draft model path (carried so `with_executor` can attach it
+    /// when promoting a preview engine to a full executor for `serve`).
+    pub draft_model: Option<PathBuf>,
+    pub num_draft_tokens: usize,
     executor: Option<Executor>,
 }
 
@@ -56,6 +64,12 @@ impl EngineConfig {
             policy: PlacementPolicy::auto_for(&inventory),
             enable_executor: true,
             cuda: CudaRuntimeConfig::from_env(),
+            draft_model: std::env::var_os("AEGIS_DRAFT_MODEL").map(PathBuf::from),
+            num_draft_tokens: std::env::var("AEGIS_NUM_DRAFT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(4),
         }
     }
 }
@@ -94,6 +108,8 @@ impl AegisEngine {
                 &placement,
                 runtime.clone(),
                 config.cuda,
+                config.draft_model.as_deref(),
+                config.num_draft_tokens,
             )?)
         } else {
             None
@@ -109,6 +125,8 @@ impl AegisEngine {
             runtime,
             storage,
             cuda: config.cuda,
+            draft_model: config.draft_model,
+            num_draft_tokens: config.num_draft_tokens,
             executor,
         })
     }
@@ -131,6 +149,8 @@ impl AegisEngine {
             &self.placement,
             self.runtime.clone(),
             self.cuda,
+            self.draft_model.as_deref(),
+            self.num_draft_tokens,
         )?;
         self.executor = Some(executor);
         Ok(self)

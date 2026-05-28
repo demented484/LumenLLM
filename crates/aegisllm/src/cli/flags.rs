@@ -18,6 +18,10 @@ pub(super) struct ParsedEngineFlags {
     pub(super) policy: PlacementPolicy,
     pub(super) cuda: CudaRuntimeConfig,
     pub(super) generation: SamplingConfig,
+    /// EAGLE/MTP speculative-decoding draft model path (`--draft-model`).
+    pub(super) draft_model: Option<PathBuf>,
+    /// Tokens proposed per spec-decode round (`--num-draft-tokens`, default 4).
+    pub(super) num_draft_tokens: usize,
 }
 
 impl ParsedEngineFlags {
@@ -27,6 +31,8 @@ impl ParsedEngineFlags {
             policy: self.policy,
             enable_executor,
             cuda: self.cuda,
+            draft_model: self.draft_model,
+            num_draft_tokens: self.num_draft_tokens,
         }
     }
 }
@@ -51,6 +57,14 @@ pub(super) fn parse_engine_flags(args: &[String]) -> Result<ParsedEngineFlags> {
     let mut cuda_linear_layout = None;
     let mut linear_materialize = None;
     let mut cuda_runtime = CudaRuntimeConfig::from_env();
+    // Speculative decoding (EAGLE/MTP draft). Env fallback so tooling can opt
+    // in without a CLI flag; an explicit `--draft-model` overrides it.
+    let mut draft_model: Option<PathBuf> = std::env::var_os("AEGIS_DRAFT_MODEL").map(PathBuf::from);
+    let mut num_draft_tokens: usize = std::env::var("AEGIS_NUM_DRAFT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(4);
 
     let mut i = 0;
     while i < args.len() {
@@ -121,6 +135,11 @@ pub(super) fn parse_engine_flags(args: &[String]) -> Result<ParsedEngineFlags> {
                         "bad --cuda-prefill-chunk-size `{value}`: {error}"
                     ))
                 })?)
+            }
+            "--draft-model" => draft_model = Some(PathBuf::from(take_value(args, &mut i, flag)?)),
+            "--num-draft-tokens" => {
+                let value: usize = parse_value(args, &mut i, flag)?;
+                num_draft_tokens = value.max(1);
             }
             other => {
                 return Err(AegisError::InvalidConfig(format!(
@@ -202,6 +221,8 @@ pub(super) fn parse_engine_flags(args: &[String]) -> Result<ParsedEngineFlags> {
         policy,
         cuda: cuda_runtime,
         generation: loaded_generation.unwrap_or_default(),
+        draft_model,
+        num_draft_tokens,
     })
 }
 
@@ -242,6 +263,8 @@ pub(super) fn is_engine_flag(flag: &str) -> bool {
             | "--cuda-stage-timings"
             | "--cuda-prefill-attention"
             | "--cuda-prefill-chunk-size"
+            | "--draft-model"
+            | "--num-draft-tokens"
     )
 }
 
