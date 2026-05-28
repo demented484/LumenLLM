@@ -729,7 +729,18 @@ fn validate_cuda_layer_shape(layer: &CudaLayer, shape: CudaLayerShape) -> Result
     let hidden = shape.hidden_size;
     let q_width = shape.num_attention_heads * shape.head_dim;
     let kv_width = shape.num_kv_heads * shape.head_dim;
-    let intermediate = shape.intermediate_size.unwrap_or(layer.gate_proj.rows());
+    // Derive the MLP intermediate from THIS layer's own gate_proj rather than
+    // the model-wide scalar. Gemma-4 E2B uses `use_double_wide_mlp`: layers
+    // 0-14 have intermediate 6144, layers 15-34 have 12288. The runtime MLP
+    // math is already per-layer correct (GEMM dims come from each loaded
+    // matrix; activations are element-wise; scratch is sized to the max
+    // intermediate across layers in full.rs). The only thing that rejected the
+    // wide layers was this validation comparing against the scalar — so we
+    // instead check the three MLP projections are mutually consistent
+    // (up.rows == gate.rows, down.cols == gate.rows) plus hidden on the other
+    // axis. Uniform models (E4B, Llama, Qwen) are unaffected: gate.rows equals
+    // their scalar intermediate.
+    let intermediate = layer.gate_proj.rows();
 
     require_vector_len(
         "input_layernorm.weight",

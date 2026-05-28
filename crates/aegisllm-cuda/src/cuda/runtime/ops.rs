@@ -1573,6 +1573,56 @@ impl CudaRuntime {
     }
 
     /// Element-wise multiply in-place: `out[i] *= scale[i]`. Lengths must match.
+    /// Batched per-token-strided multiply for the PLE per-layer additive
+    /// (prefill path). `gate[t, d] *= per_layer_inputs[t, layer_idx, d]`
+    /// where `per_layer_inputs` is `[chunk_size, num_layers, ple_dim]`
+    /// row-major and `gate` is `[chunk_size, ple_dim]` row-major.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ple_per_layer_mul_inplace_device(
+        &self,
+        gate: &mut DeviceBuffer<f32>,
+        per_layer_inputs: &DeviceBuffer<f32>,
+        chunk_size: usize,
+        num_layers: usize,
+        ple_dim: usize,
+        layer_idx: usize,
+    ) -> Result<()> {
+        if gate.len() < chunk_size * ple_dim {
+            return Err(AegisError::InvalidPlan(format!(
+                "ple_per_layer_mul: gate len={} < chunk*ple_dim={}",
+                gate.len(), chunk_size * ple_dim,
+            )));
+        }
+        if per_layer_inputs.len() < chunk_size * num_layers * ple_dim {
+            return Err(AegisError::InvalidPlan(format!(
+                "ple_per_layer_mul: per_layer_inputs len={} < chunk*num_layers*ple_dim={}",
+                per_layer_inputs.len(), chunk_size * num_layers * ple_dim,
+            )));
+        }
+        let ple_dim_u = u32_arg("ple_dim", ple_dim)?;
+        let chunk_u = u32_arg("chunk_size", chunk_size)?;
+        let num_layers_u = u32_arg("num_layers", num_layers)?;
+        let layer_idx_u = u32_arg("layer_idx", layer_idx)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(ple_dim_u, 128), chunk_u, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.ple_per_layer_mul_inplace_f32)
+                .arg(&mut gate.slice)
+                .arg(&per_layer_inputs.slice)
+                .arg(&chunk_u)
+                .arg(&num_layers_u)
+                .arg(&ple_dim_u)
+                .arg(&layer_idx_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch ple_per_layer_mul_inplace_f32"))?;
+        Ok(())
+    }
+
     /// Single-tensor in-place `gelu_pytorch_tanh` — used by the Gemma-4 E4B
     /// PLE gate before the elementwise multiply with per-layer inputs.
     pub fn gelu_tanh_inplace_device(

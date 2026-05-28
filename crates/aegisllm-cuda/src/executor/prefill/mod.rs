@@ -173,6 +173,23 @@ impl CudaLlamaExecutor {
                 }
                 self.runtime.upload_f32_slice_to_device(&hidden_host, &mut prefill.hidden)?;
             }
+            // PLE (Per-Layer Embeddings) token-entry compute for this chunk —
+            // mirrors `forward_next_token`/`forward_hidden` on the decode side.
+            // Without this call, the chunked prefill ran 42 layers WITHOUT the
+            // per-layer additive contribution → bias accumulates → prompt-final
+            // hidden picks the wrong first decode token. This was the root
+            // cause of the "coherent text in wrong language" output on E4B.
+            if let Some(ref ple) = self.ple {
+                crate::executor::ple::compute_per_layer_inputs_prefill_chunk(
+                    &self.runtime, ple,
+                    chunk,
+                    self.hidden_size,
+                    self.layers.len(),
+                    prefill,
+                    self.rms_norm_eps,
+                )?;
+            }
+
             record_prefill_stage(
                 &self.runtime,
                 &mut state.prefill_timings,
@@ -186,12 +203,31 @@ impl CudaLlamaExecutor {
             let kv_staging_ptr = state.scratch.kv_staging
                 .as_deref_mut()
                 .map_or(std::ptr::null_mut(), |p| p as *mut _);
-            for (layer_idx, layer) in self.layers.iter().enumerate() {
-                let layer_state = &mut state.layers[layer_idx];
+            let n_layers = self.layers.len();
+            for layer_idx in 0..self.layers.len() {
+                let layer = &self.layers[layer_idx];
+                // KV-cache sharing (Gemma-4 E4B/E2B): the last `num_kv_shared_layers`
+                // layers attend with their OWN query against a PARENT layer's cached
+                // K/V (their own k/v weights are vestigial at inference — see the
+                // decode path in forward.rs). Split-borrow `state.layers` so we hold a
+                // mutable borrow of THIS layer's state and an immutable borrow of the
+                // parent's KV (parent index < layer_idx by construction). Without this
+                // the chunked prefill computed each shared layer's own K/V and attended
+                // to it — diverging hard at layer `n_layers - n_shared` (the first
+                // shared layer) and corrupting the prompt-final hidden state.
+                let (left, right) = state.layers.split_at_mut(layer_idx);
+                let layer_state = &mut right[0];
+                let kv_shared_override = layer
+                    .kv_shared_from
+                    .and_then(|parent_idx| left.get(parent_idx).map(|s| &s.kv));
                 let layer_start = Instant::now();
                 forward_cuda_layer_prefill_chunk_device(
                     &self.runtime,
                     layer,
+                    layer_idx,
+                    self.ple.as_ref(),
+                    n_layers,
+                    kv_shared_override,
                     layer_state,
                     prefill,
                     CudaPrefillForwardParams {

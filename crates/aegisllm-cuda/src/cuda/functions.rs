@@ -83,6 +83,8 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) vision_row_softmax_bf16: CudaFunction,
     /// Single-tensor in-place gelu_pytorch_tanh — Gemma-4 E4B PLE gate.
     pub(crate) gelu_tanh_inplace_f32: CudaFunction,
+    /// Batched per-token-strided multiply for the prefill PLE additive.
+    pub(crate) ple_per_layer_mul_inplace_f32: CudaFunction,
     /// Stage I.3 fused bidirectional vision attention (QK·softmax·PV in one launch).
     pub(crate) vision_bidi_attn: CudaFunction,
     /// Stage I.4 GPU-only vision forward kernels.
@@ -314,6 +316,7 @@ impl CudaKernelFunctions {
             vision_row_softmax: load(&module, "aegis_vision_row_softmax")?,
             vision_row_softmax_bf16: load(&module, "aegis_vision_row_softmax_bf16")?,
             gelu_tanh_inplace_f32: load(&module, "aegis_gelu_tanh_inplace_f32")?,
+            ple_per_layer_mul_inplace_f32: load(&module, "aegis_ple_per_layer_mul_inplace_f32")?,
             vision_bidi_attn: {
                 // Needs dynamic shared scaled by max n_tok in flight. We use
                 // 96 KiB cap which fits scores[n_tok≤2376] + 8 warpred + Q[hd].

@@ -705,6 +705,27 @@ pub(super) struct CudaPrefillScratch {
     /// `chunk_size * max_kv_width` each; zero-length (stub) for non-FP8 configs.
     pub(super) prefill_global_kv_f16_scratch_k: DeviceBuffer<u16>,
     pub(super) prefill_global_kv_f16_scratch_v: DeviceBuffer<u16>,
+    /// PLE per-token-per-layer feed for the chunked prefill pass.
+    /// `[chunk_size, num_layers, ple_dim]` row-major f32. Computed once
+    /// per chunk in `prefill/mod.rs::prefill_prompt_chunked` (after embed
+    /// scale + image injection) by `compute_per_layer_inputs_prefill_chunk`,
+    /// consumed inside each prefill layer's MLP forward by
+    /// `apply_ple_contribution_prefill_chunk`. Sized 1 for non-PLE models.
+    pub(super) per_layer_inputs: DeviceBuffer<f32>,
+    /// PLE projection scratch — `[chunk_size, num_layers * ple_dim]` f32.
+    pub(super) ple_projection: DeviceBuffer<f32>,
+    /// PLE projection-normed scratch — same size.
+    pub(super) ple_projection_normed: DeviceBuffer<f32>,
+    /// PLE per-layer gate `[chunk_size, ple_dim]` f32.
+    pub(super) ple_gate: DeviceBuffer<f32>,
+    /// PLE per-layer contrib `[chunk_size, hidden]` f32.
+    pub(super) ple_contrib: DeviceBuffer<f32>,
+    /// PLE per-layer contrib-normed `[chunk_size, hidden]` f32.
+    pub(super) ple_contrib_normed: DeviceBuffer<f32>,
+    /// PLE BF16 staging — sized for the larger of {chunk × num_layers × ple_dim}
+    /// (lookup row gather) and {chunk × hidden} (cuBLASLt input/output).
+    pub(super) ple_bf16_in: DeviceBuffer<u16>,
+    pub(super) ple_bf16_out: DeviceBuffer<u16>,
 }
 
 /// Per-chunk scratch for chunked MoE prefill. Sized for `chunk_size` tokens.

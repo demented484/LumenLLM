@@ -25,8 +25,8 @@
 //!   hidden_out += contrib
 //! ```
 
-use crate::cuda::CudaRuntime;
-use crate::executor::state::{CudaLayer, CudaScratch, PleGlobal};
+use crate::cuda::{CudaRuntime, DeviceBuffer};
+use crate::executor::state::{CudaLayer, CudaPrefillScratch, CudaScratch, PleGlobal};
 use aegisllm_base::error::{AegisError, Result};
 
 /// Compute `per_layer_inputs` for a single decode token. Result lives in
@@ -164,6 +164,146 @@ pub(super) fn apply_ple_contribution_decode(
     // 6. hidden_out += contrib_normed
     runtime.add_inplace_device_len(
         &mut scratch.hidden_out, &scratch.ple_contrib_normed, layer_ple.projection.rows,
+    )?;
+    Ok(())
+}
+
+/// Batched PLE token-entry compute for a chunked prefill chunk. Mirrors
+/// `compute_per_layer_inputs_decode` but processes `chunk_size` tokens
+/// (with their `token_ids`) at once. Writes
+/// `scratch.per_layer_inputs[chunk_size, num_layers, ple_dim]`.
+pub(super) fn compute_per_layer_inputs_prefill_chunk(
+    runtime: &CudaRuntime,
+    ple: &PleGlobal,
+    token_ids: &[usize],
+    hidden_size: usize,
+    num_layers: usize,
+    scratch: &mut CudaPrefillScratch,
+    rms_norm_eps: f32,
+) -> Result<()> {
+    let chunk_size = token_ids.len();
+    if chunk_size == 0 { return Ok(()); }
+    let ple_dim = ple.ple_dim;
+    let row_len = num_layers * ple_dim;
+    let total = chunk_size * row_len;
+
+    // 1. CPU-side gather of `chunk_size` BF16 rows from the host arena,
+    //    upload as one slice to ple_bf16_in.
+    let host_bytes = ple.embed_table.host_values_u16().ok_or_else(|| {
+        AegisError::InvalidPlan("PLE embed_table not host-resident".into())
+    })?;
+    let table_cols = ple.embed_table.cols;
+    if table_cols != row_len {
+        return Err(AegisError::InvalidPlan(format!(
+            "PLE prefill: table cols={table_cols} != num_layers*ple_dim={row_len}"
+        )));
+    }
+    let mut gathered = vec![0u16; total];
+    for (i, &tok) in token_ids.iter().enumerate() {
+        let src_start = tok.checked_mul(table_cols).ok_or_else(|| {
+            AegisError::InvalidPlan(format!("PLE prefill: token_id={tok} × cols={table_cols} overflow"))
+        })?;
+        let src_end = src_start + table_cols;
+        if src_end > host_bytes.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "PLE prefill: token_id={tok} OOB"
+            )));
+        }
+        let dst_start = i * row_len;
+        gathered[dst_start..dst_start + row_len]
+            .copy_from_slice(&host_bytes[src_start..src_end]);
+    }
+    runtime.upload_u16_slice_to_device(&gathered, &mut scratch.ple_bf16_in)?;
+
+    // 2. BF16 → F32 + scale by sqrt(ple_dim) into per_layer_inputs.
+    runtime.bf16_to_f32_device(&scratch.ple_bf16_in, total, &mut scratch.per_layer_inputs)?;
+    runtime.scale_f32_device_len(
+        ple.embed_scale_per_layer, &mut scratch.per_layer_inputs, total,
+    )?;
+
+    // 3. Batched BF16 GEMM: hidden[chunk, hidden] @ model_projection.T
+    //    → ple_projection[chunk, num_layers*ple_dim].
+    runtime.f32_to_bf16_device(&scratch.hidden, chunk_size * hidden_size, &mut scratch.ple_bf16_in)?;
+    runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+        &ple.model_projection,
+        &scratch.ple_bf16_in,
+        chunk_size,
+        &mut scratch.ple_bf16_out,
+        &mut scratch.ple_projection,
+    )?;
+    runtime.scale_f32_device_len(ple.model_projection_scale, &mut scratch.ple_projection, total)?;
+
+    // 4. Batched RMSNorm per `[chunk_size * num_layers, ple_dim]` row.
+    runtime.rms_norm_batched_device(
+        &scratch.ple_projection, &ple.projection_norm,
+        chunk_size * num_layers, rms_norm_eps,
+        &mut scratch.ple_projection_normed,
+    )?;
+
+    // 5. per_layer_inputs = (per_layer_inputs + ple_projection_normed) * combine_scale.
+    runtime.add_inplace_device_len(
+        &mut scratch.per_layer_inputs, &scratch.ple_projection_normed, total,
+    )?;
+    runtime.scale_f32_device_len(ple.combine_scale, &mut scratch.per_layer_inputs, total)?;
+    Ok(())
+}
+
+/// Apply the per-layer PLE additive contribution to `prefill.hidden`
+/// inside one layer's MLP forward (prefill chunked path). Must be called
+/// AFTER residual add and BEFORE `layer_scalar`, mirroring the decode-side
+/// `apply_ple_contribution_decode`. Reads
+/// `scratch.per_layer_inputs[:, layer_idx, :]` via a strided multiply.
+pub(super) fn apply_ple_contribution_prefill_chunk(
+    runtime: &CudaRuntime,
+    layer: &CudaLayer,
+    ple: &PleGlobal,
+    layer_idx: usize,
+    chunk_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    scratch: &mut CudaPrefillScratch,
+    rms_norm_eps: f32,
+) -> Result<()> {
+    let layer_ple = match &layer.ple {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    let ple_dim = ple.ple_dim;
+
+    // 1. gate = hidden @ input_gate.T → [chunk, ple_dim]
+    runtime.f32_to_bf16_device(&scratch.hidden, chunk_size * hidden_size, &mut scratch.ple_bf16_in)?;
+    runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+        &layer_ple.input_gate,
+        &scratch.ple_bf16_in,
+        chunk_size,
+        &mut scratch.ple_bf16_out,
+        &mut scratch.ple_gate,
+    )?;
+    // 2. gate = gelu_pytorch_tanh(gate) in-place over chunk*ple_dim
+    runtime.gelu_tanh_inplace_device(&mut scratch.ple_gate, chunk_size * ple_dim)?;
+    // 3. gate[t, d] *= per_layer_inputs[t, layer_idx, d]
+    runtime.ple_per_layer_mul_inplace_device(
+        &mut scratch.ple_gate,
+        &scratch.per_layer_inputs,
+        chunk_size, num_layers, ple_dim, layer_idx,
+    )?;
+    // 4. contrib = gate @ projection.T → [chunk, hidden]
+    runtime.f32_to_bf16_device(&scratch.ple_gate, chunk_size * ple_dim, &mut scratch.ple_bf16_in)?;
+    runtime.matmul_bf16_cublaslt_with_input_bf16_device(
+        &layer_ple.projection,
+        &scratch.ple_bf16_in,
+        chunk_size,
+        &mut scratch.ple_bf16_out,
+        &mut scratch.ple_contrib,
+    )?;
+    // 5. contrib = RMSNorm(contrib, post_norm) batched per row
+    runtime.rms_norm_batched_device(
+        &scratch.ple_contrib, &layer_ple.post_norm,
+        chunk_size, rms_norm_eps, &mut scratch.ple_contrib_normed,
+    )?;
+    // 6. hidden += contrib_normed (chunk_size * hidden elements)
+    runtime.add_inplace_device_len(
+        &mut scratch.hidden, &scratch.ple_contrib_normed, chunk_size * hidden_size,
     )?;
     Ok(())
 }

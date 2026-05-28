@@ -22,6 +22,7 @@ pub struct GenerateBenchMetrics {
     pub average_decode_elapsed: Duration,
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
+    pub completion_text: String,
     pub finish_reason: String,
     pub backend: Option<String>,
     pub selection_context_tokens: usize,
@@ -75,8 +76,12 @@ pub fn run_generation_bench(
     }
 
     let mut runs = Vec::with_capacity(request.measured_runs);
+    let mut first_completion_text = String::new();
     for run_index in 0..request.measured_runs {
         let timed = engine.generate_timed(request.generate.clone())?;
+        if run_index == 0 {
+            first_completion_text = timed.output.text.clone();
+        }
         runs.push(GenerateBenchRun {
             run_index,
             total_elapsed: timed.total_elapsed,
@@ -117,6 +122,7 @@ pub fn run_generation_bench(
         average_decode_elapsed: average_duration(runs.iter().map(|run| run.decode_elapsed)),
         prompt_tokens,
         completion_tokens,
+        completion_text: first_completion_text,
         finish_reason,
         backend,
         selection_context_tokens: prompt_tokens,

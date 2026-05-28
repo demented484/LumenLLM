@@ -940,6 +940,29 @@ impl CudaLlamaExecutor {
                         self.runtime.alloc_u16(1)?
                     }
                 },
+                // PLE scratch — sized for chunked prefill. Stub size 1
+                // when the model has no PLE (Gemma-4-26B-A4B-NVFP4, Llama,
+                // Qwen) so the prefill scratch costs ~0 for non-PLE models.
+                per_layer_inputs: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|p| self.prefill_chunk_size * self.layers.len() * p.ple_dim).unwrap_or(1))?,
+                ple_projection: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|p| self.prefill_chunk_size * self.layers.len() * p.ple_dim).unwrap_or(1))?,
+                ple_projection_normed: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|p| self.prefill_chunk_size * self.layers.len() * p.ple_dim).unwrap_or(1))?,
+                ple_gate: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|p| self.prefill_chunk_size * p.ple_dim).unwrap_or(1))?,
+                ple_contrib: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|_| self.prefill_chunk_size * self.hidden_size).unwrap_or(1))?,
+                ple_contrib_normed: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|_| self.prefill_chunk_size * self.hidden_size).unwrap_or(1))?,
+                ple_bf16_in: self.runtime.alloc_u16(self.ple.as_ref()
+                    .map(|p| self.prefill_chunk_size *
+                        (self.layers.len() * p.ple_dim).max(self.hidden_size))
+                    .unwrap_or(1))?,
+                ple_bf16_out: self.runtime.alloc_u16(self.ple.as_ref()
+                    .map(|p| self.prefill_chunk_size *
+                        (self.layers.len() * p.ple_dim).max(self.hidden_size))
+                    .unwrap_or(1))?,
             })
         } else {
             None

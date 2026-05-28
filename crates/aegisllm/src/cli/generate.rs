@@ -264,6 +264,7 @@ fn print_generate_bench_json(metrics: &GenerateBenchMetrics, prompt_repeat: usiz
             "average_decode_elapsed_ms": millis(metrics.average_decode_elapsed),
             "prompt_tokens": metrics.prompt_tokens,
             "completion_tokens": metrics.completion_tokens,
+            "completion_text": metrics.completion_text,
             "prefill_tok_per_s": tokens_per_second(metrics.prompt_tokens, metrics.average_prefill_elapsed),
             "decode_tok_per_s": tokens_per_second(metrics.completion_tokens, metrics.average_decode_elapsed),
             "runs": runs,

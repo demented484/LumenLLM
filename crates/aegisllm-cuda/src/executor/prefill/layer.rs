@@ -38,6 +38,15 @@ pub(super) struct CudaPrefillForwardParams {
 pub(super) fn forward_cuda_layer_prefill_chunk_device(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
+    layer_idx: usize,
+    ple_global: Option<&crate::executor::state::PleGlobal>,
+    num_layers: usize,
+    // KV-cache sharing (Gemma-4 E4B/E2B): when Some, this is the parent layer's
+    // KV cache that the current (shared) layer must attend against, instead of
+    // its own freshly-computed K/V. Mirrors `kv_shared_override` in the decode
+    // path (forward.rs / attention.rs). None for non-shared layers and models
+    // without `num_kv_shared_layers`.
+    kv_shared_override: Option<&crate::executor::state::CudaKvCache>,
     layer_state: &mut CudaLayerState,
     prefill: &mut CudaPrefillScratch,
     params: CudaPrefillForwardParams,
@@ -409,6 +418,15 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
 
     let kv_store_start = Instant::now();
     let kv_is_host = layer_state.kv.is_host_resident();
+    // KV-share is only wired for VRAM-resident KV caches (both E4B configs use
+    // kv-cache.store=vram). Host-resident KV + shared layer would need the
+    // parent's host cache uploaded to a staging slot — not yet implemented.
+    if kv_shared_override.is_some() && kv_is_host {
+        return Err(aegisllm_base::error::AegisError::Unsupported(
+            "chunked-prefill KV-share with host-resident KV cache is not supported \
+             (use kv-cache.store=vram)".into(),
+        ));
+    }
     // Prefill uses a single staging slot (slot 0). Async transfer pipelining is
     // currently a decode-only optimization; prefill remains on the synchronous
     // upload/writeback path here.
@@ -640,8 +658,12 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
                      dense prefill (no f16 aux exists for multi-sequence)".into(),
                 ));
             }
+            // KV-share: shared layers attend against the PARENT's FP8 cache
+            // (their own freshly-stored K/V above is vestigial). Non-shared
+            // layers read their own cache.
+            let attn_kv = kv_shared_override.unwrap_or(&layer_state.kv);
             let (fp8_keys, fp8_values) =
-                match (&layer_state.kv.keys, &layer_state.kv.values) {
+                match (&attn_kv.keys, &attn_kv.values) {
                     (KvBuffer::Fp8(k), KvBuffer::Fp8(v)) => (k, v),
                     _ => return Err(aegisllm_base::error::AegisError::InvalidPlan(
                         "FP8 prefill attention: keys/values not both Fp8".into(),
@@ -687,15 +709,19 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             // GLOBAL FP8 layers never reach here (handled above) — they have
             // no f16 aux, so reading `prefill_f16_keys` here would be a None
             // deref. The `is_fp8` arm below is therefore sliding-FP8 only.
+            // KV-share: shared layers read the PARENT's cache; non-shared read
+            // their own. The parent has identical attention type (sliding↔sliding,
+            // global↔global by construction) so dtype/residency/window match.
+            let attn_kv = kv_shared_override.unwrap_or(&layer_state.kv);
             let (keys_f16_ref, values_f16_ref): (&DeviceBuffer<u16>, &DeviceBuffer<u16>) =
                 if is_fp8 {
                     (
-                        layer_state.kv.prefill_f16_keys.as_ref().ok_or_else(|| {
+                        attn_kv.prefill_f16_keys.as_ref().ok_or_else(|| {
                             aegisllm_base::error::AegisError::InvalidPlan(
                                 "sliding FP8 layer missing prefill_f16_keys aux".into(),
                             )
                         })?,
-                        layer_state.kv.prefill_f16_values.as_ref().ok_or_else(|| {
+                        attn_kv.prefill_f16_values.as_ref().ok_or_else(|| {
                             aegisllm_base::error::AegisError::InvalidPlan(
                                 "sliding FP8 layer missing prefill_f16_values aux".into(),
                             )
@@ -703,8 +729,8 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
                     )
                 } else {
                     (
-                        layer_state.kv.keys.as_f16().expect("F16 path verified above"),
-                        layer_state.kv.values.as_f16().expect("F16 path verified above"),
+                        attn_kv.keys.as_f16().expect("F16 path verified above"),
+                        attn_kv.values.as_f16().expect("F16 path verified above"),
                     )
                 };
             runtime.attention_prefill_dense_compat_device(
@@ -908,9 +934,25 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         && layer.up_proj.as_nvfp4().is_some()
         && layer.down_proj.as_nvfp4().is_some();
     if !dense_is_nvfp4 {
+        // The dense MLP helper writes the residual add into `prefill.hidden`
+        // but DEFERS `layer_scalar` to the caller — so we can interpose PLE
+        // between the residual and the scalar, matching HF order:
+        //   hidden += mlp_out  →  hidden += ple_contrib  →  hidden *= scalar
         forward_dense_mlp_prefill_non_nvfp4_device(
             runtime, layer, prefill, params, intermediate, hidden_size,
         )?;
+        if let Some(ple) = ple_global {
+            crate::executor::ple::apply_ple_contribution_prefill_chunk(
+                runtime, layer, ple, layer_idx,
+                params.batch, hidden_size, num_layers,
+                prefill, params.rms_norm_eps,
+            )?;
+        }
+        if let Some(scalar) = layer.layer_scalar {
+            runtime.scale_f32_device_len(
+                scalar, &mut prefill.hidden, params.batch * hidden_size,
+            )?;
+        }
         record_prefill_stage(runtime, timings, mlp_start, |timings, elapsed| {
             timings.mlp_us += elapsed
         })?;
@@ -1157,9 +1199,8 @@ fn forward_dense_mlp_prefill_non_nvfp4_device(
     } else {
         runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.mlp_out, batch_hidden)?;
     }
-    if let Some(scalar) = layer.layer_scalar {
-        runtime.scale_f32_device_len(scalar, &mut prefill.hidden, batch_hidden)?;
-    }
+    // NOTE: `layer_scalar` is deliberately NOT applied here — the caller
+    // applies it AFTER PLE so the order matches HF Gemma4DecoderLayer.
     Ok(())
 }
 

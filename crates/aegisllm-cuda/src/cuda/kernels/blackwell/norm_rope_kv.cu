@@ -324,6 +324,29 @@ extern "C" __global__ void aegis_swiglu(
     }
 }
 
+// Batched strided per-token elementwise multiply for the prefill PLE
+// additive: `gate[t, d] *= per_layer_inputs[t, layer_idx, d]` over a
+// chunk of `chunk_size` tokens at fixed `layer_idx`. `per_layer_inputs`
+// is laid out `[chunk_size, num_layers, ple_dim]` row-major so the
+// per-(t, layer_idx) slice is at stride `num_layers * ple_dim` between
+// tokens with offset `layer_idx * ple_dim` per token.
+extern "C" __global__ void aegis_ple_per_layer_mul_inplace_f32(
+    float* gate,                          // [chunk_size, ple_dim] f32
+    const float* per_layer_inputs,        // [chunk_size, num_layers, ple_dim] f32
+    const unsigned int chunk_size,
+    const unsigned int num_layers,
+    const unsigned int ple_dim,
+    const unsigned int layer_idx
+) {
+    const unsigned int t = blockIdx.y;
+    const unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= chunk_size || d >= ple_dim) return;
+    const size_t src_off = (size_t)t * (size_t)num_layers * (size_t)ple_dim
+                         + (size_t)layer_idx * (size_t)ple_dim + (size_t)d;
+    const size_t dst_off = (size_t)t * (size_t)ple_dim + (size_t)d;
+    gate[dst_off] *= per_layer_inputs[src_off];
+}
+
 // In-place single-tensor gelu_pytorch_tanh (Gemma-4 E4B PLE gate path: the
 // `per_layer_input_gate` Linear output goes through gelu_tanh BEFORE the
 // elementwise multiply, not after — so this is NOT a gate*up activation).

@@ -32,6 +32,16 @@ impl CudaRuntime {
     /// fallback (`matvec_bf16_host_resident_device`) since cuBLASLt cannot read
     /// host-pinned weights directly.
     pub(crate) fn cublaslt_bf16_enabled_for(&self, matrix: &DeviceBf16Matrix) -> bool {
+        // Diagnostic / correctness escape hatch: `AEGIS_PREFILL_F32_GEMM=1`
+        // forces every BF16 GEMM onto the F32-activation reference batched
+        // matvec (`matmul_bf16_reference_batched_device`) instead of the
+        // cuBLASLt BF16 path. cuBLASLt rounds BOTH activations and outputs to
+        // BF16 at every projection; the reference kernel keeps F32 activations
+        // and F32 accumulate/output — bit-matching the per-token decode path.
+        // This isolates whether chunked-prefill divergence is BF16 rounding.
+        if std::env::var("AEGIS_PREFILL_F32_GEMM").as_deref() == Ok("1") {
+            return false;
+        }
         !matrix.is_host_resident()
     }
 
