@@ -1527,6 +1527,15 @@ fn compute_host_arena_capacity(
             // overshoot by ignoring them rather than tracking precisely.
         }
     }
+    // PLE table (Gemma-4 E4B/E2B) is loaded host-resident outside the
+    // graph regions — add its size explicitly so the arena fits it.
+    if artifact.config.hidden_size_per_layer_input.is_some()
+        && let Some(t) = artifact.tensors.tensors.get(
+            &format!("{}embed_tokens_per_layer.weight",
+                aegisllm_base::graph::detect_text_prefix(artifact)))
+    {
+        total = total.saturating_add(t.data_len_bytes() as usize);
+    }
     total.max(1)
 }
 
