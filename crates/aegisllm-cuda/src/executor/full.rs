@@ -1036,9 +1036,15 @@ impl CudaLlamaExecutor {
                 // u16 = 21.5 KB at E4B) and the projection GEMM input/output.
                 per_layer_inputs: self.runtime.alloc_f32(self.ple.as_ref()
                     .map(|p| self.layers.len() * p.ple_dim).unwrap_or(1))?,
+                ple_projection: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|p| self.layers.len() * p.ple_dim).unwrap_or(1))?,
+                ple_projection_normed: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|p| self.layers.len() * p.ple_dim).unwrap_or(1))?,
                 ple_gate: self.runtime.alloc_f32(self.ple.as_ref()
                     .map(|p| p.ple_dim).unwrap_or(1))?,
                 ple_contrib: self.runtime.alloc_f32(self.ple.as_ref()
+                    .map(|_| self.hidden_size).unwrap_or(1))?,
+                ple_contrib_normed: self.runtime.alloc_f32(self.ple.as_ref()
                     .map(|_| self.hidden_size).unwrap_or(1))?,
                 ple_bf16_in: self.runtime.alloc_u16(self.ple.as_ref()
                     .map(|p| (self.layers.len() * p.ple_dim).max(self.hidden_size))

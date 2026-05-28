@@ -199,7 +199,9 @@ impl CudaLlamaExecutor {
         // PLE token-entry compute (Gemma-4 E4B/E2B): combines the
         // `embed_tokens_per_layer` lookup with the `per_layer_model_projection`
         // of `hidden`, then RMSNorm-combined into `state.scratch.per_layer_inputs`.
-        // No-op for non-PLE models.
+        // No-op for non-PLE models. (This `forward_hidden` is the prefill/
+        // hidden-only path; decode uses `forward_next_token` below which has
+        // its own PLE call site.)
         if let Some(ple) = &self.ple {
             crate::executor::ple::compute_per_layer_inputs_decode(
                 &self.runtime, ple, token_id, &state.hidden, self.layers.len(),
@@ -331,6 +333,18 @@ impl CudaLlamaExecutor {
         // token embedding magnitudes match downstream RMS-norm hidden states.
         if let Some(scale) = self.embed_scale {
             self.runtime.scale_f32_device(scale, &mut state.hidden)?;
+        }
+        // PLE (Per-Layer Embeddings) token-entry compute. Must run OUTSIDE
+        // the CUDA Graph capture/replay window because it stages a host
+        // BF16 row through cuMemcpyHtoD per token (the embed_tokens_per_layer
+        // table is 5.4 GiB host-resident — can't fit in VRAM). The per-layer
+        // additive contribution inside each decoder block runs from
+        // `apply_ple_contribution_decode` (mlp.rs).
+        if let Some(ple) = &self.ple {
+            crate::executor::ple::compute_per_layer_inputs_decode(
+                &self.runtime, ple, token_id, &state.hidden, self.layers.len(),
+                &mut state.scratch, self.rms_norm_eps,
+            )?;
         }
 
         let seq_len = state.position + 1;

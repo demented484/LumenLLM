@@ -607,11 +607,18 @@ pub(super) struct CudaScratch {
     /// state, then consumed inside each layer's MLP forward to produce the
     /// per-layer additive contribution. Sized 1 when the model has no PLE.
     pub(super) per_layer_inputs: DeviceBuffer<f32>,
+    /// PLE projection scratch `[num_layers * ple_dim]` — output of the BF16
+    /// `hidden @ per_layer_model_projection.T` GEMM before RMSNorm/combine.
+    pub(super) ple_projection: DeviceBuffer<f32>,
+    /// PLE projection normed scratch `[num_layers * ple_dim]` — after RMSNorm.
+    pub(super) ple_projection_normed: DeviceBuffer<f32>,
     /// PLE gate-projection output `[ple_dim]` — per-layer scratch consumed
     /// inside the decoder block's PLE additive contribution.
     pub(super) ple_gate: DeviceBuffer<f32>,
     /// PLE projection output `[hidden]` — per-layer scratch.
     pub(super) ple_contrib: DeviceBuffer<f32>,
+    /// PLE projection output `[hidden]` after RMSNorm.
+    pub(super) ple_contrib_normed: DeviceBuffer<f32>,
     /// PLE BF16 staging for the lookup row + projection input.
     pub(super) ple_bf16_in: DeviceBuffer<u16>,
     /// PLE BF16 GEMM output staging.

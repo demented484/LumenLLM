@@ -85,38 +85,27 @@ pub(super) fn compute_per_layer_inputs_decode(
     //    BF16 input = the F32 `hidden` vector quantized at length `hidden`.
     let hidden_len = ple.model_projection.cols;
     runtime.f32_to_bf16_device(hidden, hidden_len, &mut scratch.ple_bf16_in)?;
-    // Use a small F32 scratch for the projection result. `mlp_out` is the
-    // right size shape-wise (`hidden`) but we need `row_len` — borrow
-    // `quant_intermediate` (sized for intermediate which is ≥ row_len at
-    // E4B: intermediate=10240 > row_len=10752... wait, 10240 < 10752).
-    // To be safe, use a dedicated scratch path — we already have
-    // `ple_bf16_out` u16 for the GEMM output staging; convert to F32 in
-    // place into `mlp_out` as long as it's large enough.
-    let mlp_out_cap = scratch.mlp_out.len();
-    if mlp_out_cap < row_len {
-        return Err(AegisError::InvalidPlan(format!(
-            "PLE: mlp_out scratch ({mlp_out_cap}) too small for projection row_len={row_len}"
-        )));
-    }
     runtime.matmul_bf16_cublaslt_with_input_bf16_device(
         &ple.model_projection,
         &scratch.ple_bf16_in,
         1, // batch=1 for decode
         &mut scratch.ple_bf16_out,
-        &mut scratch.mlp_out,
+        &mut scratch.ple_projection,
     )?;
     // 3. Scale projection by `1/sqrt(hidden)`.
-    runtime.scale_f32_device_len(ple.model_projection_scale, &mut scratch.mlp_out, row_len)?;
+    runtime.scale_f32_device_len(ple.model_projection_scale, &mut scratch.ple_projection, row_len)?;
 
     // 4. RMSNorm each `[ple_dim]` row in the `[num_layers, ple_dim]` view
     //    against `projection_norm`.
-    let mut normed = runtime.alloc_f32(row_len)?;
     runtime.rms_norm_batched_device(
-        &scratch.mlp_out, &ple.projection_norm, num_layers, rms_norm_eps, &mut normed,
+        &scratch.ple_projection, &ple.projection_norm, num_layers, rms_norm_eps,
+        &mut scratch.ple_projection_normed,
     )?;
 
-    // 5. per_layer_inputs += normed; then * combine_scale.
-    runtime.add_inplace_device_len(&mut scratch.per_layer_inputs, &normed, row_len)?;
+    // 5. per_layer_inputs += projection_normed; then * combine_scale.
+    runtime.add_inplace_device_len(
+        &mut scratch.per_layer_inputs, &scratch.ple_projection_normed, row_len,
+    )?;
     runtime.scale_f32_device_len(ple.combine_scale, &mut scratch.per_layer_inputs, row_len)?;
     Ok(())
 }
@@ -168,14 +157,13 @@ pub(super) fn apply_ple_contribution_decode(
         &mut scratch.ple_bf16_out,
         &mut scratch.ple_contrib,
     )?;
-    // 5. contrib = RMSNorm(contrib, post_norm).
-    let mut contrib_normed = runtime.alloc_f32(layer_ple.projection.rows)?;
+    // 5. contrib = RMSNorm(contrib, post_norm) into ple_contrib_normed.
     runtime.rms_norm_device(
-        &scratch.ple_contrib, &layer_ple.post_norm, rms_norm_eps, &mut contrib_normed,
+        &scratch.ple_contrib, &layer_ple.post_norm, rms_norm_eps, &mut scratch.ple_contrib_normed,
     )?;
     // 6. hidden_out += contrib_normed
     runtime.add_inplace_device_len(
-        &mut scratch.hidden_out, &contrib_normed, layer_ple.projection.rows,
+        &mut scratch.hidden_out, &scratch.ple_contrib_normed, layer_ple.projection.rows,
     )?;
     Ok(())
 }
