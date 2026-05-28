@@ -78,6 +78,9 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) router_softmax_topk: CudaFunction,
     /// Stage I.2 vision row-softmax (bidirectional attention's softmax pass).
     pub(crate) vision_row_softmax: CudaFunction,
+    /// BF16 in-place row-softmax — skips the BF16↔F32 round-trip on the
+    /// vision tower's BF16 attention path.
+    pub(crate) vision_row_softmax_bf16: CudaFunction,
     /// Stage I.3 fused bidirectional vision attention (QK·softmax·PV in one launch).
     pub(crate) vision_bidi_attn: CudaFunction,
     /// Stage I.4 GPU-only vision forward kernels.
@@ -307,6 +310,7 @@ impl CudaKernelFunctions {
             bf16_to_f32: load(&module, "aegis_bf16_to_f32")?,
             router_softmax_topk: load(&module, "aegis_router_softmax_topk")?,
             vision_row_softmax: load(&module, "aegis_vision_row_softmax")?,
+            vision_row_softmax_bf16: load(&module, "aegis_vision_row_softmax_bf16")?,
             vision_bidi_attn: {
                 // Needs dynamic shared scaled by max n_tok in flight. We use
                 // 96 KiB cap which fits scores[n_tok≤2376] + 8 warpred + Q[hd].

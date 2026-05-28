@@ -106,4 +106,97 @@ void aegis_vision_row_softmax(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// In-place row softmax on BF16 storage (compute in F32). Replaces the
+// BF16→F32→softmax→F32→BF16 round-trip that the BF16 attention path
+// otherwise needs. Same launch shape as the F32 variant: grid (n_rows),
+// block 256.
+//
+// BF16 ↔ F32 round-trip per element: high 16 bits of an IEEE-754 binary32
+// is exactly bfloat16. So `f32 = (u32)bf16 << 16` and `bf16 = f32 >> 16
+// (with RNE)` are bit-exact for finite values.
+// ─────────────────────────────────────────────────────────────────────────
+__device__ __forceinline__ float bf16_to_f32_dev(unsigned short b) {
+    unsigned int u = ((unsigned int)b) << 16;
+    return __int_as_float((int)u);
+}
+__device__ __forceinline__ unsigned short f32_to_bf16_rne(float f) {
+    unsigned int u = __float_as_int(f);
+    // Round-to-nearest-even: add 0x7FFF + LSB-of-truncated-mantissa.
+    unsigned int rounding_bias = 0x7FFFu + ((u >> 16) & 1u);
+    u += rounding_bias;
+    return (unsigned short)(u >> 16);
+}
+
+extern "C" __global__
+__launch_bounds__(256, 1)
+void aegis_vision_row_softmax_bf16(
+    unsigned short* __restrict__ scores,   // [n_rows, n_cols] BF16 in-place
+    const unsigned int n_rows,
+    const unsigned int n_cols,
+    const float scale
+) {
+    const unsigned int row = blockIdx.x;
+    if (row >= n_rows) return;
+    unsigned short* row_ptr = scores + (size_t)row * n_cols;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & 31u;
+    const unsigned int warp = tid >> 5u;
+
+    __shared__ float smem[8];
+
+    // Phase 1: row max (reads BF16, compares in F32).
+    float m = -3.402823466e38f;
+    for (unsigned int c = tid; c < n_cols; c += 256u) {
+        float v = bf16_to_f32_dev(row_ptr[c]) * scale;
+        m = fmaxf(m, v);
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_xor_sync(0xFFFFFFFFu, m, off, 32);
+        m = fmaxf(m, other);
+    }
+    if (lane == 0) smem[warp] = m;
+    __syncthreads();
+    if (warp == 0) {
+        float v = lane < 8u ? smem[lane] : -3.402823466e38f;
+        for (int off = 4; off > 0; off >>= 1) {
+            float other = __shfl_xor_sync(0xFFu, v, off, 32);
+            v = fmaxf(v, other);
+        }
+        if (lane == 0) smem[0] = v;
+    }
+    __syncthreads();
+    const float row_max = smem[0];
+
+    // Phase 2: exp + write back BF16 + accumulate sum in F32.
+    float s = 0.0f;
+    for (unsigned int c = tid; c < n_cols; c += 256u) {
+        float v = bf16_to_f32_dev(row_ptr[c]) * scale;
+        float e = expf(v - row_max);
+        row_ptr[c] = f32_to_bf16_rne(e);
+        s += e;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        s += __shfl_xor_sync(0xFFFFFFFFu, s, off, 32);
+    }
+    if (lane == 0) smem[warp] = s;
+    __syncthreads();
+    if (warp == 0) {
+        float v = lane < 8u ? smem[lane] : 0.0f;
+        for (int off = 4; off > 0; off >>= 1) {
+            float other = __shfl_xor_sync(0xFFu, v, off, 32);
+            v += other;
+        }
+        if (lane == 0) smem[0] = v;
+    }
+    __syncthreads();
+    const float inv = 1.0f / smem[0];
+
+    // Phase 3: normalize. Read back the exp(BF16), multiply by inv, store.
+    for (unsigned int c = tid; c < n_cols; c += 256u) {
+        float e = bf16_to_f32_dev(row_ptr[c]);
+        row_ptr[c] = f32_to_bf16_rne(e * inv);
+    }
+}
+
 #endif  // __CUDA_ARCH__ >= 800

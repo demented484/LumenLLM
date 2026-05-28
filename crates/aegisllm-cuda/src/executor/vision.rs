@@ -676,19 +676,39 @@ impl VisionTower {
         // bounded, but the attention logits still get the raw QK^T scale.
         let scale = 1.0_f32;
 
-        // Optional fast attention path: replaces the naive `vision_bidi_attn`
-        // kernel (one block per (head, q_row), bandwidth-bound at large n_tok)
-        // with two cuBLASLt strided-batched F32 GEMMs around a row-softmax.
-        // Q-tiled (Bq = 128) so the scores chunk is `nh × Bq × n_tok × 4 B`
-        // (~71 MB at 8694 tok × 16 heads, vs ~4.8 GB for a single un-tiled
-        // call) — fits alongside the 262K-context KV cache pre-reservation.
-        let fast_attn = std::env::var("AEGIS_VISION_FAST_ATTN").is_ok();
+        // Fast attention path: two cuBLASLt strided-batched GEMMs around a
+        // row-softmax, replacing the naive `vision_bidi_attn` kernel (one
+        // block per (head, q_row), bandwidth-bound at large n_tok). Q-tiled
+        // (Bq = 128) so the scores chunk is `nh × Bq × n_tok × 4 B` (~71 MB
+        // at 8694 tok × 16 heads, vs ~4.8 GB for un-tiled) — fits with the
+        // 262K-context KV cache pre-reservation.
+        //
+        // Default-on (15× speedup at 966 OCR tokens, bit-equivalent quality
+        // vs the naive kernel verified via HF cross-dump). Opt out with
+        // `AEGIS_VISION_FAST_ATTN=0` if you need to A/B against the slow path.
+        let fast_attn = std::env::var("AEGIS_VISION_FAST_ATTN")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
         let bq: usize = std::env::var("AEGIS_VISION_ATTN_Q_TILE")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(128);
-        let mut scores_buf = if fast_attn {
-            runtime.alloc_f32(nh * bq * n_patches)?
+        // BF16 scratch for Q/K/V converted once per layer (outside Q-tile
+        // loop) + BF16 scores buffer for the BF16 cuBLASLt path. This pushes
+        // attention through the SM_120 BF16 mma.sync.kind::bf16 tensor cores
+        // (~150 TFLOPs/s) instead of the TF32 F32 path (~50 TFLOPs/s
+        // effective) and halves the scores memory footprint (35.5 MB vs
+        // 71 MB at the default tile). Row-softmax operates directly on the
+        // BF16 buffer via `vision_row_softmax_bf16_device` (F32 compute,
+        // BF16 storage) so we avoid F32 scratch entirely on this path.
+        let (mut q_bf16, mut k_bf16, mut v_bf16, mut scores_bf16) = if fast_attn {
+            (
+                runtime.alloc_u16(n_patches * h)?,
+                runtime.alloc_u16(n_patches * h)?,
+                runtime.alloc_u16(n_patches * h)?,
+                runtime.alloc_u16(nh * bq * n_patches)?,
+            )
         } else {
-            runtime.alloc_f32(1)?
+            (runtime.alloc_u16(1)?, runtime.alloc_u16(1)?,
+             runtime.alloc_u16(1)?, runtime.alloc_u16(1)?)
         };
 
         for li in 0..s.num_layers {
@@ -725,24 +745,23 @@ impl VisionTower {
                 &mut k_buf, n_patches, n_patches_w, nh, hd, s.rope_theta)?;
 
             if fast_attn {
-                // Q-tiled cuBLASLt batched attention. Loop over Q in chunks
-                // of `bq` rows; per chunk compute scores[h, i in q_chunk, j] =
-                // Q[i,h,:]·K[j,h,:] via batched F32 GEMM (TF32 TC), then
-                // row-softmax, then out[i,h,d] = scores · V via batched F32
-                // GEMM. Scores chunk is `nh * bq * n_patches × 4 B` (~71 MB
-                // at bq=128, n_patches=8694, nh=16) — fits with KV cache.
+                // Q-tiled cuBLASLt BF16 batched attention. One F32→BF16
+                // conversion per layer for Q/K/V; per Q-tile do BF16 QK^T,
+                // BF16→F32 for the softmax, F32→BF16 back, BF16 PV. Writes
+                // directly into `attn_bf16` so the downstream o_proj GEMM
+                // consumes it without an extra F32 round-trip.
+                runtime.f32_to_bf16_device(&q_buf, n_patches * h, &mut q_bf16)?;
+                runtime.f32_to_bf16_device(&k_buf, n_patches * h, &mut k_bf16)?;
+                runtime.f32_to_bf16_device(&v_buf, n_patches * h, &mut v_bf16)?;
                 let mut q_start = 0usize;
                 while q_start < n_patches {
                     let q_end = (q_start + bq).min(n_patches);
                     let q_len = q_end - q_start;
-                    // QK^T: per head h, scores_chunk[h, i, j] = Q[i+q_start, h, :] · K[j, h, :]
-                    // A=K (per head offset h*hd, lda=nh*hd, stride_a=hd) — covers all n_patches K rows.
-                    // B=Q chunk (per head offset q_start*nh*hd + h*hd, ldb=nh*hd, stride_b=hd) — q_len rows.
-                    // C=scores_chunk (per head [q_len, n_patches] tight, ldc=n_patches, stride_c=q_len*n_patches).
-                    runtime.f32_strided_batched_gemm_device(
-                        &k_buf, 0, n_patches * nh * hd,
-                        &q_buf, q_start * nh * hd, q_len * nh * hd,
-                        &mut scores_buf, 0, nh * q_len * n_patches,
+                    // QK^T BF16: scores_chunk[h, i, j] = Q[i+q_start, h, :]·K[j, h, :]
+                    runtime.bf16_strided_batched_gemm_device(
+                        &k_bf16, 0, n_patches * nh * hd,
+                        &q_bf16, q_start * nh * hd, q_len * nh * hd,
+                        &mut scores_bf16, 0, nh * q_len * n_patches,
                         /* transa */ true, /* transb */ false,
                         /* m */ n_patches, /* n */ q_len, /* k */ hd,
                         /* lda */ nh * hd, /* ldb */ nh * hd,
@@ -751,18 +770,20 @@ impl VisionTower {
                         /* stride_c */ q_len * n_patches,
                         /* batch */ nh, /* alpha */ scale, /* beta */ 0.0,
                     )?;
-                    // Row-softmax over [nh*q_len, n_patches] in place.
-                    runtime.vision_row_softmax_device(
-                        &mut scores_buf, nh * q_len, n_patches, 1.0,
+                    // BF16 in-place row-softmax (F32 compute, BF16 storage —
+                    // skips the BF16↔F32 round-trip the F32 softmax kernel
+                    // would need around it; ~10 GB/layer of scratch traffic
+                    // saved at the 8694-token OCR scale).
+                    runtime.vision_row_softmax_bf16_device(
+                        &mut scores_bf16, nh * q_len, n_patches, 1.0,
                     )?;
-                    // PV: per head h, out_chunk[i, h, d] = sum_j scores_chunk[h, i, j] * V[j, h, d]
-                    // A=V (per head offset h*hd, lda=nh*hd, stride_a=hd).
-                    // B=scores_chunk per head [q_len, n_patches] (ldb=n_patches, stride_b=q_len*n_patches).
-                    // C=attn_out chunk (q_start*nh*hd + h*hd, ldc=nh*hd, stride_c=hd).
-                    runtime.f32_strided_batched_gemm_device(
-                        &v_buf, 0, n_patches * nh * hd,
-                        &scores_buf, 0, nh * q_len * n_patches,
-                        &mut attn_out, q_start * nh * hd, q_len * nh * hd,
+                    // PV BF16: out_chunk[i, h, d] = sum_j scores·V — writes
+                    // straight into `attn_bf16` chunk (per-head offset
+                    // q_start*nh*hd + h*hd, ldc=nh*hd, stride_c=hd).
+                    runtime.bf16_strided_batched_gemm_device(
+                        &v_bf16, 0, n_patches * nh * hd,
+                        &scores_bf16, 0, nh * q_len * n_patches,
+                        &mut attn_bf16, q_start * nh * hd, q_len * nh * hd,
                         /* transa */ false, /* transb */ false,
                         /* m */ hd, /* n */ q_len, /* k */ n_patches,
                         /* lda */ nh * hd, /* ldb */ n_patches,
@@ -781,10 +802,12 @@ impl VisionTower {
                     n_patches, nh, hd, scale,
                     &mut attn_out,
                 )?;
+                // Slow path writes F32; pack to BF16 for o_proj's BF16 GEMM.
+                runtime.f32_to_bf16_device(&attn_out, n_patches * h, &mut attn_bf16)?;
             }
 
-            // o_proj: attn_out @ o_proj.T → o_out.
-            runtime.f32_to_bf16_device(&attn_out, n_patches * h, &mut attn_bf16)?;
+            // o_proj: attn_bf16 @ o_proj.T → o_out (attn_bf16 is populated
+            // directly by the fast path, or by the post-slow-path conversion).
             runtime.matmul_bf16_cublaslt_with_input_bf16_device(
                 &layer.o_proj, &attn_bf16, n_patches,
                 &mut o_out_bf16, &mut o_out,

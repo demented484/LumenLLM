@@ -1918,4 +1918,41 @@ impl CudaRuntime {
         .map_err(map_cuda_err("launch vision_row_softmax"))?;
         Ok(())
     }
+
+    /// BF16 in-place row-softmax — same math as `vision_row_softmax_device`
+    /// but reads/writes BF16 storage with F32 compute. Used by the BF16
+    /// vision-attention path to avoid the BF16→F32→softmax→F32→BF16
+    /// round-trip around the row reduction.
+    pub fn vision_row_softmax_bf16_device(
+        &self,
+        scores: &mut DeviceBuffer<u16>,
+        n_rows: usize,
+        n_cols: usize,
+        scale: f32,
+    ) -> Result<()> {
+        if scores.len() < n_rows * n_cols {
+            return Err(AegisError::InvalidPlan(format!(
+                "vision_row_softmax_bf16: scores len={} < n_rows({}) * n_cols({}) = {}",
+                scores.len(), n_rows, n_cols, n_rows * n_cols,
+            )));
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_rows", n_rows)?, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_rows_u = n_rows as u32;
+        let n_cols_u = n_cols as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_row_softmax_bf16)
+                .arg(&mut scores.slice)
+                .arg(&n_rows_u)
+                .arg(&n_cols_u)
+                .arg(&scale)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_row_softmax_bf16"))?;
+        Ok(())
+    }
 }
