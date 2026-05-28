@@ -6,6 +6,42 @@ use crate::cuda::{CudaRuntime, DeviceBf16Matrix, DeviceBuffer, DeviceNvfp4Linear
 use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::planning::placement::StoragePlacement;
 
+/// Global PLE state shared across the whole model. Per-layer `input_gate`,
+/// `projection`, and `post_norm` live on `CudaLayer::ple`.
+#[derive(Debug)]
+pub(super) struct PleGlobal {
+    /// `model.embed_tokens_per_layer.weight` — `[vocab, num_layers * ple_dim]`
+    /// BF16. Host-resident (~5.4 GiB at E4B); per-token slice streamed on
+    /// demand. The slice for token `t` reshapes to `[num_layers, ple_dim]`.
+    pub(super) embed_table: DeviceBf16Matrix,
+    /// `model.per_layer_model_projection.weight` — `[num_layers * ple_dim,
+    /// hidden]` BF16. Projects each token's hidden state into a parallel
+    /// per-layer feed.
+    pub(super) model_projection: DeviceBf16Matrix,
+    /// `model.per_layer_projection_norm.weight` — `[ple_dim]` f32 weights
+    /// used by an RMSNorm over the projection output.
+    pub(super) projection_norm: DeviceBuffer<f32>,
+    /// Feature dim per layer (Gemma-4 E4B: 256).
+    pub(super) ple_dim: usize,
+    /// `embed_scale_per_layer = sqrt(ple_dim)`.
+    pub(super) embed_scale_per_layer: f32,
+    /// `per_layer_model_projection_scale = 1 / sqrt(hidden_size)`.
+    pub(super) model_projection_scale: f32,
+    /// Combine weight = `1 / sqrt(2)` per HF Gemma-4.
+    pub(super) combine_scale: f32,
+}
+
+/// Per-layer PLE weights, attached to each `CudaLayer` when PLE is enabled.
+#[derive(Debug)]
+pub(super) struct PleLayer {
+    /// `per_layer_input_gate.weight` — `[ple_dim, hidden]` BF16.
+    pub(super) input_gate: DeviceBf16Matrix,
+    /// `per_layer_projection.weight` — `[hidden, ple_dim]` BF16.
+    pub(super) projection: DeviceBf16Matrix,
+    /// `post_per_layer_input_norm.weight` — `[hidden]` f32 RMSNorm weight.
+    pub(super) post_norm: DeviceBuffer<f32>,
+}
+
 /// Wraps a linear projection in NVFP4, BF16, or FP8 storage.
 #[derive(Debug)]
 pub(super) enum CudaLinear {
@@ -190,6 +226,10 @@ pub(super) struct CudaLlamaExecutor {
     pub(super) lm_head_softcap: Option<f32>,
     /// Multiplicative scale applied to token embeddings after lookup (Gemma 4 = sqrt(hidden_size)).
     pub(super) embed_scale: Option<f32>,
+    /// PLE (Per-Layer Embeddings) apparatus, present only on Gemma-4 dense
+    /// checkpoints with `hidden_size_per_layer_input` set (E4B, E2B). When
+    /// `None`, every PLE step in the forward pass is a no-op.
+    pub(super) ple: Option<PleGlobal>,
     /// True when any layer has host-resident (StagedHostToDevice) weights.
     /// Used to inhibit CUDA Graph capture (H2D copies cannot be in a captured graph).
     pub(super) has_staged_layers: bool,
@@ -265,6 +305,8 @@ pub(super) struct CudaLayer {
     pub(super) layer_head_dim: usize,
     /// Per-layer KV head count. Differs from model-wide for Gemma 4 global layers (2 vs 8).
     pub(super) layer_num_kv_heads: usize,
+    /// Per-layer PLE weights (E4B / E2B). `None` when the model has no PLE.
+    pub(super) ple: Option<PleLayer>,
 }
 
 #[derive(Debug)]

@@ -187,6 +187,13 @@ pub struct HfConfig {
     /// Number of attention layers when using hybrid GDN model.
     pub num_attention_heads_per_layer: Option<Vec<usize>>,
 
+    // ── Per-Layer Embeddings / PLE (Gemma-4 E4B / E2B) ────────────────────
+    /// PLE feature dim per layer (Gemma-4 E4B: 256). Triggers PLE pipeline.
+    pub hidden_size_per_layer_input: Option<usize>,
+    /// Vocabulary size for the parallel PLE embedding table (E4B: 262144,
+    /// matches the main vocab; absent → no PLE).
+    pub vocab_size_per_layer_input: Option<usize>,
+
     // ── Multimodal sub-configs (verbatim from HF config.json) ────────────
     /// Vision-tower architecture parameters. Present on every multimodal
     /// checkpoint (Gemma-4 26B-A4B has 27L/1152/72; E4B has 16L/768/64).

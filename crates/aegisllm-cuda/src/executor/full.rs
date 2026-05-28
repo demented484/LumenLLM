@@ -164,6 +164,13 @@ impl CudaLlamaExecutor {
             cuda_residency_for_store(lm_head_region.store, device)?,
             &mut loader,
         )?;
+        // PLE (Per-Layer Embeddings) global state — embed_tokens_per_layer
+        // table (5.4 GiB at E4B, host-resident mmap), per_layer_model_projection,
+        // per_layer_projection_norm. Returns None for non-PLE models so the
+        // rest of the engine treats it as a no-op.
+        let ple = crate::executor::loader::load_ple_global(
+            &cuda_weights, artifact, device, &graph.text_prefix, &mut loader,
+        )?;
         // lm_head is the last VRAM-resident BF16 weight loaded; the
         // layer loop below only fills the host arena. Drop the
         // ~1.4 GiB pinned bounce buffer NOW so it doesn't compete
@@ -510,6 +517,7 @@ impl CudaLlamaExecutor {
             prefill_stage_timings_enabled: cuda_config.prefill_stage_timings,
             lm_head_softcap: graph.lm_head_softcap,
             embed_scale: graph.embed_scale,
+            ple,
             has_staged_layers,
             has_staged_kv,
             kv_store,

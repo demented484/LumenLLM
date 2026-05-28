@@ -13,7 +13,7 @@ use aegisllm_base::tensor::storage::TensorResidencyPlan;
 
 use crate::cuda::DeviceBuffer;
 use super::rope::RopeConfig;
-use super::state::{CudaLayer, CudaLinear, CudaMoE, CudaMoEExpert, CudaMoEShared};
+use super::state::{CudaLayer, CudaLinear, CudaMoE, CudaMoEExpert, CudaMoEShared, PleGlobal, PleLayer};
 use aegisllm_base::executor::tensors::require_tensor;
 
 #[derive(Debug, Clone)]
@@ -306,6 +306,7 @@ pub(super) fn load_cuda_layer(
         moe,
         layer_head_dim,
         layer_num_kv_heads,
+        ple: load_ple_layer(cuda, artifact, &prefix, placement.store, residency, loader)?,
         dense_activation: {
             // Pick activation from the architecture descriptor: `silu` (Llama
             // / Qwen) → SwiGLU; `gelu_pytorch_tanh` (Gemma-4 E4B / 26B-A4B
@@ -810,4 +811,84 @@ fn require_linear_shape(
         )));
     }
     Ok(())
+}
+
+/// Load global PLE state (embed table + model projection + projection norm)
+/// from the artifact. Returns `None` when the model has no PLE config
+/// (Gemma-4-26B-A4B-NVFP4 and earlier targets). Returns `Some(PleGlobal)`
+/// for Gemma-4 E4B / E2B and any future checkpoint that exposes
+/// `hidden_size_per_layer_input` in its top-level config.
+///
+/// The 5.4 GiB embed_table is stored host-resident (mmap-streamed per
+/// token) to keep the GPU VRAM budget viable on 16 GiB cards. The smaller
+/// model projection + norm sit on VRAM alongside the model weights.
+pub(super) fn load_ple_global(
+    cuda: &CudaWeightLoader<'_>,
+    artifact: &ModelArtifact,
+    device_index: usize,
+    text_prefix: &str,
+    loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
+) -> Result<Option<PleGlobal>> {
+    let ple_dim = match artifact.config.hidden_size_per_layer_input {
+        Some(d) if d > 0 => d,
+        _ => return Ok(None),
+    };
+    let hidden = artifact.config.hidden_size;
+    let table_store = StoragePlacement::Ram;
+    let table_residency = cuda_residency_for_store(table_store, device_index)?;
+    let proj_store = StoragePlacement::Vram { device: device_index };
+    let proj_residency = cuda_residency_for_store(proj_store, device_index)?;
+
+    let embed_table = cuda.load_bf16_matrix_with_store(
+        require_tensor(artifact, &format!("{text_prefix}embed_tokens_per_layer.weight"))?,
+        table_store, table_residency, loader,
+    )?;
+    let model_projection = cuda.load_bf16_matrix_with_store(
+        require_tensor(artifact, &format!("{text_prefix}per_layer_model_projection.weight"))?,
+        proj_store, proj_residency, loader,
+    )?;
+    let projection_norm = cuda.load_dense_vector_with_store(
+        require_tensor(artifact, &format!("{text_prefix}per_layer_projection_norm.weight"))?,
+        proj_store, loader,
+    )?;
+    let embed_scale_per_layer = (ple_dim as f32).sqrt();
+    let model_projection_scale = 1.0 / (hidden as f32).sqrt();
+    let combine_scale = 1.0 / (2.0_f32).sqrt();
+    Ok(Some(PleGlobal {
+        embed_table,
+        model_projection,
+        projection_norm,
+        ple_dim,
+        embed_scale_per_layer,
+        model_projection_scale,
+        combine_scale,
+    }))
+}
+
+/// Load per-layer PLE weights (gate / projection / post_norm). Returns
+/// `None` when the model has no PLE config, mirroring `load_ple_global`.
+pub(super) fn load_ple_layer(
+    cuda: &CudaWeightLoader<'_>,
+    artifact: &ModelArtifact,
+    prefix: &str,
+    store: StoragePlacement,
+    residency: TensorResidencyPlan,
+    loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
+) -> Result<Option<PleLayer>> {
+    if artifact.config.hidden_size_per_layer_input.unwrap_or(0) == 0 {
+        return Ok(None);
+    }
+    let input_gate = cuda.load_bf16_matrix_with_store(
+        require_tensor(artifact, &format!("{prefix}.per_layer_input_gate.weight"))?,
+        store, residency.clone(), loader,
+    )?;
+    let projection = cuda.load_bf16_matrix_with_store(
+        require_tensor(artifact, &format!("{prefix}.per_layer_projection.weight"))?,
+        store, residency, loader,
+    )?;
+    let post_norm = cuda.load_dense_vector_with_store(
+        require_tensor(artifact, &format!("{prefix}.post_per_layer_input_norm.weight"))?,
+        store, loader,
+    )?;
+    Ok(Some(PleLayer { input_gate, projection, post_norm }))
 }
