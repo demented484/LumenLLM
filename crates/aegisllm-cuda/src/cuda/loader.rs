@@ -441,12 +441,18 @@ impl CudaWeightLoader<'_> {
         residency: TensorResidencyPlan,
         loader: &mut TensorStorageLoader,
     ) -> Result<DeviceBf16Matrix> {
-        if tensor.dtype != TensorDType::BF16 || tensor.shape.len() != 2 {
+        if tensor.dtype != TensorDType::BF16 || tensor.shape.len() < 2 {
             return Err(AegisError::InvalidPlan(format!(
-                "`{}` must be a BF16 matrix",
-                tensor.name
+                "`{}` must be a BF16 matrix (>= 2-D; got dtype={:?} shape={:?})",
+                tensor.name, tensor.dtype, tensor.shape,
             )));
         }
+        // For N-D tensors (e.g. vision position_embedding_table [2, 10240, 1152]),
+        // collapse all leading dims into `rows`; the last dim stays `cols`.
+        let last_dim = tensor.shape[tensor.shape.len() - 1];
+        let row_product: usize = tensor.shape[..tensor.shape.len() - 1].iter().product();
+        let effective_rows = row_product;
+        let effective_cols = last_dim;
         let is_host_resident = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
 
         if is_host_resident {
@@ -477,8 +483,8 @@ impl CudaWeightLoader<'_> {
             let host_weights = HostBf16Weights::from_arena(arena.clone(), offset, len)?;
             return Ok(DeviceBf16Matrix {
                 name: tensor.name.clone(),
-                rows: tensor.shape[0],
-                cols: tensor.shape[1],
+                rows: effective_rows,
+                cols: effective_cols,
                 residency,
                 values: stub,
                 host_values: Some(Box::new(host_weights)),
@@ -522,8 +528,8 @@ impl CudaWeightLoader<'_> {
             .map_err(|e| AegisError::Unsupported(format!("sync after bf16 bounce htod: {e}")))?;
         Ok(DeviceBf16Matrix {
             name: tensor.name.clone(),
-            rows: tensor.shape[0],
-            cols: tensor.shape[1],
+            rows: effective_rows,
+            cols: effective_cols,
             residency,
             values: buffer.slice,
             host_values: None,

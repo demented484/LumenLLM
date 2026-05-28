@@ -739,6 +739,66 @@ fn first_cuda_device(engine: &AegisEngine, command_name: &'static str) -> Result
     }
 }
 
+/// Vision-tower load smoke (Stage I.1). Opens the artifact, builds a
+/// CudaRuntime + WeightLoader the same way `cuda_smoke` does, then calls
+/// `VisionTower::from_artifact` to load all 356 vision-tower + projector
+/// tensors into VRAM. Reports counts and a quick sanity check.
+pub(super) fn vision_load_smoke(config: EngineConfig) -> Result<()> {
+    use aegisllm_cuda::executor::vision::{VisionEncoderShape, VisionTower};
+    use aegisllm_base::tensor::storage::TensorStorageLoader;
+
+    let cuda_config = config.cuda;
+    let engine = AegisEngine::build(EngineConfig {
+        enable_executor: false,
+        ..config
+    })?;
+    let device = first_cuda_device(&engine, "vision-load-smoke")?;
+    let cuda = aegisllm_cuda::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
+    let cuda_weights = cuda.weight_loader();
+    let mut loader = TensorStorageLoader::new();
+
+    let t0 = std::time::Instant::now();
+    let shape = VisionEncoderShape::gemma4();
+    eprintln!(
+        "vision-load-smoke: arch=Gemma-4 vision\n  hidden={} intermediate={} layers={} heads={} head_dim={}\n  patch={} pool={} pos_table={}\n  loading vision tower (356 BF16 tensors)...",
+        shape.hidden_size, shape.intermediate_size, shape.num_layers,
+        shape.num_attention_heads, shape.head_dim,
+        shape.patch_size, shape.pooling_kernel_size, shape.position_embedding_size,
+    );
+    let tower = VisionTower::from_artifact(
+        &engine.artifact, shape, &cuda_weights, device, &mut loader,
+    )?;
+    let dt = t0.elapsed();
+    eprintln!(
+        "vision-load-smoke: OK — loaded in {:.2}s",
+        dt.as_secs_f64()
+    );
+    eprintln!(
+        "  patch_embed:    {}x{}",
+        tower.patch_embed.rows, tower.patch_embed.cols
+    );
+    eprintln!(
+        "  position_table: {}x{}",
+        tower.position_table.rows, tower.position_table.cols
+    );
+    eprintln!(
+        "  std_scale:      len={}     std_bias: len={}",
+        tower.std_scale.len(), tower.std_bias.len()
+    );
+    eprintln!("  layers:         {} loaded", tower.layers.len());
+    eprintln!(
+        "  layer[0]:       q_proj={}x{} mlp_gate={}x{}",
+        tower.layers[0].q_proj.rows, tower.layers[0].q_proj.cols,
+        tower.layers[0].mlp_gate.rows, tower.layers[0].mlp_gate.cols,
+    );
+    eprintln!(
+        "  projector:      {}x{}  (vision_hidden -> text_hidden)",
+        tower.projector.rows, tower.projector.cols
+    );
+    println!("vision-load-smoke: PASS");
+    Ok(())
+}
+
 pub(super) fn cuda_dense_smoke(config: EngineConfig) -> Result<()> {
     let cuda_config = config.cuda;
     let engine = AegisEngine::build(EngineConfig {

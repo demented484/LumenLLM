@@ -25,6 +25,9 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Command> {
         Some("cpu-smoke") => parse_cpu_smoke(&args[1..]),
         Some("cpu-materialize-smoke") => parse_cpu_materialize_smoke(&args[1..]),
         Some("cuda-smoke") => parse_cuda_smoke(&args[1..]),
+        Some("vision-load-smoke") => Ok(Command::VisionLoadSmoke(
+            parse_engine_flags(&args[1..])?.engine_config(false),
+        )),
         Some("cuda-cutlass-nvfp4-smoke") => Ok(Command::CudaCutlassNvfp4Smoke),
         Some("cuda-attn-fp8-smoke") => Ok(Command::CudaAttnFp8Smoke),
         Some("cuda-attn-ref-check") => Ok(Command::CudaAttnRefCheck),

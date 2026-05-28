@@ -28,6 +28,10 @@ pub enum Command {
     CpuSmoke(EngineConfig),
     CpuMaterializeSmoke(EngineConfig),
     CudaSmoke(EngineConfig),
+    /// Vision-tower load smoke: opens the artifact, loads
+    /// `model.vision_tower.*` + `model.embed_vision.*` into VRAM via the
+    /// existing safetensors path, reports the loaded tensor stats. No forward.
+    VisionLoadSmoke(EngineConfig),
     CudaCutlassNvfp4Smoke,
     CudaAttnFp8Smoke,
     /// Standalone correctness check (Stage A.3 / B.1): validates the GPU f32
