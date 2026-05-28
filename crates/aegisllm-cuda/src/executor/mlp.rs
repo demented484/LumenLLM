@@ -2,10 +2,10 @@ use super::linear_ops::{
     matvec_cuda_linear_with_scratch, matvec_nvfp4_device_with_scratch,
     matvec_nvfp4_prepared_device_reuse, native_mxfp4_enabled, prepare_nvfp4_input,
 };
-use super::state::{CudaLayer, CudaMoE, CudaMoEScratch, CudaScratch};
+use super::state::{CudaLayer, CudaLinear, CudaMoE, CudaMoEScratch, CudaScratch};
 use crate::cuda::CudaRuntime;
 use crate::cuda::staging::LinearStagingPool;
-use aegisllm_base::error::Result;
+use aegisllm_base::error::{AegisError, Result};
 
 pub(super) fn forward_mlp_device(
     runtime: &CudaRuntime,
@@ -38,11 +38,27 @@ pub(super) fn forward_mlp_device(
             rms_norm_eps,
         );
     }
+    // Dense MLP: dispatch on weight variant. NVFP4-only path (all three of
+    // gate/up/down are NVFP4) keeps the existing native-MXFP4 / CUTLASS /
+    // unfused fallbacks. BF16 and FP8 variants take the cuBLASLt dense path
+    // below. Mixed variants are rejected — checkpoint format is uniform per
+    // dense layer.
+    let nvfp4_triple = layer.gate_proj.as_nvfp4()
+        .zip(layer.up_proj.as_nvfp4())
+        .zip(layer.down_proj.as_nvfp4());
+    if nvfp4_triple.is_none() {
+        return forward_dense_mlp_non_nvfp4_device(runtime, layer, scratch, rms_norm_eps);
+    }
+    let (gate_proj_nvfp4, up_proj_nvfp4, down_proj_nvfp4) = {
+        let ((g, u), d) = nvfp4_triple.unwrap();
+        (g, u, d)
+    };
+    // From here on out, the NVFP4-specific code uses the unwrapped refs.
     // For decode (M=1), native MXFP4 MATVEC is strongly preferred over CUTLASS.
     // CUTLASS tiles are 128×128, so M=1 uses <1% of each tile. Native MXFP4 GEMV
     // with hardware mxf4 MMA instructions is purpose-built for this shape.
-    let use_native_gate_up = native_mxfp4_enabled(runtime, &layer.gate_proj)
-        && native_mxfp4_enabled(runtime, &layer.up_proj);
+    let use_native_gate_up = native_mxfp4_enabled(runtime, gate_proj_nvfp4)
+        && native_mxfp4_enabled(runtime, up_proj_nvfp4);
     if use_native_gate_up {
         runtime.rms_norm_device(
             &scratch.residual,
@@ -53,7 +69,7 @@ pub(super) fn forward_mlp_device(
         // Gate: quantize post_normed to MXFP4, run native GEMV.
         let mxfp4_valid = matvec_nvfp4_prepared_device_reuse(
             runtime,
-            &layer.gate_proj,
+            gate_proj_nvfp4,
             &scratch.post_normed,
             &scratch.quant_hidden,
             &mut scratch.mxfp4_hidden,
@@ -64,7 +80,7 @@ pub(super) fn forward_mlp_device(
         // Up: reuse MXFP4-quantized input (same post_normed), skip re-quantize.
         matvec_nvfp4_prepared_device_reuse(
             runtime,
-            &layer.up_proj,
+            up_proj_nvfp4,
             &scratch.post_normed,
             &scratch.quant_hidden,
             &mut scratch.mxfp4_hidden,
@@ -72,8 +88,8 @@ pub(super) fn forward_mlp_device(
             &mut scratch.up,
             scratch.staging_pool.as_deref_mut(),
         )?;
-    } else if runtime.cutlass_nvfp4_inference_enabled_for(&layer.gate_proj)
-        && runtime.cutlass_nvfp4_inference_enabled_for(&layer.up_proj)
+    } else if runtime.cutlass_nvfp4_inference_enabled_for(gate_proj_nvfp4)
+        && runtime.cutlass_nvfp4_inference_enabled_for(up_proj_nvfp4)
     {
         runtime.rms_norm_device(
             &scratch.residual,
@@ -84,12 +100,12 @@ pub(super) fn forward_mlp_device(
         runtime.quantize_cutlass_nvfp4_activation_device(
             &scratch.post_normed,
             1,
-            layer.gate_proj.cols,
+            gate_proj_nvfp4.cols,
             &mut scratch.cutlass_payload,
             &mut scratch.cutlass_scales,
         )?;
         runtime.matmul_cutlass_nvfp4_prepacked_prefill_device(
-            &layer.gate_proj,
+            gate_proj_nvfp4,
             &scratch.cutlass_payload,
             &scratch.cutlass_scales,
             1,
@@ -97,7 +113,7 @@ pub(super) fn forward_mlp_device(
             &mut scratch.gate,
         )?;
         runtime.matmul_cutlass_nvfp4_prepacked_prefill_device(
-            &layer.up_proj,
+            up_proj_nvfp4,
             &scratch.cutlass_payload,
             &scratch.cutlass_scales,
             1,
@@ -109,14 +125,14 @@ pub(super) fn forward_mlp_device(
             &scratch.residual,
             &layer.post_attention_norm_weight,
             rms_norm_eps,
-            layer.gate_proj.input_scale,
+            gate_proj_nvfp4.input_scale,
             &mut scratch.post_normed,
             &mut scratch.quant_hidden,
         )?;
-        let mut quant_scale = Some(layer.gate_proj.input_scale);
+        let mut quant_scale = Some(gate_proj_nvfp4.input_scale);
         let mxfp4_valid = matvec_nvfp4_prepared_device_reuse(
             runtime,
-            &layer.gate_proj,
+            gate_proj_nvfp4,
             &scratch.post_normed,
             &scratch.quant_hidden,
             &mut scratch.mxfp4_hidden,
@@ -126,14 +142,14 @@ pub(super) fn forward_mlp_device(
         )?;
         prepare_nvfp4_input(
             runtime,
-            &layer.up_proj,
+            up_proj_nvfp4,
             &scratch.post_normed,
             &mut quant_scale,
             &mut scratch.quant_hidden,
         )?;
         matvec_nvfp4_prepared_device_reuse(
             runtime,
-            &layer.up_proj,
+            up_proj_nvfp4,
             &scratch.post_normed,
             &scratch.quant_hidden,
             &mut scratch.mxfp4_hidden,
@@ -142,29 +158,29 @@ pub(super) fn forward_mlp_device(
             scratch.staging_pool.as_deref_mut(),
         )?;
     }
-    let use_native_down = native_mxfp4_enabled(runtime, &layer.down_proj);
+    let use_native_down = native_mxfp4_enabled(runtime, down_proj_nvfp4);
     if use_native_down {
         runtime.swiglu_device(&scratch.gate, &scratch.up, &mut scratch.swiglu)?;
         matvec_nvfp4_device_with_scratch(
             runtime,
-            &layer.down_proj,
+            down_proj_nvfp4,
             &scratch.swiglu,
             &mut scratch.quant_intermediate,
             &mut scratch.mxfp4_intermediate,
             &mut scratch.mlp_out,
             scratch.staging_pool.as_deref_mut(),
         )?;
-    } else if runtime.cutlass_nvfp4_inference_enabled_for(&layer.down_proj) {
+    } else if runtime.cutlass_nvfp4_inference_enabled_for(down_proj_nvfp4) {
         runtime.swiglu_quantize_cutlass_nvfp4_activation_device(
             &scratch.gate,
             &scratch.up,
             1,
-            layer.down_proj.cols,
+            down_proj_nvfp4.cols,
             &mut scratch.cutlass_payload,
             &mut scratch.cutlass_scales,
         )?;
         runtime.matmul_cutlass_nvfp4_prepacked_prefill_device(
-            &layer.down_proj,
+            down_proj_nvfp4,
             &scratch.cutlass_payload,
             &scratch.cutlass_scales,
             1,
@@ -175,7 +191,7 @@ pub(super) fn forward_mlp_device(
         runtime.swiglu_device(&scratch.gate, &scratch.up, &mut scratch.swiglu)?;
         matvec_nvfp4_device_with_scratch(
             runtime,
-            &layer.down_proj,
+            down_proj_nvfp4,
             &scratch.swiglu,
             &mut scratch.quant_intermediate,
             &mut scratch.mxfp4_intermediate,
@@ -195,6 +211,113 @@ pub(super) fn forward_mlp_device(
         runtime.scale_f32_device(scalar, &mut scratch.hidden_out)?;
     }
     Ok(())
+}
+
+/// Dense MLP decode forward for BF16 and FP8 weight variants. Mirrors the
+/// NVFP4 path's structure (RMSNorm → gate/up GEMMs → SwiGLU/GeGLU →
+/// down GEMM → residual + optional post-norm + layer_scalar) but routes
+/// through cuBLASLt BF16 or FP8 GEMMs instead of NVFP4 matvec kernels.
+///
+/// Selects SwiGLU vs GeGLU-tanh based on the layer's `dense_activation`
+/// (driven by the architecture descriptor's `hidden_activation`). For
+/// Gemma-4 E4B that's `gelu_pytorch_tanh`; for Llama / Qwen text it's
+/// `silu` (SwiGLU).
+fn forward_dense_mlp_non_nvfp4_device(
+    runtime: &CudaRuntime,
+    layer: &CudaLayer,
+    scratch: &mut CudaScratch,
+    rms_norm_eps: f32,
+) -> Result<()> {
+    runtime.rms_norm_device(
+        &scratch.residual,
+        &layer.post_attention_norm_weight,
+        rms_norm_eps,
+        &mut scratch.post_normed,
+    )?;
+    // Gate / up projection: dispatch on the (uniform) variant of the triple.
+    // Mixed variants are rejected at load time by `load_cuda_linear` because
+    // a single dense layer's checkpoint format is uniform across the three
+    // sub-projections, so we only need to look at gate_proj here.
+    match &layer.gate_proj {
+        CudaLinear::Bf16(_) => {
+            matvec_cuda_linear_with_scratch(
+                runtime,
+                &layer.gate_proj,
+                &scratch.post_normed,
+                &mut scratch.quant_hidden,
+                &mut scratch.mxfp4_hidden,
+                &mut scratch.gate,
+                scratch.staging_pool.as_deref_mut(),
+            )?;
+            matvec_cuda_linear_with_scratch(
+                runtime,
+                &layer.up_proj,
+                &scratch.post_normed,
+                &mut scratch.quant_hidden,
+                &mut scratch.mxfp4_hidden,
+                &mut scratch.up,
+                scratch.staging_pool.as_deref_mut(),
+            )?;
+        }
+        CudaLinear::Fp8(_) => {
+            matvec_cuda_linear_with_scratch(
+                runtime,
+                &layer.gate_proj,
+                &scratch.post_normed,
+                &mut scratch.quant_hidden,
+                &mut scratch.mxfp4_hidden,
+                &mut scratch.gate,
+                scratch.staging_pool.as_deref_mut(),
+            )?;
+            matvec_cuda_linear_with_scratch(
+                runtime,
+                &layer.up_proj,
+                &scratch.post_normed,
+                &mut scratch.quant_hidden,
+                &mut scratch.mxfp4_hidden,
+                &mut scratch.up,
+                scratch.staging_pool.as_deref_mut(),
+            )?;
+        }
+        CudaLinear::Nvfp4(_) => unreachable!("NVFP4 path handled upstream"),
+    }
+    // Activation: dispatch on the architecture's MLP activation.
+    match layer.dense_activation {
+        DenseActivation::Swiglu => {
+            runtime.swiglu_device(&scratch.gate, &scratch.up, &mut scratch.swiglu)?;
+        }
+        DenseActivation::GeluTanh => {
+            runtime.geglu_tanh_device(&scratch.gate, &scratch.up, &mut scratch.swiglu)?;
+        }
+    }
+    // Down projection.
+    matvec_cuda_linear_with_scratch(
+        runtime,
+        &layer.down_proj,
+        &scratch.swiglu,
+        &mut scratch.quant_intermediate,
+        &mut scratch.mxfp4_intermediate,
+        &mut scratch.mlp_out,
+        scratch.staging_pool.as_deref_mut(),
+    )?;
+    if let Some(ref post_norm) = layer.post_mlp_sublayer_norm {
+        runtime.rms_norm_device(&scratch.mlp_out, post_norm, rms_norm_eps, &mut scratch.post_normed)?;
+        runtime.add_device(&scratch.residual, &scratch.post_normed, &mut scratch.hidden_out)?;
+    } else {
+        runtime.add_device(&scratch.residual, &scratch.mlp_out, &mut scratch.hidden_out)?;
+    }
+    if let Some(scalar) = layer.layer_scalar {
+        runtime.scale_f32_device(scalar, &mut scratch.hidden_out)?;
+    }
+    Ok(())
+}
+
+/// Dense MLP activation kind, decided per-architecture at load time. Gemma-4
+/// E4B uses GeGLU-tanh (`gelu_pytorch_tanh`); Llama / Qwen text uses SwiGLU.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum DenseActivation {
+    Swiglu,
+    GeluTanh,
 }
 
 #[allow(clippy::too_many_arguments)]

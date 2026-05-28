@@ -239,9 +239,22 @@ pub(super) struct CudaLayer {
     pub(super) q_norm_weight: Option<DeviceBuffer<f32>>,
     /// Gemma 4: RMS norm applied per-head to K after the projection, before RoPE.
     pub(super) k_norm_weight: Option<DeviceBuffer<f32>>,
-    pub(super) gate_proj: DeviceNvfp4Linear,
-    pub(super) up_proj: DeviceNvfp4Linear,
-    pub(super) down_proj: DeviceNvfp4Linear,
+    /// Dense MLP gate/up/down projections. `CudaLinear` enum so a single
+    /// dense decoder can hold NVFP4 (NVIDIA prequantized checkpoints), BF16
+    /// (vanilla HF releases like Gemma-4-E4B-it), or load-time-quantized FP8
+    /// (`shared-MLP-quantization = "fp8"`). The variant is chosen by
+    /// `load_cuda_linear` at load time based on whether `{prefix}.weight_scale`
+    /// is present in the checkpoint and the `shared-MLP-quantization` config
+    /// override.
+    pub(super) gate_proj: CudaLinear,
+    pub(super) up_proj: CudaLinear,
+    pub(super) down_proj: CudaLinear,
+    /// Dense MLP activation. Most models use SwiGLU (silu(gate) * up); Gemma-4
+    /// (E4B and 26B-A4B) uses GeGLU-tanh (gelu_pytorch_tanh(gate) * up).
+    /// NVFP4 dense MLPs ignore this — they fuse the activation into
+    /// kernel-specific fast paths that always run SwiGLU; setting this to
+    /// GeluTanh on an NVFP4 layer is a load-time error (unsupported combo).
+    pub(super) dense_activation: super::mlp::DenseActivation,
     /// 0 = full causal; >0 = sliding-window (Gemma 4 local layers, Mistral).
     pub(super) window_size: usize,
     /// Per-layer RoPE config with the correct partial_dim baked in.

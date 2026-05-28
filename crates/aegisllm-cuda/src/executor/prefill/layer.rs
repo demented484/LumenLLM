@@ -46,7 +46,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     let hidden_size = layer.o_proj.rows();
     // For MoE layers, gate_proj is a dummy (rows=1). The real intermediate lives in
     // CudaMoE::expert_intermediate_size, but prefill MoE is guarded below.
-    let intermediate = if layer.moe.is_some() { 1 } else { layer.gate_proj.rows };
+    let intermediate = if layer.moe.is_some() { 1 } else { layer.gate_proj.rows() };
     // Prefill scratch is lifetime-pooled manually here: Q lives in `gate`
     // until attention finishes, K lives in `up`, and attention context lives
     // in `qkv` after QKV split has consumed it. MLP overwrites gate/up later.
@@ -900,8 +900,27 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         })?;
         return Ok(());
     }
-    if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.gate_proj)
-        && prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.up_proj)
+    // Dense MLP prefill: dispatch on the (uniform) weight variant. The NVFP4
+    // path below handles CUTLASS / native-MXFP4 / unfused fallbacks. BF16 and
+    // FP8 variants take the cuBLASLt batched dense path. Mixed variants are
+    // rejected at load time.
+    let dense_is_nvfp4 = layer.gate_proj.as_nvfp4().is_some()
+        && layer.up_proj.as_nvfp4().is_some()
+        && layer.down_proj.as_nvfp4().is_some();
+    if !dense_is_nvfp4 {
+        forward_dense_mlp_prefill_non_nvfp4_device(
+            runtime, layer, prefill, params, intermediate, hidden_size,
+        )?;
+        record_prefill_stage(runtime, timings, mlp_start, |timings, elapsed| {
+            timings.mlp_us += elapsed
+        })?;
+        return Ok(());
+    }
+    let gate_proj_nvfp4 = layer.gate_proj.as_nvfp4().unwrap();
+    let up_proj_nvfp4 = layer.up_proj.as_nvfp4().unwrap();
+    let down_proj_nvfp4 = layer.down_proj.as_nvfp4().unwrap();
+    if prefill_linear_cutlass_nvfp4_enabled(runtime, gate_proj_nvfp4)
+        && prefill_linear_cutlass_nvfp4_enabled(runtime, up_proj_nvfp4)
     {
         runtime.rms_norm_batched_device(
             &prefill.hidden,
@@ -913,13 +932,13 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         runtime.quantize_cutlass_nvfp4_activation_device(
             &prefill.input_normed,
             params.batch,
-            layer.gate_proj.cols,
+            gate_proj_nvfp4.cols,
             &mut prefill.cutlass_payload,
             &mut prefill.cutlass_scales,
         )?;
         runtime.matmul_cutlass_nvfp4_pair_prepacked_prefill_device(
-            &layer.gate_proj,
-            &layer.up_proj,
+            gate_proj_nvfp4,
+            up_proj_nvfp4,
             &prefill.cutlass_payload,
             &prefill.cutlass_scales,
             params.batch,
@@ -927,8 +946,8 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.gate,
             &mut prefill.up,
         )?;
-    } else if prefill_linear_native_mxfp4_enabled(runtime, &layer.gate_proj)
-        && prefill_linear_native_mxfp4_enabled(runtime, &layer.up_proj)
+    } else if prefill_linear_native_mxfp4_enabled(runtime, gate_proj_nvfp4)
+        && prefill_linear_native_mxfp4_enabled(runtime, up_proj_nvfp4)
     {
         runtime.rms_norm_batched_device(
             &prefill.hidden,
@@ -940,13 +959,13 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         runtime.quantize_mxfp4_input_batched_device(
             &prefill.input_normed,
             params.batch,
-            layer.gate_proj.cols,
+            gate_proj_nvfp4.cols,
             &mut prefill.mxfp4_hidden,
         )?;
         prefill_gate_up_mxfp4_native_device(
             runtime,
-            &layer.gate_proj,
-            &layer.up_proj,
+            gate_proj_nvfp4,
+            up_proj_nvfp4,
             &prefill.mxfp4_hidden,
             params.batch,
             &mut prefill.gate,
@@ -959,13 +978,13 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &layer.post_attention_norm_weight,
             params.batch,
             params.rms_norm_eps,
-            layer.gate_proj.input_scale,
+            gate_proj_nvfp4.input_scale,
             &mut prefill.input_normed,
             &mut prefill.quant_hidden,
         )?;
         prefill_linear_prepared_batched_device(
             runtime,
-            &layer.gate_proj,
+            gate_proj_nvfp4,
             &prefill.input_normed,
             &prefill.quant_hidden,
             params.batch,
@@ -973,10 +992,10 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.gate,
             if sp.is_null() { None } else { Some(unsafe { &mut *sp }) },
         )?;
-        let mut quant_scale = Some(layer.gate_proj.input_scale);
+        let mut quant_scale = Some(gate_proj_nvfp4.input_scale);
         prefill_linear_prepare_nvfp4_input(
             runtime,
-            &layer.up_proj,
+            up_proj_nvfp4,
             &prefill.input_normed,
             params.batch,
             &mut quant_scale,
@@ -984,7 +1003,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         )?;
         prefill_linear_prepared_batched_device(
             runtime,
-            &layer.up_proj,
+            up_proj_nvfp4,
             &prefill.input_normed,
             &prefill.quant_hidden,
             params.batch,
@@ -993,7 +1012,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             if sp.is_null() { None } else { Some(unsafe { &mut *sp }) },
         )?;
     }
-    if prefill_linear_cutlass_nvfp4_enabled(runtime, &layer.down_proj) {
+    if prefill_linear_cutlass_nvfp4_enabled(runtime, down_proj_nvfp4) {
         runtime.swiglu_quantize_cutlass_nvfp4_activation_device(
             &prefill.gate,
             &prefill.up,
@@ -1004,14 +1023,14 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         )?;
         prefill_linear_cutlass_nvfp4_prepacked_device(
             runtime,
-            &layer.down_proj,
+            down_proj_nvfp4,
             &prefill.cutlass_payload,
             &prefill.cutlass_scales,
             params.batch,
             &mut prefill.cutlass_workspace,
             &mut prefill.input_normed,
         )?;
-    } else if prefill_linear_native_mxfp4_enabled(runtime, &layer.down_proj) {
+    } else if prefill_linear_native_mxfp4_enabled(runtime, down_proj_nvfp4) {
         runtime.swiglu_mxfp4_quantize_batched_device(
             &prefill.gate,
             &prefill.up,
@@ -1020,7 +1039,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
             &mut prefill.mxfp4_intermediate,
         )?;
         runtime.matmul_mxfp4_native_prepacked_prefill_device(
-            &layer.down_proj,
+            down_proj_nvfp4,
             &prefill.mxfp4_intermediate,
             params.batch,
             &mut prefill.input_normed,
@@ -1034,7 +1053,7 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
         )?;
         prefill_linear_batched_device_with_scratch(
             runtime,
-            &layer.down_proj,
+            down_proj_nvfp4,
             &prefill.gate,
             params.batch,
             &mut prefill.quant_intermediate,
@@ -1064,14 +1083,120 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     let mlp_flops =
         prefill_gemm_flops(
             params.batch,
-            layer.gate_proj.rows + layer.up_proj.rows,
-            layer.gate_proj.cols,
-        ) + prefill_gemm_flops(params.batch, layer.down_proj.rows, layer.down_proj.cols);
+            layer.gate_proj.rows() + layer.up_proj.rows(),
+            gate_proj_nvfp4.cols,
+        ) + prefill_gemm_flops(params.batch, layer.down_proj.rows(), layer.down_proj.cols());
     record_prefill_stage(runtime, timings, mlp_start, |timings, elapsed| {
         timings.mlp_us += elapsed;
         timings.mlp_tflops = timings.mlp_tflops.max(tflops(mlp_flops, elapsed));
     })?;
     Ok(())
+}
+
+/// Dense MLP prefill for BF16 and FP8 weight variants. RMSNorm → cuBLASLt
+/// dense gate/up GEMMs (BF16 or FP8 via existing per-format helpers) →
+/// SwiGLU or GeGLU-tanh activation → cuBLASLt down GEMM → residual + optional
+/// post-MLP norm + per-layer scalar.
+///
+/// `layer.dense_activation` selects SwiGLU (Llama / Qwen) vs GeGLU-tanh
+/// (Gemma-4 family). The function dispatches once on `layer.gate_proj`'s
+/// variant since `load_cuda_linear` guarantees gate/up/down share a variant
+/// per dense layer.
+fn forward_dense_mlp_prefill_non_nvfp4_device(
+    runtime: &CudaRuntime,
+    layer: &CudaLayer,
+    prefill: &mut CudaPrefillScratch,
+    params: CudaPrefillForwardParams,
+    intermediate: usize,
+    hidden_size: usize,
+) -> Result<()> {
+    use crate::executor::mlp::DenseActivation;
+    runtime.rms_norm_batched_device(
+        &prefill.hidden,
+        &layer.post_attention_norm_weight,
+        params.batch,
+        params.rms_norm_eps,
+        &mut prefill.input_normed,
+    )?;
+    // Gate projection: BF16 or FP8 dispatch.
+    dense_proj_prefill(
+        runtime, &layer.gate_proj, &prefill.input_normed, params.batch,
+        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
+        &mut prefill.fp8_dequant_scratch, &mut prefill.gate,
+    )?;
+    // Up projection.
+    dense_proj_prefill(
+        runtime, &layer.up_proj, &prefill.input_normed, params.batch,
+        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
+        &mut prefill.fp8_dequant_scratch, &mut prefill.up,
+    )?;
+    // Activation: writes to `prefill.swiglu` which is sized for
+    // [batch, intermediate] — `input_normed` is only [batch, hidden].
+    let _ = intermediate;
+    match layer.dense_activation {
+        DenseActivation::Swiglu => {
+            runtime.swiglu_device(&prefill.gate, &prefill.up, &mut prefill.swiglu)?;
+        }
+        DenseActivation::GeluTanh => {
+            runtime.geglu_tanh_device(&prefill.gate, &prefill.up, &mut prefill.swiglu)?;
+        }
+    }
+    // Down projection: activated [batch, intermediate] → mlp_out [batch, hidden].
+    dense_proj_prefill(
+        runtime, &layer.down_proj, &prefill.swiglu, params.batch,
+        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch,
+        &mut prefill.fp8_dequant_scratch, &mut prefill.mlp_out,
+    )?;
+    let batch_hidden = params.batch * hidden_size;
+    if let Some(ref post_norm) = layer.post_mlp_sublayer_norm {
+        runtime.rms_norm_batched_device(
+            &prefill.mlp_out, post_norm, params.batch, params.rms_norm_eps,
+            &mut prefill.input_normed,
+        )?;
+        runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.input_normed, batch_hidden)?;
+    } else {
+        runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.mlp_out, batch_hidden)?;
+    }
+    if let Some(scalar) = layer.layer_scalar {
+        runtime.scale_f32_device_len(scalar, &mut prefill.hidden, batch_hidden)?;
+    }
+    Ok(())
+}
+
+/// Dense projection prefill dispatcher for BF16 and FP8 variants. NVFP4 is
+/// handled separately (different scratch layout). Mirrors the per-variant
+/// dispatch used in the o_proj path of `forward_cuda_layer_prefill_chunk_device`.
+fn dense_proj_prefill(
+    runtime: &CudaRuntime,
+    linear: &CudaLinear,
+    input: &DeviceBuffer<f32>,
+    batch: usize,
+    bf16_in_scratch: &mut DeviceBuffer<u16>,
+    bf16_out_scratch: &mut DeviceBuffer<u16>,
+    fp8_dequant_scratch: &mut DeviceBuffer<u16>,
+    output: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    match linear {
+        CudaLinear::Bf16(m) => {
+            if runtime.cublaslt_bf16_enabled_for(m) {
+                runtime.matmul_bf16_cublaslt_device(
+                    m, input, batch, bf16_in_scratch, bf16_out_scratch, output,
+                )?;
+            } else {
+                runtime.matmul_bf16_reference_batched_device(m, input, batch, output)?;
+            }
+            Ok(())
+        }
+        CudaLinear::Fp8(m) => {
+            runtime.matmul_fp8_via_bf16_cublaslt_device(
+                m, fp8_dequant_scratch, input, batch,
+                bf16_in_scratch, bf16_out_scratch, output,
+            )
+        }
+        CudaLinear::Nvfp4(_) => Err(AegisError::Unsupported(
+            "dense_proj_prefill: NVFP4 should be handled by the NVFP4 prefill path".into()
+        )),
+    }
 }
 
 fn prefill_gemm_flops(tokens: usize, output_channels: usize, hidden: usize) -> f64 {

@@ -104,28 +104,31 @@ pub(super) fn load_cuda_layer(
     let layer_head_dim = shape.head_dim;
     let layer_num_kv_heads = shape.num_kv_heads;
 
+    // Dense MLP load is format-aware (NVFP4 / BF16 / FP8) via `load_cuda_linear`.
+    // For MoE layers the dense slots are stubbed; the real per-expert weights
+    // are loaded in `load_cuda_moe` below.
     let (gate_proj, up_proj, down_proj) = if is_moe {
         (
-            cuda.alloc_dummy_nvfp4_linear(&format!("{prefix}.mlp.gate_proj"))?,
-            cuda.alloc_dummy_nvfp4_linear(&format!("{prefix}.mlp.up_proj"))?,
-            cuda.alloc_dummy_nvfp4_linear(&format!("{prefix}.mlp.down_proj"))?,
+            CudaLinear::Nvfp4(cuda.alloc_dummy_nvfp4_linear(&format!("{prefix}.mlp.gate_proj"))?),
+            CudaLinear::Nvfp4(cuda.alloc_dummy_nvfp4_linear(&format!("{prefix}.mlp.up_proj"))?),
+            CudaLinear::Nvfp4(cuda.alloc_dummy_nvfp4_linear(&format!("{prefix}.mlp.down_proj"))?),
         )
     } else {
         (
-            load_nvfp4_maybe_sliced_linear(
+            load_cuda_linear(
                 cuda, artifact, &format!("{prefix}.mlp.gate_proj"),
                 placement.store, residency, resident_layout,
-                intermediate, hidden, is_sliced, loader,
+                intermediate, hidden, is_sliced, shared_mlp_quantization, loader,
             )?,
-            load_nvfp4_maybe_sliced_linear(
+            load_cuda_linear(
                 cuda, artifact, &format!("{prefix}.mlp.up_proj"),
                 placement.store, residency, resident_layout,
-                intermediate, hidden, is_sliced, loader,
+                intermediate, hidden, is_sliced, shared_mlp_quantization, loader,
             )?,
-            load_nvfp4_maybe_sliced_linear(
+            load_cuda_linear(
                 cuda, artifact, &format!("{prefix}.mlp.down_proj"),
                 placement.store, residency, resident_layout,
-                hidden, intermediate, is_sliced, loader,
+                hidden, intermediate, is_sliced, shared_mlp_quantization, loader,
             )?,
         )
     };
@@ -303,6 +306,21 @@ pub(super) fn load_cuda_layer(
         moe,
         layer_head_dim,
         layer_num_kv_heads,
+        dense_activation: {
+            // Pick activation from the architecture descriptor: `silu` (Llama
+            // / Qwen) → SwiGLU; `gelu_pytorch_tanh` (Gemma-4 E4B / 26B-A4B
+            // dense layers) → GeGLU-tanh. Anything else is rejected at load
+            // time rather than silently miscomputed at decode.
+            use super::mlp::DenseActivation;
+            match artifact.config.hidden_activation.as_deref() {
+                None | Some("silu") | Some("swiglu") => DenseActivation::Swiglu,
+                Some("gelu_pytorch_tanh") | Some("gelu_tanh") | Some("gelu") =>
+                    DenseActivation::GeluTanh,
+                Some(other) => return Err(AegisError::InvalidPlan(format!(
+                    "dense MLP: unsupported hidden_activation `{other}` — supported: silu/swiglu, gelu_pytorch_tanh"
+                ))),
+            }
+        },
     };
     if !is_moe {
         validate_cuda_layer_shape(&layer_out, shape)?;
@@ -706,7 +724,7 @@ fn validate_cuda_layer_shape(layer: &CudaLayer, shape: CudaLayerShape) -> Result
     let hidden = shape.hidden_size;
     let q_width = shape.num_attention_heads * shape.head_dim;
     let kv_width = shape.num_kv_heads * shape.head_dim;
-    let intermediate = shape.intermediate_size.unwrap_or(layer.gate_proj.rows);
+    let intermediate = shape.intermediate_size.unwrap_or(layer.gate_proj.rows());
 
     require_vector_len(
         "input_layernorm.weight",
@@ -747,23 +765,23 @@ fn validate_cuda_layer_shape(layer: &CudaLayer, shape: CudaLayerShape) -> Result
         q_width,
     )?;
     require_linear_shape(
-        &layer.gate_proj.name,
-        layer.gate_proj.rows,
-        layer.gate_proj.cols,
+        layer.gate_proj.name(),
+        layer.gate_proj.rows(),
+        layer.gate_proj.cols(),
         intermediate,
         hidden,
     )?;
     require_linear_shape(
-        &layer.up_proj.name,
-        layer.up_proj.rows,
-        layer.up_proj.cols,
+        layer.up_proj.name(),
+        layer.up_proj.rows(),
+        layer.up_proj.cols(),
         intermediate,
         hidden,
     )?;
     require_linear_shape(
-        &layer.down_proj.name,
-        layer.down_proj.rows,
-        layer.down_proj.cols,
+        layer.down_proj.name(),
+        layer.down_proj.rows(),
+        layer.down_proj.cols(),
         hidden,
         intermediate,
     )?;

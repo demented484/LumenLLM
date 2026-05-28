@@ -213,6 +213,32 @@ pub(super) fn native_mxfp4_enabled(runtime: &CudaRuntime, linear: &DeviceNvfp4Li
     runtime.native_mxfp4_inference_enabled_for(linear)
 }
 
+/// Variant-aware wrapper: returns false for non-NVFP4 variants since native
+/// MXFP4 instructions only apply to NVFP4-packed weights. Called from the
+/// dense MLP path where `layer.gate_proj` is now a `CudaLinear` enum
+/// covering NVFP4 / BF16 / FP8.
+pub(super) fn cuda_linear_on_native_mxfp4_path(
+    runtime: &CudaRuntime,
+    linear: &CudaLinear,
+) -> bool {
+    match linear {
+        CudaLinear::Nvfp4(l) => runtime.native_mxfp4_inference_enabled_for(l),
+        _ => false,
+    }
+}
+
+/// Variant-aware wrapper: returns false for non-NVFP4 variants since the
+/// CUTLASS NVFP4 inference kernel is NVFP4-only.
+pub(super) fn cuda_linear_on_cutlass_nvfp4_path(
+    runtime: &CudaRuntime,
+    linear: &CudaLinear,
+) -> bool {
+    match linear {
+        CudaLinear::Nvfp4(l) => runtime.cutlass_nvfp4_inference_enabled_for(l),
+        _ => false,
+    }
+}
+
 /// Matvec dispatch for a CudaLinear (BF16 or NVFP4 path).
 pub(super) fn matvec_cuda_linear_with_scratch(
     runtime: &CudaRuntime,

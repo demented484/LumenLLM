@@ -1,4 +1,8 @@
-use super::linear_ops::native_mxfp4_enabled;
+use super::linear_ops::{
+    native_mxfp4_enabled,
+    cuda_linear_on_native_mxfp4_path,
+    cuda_linear_on_cutlass_nvfp4_path,
+};
 use super::load_progress::LoadProgress;
 use super::loader::{
     CudaLayerShape, cuda_residency_for_store, first_existing_tensor, load_cuda_layer,
@@ -273,20 +277,11 @@ impl CudaLlamaExecutor {
         // so all-MoE models (Gemma-4-26B-A4B) are unaffected — reject only a
         // dense layer paired with a non-SiLU activation, loudly, instead of
         // corrupting output.
-        if let Some(act) = artifact.config.hidden_activation.as_deref() {
-            let act_l = act.to_ascii_lowercase();
-            let is_silu = act_l.contains("silu")
-                || act_l.contains("swish")
-                || act_l.contains("swiglu");
-            if !is_silu && layers.iter().any(|l| l.moe.is_none()) {
-                return Err(AegisError::Unsupported(format!(
-                    "dense MLP path implements SiLU/SwiGLU only, but the model \
-                     declares hidden_activation=`{act}`. gelu-tanh dense MLP is \
-                     not yet wired (the MoE expert path handles gelu-tanh \
-                     correctly). Refusing to silently compute the wrong activation."
-                )));
-            }
-        }
+        // GeGLU-tanh dense MLP is now wired through CudaLayer.dense_activation +
+        // forward_dense_mlp_non_nvfp4_device (mlp.rs). The previous guard rejecting
+        // gelu_pytorch_tanh on dense layers has been removed — the activation is
+        // chosen per-layer at load time from `hidden_activation`. Unsupported
+        // activations are still rejected loudly inside the loader.
 
         let has_staged_layers = layers.iter().any(|layer| {
             [&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj]
@@ -544,7 +539,7 @@ impl CudaLlamaExecutor {
             .layers
             .iter()
             .filter(|l| l.moe.is_none())
-            .map(|l| l.gate_proj.rows)
+            .map(|l| l.gate_proj.rows())
             .max()
             .unwrap_or(self.hidden_size);
         // MoE expert intermediate size: max across MoE layers (0 if no MoE layers).
@@ -567,10 +562,10 @@ impl CudaLlamaExecutor {
             .unwrap_or(0);
         let max_expert_intermediate = moe_intermediate.max(shared_expert_intermediate);
         let needs_fallback_down_scratch = self.layers.iter().any(|layer| {
-            !self
-                .runtime
-                .cutlass_nvfp4_inference_enabled_for(&layer.down_proj)
-                && !native_mxfp4_enabled(&self.runtime, &layer.down_proj)
+            // Only NVFP4 dense MLPs use the CUTLASS or native-MXFP4 fast paths;
+            // BF16/FP8 dense MLPs always go through cuBLASLt (no extra scratch).
+            !cuda_linear_on_cutlass_nvfp4_path(&self.runtime, &layer.down_proj)
+                && !cuda_linear_on_native_mxfp4_path(&self.runtime, &layer.down_proj)
         });
         let needs_quant_hidden_scratch = self
             .layers
@@ -584,7 +579,7 @@ impl CudaLlamaExecutor {
             || self
                 .layers
                 .iter()
-                .any(|layer| linear_on_native_mxfp4_path(&self.runtime, &layer.down_proj));
+                .any(|layer| cuda_linear_on_native_mxfp4_path(&self.runtime, &layer.down_proj));
         let quant_hidden_len = if needs_quant_hidden_scratch {
             self.prefill_chunk_size * self.hidden_size
         } else {
@@ -691,9 +686,18 @@ impl CudaLlamaExecutor {
                 up: self
                     .runtime
                     .alloc_f32(self.prefill_chunk_size * intermediate.max(max_kv_width))?,
-                swiglu: self.runtime.alloc_f32(1)?,
-                // Reused output now lives in input_normed after gate/up.
-                mlp_out: self.runtime.alloc_f32(1)?,
+                // Activation output [chunk_size, intermediate] — used by the
+                // BF16/FP8 dense MLP path (NVFP4 path overwrites `gate` in-place
+                // and skips this). Sized whenever dense layers exist; ~2.5 MB
+                // at chunk=64, intermediate=10240.
+                swiglu: self.runtime.alloc_f32(
+                    if intermediate > 0 { self.prefill_chunk_size * intermediate } else { 1 }
+                )?,
+                // Down-projection output [chunk_size, hidden] — same gating
+                // as swiglu. NVFP4 path uses `input_normed` instead.
+                mlp_out: self.runtime.alloc_f32(
+                    if intermediate > 0 { self.prefill_chunk_size * self.hidden_size } else { 1 }
+                )?,
                 // cuBLASLt BF16 scratch — size for the largest single matmul. Worst
                 // case is shared MLP / down_proj: chunk_size * max(intermediate, hidden,
                 // max_q_width). For Gemma 4 26B: 64 * max(2112, 2816, 8192) = 64*8192 ≈ 1MB.
@@ -713,7 +717,16 @@ impl CudaLlamaExecutor {
                         .layers
                         .iter()
                         .flat_map(|l| {
-                            let attn_projs = [&l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj];
+                            // Attention projections + dense MLP (gate/up/down)
+                            // now both run through the CudaLinear enum and
+                            // either can be FP8 (per `attention-quantization`
+                            // / `shared-MLP-quantization` config). Size the
+                            // shared scratch to fit the largest FP8 tile
+                            // across both.
+                            let attn_dense = [
+                                &l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj,
+                                &l.gate_proj, &l.up_proj, &l.down_proj,
+                            ];
                             let shared_iter = l
                                 .moe
                                 .as_ref()
@@ -722,7 +735,7 @@ impl CudaLlamaExecutor {
                                 .flat_map(|se| {
                                     [&se.gate_proj, &se.up_proj, &se.down_proj].into_iter()
                                 });
-                            attn_projs.into_iter().chain(shared_iter)
+                            attn_dense.into_iter().chain(shared_iter)
                         })
                         .filter(|p| matches!(p, CL::Fp8(_)))
                         .map(|p| p.rows() * p.cols())
@@ -1093,11 +1106,11 @@ impl CudaLlamaExecutor {
         let mut max_m = 0usize;
         for layer in &self.layers {
             let nvfp4_linears: Vec<&crate::cuda::DeviceNvfp4Linear> = {
-                let mut v: Vec<&crate::cuda::DeviceNvfp4Linear> = vec![
-                    &layer.gate_proj, &layer.up_proj, &layer.down_proj,
-                ];
-                // Add q/k/v/o if they're NVFP4
-                for cl in [&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj] {
+                let mut v: Vec<&crate::cuda::DeviceNvfp4Linear> = Vec::new();
+                // All 7 dense projections are CudaLinear; only NVFP4 variants
+                // need the staged-load byte calculation here.
+                for cl in [&layer.gate_proj, &layer.up_proj, &layer.down_proj,
+                           &layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj] {
                     if let Some(l) = cl.as_nvfp4() { v.push(l); }
                 }
                 if let Some(ref qkv) = layer.qkv_proj {
@@ -1299,15 +1312,15 @@ fn prefill_layer_needs_quant_hidden_scratch(
 
     let gate_up_all_cutlass = [&layer.gate_proj, &layer.up_proj]
         .into_iter()
-        .all(|linear| runtime.cutlass_nvfp4_inference_enabled_for(linear));
+        .all(|linear| cuda_linear_on_cutlass_nvfp4_path(runtime, linear));
     let gate_up_all_native = [&layer.gate_proj, &layer.up_proj]
         .into_iter()
-        .all(|linear| native_mxfp4_enabled(runtime, linear));
+        .all(|linear| cuda_linear_on_native_mxfp4_path(runtime, linear));
     let gate_up_fallback_needs_quant = !gate_up_all_cutlass
         && !gate_up_all_native
         && [&layer.gate_proj, &layer.up_proj]
             .into_iter()
-            .any(|linear| !native_mxfp4_enabled(runtime, linear));
+            .any(|linear| !cuda_linear_on_native_mxfp4_path(runtime, linear));
 
     qkv_fallback_needs_quant || o_needs_quant || gate_up_fallback_needs_quant
 }
@@ -1337,11 +1350,11 @@ fn prefill_layer_needs_mxfp4_hidden_scratch(
 
     let gate_up_all_cutlass = [&layer.gate_proj, &layer.up_proj]
         .into_iter()
-        .all(|linear| runtime.cutlass_nvfp4_inference_enabled_for(linear));
+        .all(|linear| cuda_linear_on_cutlass_nvfp4_path(runtime, linear));
     let gate_up_needs_mxfp4 = !gate_up_all_cutlass
         && [&layer.gate_proj, &layer.up_proj]
             .into_iter()
-            .any(|linear| linear_on_native_mxfp4_path(runtime, linear));
+            .any(|linear| cuda_linear_on_native_mxfp4_path(runtime, linear));
 
     qkv_needs_mxfp4 || o_needs_mxfp4 || gate_up_needs_mxfp4
 }
@@ -1484,18 +1497,16 @@ fn cutlass_prefill_scratch_bytes(
         || layer.qkv_proj.as_ref().is_some_and(|cl| cl.cutlass_nvfp4_enabled(&executor.runtime))
         || [&layer.gate_proj, &layer.up_proj, &layer.down_proj]
             .iter()
-            .any(|l| executor.runtime.cutlass_nvfp4_inference_enabled_for(*l))
+            .any(|cl| cl.cutlass_nvfp4_enabled(&executor.runtime))
     });
     let workspace_bytes = if any_cutlass {
         executor
             .layers
             .iter()
             .flat_map(|layer| {
-                // gate/up/down are always DeviceNvfp4Linear
-                let mut nvfp4s: Vec<&crate::cuda::DeviceNvfp4Linear> = vec![
-                    &layer.gate_proj, &layer.up_proj, &layer.down_proj,
-                ];
-                for cl in [&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj] {
+                let mut nvfp4s: Vec<&crate::cuda::DeviceNvfp4Linear> = Vec::new();
+                for cl in [&layer.gate_proj, &layer.up_proj, &layer.down_proj,
+                           &layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj] {
                     if let Some(l) = cl.as_nvfp4() { nvfp4s.push(l); }
                 }
                 if let Some(ref qkv) = layer.qkv_proj {

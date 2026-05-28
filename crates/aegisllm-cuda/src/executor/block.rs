@@ -155,7 +155,7 @@ impl CudaLayerBlockExecutor {
             .layers
             .values()
             .filter(|l| l.moe.is_none())
-            .map(|l| l.gate_proj.rows)
+            .map(|l| l.gate_proj.rows())
             .max()
             .unwrap_or(self.hidden_size);
         let max_cutlass_input = self.hidden_size.max(intermediate);
@@ -171,11 +171,12 @@ impl CudaLayerBlockExecutor {
             .layers
             .values()
             .flat_map(|layer| {
-                // gate/up/down are always DeviceNvfp4Linear; q/k/v/o are CudaLinear
-                let mut nvfp4s: Vec<&crate::cuda::DeviceNvfp4Linear> = vec![
-                    &layer.gate_proj, &layer.up_proj, &layer.down_proj,
-                ];
-                for cl in [&layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj] {
+                // All 7 dense projections are now CudaLinear; only NVFP4
+                // variants need cuBLASLt-CUTLASS scratch. Filter via
+                // `as_nvfp4()` before sizing.
+                let mut nvfp4s: Vec<&crate::cuda::DeviceNvfp4Linear> = Vec::new();
+                for cl in [&layer.gate_proj, &layer.up_proj, &layer.down_proj,
+                           &layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj] {
                     if let Some(l) = cl.as_nvfp4() { nvfp4s.push(l); }
                 }
                 nvfp4s
