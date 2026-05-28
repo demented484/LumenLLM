@@ -1189,6 +1189,9 @@ impl CudaLlamaExecutor {
             image_embeds: None,
             image_token_id: 0,
             image_n_tokens: 0,
+            audio_embeds: None,
+            audio_token_id: 0,
+            audio_n_tokens: 0,
         })
     }
 

@@ -116,7 +116,7 @@ pub fn run_env() -> Result<()> {
             cuda_attn_compare(config, prompt, reference)?
         }
         Command::Gates(config, gates) => run_gates(config, gates)?,
-        Command::Generate(config, mut request, image) => {
+        Command::Generate(config, mut request, image, audio_mel) => {
             let engine = AegisEngine::build(config)?;
             // Stage I.2 multimodal: if --image was passed, load + preprocess
             // it + run the vision tower to produce image-soft-token embeddings
@@ -161,6 +161,44 @@ pub fn run_env() -> Result<()> {
                     );
                 }
                 request.image_injection = Some(injection);
+            }
+            // Audio multimodal: if --audio-mel was passed, load the precomputed
+            // log-mel features + run the audio tower to produce audio-soft-token
+            // embeddings in text-embedding space, then attach to the request so
+            // the engine's prefill splices them at `<audio_soft_token>` positions.
+            // Mirrors the image path (BOA + N audio tokens + EOA expansion).
+            if let Some(mel_path) = audio_mel {
+                let injection = compute_audio_injection(&engine, &mel_path)?;
+                eprintln!(
+                    "audio: {} tokens × {} hidden",
+                    injection.n_tokens, injection.hidden
+                );
+                let cfg = &engine.artifact.config;
+                let text = aegisllm_base::text::TextProcessor::from_artifact(&engine.artifact)?;
+                let aud_tok_u32 = injection.audio_token_id as u32;
+                let audio_marker = text.token_string(aud_tok_u32)
+                    .ok_or_else(|| AegisError::InvalidPlan(format!(
+                        "audio: tokenizer has no string for audio_token_id={}",
+                        aud_tok_u32
+                    )))?;
+                let boa = cfg.boa_token_id.and_then(|id| text.token_string(id));
+                let eoa = cfg.eoa_token_id.and_then(|id| text.token_string(id));
+                if request.prompt.contains(&audio_marker) {
+                    let boa_s = boa.as_deref().unwrap_or("");
+                    let eoa_s = eoa.as_deref().unwrap_or("");
+                    let mut block = String::with_capacity(
+                        boa_s.len() + audio_marker.len() * injection.n_tokens + eoa_s.len()
+                    );
+                    block.push_str(boa_s);
+                    for _ in 0..injection.n_tokens { block.push_str(&audio_marker); }
+                    block.push_str(eoa_s);
+                    request.prompt = request.prompt.replacen(&audio_marker, &block, 1);
+                    eprintln!(
+                        "audio: expanded `{}` to {}{}×{}{} block",
+                        audio_marker, boa_s, injection.n_tokens, audio_marker, eoa_s,
+                    );
+                }
+                request.audio_injection = Some(injection);
             }
             let output = engine.generate(request)?;
             println!("{}", output.text);
@@ -384,5 +422,78 @@ fn compute_image_injection(
         n_tokens,
         hidden: text_hidden,
         image_token_id: image_token_id as usize,
+    })
+}
+
+/// Load precomputed log-mel features from a raw f32 `.bin` (`[n_frames, 128]`),
+/// run the audio tower, and return an `AudioInjection` ready to splice into the
+/// prompt's embedding stream. Mirrors `compute_image_injection`.
+///
+/// v1 INPUT: the `.bin` holds raw little-endian f32, row-major
+/// `[n_frames, n_mel_bins]`. We infer `n_frames = byte_len / (4 * n_mel_bins)`.
+///
+/// TODO(gpu-verify): the real mel front-end (frame=320 hop=160 fft=512 @16kHz →
+/// 100 frames/s, 128 log-mel bins, per-feature normalization) is NOT
+/// implemented this pass — the caller must precompute the mel features. Add an
+/// FFT/ffmpeg front-end in a later pass.
+fn compute_audio_injection(
+    engine: &AegisEngine,
+    mel_path: &Path,
+) -> Result<aegisllm_base::generation::AudioInjection> {
+    use aegisllm_base::tensor::storage::TensorStorageLoader;
+    use aegisllm_cuda::executor::audio::{AudioEncoderShape, AudioTower};
+
+    let device = engine
+        .inventory
+        .gpus
+        .first()
+        .map(|gpu| gpu.index)
+        .ok_or_else(|| AegisError::Unsupported("no CUDA device for --audio-mel".into()))?;
+    let cuda_config = engine.cuda;
+    let cuda = aegisllm_cuda::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
+    let cuda_weights = cuda.weight_loader();
+    let mut loader = TensorStorageLoader::new();
+
+    let shape = AudioEncoderShape::from_artifact(&engine.artifact)?;
+    eprintln!(
+        "audio: loading tower ({}L hidden={} heads={} head_dim={})...",
+        shape.num_layers, shape.hidden_size, shape.num_attention_heads, shape.head_dim
+    );
+    let n_mel = shape.n_mel_bins;
+    let tower = AudioTower::from_artifact(
+        &engine.artifact, shape, &cuda_weights, device, &mut loader,
+    )?;
+
+    // Load the raw f32 [n_frames, n_mel] log-mel features.
+    let bytes = std::fs::read(mel_path)
+        .map_err(|e| AegisError::InvalidPlan(format!("read {mel_path:?}: {e}")))?;
+    if bytes.len() % (4 * n_mel) != 0 {
+        return Err(AegisError::InvalidPlan(format!(
+            "audio-mel: {} bytes not a multiple of 4*n_mel_bins ({})",
+            bytes.len(), 4 * n_mel
+        )));
+    }
+    let n_frames = bytes.len() / (4 * n_mel);
+    let mut mel = vec![0.0_f32; n_frames * n_mel];
+    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+        mel[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    eprintln!("audio: {n_frames} frames × {n_mel} mel → running tower forward...");
+
+    let t0 = std::time::Instant::now();
+    let embeds = tower.forward(&cuda, &mel, n_frames)?;
+    eprintln!("audio: forward done in {:.2}s", t0.elapsed().as_secs_f64());
+
+    let text_hidden = tower.embed_audio.rows;
+    let n_tokens = if text_hidden > 0 { embeds.len() / text_hidden } else { 0 };
+
+    let audio_token_id = engine.artifact.config.audio_token_id.ok_or_else(|| {
+        AegisError::InvalidPlan("audio: config.json missing `audio_token_id` (top-level)".into())
+    })?;
+    Ok(aegisllm_base::generation::AudioInjection {
+        data: embeds,
+        n_tokens,
+        hidden: text_hidden,
+        audio_token_id: audio_token_id as usize,
     })
 }

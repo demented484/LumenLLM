@@ -33,6 +33,7 @@ pub fn run_quality_smoke(config: EngineConfig) -> Result<Vec<QualitySmokeResult>
                 },
                 stop_token_ids: Vec::new(),
                 image_injection: None,
+                audio_injection: None,
             })?;
             validate_quality_output(&case, &output.text)?;
             Ok(QualitySmokeResult { case, output })

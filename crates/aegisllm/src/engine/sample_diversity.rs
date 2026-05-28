@@ -62,6 +62,7 @@ pub fn run_sample_diversity(
             sampling,
             stop_token_ids: Vec::new(),
             image_injection: None,
+            audio_injection: None,
         })?;
         // First "word" of the output is usually a stable proxy for the
         // model's first sampled token (greedy-tokenizers concatenate

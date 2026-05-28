@@ -106,6 +106,17 @@ pub trait GenerationBackendPrimitives: Debug + Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Attach audio-encoder soft-token embeddings for the next prefill. The
+    /// prefill embed step splices them into the embedding stream at every
+    /// position whose token id matches `injection.audio_token_id`. Default no-op.
+    fn set_audio_injection(
+        &self,
+        _state: &mut dyn GenerationState,
+        _injection: &crate::generation::AudioInjection,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait ModelExecutorBackend: GenerationBackendPrimitives {

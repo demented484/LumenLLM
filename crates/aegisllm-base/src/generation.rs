@@ -14,6 +14,9 @@ pub struct GenerateRequest {
     /// Stage I.2: multimodal image embeddings spliced into the prefill at
     /// every `image_token_id` slot. `None` for text-only.
     pub image_injection: Option<ImageInjection>,
+    /// Audio-encoder soft-token embeddings spliced into the prefill at every
+    /// `audio_token_id` slot. `None` for text/image-only requests.
+    pub audio_injection: Option<AudioInjection>,
 }
 
 impl PartialEq for GenerateRequest {
@@ -25,6 +28,7 @@ impl PartialEq for GenerateRequest {
             && self.sampling == other.sampling
             && self.stop_token_ids == other.stop_token_ids
             && self.image_injection.is_some() == other.image_injection.is_some()
+            && self.audio_injection.is_some() == other.audio_injection.is_some()
     }
 }
 
@@ -36,6 +40,7 @@ impl Default for GenerateRequest {
             sampling: SamplingConfig::default(),
             stop_token_ids: Vec::new(),
             image_injection: None,
+            audio_injection: None,
         }
     }
 }
@@ -51,6 +56,19 @@ pub struct ImageInjection {
     pub n_tokens: usize,
     pub hidden: usize,
     pub image_token_id: usize,
+}
+
+/// Audio soft-token embeddings spliced into the prefill embedding stream.
+/// Layout mirrors `ImageInjection`: `data` is row-major `[n_tokens, hidden]`
+/// f32 in the LLM's text-embedding space. The prefill embed step overwrites
+/// every input position whose token id == `audio_token_id` with consecutive
+/// rows of `data`; tokens beyond `n_tokens` cycle.
+#[derive(Debug, Clone)]
+pub struct AudioInjection {
+    pub data: Vec<f32>,
+    pub n_tokens: usize,
+    pub hidden: usize,
+    pub audio_token_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

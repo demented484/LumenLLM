@@ -173,6 +173,42 @@ impl CudaLlamaExecutor {
                 }
                 self.runtime.upload_f32_slice_to_device(&hidden_host, &mut prefill.hidden)?;
             }
+
+            // Audio soft-token injection — exact parallel of the image splice
+            // above. Overwrite slots whose token id == audio_token_id with
+            // consecutive rows from the VRAM-resident audio-embeddings buffer
+            // (already in text-hidden space; NOT scaled by embed_scale, so we
+            // overwrite AFTER the embed_scale step). Gated so non-audio prompts
+            // are unaffected.
+            if state.audio_embeds.is_some()
+                && state.audio_n_tokens > 0
+                && chunk.iter().any(|&t| t as u32 == state.audio_token_id)
+            {
+                let h = self.hidden_size;
+                let n_aud = state.audio_n_tokens;
+                let aud_tok_id = state.audio_token_id;
+                let aud_data = self.runtime.download_f32(
+                    state.audio_embeds.as_ref().unwrap()
+                )?;
+                let mut hidden_host = self.runtime.download_f32(&prefill.hidden)?;
+                let mut aud_row_idx = 0usize;
+                for (slot, &tok) in chunk.iter().enumerate() {
+                    if tok as u32 != aud_tok_id { continue; }
+                    let src_row = aud_row_idx % n_aud;
+                    aud_row_idx += 1;
+                    let src_off = src_row * h;
+                    let dst_off = slot * h;
+                    hidden_host[dst_off..dst_off + h]
+                        .copy_from_slice(&aud_data[src_off..src_off + h]);
+                }
+                if std::env::var("AEGIS_DEBUG_INJECT").is_ok() {
+                    eprintln!(
+                        "[inject-audio] chunk_len={} n_aud={} injected_rows={}",
+                        chunk.len(), n_aud, aud_row_idx
+                    );
+                }
+                self.runtime.upload_f32_slice_to_device(&hidden_host, &mut prefill.hidden)?;
+            }
             // PLE (Per-Layer Embeddings) token-entry compute for this chunk —
             // mirrors `forward_next_token`/`forward_hidden` on the decode side.
             // Without this call, the chunked prefill ran 42 layers WITHOUT the

@@ -237,8 +237,8 @@ fn parse_serve(args: &[String]) -> Result<Command> {
 }
 
 fn parse_generate(args: &[String]) -> Result<Command> {
-    let (config, request, image) = parse_generate_request(args, "generate")?;
-    Ok(Command::Generate(config, request, image))
+    let (config, request, image, audio_mel) = parse_generate_request(args, "generate")?;
+    Ok(Command::Generate(config, request, image, audio_mel))
 }
 
 fn parse_quality_diff(args: &[String]) -> Result<Command> {
@@ -268,7 +268,7 @@ fn parse_quality_diff(args: &[String]) -> Result<Command> {
                 .into(),
         )
     })?;
-    let (config, request, _image) = parse_generate_request(&filtered, "quality-diff")?;
+    let (config, request, _image, _audio_mel) = parse_generate_request(&filtered, "quality-diff")?;
     Ok(Command::QualityDiff(config, request, reference_path))
 }
 
@@ -330,7 +330,7 @@ fn parse_bench_generate(args: &[String]) -> Result<Command> {
         ));
     }
 
-    let (config, mut request, _image) = parse_generate_request(&generate_args, "bench-generate")?;
+    let (config, mut request, _image, _audio_mel) = parse_generate_request(&generate_args, "bench-generate")?;
     if !prompt_repeats.is_empty() || !chunk_sizes.is_empty() {
         if prompt_repeats.is_empty() {
             prompt_repeats.push(prompt_repeat);
@@ -628,7 +628,7 @@ fn parse_bench_format(value: &str) -> Result<BenchOutputFormat> {
 fn parse_generate_request(
     args: &[String],
     command: &str,
-) -> Result<(EngineConfig, GenerateRequest, Option<PathBuf>)> {
+) -> Result<(EngineConfig, GenerateRequest, Option<PathBuf>, Option<PathBuf>)> {
     let mut engine_args = Vec::new();
     let mut prompt = None;
     let mut max_tokens = 32;
@@ -636,6 +636,7 @@ fn parse_generate_request(
     let mut top_k = None;
     let mut top_p = None;
     let mut image_path: Option<PathBuf> = None;
+    let mut audio_mel_path: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -643,6 +644,9 @@ fn parse_generate_request(
         match flag.as_str() {
             "--prompt" => prompt = Some(take_value(args, &mut i, flag)?),
             "--image" => image_path = Some(PathBuf::from(take_value(args, &mut i, flag)?)),
+            "--audio-mel" => {
+                audio_mel_path = Some(PathBuf::from(take_value(args, &mut i, flag)?))
+            }
             "--max-tokens" => max_tokens = parse_value(args, &mut i, flag)?,
             "--temp" | "--temperature" => temperature = Some(parse_value(args, &mut i, flag)?),
             "--top-k" => top_k = Some(parse_value(args, &mut i, flag)?),
@@ -683,8 +687,10 @@ fn parse_generate_request(
             sampling,
             stop_token_ids: Vec::new(),
             image_injection: None,
+            audio_injection: None,
         },
         image_path,
+        audio_mel_path,
     ))
 }
 
