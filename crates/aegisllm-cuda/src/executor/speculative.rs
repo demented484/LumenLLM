@@ -711,6 +711,21 @@ impl CudaLlamaExecutor {
         )?;
 
         // 3. Decode position/seq_len, then the 4 Q-only layers vs target KV.
+        //
+        // TODO(gpu-verify): seq_len off-by-one. The draft is Q-ONLY — it never
+        // writes its own K/V — so the target KV slot at `draft_position` is NOT
+        // populated at draft time (the target only writes it later, during
+        // verification, when it forwards this token). The attention kernel
+        // attends keys at positions [0, seq_len). For a draft token whose query
+        // sits at `draft_position`, the valid (already-written) target KV spans
+        // positions [0, draft_position), i.e. seq_len SHOULD be `draft_position`
+        // (= base_pos + k), NOT `draft_position + 1`. Using `+1` here makes the
+        // draft attend one KV slot of stale/garbage ring-buffer data. We keep
+        // `+1` to mirror the normal decode convention (where the current token's
+        // KV *is* written before attention) but this is the single most likely
+        // numeric bug in the spec path; verify against a reference EAGLE trace
+        // and change to `draft_position` if the draft must exclude the
+        // not-yet-written current position.
         let seq_len = draft_position + 1;
         rt.copy_u32_to_device(&[draft_position as u32], decode_position)?;
         rt.copy_u32_to_device(&[seq_len as u32], decode_seq_len)?;
@@ -735,8 +750,20 @@ impl CudaLlamaExecutor {
     /// Returns the produced token ids (caller decodes to text).
     ///
     /// EXACT-MATCH greedy only this pass.
-    /// TODO(gpu-verify): temp>0 rejection sampling deferred; accept/reject
-    /// position rewind semantics need a reference trace.
+    ///
+    /// KV bookkeeping: verification runs ONE proven `forward_hidden` per
+    /// proposed position and STOPS at the first mismatch, so the target KV is
+    /// only ever written for positions that are accepted (or the single
+    /// mismatch-corrected token) — strictly in order. Rejected proposals never
+    /// reach a target forward, so there is NO speculative KV to roll back and
+    /// `state.position` is always exactly `base_pos + (#forwards)`. A future
+    /// batched-verify optimization (one forward over all K proposals) WOULD
+    /// write K positions up front and need an explicit position/KV rewind on
+    /// rejection — that variant is deferred.
+    ///
+    /// TODO(gpu-verify): temp>0 rejection sampling deferred; for the batched
+    /// (non-per-token) verify path, the accept/reject position rewind semantics
+    /// need a reference trace. The per-token path used here needs no rewind.
     pub(super) fn generate_speculative_greedy(
         &self,
         state: &mut CudaLlamaState,
@@ -800,33 +827,54 @@ impl CudaLlamaExecutor {
             // it — draft attention reads target KV but the override path skips
             // KV store). So the forwards below fill positions base_pos,
             // base_pos+1, ... exactly as a non-spec run.
+            //
+            // Invariant on `next`: the current `next` was ALREADY pushed to
+            // `generated` at the top of this outer iteration. `next` must NEVER
+            // be pushed again here. Each target forward produces `target_tok`,
+            // the prediction for the FOLLOWING position. When we accept it and
+            // there is still another proposal to verify, we push `target_tok`
+            // now (it is strictly followed by another verified token) and feed
+            // it as the next `verify_input`. When `target_tok` is the LAST
+            // accepted/verified token of the round (final proposal accepted, or
+            // a mismatch correction), we leave it UNPUSHED in `next` so the next
+            // outer iteration pushes it exactly once. This avoids the
+            // double-push that would duplicate the final accepted token.
             let mut verify_input = next;
-            for k in 0..proposals.len() {
+            let n_proposals = proposals.len();
+            for k in 0..n_proposals {
                 self.forward_hidden(state, verify_input)?;
                 let target_tok = self.sample_next_from_current_hidden(state, &greedy)?;
-                if target_tok == proposals[k] {
-                    if is_eos(target_tok) {
-                        next = target_tok;
-                        break;
-                    }
-                    if request.stop_token_ids.contains(&target_tok) {
-                        generated.push(target_tok);
-                        break 'outer;
-                    }
-                    if generated.len() >= request.max_tokens {
-                        // Budget hit on an accepted token; it was already pushed
-                        // before this round, so just stop.
-                        break 'outer;
-                    }
-                    generated.push(target_tok);
-                    verify_input = target_tok;
-                    next = target_tok;
-                } else {
-                    // Mismatch: emit the target's corrected argmax, abandon the
-                    // rest. Draft re-seeds from `next` on the next outer round.
+                let accepted = target_tok == proposals[k];
+                // `target_tok` is the last token this round when it is a
+                // mismatch correction OR the final accepted proposal.
+                let is_last = !accepted || k + 1 == n_proposals;
+                if is_eos(target_tok) {
+                    // EOS: surface as the pending `next` (the outer loop's
+                    // is_eos check terminates without emitting it).
                     next = target_tok;
                     break;
                 }
+                if request.stop_token_ids.contains(&target_tok) {
+                    // Stop tokens are emitted (matches the outer-loop stop path)
+                    // and terminate generation.
+                    generated.push(target_tok);
+                    break 'outer;
+                }
+                if is_last {
+                    // Final token of the round (accepted-tail or mismatch
+                    // correction). Hand it to `next`, UNPUSHED — the next outer
+                    // iteration pushes it (or terminates on it).
+                    next = target_tok;
+                    break;
+                }
+                // Accepted, and strictly followed by another verified token:
+                // safe to emit now.
+                if generated.len() >= request.max_tokens {
+                    break 'outer;
+                }
+                generated.push(target_tok);
+                verify_input = target_tok;
+                next = target_tok;
             }
         }
         Ok(generated)
