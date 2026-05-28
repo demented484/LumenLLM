@@ -303,6 +303,23 @@ impl GenerationBackendPrimitives for CudaExecutorProvider {
         s.image_n_tokens = injection.n_tokens;
         Ok(())
     }
+
+    fn set_audio_injection(
+        &self,
+        state: &mut dyn GenerationState,
+        injection: &aegisllm_base::generation::AudioInjection,
+    ) -> Result<()> {
+        let cuda = self.cuda.as_ref().ok_or_else(|| {
+            AegisError::Unsupported("CUDA executor not initialized".into())
+        })?;
+        let s = cuda_state_mut(state)?;
+        // Upload [n_tokens, hidden] row-major f32 to VRAM.
+        let buf = cuda.upload_f32(&injection.data)?;
+        s.audio_embeds = Some(buf);
+        s.audio_token_id = injection.audio_token_id as u32;
+        s.audio_n_tokens = injection.n_tokens;
+        Ok(())
+    }
 }
 
 impl ModelExecutorBackend for CudaExecutorProvider {

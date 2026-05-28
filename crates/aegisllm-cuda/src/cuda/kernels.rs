@@ -46,4 +46,6 @@ pub(crate) const BLACKWELL_FP4_KERNEL_SRC: &str = concat!(
     include_str!("kernels/blackwell/vision_attention.cu"),
     "\n",
     include_str!("kernels/blackwell/vision_ops.cu"),
+    "\n",
+    include_str!("kernels/blackwell/audio_ops.cu"),
 );

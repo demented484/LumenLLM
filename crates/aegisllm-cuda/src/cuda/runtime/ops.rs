@@ -2009,6 +2009,226 @@ impl CudaRuntime {
         Ok(())
     }
 
+    // ── Gemma-4 audio tower (USM/Conformer) kernels. ─────────────────────
+
+    /// GLU split-half: `out[t, c] = a[t, c] * sigmoid(a[t, c + half])`.
+    /// `a` is `[n_frames, 2*half]`, `out` is `[n_frames, half]`. Matches
+    /// `torch.nn.functional.glu(x, dim=-1)` (first half value, second half gate).
+    pub fn audio_glu_halfsplit_device(
+        &self,
+        a: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>,
+        n_frames: usize,
+        half: usize,
+    ) -> Result<()> {
+        if a.len() < n_frames * 2 * half || out.len() < n_frames * half {
+            return Err(AegisError::InvalidPlan(format!(
+                "audio_glu_halfsplit: a={} need {}, out={} need {}",
+                a.len(), n_frames * 2 * half, out.len(), n_frames * half
+            )));
+        }
+        let half_u = u32_arg("half", half)?;
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_frames", n_frames)?, ceil_div(half_u, 256), 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_frames_u = n_frames as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.audio_glu_halfsplit)
+                .arg(&a.slice)
+                .arg(&mut out.slice)
+                .arg(&n_frames_u)
+                .arg(&half_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch audio_glu_halfsplit"))?;
+        Ok(())
+    }
+
+    /// Depthwise causal conv1d over time. `in`/`out` are `[n_frames, channels]`,
+    /// `w` is `[channels, kernel]` (flattened from `[channels, 1, kernel]`).
+    /// Left-padded by `kernel-1` (causal); out-of-range frames read as zero.
+    pub fn audio_depthwise_causal_conv1d_device(
+        &self,
+        input: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+        n_frames: usize,
+        channels: usize,
+        kernel: usize,
+    ) -> Result<()> {
+        let total = n_frames * channels;
+        if input.len() < total || output.len() < total || weight.len() < channels * kernel {
+            return Err(AegisError::InvalidPlan(format!(
+                "audio_depthwise_causal_conv1d: in={} out={} w={} (need in/out {}, w {})",
+                input.len(), output.len(), weight.len(), total, channels * kernel
+            )));
+        }
+        let channels_u = u32_arg("channels", channels)?;
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_frames", n_frames)?, ceil_div(channels_u, 256), 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_frames_u = n_frames as u32;
+        let kernel_u = kernel as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.audio_depthwise_causal_conv1d)
+                .arg(&input.slice)
+                .arg(&weight.slice)
+                .arg(&mut output.slice)
+                .arg(&n_frames_u)
+                .arg(&channels_u)
+                .arg(&kernel_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch audio_depthwise_causal_conv1d"))?;
+        Ok(())
+    }
+
+    /// Apply `per_dim_scale` to the attention query, in place. `q` is
+    /// `[n_frames, n_heads, head_dim]`; `per_dim_scale` is `[head_dim]` (raw
+    /// learned param — softplus is applied inside the kernel). `q_scale` is the
+    /// precomputed scalar `head_dim^-0.5 / softplus(0)`.
+    pub fn audio_per_dim_scale_device(
+        &self,
+        q: &mut DeviceBuffer<f32>,
+        per_dim_scale: &DeviceBuffer<f32>,
+        n_frames: usize,
+        n_heads: usize,
+        head_dim: usize,
+        q_scale: f32,
+    ) -> Result<()> {
+        if head_dim == 0 || head_dim > 1024 {
+            return Err(AegisError::InvalidPlan(format!(
+                "audio_per_dim_scale: head_dim={head_dim} out of range (1..=1024)"
+            )));
+        }
+        if per_dim_scale.len() < head_dim {
+            return Err(AegisError::InvalidPlan(format!(
+                "audio_per_dim_scale: per_dim_scale len {} < head_dim {}",
+                per_dim_scale.len(), head_dim
+            )));
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_frames", n_frames)?, u32_arg("n_heads", n_heads)?, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_heads_u = n_heads as u32;
+        let head_dim_u = head_dim as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.audio_per_dim_scale)
+                .arg(&mut q.slice)
+                .arg(&per_dim_scale.slice)
+                .arg(&n_heads_u)
+                .arg(&head_dim_u)
+                .arg(&q_scale)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch audio_per_dim_scale"))?;
+        Ok(())
+    }
+
+    /// Clamp a flat f32 buffer in place to `[-c, c]` (HF gradient clipping).
+    ///
+    /// NOTE: the current `AudioTower::forward` does the gradient clamp on the
+    /// CPU (the threshold is 1e10, effectively inert), so this GPU kernel is
+    /// defined+registered but not yet on the hot path. Kept for the future
+    /// fused-GPU Conformer pass. Same applies to `audio_add_bias_rows_device`.
+    pub fn audio_clamp_inplace_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        n: usize,
+        c: f32,
+    ) -> Result<()> {
+        if x.len() < n {
+            return Err(AegisError::InvalidPlan(format!(
+                "audio_clamp_inplace: x len {} < n {}", x.len(), n
+            )));
+        }
+        let n_u = u32_arg("n", n)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(n_u, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.audio_clamp_inplace)
+                .arg(&mut x.slice)
+                .arg(&n_u)
+                .arg(&c)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch audio_clamp_inplace"))?;
+        Ok(())
+    }
+
+    /// SiLU in place: `x = x * sigmoid(x)` over the first `n` elements.
+    pub fn audio_silu_inplace_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<()> {
+        if x.len() < n {
+            return Err(AegisError::InvalidPlan(format!(
+                "audio_silu_inplace: x len {} < n {}", x.len(), n
+            )));
+        }
+        let n_u = u32_arg("n", n)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(n_u, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.audio_silu_inplace)
+                .arg(&mut x.slice)
+                .arg(&n_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch audio_silu_inplace"))?;
+        Ok(())
+    }
+
+    /// Add a learned bias vector to each row of `x` `[n_rows, dim]`, in place.
+    pub fn audio_add_bias_rows_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        bias: &DeviceBuffer<f32>,
+        n_rows: usize,
+        dim: usize,
+    ) -> Result<()> {
+        if x.len() < n_rows * dim || bias.len() < dim {
+            return Err(AegisError::InvalidPlan(format!(
+                "audio_add_bias_rows: x={} need {}, bias={} need {}",
+                x.len(), n_rows * dim, bias.len(), dim
+            )));
+        }
+        let dim_u = u32_arg("dim", dim)?;
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_rows", n_rows)?, ceil_div(dim_u, 256), 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.audio_add_bias_rows)
+                .arg(&mut x.slice)
+                .arg(&bias.slice)
+                .arg(&dim_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch audio_add_bias_rows"))?;
+        Ok(())
+    }
+
     /// Stage I.2 vision row-softmax. In-place: for each of `n_rows` rows of
     /// `scores` (shape `[n_rows, n_cols]` row-major), pre-multiply by `scale`
     /// then apply numerically-stable softmax along the row. Used by the

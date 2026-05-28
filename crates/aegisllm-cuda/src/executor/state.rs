@@ -334,6 +334,13 @@ pub struct CudaLlamaState {
     pub image_embeds: Option<DeviceBuffer<f32>>,
     pub image_token_id: u32,
     pub image_n_tokens: usize,
+    /// Audio soft-token embeddings `[audio_n_tokens, hidden_size]` (VRAM).
+    /// The prefill embed step overwrites every input position whose token id
+    /// equals `audio_token_id` with consecutive rows from this buffer. Mirrors
+    /// the image-injection path.
+    pub audio_embeds: Option<DeviceBuffer<f32>>,
+    pub audio_token_id: u32,
+    pub audio_n_tokens: usize,
     /// Device buffers holding the current decode `position` and `seq_len` (= position + 1).
     /// Kept here (not in CudaScratch) so we can borrow them alongside `&mut scratch`.
     /// Updated before each decode step (outside graph capture), read by the ptr-based kernels.

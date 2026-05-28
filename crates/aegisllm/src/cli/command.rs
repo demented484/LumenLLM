@@ -54,11 +54,13 @@ pub enum Command {
     /// diff summary. `String` is the optional prompt override; the kernel is
     /// the run-1 reference backend.
     CudaAttnCompare(EngineConfig, Option<String>, CudaPrefillAttentionKernel),
-    /// `Option<PathBuf>` is the optional `--image PATH` for multimodal
+    /// First `Option<PathBuf>` is the optional `--image PATH` for multimodal
     /// generation; when present the CLI loads + preprocesses the image,
     /// runs the vision tower, and attaches the resulting embeddings to
-    /// the request before generating.
-    Generate(EngineConfig, GenerateRequest, Option<PathBuf>),
+    /// the request before generating. Second `Option<PathBuf>` is the optional
+    /// `--audio-mel PATH` (raw f32 `[n_frames, 128]` log-mel `.bin`); when
+    /// present the CLI runs the audio tower and splices the audio soft tokens.
+    Generate(EngineConfig, GenerateRequest, Option<PathBuf>, Option<PathBuf>),
     /// Greedy generation + character-level diff against a reference text.
     /// If the reference file doesn't exist yet, the current generation is saved
     /// to it (snapshot mode). On subsequent runs, the new generation is

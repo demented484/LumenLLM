@@ -34,6 +34,9 @@ pub fn generate_with_backend_timed<B: GenerationBackendPrimitives + ?Sized>(
     if let Some(ref injection) = request.image_injection {
         backend.set_image_injection(state.as_mut(), injection)?;
     }
+    if let Some(ref injection) = request.audio_injection {
+        backend.set_audio_injection(state.as_mut(), injection)?;
+    }
     let prefill_start = Instant::now();
     let mut next = backend.prefill_prompt(state.as_mut(), &prompt_tokens, &request.sampling)?;
     let prefill_elapsed = prefill_start.elapsed();
@@ -88,6 +91,9 @@ pub fn generate_streaming_with_backend<B: GenerationBackendPrimitives + ?Sized>(
     let mut state = backend.new_sequence_state()?;
     if let Some(ref injection) = request.image_injection {
         backend.set_image_injection(state.as_mut(), injection)?;
+    }
+    if let Some(ref injection) = request.audio_injection {
+        backend.set_audio_injection(state.as_mut(), injection)?;
     }
     let mut next = backend.prefill_prompt(state.as_mut(), &prompt_tokens, &request.sampling)?;
 
