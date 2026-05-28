@@ -254,6 +254,15 @@ impl ChatTemplate {
         if looks_preformatted(prompt) {
             return Ok(prompt.to_string());
         }
+        // We load the model's `chat_template.jinja` verbatim from the artifact
+        // folder; this is just the Jinja *context variable* we feed it. Match
+        // llama.cpp / vLLM / HF transformers defaults: `enable_thinking=true`
+        // (see llama.cpp `common/chat.h:169`). Set `AEGIS_ENABLE_THINKING=0`
+        // to force the no-CoT branch of the template (`<|channel>thought\n
+        // <channel|>` auto-emitted) for raw-speed completion-style use.
+        let enable_thinking = std::env::var("AEGIS_ENABLE_THINKING")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
         self.render(
             &[ChatMessage {
                 role: "user".into(),
@@ -261,7 +270,7 @@ impl ChatTemplate {
                 ..Default::default()
             }],
             None,
-            false,
+            enable_thinking,
             true,
         )
     }
