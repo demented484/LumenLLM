@@ -565,7 +565,24 @@ impl CudaLlamaExecutor {
             kv_first_store,
             kv_quantization: placement.kv_cache.quantization,
             registered_shards,
+            draft: None,
+            num_draft_tokens: super::speculative::default_num_draft_tokens(),
         })
+    }
+
+    /// Load and attach the EAGLE/MTP speculative-decoding draft model from
+    /// `draft_path`. Idempotent-ish: replaces any previously attached draft.
+    /// Gated by the caller (CLI `--draft-model` / `AEGIS_DRAFT_MODEL`); when
+    /// never called, `self.draft` stays `None` and generation is unchanged.
+    pub fn attach_draft_model(
+        &mut self,
+        draft_path: &std::path::Path,
+        num_draft_tokens: usize,
+    ) -> Result<()> {
+        let draft = super::speculative::load_draft_model(self, draft_path)?;
+        self.draft = Some(Box::new(draft));
+        self.num_draft_tokens = num_draft_tokens.max(1);
+        Ok(())
     }
 
     pub(super) fn new_state(&self) -> Result<CudaLlamaState> {
@@ -1192,6 +1209,9 @@ impl CudaLlamaExecutor {
             audio_embeds: None,
             audio_token_id: 0,
             audio_n_tokens: 0,
+            // Spec-decode draft scratch is attached separately by
+            // `new_spec_state()` when a draft model is present.
+            draft: None,
         })
     }
 

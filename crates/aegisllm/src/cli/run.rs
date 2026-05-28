@@ -288,6 +288,11 @@ pub fn run_env() -> Result<()> {
                 policy: config.engine.policy,
                 enable_executor: false,
                 cuda: config.engine.cuda,
+                // TODO(spec-decode): the `serve` path does not yet plumb a draft
+                // model through `ServeConfig`/`EngineConfigFragment`. Spec-decode
+                // is wired for `generate` (--draft-model). Serve stays plain.
+                draft_model: None,
+                num_draft_tokens: 4,
             };
             // Build the preview engine WITHOUT the executor first so we can
             // compute readiness from the placement + runtime plan. If the

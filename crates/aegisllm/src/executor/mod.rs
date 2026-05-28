@@ -47,12 +47,24 @@ impl Executor {
         placement: &ResolvedPlacement,
         runtime: RuntimePlan,
         cuda: CudaRuntimeConfig,
+        // EAGLE/MTP speculative-decoding draft model path. CUDA-only; ignored
+        // by the CPU / hybrid / wgpu backends (spec-decode is wired only on the
+        // CUDA executor). `None` = no spec-decode.
+        draft_model: Option<&std::path::Path>,
+        num_draft_tokens: usize,
     ) -> Result<Self> {
         let readiness = readiness_for_plan(placement, &runtime);
         if !readiness.runnable {
             return Err(AegisError::Unsupported(format!(
                 "executor plan is not runnable yet: {}",
                 readiness.limitations.join("; ")
+            )));
+        }
+        if draft_model.is_some() && readiness.selected_backend != "cuda" {
+            return Err(AegisError::Unsupported(format!(
+                "speculative decoding (--draft-model) is only supported on the CUDA backend; \
+                 selected backend is `{}`",
+                readiness.selected_backend
             )));
         }
         match readiness.selected_backend {
@@ -62,8 +74,13 @@ impl Executor {
                 )?),
             }),
             "cuda" => Ok(Self {
-                backend: Box::new(CudaExecutorProvider::from_artifact(
-                    artifact, graph, placement, &runtime, cuda,
+                backend: Box::new(CudaExecutorProvider::from_artifact_with_draft(
+                    artifact,
+                    graph,
+                    placement,
+                    &runtime,
+                    cuda,
+                    draft_model.map(|p| (p, num_draft_tokens)),
                 )?),
             }),
             "hybrid" => Ok(Self {

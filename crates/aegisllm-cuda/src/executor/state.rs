@@ -251,6 +251,12 @@ pub(super) struct CudaLlamaExecutor {
     /// pages (DMA fast path); on drop, every shard is unregistered before
     /// its mmap is unmapped.
     pub(super) registered_shards: crate::cuda::registered_shards::RegisteredShards,
+    /// EAGLE/MTP speculative-decoding draft model. `Some` only when the engine
+    /// was loaded with `--draft-model <path>` (or `AEGIS_DRAFT_MODEL`). When
+    /// `None`, generation runs exactly as before (no spec-decode path is taken).
+    pub(super) draft: Option<Box<DraftModel>>,
+    /// Number of tokens the draft proposes per spec-decode round (default 4).
+    pub(super) num_draft_tokens: usize,
 }
 
 #[derive(Debug)]
@@ -317,6 +323,111 @@ pub(super) struct CudaLayer {
     pub(super) kv_shared_from: Option<usize>,
 }
 
+/// EAGLE/MTP speculative-decoding draft model (Gemma-4 E4B-it-assistant).
+///
+/// The draft is a tiny (4-layer, hidden=256) Q-ONLY decoder that re-uses the
+/// TARGET model's per-layer K/V cache: each draft layer computes only `q_proj`
+/// + `q_norm` + RoPE and attends against a target layer's KV buffer (exactly
+/// the `kv_shared_override` machinery the target's own shared layers use, but
+/// cross-model). The draft input is
+/// `concat(draft_embed(token), target_backbone_hidden)` → `pre_projection` →
+/// 4 Q-only layers → `final_norm` → `post_projection` (back to backbone width,
+/// fed forward as the next step's `target_backbone_hidden`) and, in parallel,
+/// the centroid-masked sparse LM head produces the proposed token.
+///
+/// All weights are VRAM-resident (~135 MiB total) and the draft NEVER allocates
+/// its own KV cache — it reads the target's.
+#[derive(Debug)]
+pub(super) struct DraftModel {
+    /// `pre_projection.weight` — `[draft_hidden, 2*backbone_hidden]` BF16
+    /// (checkpoint: `[256, 5120]` = 256 × (2 × 2560)). Input is
+    /// `concat(token_embed[backbone_hidden], target_backbone_hidden[backbone_hidden])`
+    /// → `draft_hidden`. NOTE: the token-embed half uses the TARGET model's
+    /// backbone embedding (2560-wide), NOT the draft's own 256-wide
+    /// `embed_tokens` (which is the tied sparse LM head). TODO(gpu-verify):
+    /// confirm the token-embed source (target embed_tokens vs a draft-side
+    /// 2560-wide embed) and the concat order (`[embed, hidden]` vs `[hidden,
+    /// embed]`) against the HF `Gemma4AssistantModel` reference.
+    pub(super) pre_projection: DeviceBf16Matrix,
+    /// `post_projection.weight` — `[backbone_hidden, draft_hidden]` BF16.
+    /// Projects the draft's post-`final_norm` hidden back to backbone width so
+    /// it can seed the next draft step as `target_backbone_hidden`.
+    pub(super) post_projection: DeviceBf16Matrix,
+    /// `model.embed_tokens.weight` — `[vocab, draft_hidden]` BF16. Tied to the
+    /// sparse LM head (the draft scores candidate token rows of THIS matrix).
+    /// Used ONLY by the centroid sparse head, not by `pre_projection`.
+    pub(super) embed_tokens: DeviceBf16Matrix,
+    /// `model.norm.weight` — `[draft_hidden]` f32 RMSNorm.
+    pub(super) final_norm: DeviceBuffer<f32>,
+    /// 4 Q-only decoder layers. Built as full `CudaLayer`s (with stub k/v/o
+    /// where unused) so the existing `forward_attention_device` + `forward_mlp_device`
+    /// can run them unchanged when `kv_shared_override` is always `Some`.
+    pub(super) layers: Vec<CudaLayer>,
+    /// Per draft layer: index into the TARGET's `state.layers` whose KV cache
+    /// this draft layer attends. Selected at load time as the most recent
+    /// KV-owning target layer of matching attention type (sliding ↔ sliding,
+    /// global ↔ global). TODO(gpu-verify): confirm cross-model parent choice.
+    pub(super) target_kv_layer: Vec<usize>,
+    /// Centroid-masked sparse LM head apparatus.
+    pub(super) centroid_head: CentroidHead,
+    pub(super) draft_hidden: usize,
+    pub(super) backbone_hidden: usize,
+    pub(super) num_attention_heads: usize,
+    pub(super) rms_norm_eps: f32,
+    pub(super) draft_hidden_for_scratch: usize,
+    pub(super) intermediate_for_scratch: usize,
+    pub(super) num_centroids: usize,
+    pub(super) max_candidates: usize,
+}
+
+impl DraftModel {
+    pub(super) fn draft_hidden(&self) -> usize { self.draft_hidden }
+}
+
+/// Centroid-masked sparse LM head. The full `[vocab, draft_hidden]` head is
+/// never scored densely; the draft hidden is first scored against
+/// `num_centroids` centroids, the top-`top_k` centroids are kept, and each
+/// maps (via `token_ordering`) to a contiguous block of candidate token ids.
+/// The dense head is then evaluated only over the gathered candidate rows.
+#[derive(Debug)]
+pub(super) struct CentroidHead {
+    /// `masked_embedding.centroids.weight` — `[num_centroids, draft_hidden]` BF16.
+    pub(super) centroids: DeviceBf16Matrix,
+    /// `masked_embedding.token_ordering` — `[vocab]` i64 (loaded as u32). The
+    /// permutation that groups the vocab by centroid: token ids sorted so each
+    /// centroid owns a contiguous slice. TODO(gpu-verify): confirm the exact
+    /// per-centroid slice boundaries (uniform vocab/num_centroids vs an offsets
+    /// table) against the HF `Gemma4MaskedEmbedding` reference.
+    pub(super) token_ordering: Vec<u32>,
+    pub(super) num_centroids: usize,
+    /// `centroid_intermediate_top_k` — number of centroids kept (=32).
+    pub(super) top_k: usize,
+    pub(super) vocab_size: usize,
+}
+
+/// Draft-only scratch buffers (all small — draft hidden is 256).
+#[derive(Debug)]
+pub(super) struct DraftScratch {
+    /// `[2*backbone_hidden]` — the pre_projection input concat buffer
+    /// `[token_embed(backbone), target_backbone_hidden(backbone)]`.
+    pub(super) pre_proj_input: DeviceBuffer<f32>,
+    /// `[backbone_hidden]` — target-embedding lookup of the current draft token
+    /// (first half of the pre_projection input).
+    pub(super) draft_embed: DeviceBuffer<f32>,
+    /// `[draft_hidden]` — running draft hidden (post pre_projection / per layer).
+    pub(super) hidden: DeviceBuffer<f32>,
+    /// `[draft_hidden]` — final-normed draft hidden (input to head + post_projection).
+    pub(super) final_hidden: DeviceBuffer<f32>,
+    /// `[backbone_hidden]` — post_projection output (seeds next step's target hidden).
+    pub(super) backbone_out: DeviceBuffer<f32>,
+    /// `[num_centroids]` — centroid scores.
+    pub(super) centroid_scores: DeviceBuffer<f32>,
+    /// `[max_candidates]` — candidate token-id list (device).
+    pub(super) candidate_rows: DeviceBuffer<u32>,
+    /// `[max_candidates]` — candidate logits.
+    pub(super) candidate_logits: DeviceBuffer<f32>,
+}
+
 #[derive(Debug)]
 pub struct CudaLlamaState {
     pub(super) position: usize,
@@ -350,6 +461,32 @@ pub struct CudaLlamaState {
     /// When set, each subsequent step updates decode_position/decode_seq_len then replays
     /// this graph instead of issuing ~645 kernel launches.
     pub(super) decode_graph: Option<SendCudaGraph>,
+    /// Speculative-decoding draft scratch. `Some` only when the executor has a
+    /// draft model attached and this state was allocated for spec-decode. Holds
+    /// the draft's per-step buffers + the draft decoder `CudaScratch` (sized to
+    /// the draft's small 256-wide layers). All mutation of the draft happens
+    /// through the STATE (mirrors how the target's scratch lives on the state),
+    /// so the executor's `&self` weight references stay immutable.
+    pub(super) draft: Option<Box<DraftState>>,
+}
+
+/// Per-sequence speculative-decoding scratch (lives on `CudaLlamaState`).
+#[derive(Debug)]
+pub(super) struct DraftState {
+    /// Small per-step buffers (embed concat, centroid scores, candidate lists).
+    pub(super) scratch: DraftScratch,
+    /// Full `CudaScratch` sized to the draft's small decoder widths, reused by
+    /// `forward_attention_device` / `forward_mlp_device` for the draft's 4
+    /// Q-only layers. Separate from the target's scratch because the draft's
+    /// RMSNorm kernels require exact-length (256-wide) buffers.
+    pub(super) decoder_scratch: CudaScratch,
+    /// Throwaway `CudaLayerState` handed to `forward_attention_device` as its
+    /// `&mut layer_state` argument. The draft always passes
+    /// `kv_shared_override = Some(target_kv)`, and the override branch NEVER
+    /// reads or writes `layer_state.kv` — so this exists purely to satisfy the
+    /// function signature without aliasing the target's KV buffers. Its KV is a
+    /// 1-element stub.
+    pub(super) dummy_layer_state: CudaLayerState,
 }
 
 #[derive(Debug)]

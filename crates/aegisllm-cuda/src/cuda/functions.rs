@@ -189,6 +189,9 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) copy_row_f32: CudaFunction,
     pub(crate) argmax_blocks: CudaFunction,
     pub(crate) argmax_finalize: CudaFunction,
+    /// Speculative decoding: sparse lm_head matvec over an explicit candidate-row
+    /// list (centroid-masked draft head). Registered alongside the sampling kernels.
+    pub(crate) spec_sparse_lm_head_matvec: CudaFunction,
     pub(crate) axpy_f32: CudaFunction,
     pub(crate) zero_f32: CudaFunction,
     pub(crate) scale_f32: CudaFunction,
@@ -700,6 +703,7 @@ impl CudaKernelFunctions {
             copy_row_f32: load(&module, "aegis_copy_row_f32")?,
             argmax_blocks: load(&module, "aegis_argmax_f32_blocks")?,
             argmax_finalize: load(&module, "aegis_argmax_f32_finalize")?,
+            spec_sparse_lm_head_matvec: load(&module, "aegis_spec_sparse_lm_head_matvec")?,
             axpy_f32: load(&module, "aegis_axpy_f32")?,
             zero_f32: load(&module, "aegis_zero_f32")?,
             scale_f32: load(&module, "aegis_scale_f32")?,
