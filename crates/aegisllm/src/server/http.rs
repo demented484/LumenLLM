@@ -384,6 +384,7 @@ fn generate_http_response(
             min_p: json_f32(&parsed, "min_p", default_sampling.min_p),
         },
         stop_token_ids,
+        image_injection: None,
     };
     let started = Instant::now();
     let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
@@ -526,6 +527,7 @@ fn generate_anthropic_response(
             min_p: json_f32(&parsed, "min_p", default_sampling.min_p),
         },
         stop_token_ids,
+        image_injection: None,
     };
     let started = Instant::now();
     let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
@@ -642,6 +644,7 @@ fn generate_google_response(
             min_p: json_f32(generation_config, "minP", default_sampling.min_p),
         },
         stop_token_ids: Vec::new(),
+        image_injection: None,
     };
     let started = Instant::now();
     let _kv_guard = GenerationGuard::new(Arc::clone(&state.active_generations));
@@ -797,6 +800,7 @@ fn sse_openai(
             min_p: json_f32(parsed, "min_p", default_sampling.min_p),
         },
         stop_token_ids,
+        image_injection: None,
     };
 
     write_sse_headers(stream)?;
@@ -965,6 +969,7 @@ fn sse_anthropic(
             min_p: json_f32(parsed, "min_p", default_sampling.min_p),
         },
         stop_token_ids: Vec::new(),
+        image_injection: None,
     };
 
     write_sse_headers(stream)?;
@@ -1079,6 +1084,7 @@ fn sse_google(
             min_p: json_f32(generation_config, "minP", default_sampling.min_p),
         },
         stop_token_ids: Vec::new(),
+        image_injection: None,
     };
 
     write_sse_headers(stream)?;

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct GenerateRequest {
     pub prompt: String,
     pub max_tokens: usize,
@@ -11,6 +11,21 @@ pub struct GenerateRequest {
     /// present so the model halts cleanly after a tool_call instead of
     /// hallucinating a fake tool response.
     pub stop_token_ids: Vec<usize>,
+    /// Stage I.2: multimodal image embeddings spliced into the prefill at
+    /// every `image_token_id` slot. `None` for text-only.
+    pub image_injection: Option<ImageInjection>,
+}
+
+impl PartialEq for GenerateRequest {
+    fn eq(&self, other: &Self) -> bool {
+        // image_injection (Vec<f32>) excluded from equality to keep
+        // existing tests/snapshots stable; equality is text-only.
+        self.prompt == other.prompt
+            && self.max_tokens == other.max_tokens
+            && self.sampling == other.sampling
+            && self.stop_token_ids == other.stop_token_ids
+            && self.image_injection.is_some() == other.image_injection.is_some()
+    }
 }
 
 impl Default for GenerateRequest {
@@ -20,8 +35,22 @@ impl Default for GenerateRequest {
             max_tokens: 0,
             sampling: SamplingConfig::default(),
             stop_token_ids: Vec::new(),
+            image_injection: None,
         }
     }
+}
+
+/// Image embeddings spliced into the prefill embedding stream. Layout:
+/// `data` is row-major `[n_tokens, hidden]` f32 in the LLM's text-embedding
+/// space. The prefill embed step overwrites every input position whose
+/// token id == `image_token_id` with consecutive rows of `data`; tokens
+/// beyond `n_tokens` cycle.
+#[derive(Debug, Clone)]
+pub struct ImageInjection {
+    pub data: Vec<f32>,
+    pub n_tokens: usize,
+    pub hidden: usize,
+    pub image_token_id: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

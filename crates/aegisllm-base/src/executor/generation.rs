@@ -28,6 +28,12 @@ pub fn generate_with_backend_timed<B: GenerationBackendPrimitives + ?Sized>(
     }
 
     let mut state = backend.new_sequence_state()?;
+    // Stage I.2 multimodal: attach image embeddings to the state so the
+    // prefill embed step can splice them at the image-token placeholder
+    // positions. No-op for text-only backends / requests.
+    if let Some(ref injection) = request.image_injection {
+        backend.set_image_injection(state.as_mut(), injection)?;
+    }
     let prefill_start = Instant::now();
     let mut next = backend.prefill_prompt(state.as_mut(), &prompt_tokens, &request.sampling)?;
     let prefill_elapsed = prefill_start.elapsed();
@@ -80,6 +86,9 @@ pub fn generate_streaming_with_backend<B: GenerationBackendPrimitives + ?Sized>(
         ));
     }
     let mut state = backend.new_sequence_state()?;
+    if let Some(ref injection) = request.image_injection {
+        backend.set_image_injection(state.as_mut(), injection)?;
+    }
     let mut next = backend.prefill_prompt(state.as_mut(), &prompt_tokens, &request.sampling)?;
 
     let mut generated = Vec::new();

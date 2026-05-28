@@ -54,7 +54,11 @@ pub enum Command {
     /// diff summary. `String` is the optional prompt override; the kernel is
     /// the run-1 reference backend.
     CudaAttnCompare(EngineConfig, Option<String>, CudaPrefillAttentionKernel),
-    Generate(EngineConfig, GenerateRequest),
+    /// `Option<PathBuf>` is the optional `--image PATH` for multimodal
+    /// generation; when present the CLI loads + preprocesses the image,
+    /// runs the vision tower, and attaches the resulting embeddings to
+    /// the request before generating.
+    Generate(EngineConfig, GenerateRequest, Option<PathBuf>),
     /// Greedy generation + character-level diff against a reference text.
     /// If the reference file doesn't exist yet, the current generation is saved
     /// to it (snapshot mode). On subsequent runs, the new generation is

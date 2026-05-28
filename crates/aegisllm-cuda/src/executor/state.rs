@@ -264,6 +264,13 @@ pub struct CudaLlamaState {
     pub(super) scratch: CudaScratch,
     pub(super) prefill: Option<CudaPrefillScratch>,
     pub(super) prefill_timings: CudaPrefillStageTimings,
+    /// Stage I.2 image injection — VRAM-resident image-soft-token embeddings
+    /// `[image_n_tokens, hidden_size]`. The prefill embed step overwrites
+    /// every input position whose token id equals `image_token_id` with
+    /// consecutive rows from this buffer.
+    pub image_embeds: Option<DeviceBuffer<f32>>,
+    pub image_token_id: u32,
+    pub image_n_tokens: usize,
     /// Device buffers holding the current decode `position` and `seq_len` (= position + 1).
     /// Kept here (not in CudaScratch) so we can borrow them alongside `&mut scratch`.
     /// Updated before each decode step (outside graph capture), read by the ptr-based kernels.

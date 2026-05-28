@@ -110,6 +110,39 @@ impl CudaLlamaExecutor {
                 let h = self.runtime.download_f32(&prefill.hidden)?;
                 eprintln!("[DUMP {tag} EMBED] first8={:?}", &h[0..8.min(h.len())]);
             }
+
+            // Stage I.2 image injection. After embed lookup + embed_scale,
+            // overwrite slots whose token id == image_token_id with rows from
+            // the VRAM-resident image-embeddings buffer. Image embeddings are
+            // already scaled by sqrt(hidden) by the vision pooler — DO NOT
+            // apply embed_scale to them. We mirror that by overwriting AFTER
+            // the embed_scale step.
+            // Implementation: CPU-side splice via download/modify/upload.
+            // Tolerable cost: hidden ≈ 9 KB/token × ~280 image tokens + ~chunk
+            // text tokens = a few MB per prefill chunk, one-shot.
+            if state.image_embeds.is_some()
+                && state.image_n_tokens > 0
+                && chunk.iter().any(|&t| t as u32 == state.image_token_id)
+            {
+                let h = self.hidden_size;
+                let n_img = state.image_n_tokens;
+                let img_tok_id = state.image_token_id;
+                let img_data = self.runtime.download_f32(
+                    state.image_embeds.as_ref().unwrap()
+                )?;
+                let mut hidden_host = self.runtime.download_f32(&prefill.hidden)?;
+                let mut img_row_idx = 0usize;
+                for (slot, &tok) in chunk.iter().enumerate() {
+                    if tok as u32 != img_tok_id { continue; }
+                    let src_row = img_row_idx % n_img;
+                    img_row_idx += 1;
+                    let src_off = src_row * h;
+                    let dst_off = slot * h;
+                    hidden_host[dst_off..dst_off + h]
+                        .copy_from_slice(&img_data[src_off..src_off + h]);
+                }
+                self.runtime.upload_f32_slice_to_device(&hidden_host, &mut prefill.hidden)?;
+            }
             record_prefill_stage(
                 &self.runtime,
                 &mut state.prefill_timings,

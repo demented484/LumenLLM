@@ -28,6 +28,12 @@ const PREFILL_SPLIT_K_TOKENS: usize = CUDA_PREFILL_DENSE_SPLIT_K_TOKENS;
 const PREFILL_SPLIT_Q_BLOCK: usize = 16;
 
 impl CudaLlamaExecutor {
+    /// Upload an f32 host slice into a fresh VRAM buffer (for image-injection
+    /// embeddings and similar small one-off uploads).
+    pub(super) fn upload_f32(&self, values: &[f32]) -> Result<crate::cuda::DeviceBuffer<f32>> {
+        self.runtime.upload_f32(values)
+    }
+
     pub(super) fn from_artifact(
         artifact: &ModelArtifact,
         graph: &ModelGraph,
@@ -1073,6 +1079,9 @@ impl CudaLlamaExecutor {
             decode_position: self.runtime.alloc_u32(1)?,
             decode_seq_len: self.runtime.alloc_u32(1)?,
             decode_graph: None,
+            image_embeds: None,
+            image_token_id: 0,
+            image_n_tokens: 0,
         })
     }
 

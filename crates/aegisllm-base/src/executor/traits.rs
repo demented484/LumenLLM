@@ -95,6 +95,17 @@ pub trait GenerationBackendPrimitives: Debug + Send + Sync {
     ) -> Option<PrefillStageTimings> {
         None
     }
+
+    /// Attach multimodal image embeddings for the next prefill. The prefill
+    /// embed step splices them into the embedding stream at every position
+    /// whose token id matches `injection.image_token_id`. Default no-op.
+    fn set_image_injection(
+        &self,
+        _state: &mut dyn GenerationState,
+        _injection: &crate::generation::ImageInjection,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait ModelExecutorBackend: GenerationBackendPrimitives {

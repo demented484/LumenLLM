@@ -116,8 +116,35 @@ pub fn run_env() -> Result<()> {
             cuda_attn_compare(config, prompt, reference)?
         }
         Command::Gates(config, gates) => run_gates(config, gates)?,
-        Command::Generate(config, request) => {
+        Command::Generate(config, mut request, image) => {
             let engine = AegisEngine::build(config)?;
+            // Stage I.2 multimodal: if --image was passed, load + preprocess
+            // it + run the vision tower to produce image-soft-token embeddings
+            // in text-embedding space, then attach to the request so the
+            // engine's prefill step splices them at `<|image|>` positions.
+            if let Some(path) = image {
+                let injection = compute_image_injection(&engine, &path)?;
+                eprintln!(
+                    "vision: {} tokens × {} hidden",
+                    injection.n_tokens, injection.hidden
+                );
+                // The chat template emits a single `<|image|>` marker; HF's
+                // processor expands that into N image_soft_tokens in the
+                // tokenized prompt. We replicate that here by replacing
+                // the single marker with N copies BEFORE tokenization, so
+                // the prompt has N=image_n_tokens placeholder positions
+                // matching the N image-embedding rows we produce.
+                let marker = "<|image|>";
+                if request.prompt.contains(marker) {
+                    let replacement = marker.repeat(injection.n_tokens);
+                    request.prompt = request.prompt.replacen(marker, &replacement, 1);
+                    eprintln!(
+                        "vision: expanded `<|image|>` to {} markers in prompt",
+                        injection.n_tokens
+                    );
+                }
+                request.image_injection = Some(injection);
+            }
             let output = engine.generate(request)?;
             println!("{}", output.text);
             eprintln!(
@@ -252,4 +279,59 @@ pub fn run_env() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Stage I.2 helper: load an image, preprocess, run the vision tower, and
+/// return an `ImageInjection` ready to splice into the prompt's embedding
+/// stream. Currently hard-coded to Gemma-4 (image_token_id=258880).
+fn compute_image_injection(
+    engine: &AegisEngine,
+    image_path: &Path,
+) -> Result<aegisllm_base::generation::ImageInjection> {
+    use aegisllm_base::modalities::image_preprocess::ImageProcessor;
+    use aegisllm_base::tensor::storage::TensorStorageLoader;
+    use aegisllm_cuda::executor::vision::{VisionEncoderShape, VisionTower};
+
+    let device = engine
+        .inventory
+        .gpus
+        .first()
+        .map(|gpu| gpu.index)
+        .ok_or_else(|| AegisError::Unsupported("no CUDA device for --image".into()))?;
+    let cuda_config = engine.cuda;
+    let cuda = aegisllm_cuda::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
+    let cuda_weights = cuda.weight_loader();
+    let mut loader = TensorStorageLoader::new();
+
+    eprintln!("vision: loading tower...");
+    let tower = VisionTower::from_artifact(
+        &engine.artifact,
+        VisionEncoderShape::gemma4(),
+        &cuda_weights,
+        device,
+        &mut loader,
+    )?;
+
+    eprintln!("vision: preprocessing {image_path:?}...");
+    let processor = ImageProcessor::gemma4();
+    let img = processor.load(image_path)?;
+    eprintln!(
+        "vision: {}x{} → {} patches → {} soft tokens",
+        img.height, img.width, img.num_patches(), img.num_tokens()
+    );
+
+    eprintln!("vision: running tower forward (~55s)...");
+    let t0 = std::time::Instant::now();
+    let embeds = tower.forward(&cuda, &img.patches, img.num_patches_h, img.num_patches_w)?;
+    let dt = t0.elapsed();
+    let text_hidden = tower.projector.rows;
+    let n_tokens = img.num_tokens();
+    eprintln!("vision: forward done in {:.2}s", dt.as_secs_f64());
+
+    Ok(aegisllm_base::generation::ImageInjection {
+        data: embeds,
+        n_tokens,
+        hidden: text_hidden,
+        image_token_id: 258880, // Gemma-4 `<|image|>`
+    })
 }

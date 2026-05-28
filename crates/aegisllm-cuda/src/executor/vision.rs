@@ -585,9 +585,27 @@ impl VisionTower {
             }
         }
 
-        // ── Projector: [n_tokens, vision_hidden] @ projector.T  →  [n_tokens, text_hidden]
-        // projector.weight = [text_hidden=2816, vision_hidden=1152].
-        let pooled_f32 = runtime.upload_f32(&pooled)?;
+        // ── Multimodal embedder (Gemma4MultimodalEmbedder):
+        //   1. RMSNorm-no-scale over the pooler output (per-token, dim=vision_hidden).
+        //      Brings the per-token RMS to ~1 before the projection — without
+        //      this, the projector output magnitude blows up by ~sqrt(hidden)
+        //      and the LLM treats it as noise.
+        //   2. Linear projection vision_hidden → text_hidden.
+        let mut pooled_normed = vec![0f32; pooled.len()];
+        for t in 0..n_tokens {
+            let mut sum = 0f32;
+            for c in 0..h {
+                let v = pooled[t * h + c];
+                sum += v * v;
+            }
+            let rms = 1.0 / ((sum / h as f32) + eps).sqrt();
+            for c in 0..h {
+                pooled_normed[t * h + c] = pooled[t * h + c] * rms;
+            }
+        }
+
+        // Projector: [n_tokens, vision_hidden] @ projector.T → [n_tokens, text_hidden].
+        let pooled_f32 = runtime.upload_f32(&pooled_normed)?;
         let mut pooled_bf16 = runtime.alloc_u16(n_tokens * h)?;
         runtime.f32_to_bf16_device(&pooled_f32, n_tokens * h, &mut pooled_bf16)?;
         let text_hidden = self.projector.rows;
