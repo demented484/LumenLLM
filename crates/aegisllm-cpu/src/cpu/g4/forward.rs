@@ -21,7 +21,9 @@ use super::moe::router_softmax_topk_normalized;
 use super::norm::{rms_norm_per_head_into, rms_norm_per_head_no_weight_into};
 use super::ple;
 use super::rope::apply_rope_partial_in_place;
-use super::state::{G4CpuExecutor, G4CpuLayer, G4CpuState, G4DenseMlp, G4MoeLayer};
+use super::state::{
+    G4CpuExecutor, G4CpuLayer, G4CpuState, G4DenseMlp, G4MoeLayer, G4PrefillScratch,
+};
 use crate::cpu::math::{add_into, geglu_into, rms_norm_into};
 use crate::cpu::simd;
 use aegisllm_base::error::{AegisError, Result};
@@ -179,28 +181,37 @@ impl G4CpuExecutor {
         let ple_row = self.ple.as_ref().map(|p| num_layers * p.ple_dim).unwrap_or(0);
         let mut last_hidden = vec![0.0_f32; hidden_size];
 
+        // Reusable scratch pool: allocated ONCE, reused across every layer and
+        // chunk (no per-layer alloc, no re-zero). `per_layer_inputs` is sized to
+        // the max chunk width once, too.
+        let mut scratch = self.new_prefill_scratch(PREFILL_MAX_BATCH);
+        let mut per_layer_inputs = vec![0.0_f32; PREFILL_MAX_BATCH * ple_row];
+
         let mut chunk_start = start_position;
         for chunk in token_ids.chunks(PREFILL_MAX_BATCH) {
             let batch = chunk.len();
 
             // ── Token entry (per token) ─────────────────────────────────
-            // 1-2. embed lookup + embed scale → hidden[batch, hidden].
-            let mut hidden = vec![0.0_f32; batch * hidden_size];
+            // 1-2. embed lookup + embed scale → main_a[batch, hidden]. main_a is
+            // the per-layer hidden input; the per-layer ping-pong is
+            //   attention: main_a (hidden) → main_b (residual)
+            //   MLP:       main_b (residual) → main_a (hidden_out)
+            // so the result lands back in main_a after every layer.
             for (i, &token) in chunk.iter().enumerate() {
                 let row = self.embed_tokens.row(token)?;
-                let dst = &mut hidden[i * hidden_size..(i + 1) * hidden_size];
+                let dst = &mut scratch.main_a[i * hidden_size..(i + 1) * hidden_size];
                 dst.copy_from_slice(&row);
                 simd::scale_in_place(dst, self.embed_scale);
             }
 
             // 3. PLE token-entry: per-token per_layer_inputs[batch, num_layers*ple_dim].
-            let mut per_layer_inputs = vec![0.0_f32; batch * ple_row];
+            // Each row is fully written by compute_per_layer_inputs before any read.
             if let Some(ple_g) = &self.ple {
                 for i in 0..batch {
                     ple::compute_per_layer_inputs(
                         ple_g,
                         chunk[i],
-                        &hidden[i * hidden_size..(i + 1) * hidden_size],
+                        &scratch.main_a[i * hidden_size..(i + 1) * hidden_size],
                         num_layers,
                         self.rms_norm_eps,
                         &mut per_layer_inputs[i * ple_row..(i + 1) * ple_row],
@@ -213,9 +224,10 @@ impl G4CpuExecutor {
             let mut t_mlp = std::time::Duration::ZERO;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
                 // ── Attention sublayer (batched proj + per-position attn) ──
+                // Reads scratch.main_a (hidden), writes scratch.main_b (residual).
                 let t0 = std::time::Instant::now();
-                let residual = self.forward_attention_batched(
-                    state, layer, layer_idx, chunk_start, batch, &hidden,
+                self.forward_attention_batched(
+                    state, &mut scratch, layer, layer_idx, chunk_start, batch,
                 )?;
                 if timing {
                     t_attn += t0.elapsed();
@@ -224,9 +236,9 @@ impl G4CpuExecutor {
                 // ── MLP sublayer ──────────────────────────────────────────
                 // Dense + PLE (E2B/E4B) is fully batched; MoE falls back to
                 // per-token forward_moe (two-stream combine batching deferred).
+                // Reads scratch.main_b (residual), writes scratch.main_a (hidden_out).
                 let t1 = std::time::Instant::now();
-                let hidden_out = if let Some(moe) = &layer.moe {
-                    let mut out = vec![0.0_f32; batch * hidden_size];
+                if let Some(moe) = &layer.moe {
                     for i in 0..batch {
                         let pli = if ple_row == 0 {
                             &[][..]
@@ -238,24 +250,23 @@ impl G4CpuExecutor {
                             moe,
                             layer_idx,
                             pli,
-                            &residual[i * hidden_size..(i + 1) * hidden_size],
+                            &scratch.main_b[i * hidden_size..(i + 1) * hidden_size],
                         )?;
-                        out[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(&row);
+                        scratch.main_a[i * hidden_size..(i + 1) * hidden_size]
+                            .copy_from_slice(&row);
                     }
-                    out
-                } else if let Some(mlp) = &layer.mlp {
+                } else if layer.mlp.is_some() {
                     self.forward_dense_mlp_batched(
-                        layer, mlp, layer_idx, batch, &per_layer_inputs, ple_row, &residual,
-                    )?
+                        &mut scratch, layer, layer_idx, batch, &per_layer_inputs, ple_row,
+                    )?;
                 } else {
                     return Err(AegisError::InvalidPlan(format!(
                         "g4 layer {layer_idx} has neither dense MLP nor MoE"
                     )));
-                };
+                }
                 if timing {
                     t_mlp += t1.elapsed();
                 }
-                hidden = hidden_out;
             }
             if timing {
                 eprintln!(
@@ -267,7 +278,9 @@ impl G4CpuExecutor {
             }
 
             // Keep the last token of this chunk; final chunk's last = prompt last.
-            last_hidden.copy_from_slice(&hidden[(batch - 1) * hidden_size..batch * hidden_size]);
+            // Layer output lives in main_a.
+            last_hidden
+                .copy_from_slice(&scratch.main_a[(batch - 1) * hidden_size..batch * hidden_size]);
             state.position += batch;
             chunk_start += batch;
         }
@@ -411,17 +424,25 @@ impl G4CpuExecutor {
     /// (`matmul_into`); every per-head norm, RoPE, and KV store is per-token; and
     /// attention is PER-POSITION (token i attends to cached K/V at positions
     /// `[.. chunk_start+i]`, sliding window respected). Math mirrors
-    /// `forward_attention` exactly. Returns `residual[batch, hidden]`.
+    /// `forward_attention` exactly.
+    ///
+    /// Buffers come from the reusable `scratch` pool (no per-call alloc/zero):
+    /// reads `scratch.main_a[..batch*hidden]` (hidden), writes the post-residual
+    /// `residual` into `scratch.main_b[..batch*hidden]`. Every scratch region is
+    /// FULLY OVERWRITTEN before any read — `normed`/`q`/`attn_context`/`proj_out`
+    /// /`main_b` by matmul/rms/attention writes; `k`/`v` only on non-shared
+    /// layers (on shared layers their stale content is NEVER read: attention
+    /// reads the parent layer's already-stored KV, and the local k/v are unused).
     #[allow(clippy::too_many_arguments)]
     fn forward_attention_batched(
         &self,
         state: &mut G4CpuState,
+        scratch: &mut G4PrefillScratch,
         layer: &G4CpuLayer,
         layer_idx: usize,
         chunk_start: usize,
         batch: usize,
-        hidden: &[f32],
-    ) -> Result<Vec<f32>> {
+    ) -> Result<()> {
         let hidden_size = self.hidden_size;
         let head_dim = layer.layer_head_dim;
         let num_kv_heads = layer.layer_num_kv_heads;
@@ -429,68 +450,102 @@ impl G4CpuExecutor {
         let kv_width = num_kv_heads * head_dim;
         let shared = layer.kv_shared_from.is_some();
 
-        // 4. input_layernorm (RMS), per token.
-        let mut input_normed = vec![0.0_f32; batch * hidden_size];
-        input_normed
+        // 4. input_layernorm (RMS), per token. Reads main_a (hidden), writes
+        // normed[..batch*hidden] (fully overwritten by the par_chunks).
+        let hidden = &scratch.main_a[..batch * hidden_size];
+        let normed = &mut scratch.normed[..batch * hidden_size];
+        normed
             .par_chunks_mut(hidden_size)
             .zip(hidden.par_chunks(hidden_size))
             .for_each(|(out, h)| {
                 rms_norm_into(h, &layer.input_norm_weight, self.rms_norm_eps, out);
             });
 
-        // 5-6. BATCHED Q (and K/V unless shared) projections.
-        let mut q = vec![0.0_f32; batch * q_width];
-        layer.q_proj.matmul_into(&input_normed, batch, &mut q)?;
-        let mut k = vec![0.0_f32; batch * kv_width];
-        let mut v = vec![0.0_f32; batch * kv_width];
+        // 5-6. BATCHED Q (and K/V unless shared) projections. matmul_into fully
+        // writes its [batch*width] output.
+        let normed = &scratch.normed[..batch * hidden_size];
+        layer
+            .q_proj
+            .matmul_into(normed, batch, &mut scratch.q[..batch * q_width])?;
         if !shared {
-            layer.k_proj.matmul_into(&input_normed, batch, &mut k)?;
-            layer.v_proj.matmul_into(&input_normed, batch, &mut v)?;
+            layer
+                .k_proj
+                .matmul_into(normed, batch, &mut scratch.k[..batch * kv_width])?;
+            layer
+                .v_proj
+                .matmul_into(normed, batch, &mut scratch.v[..batch * kv_width])?;
         }
 
         // 7-11. Per-token per-head q/k/v norms + partial RoPE at the token's
-        // position. (Same ops as forward_attention, looped over the batch.)
-        for i in 0..batch {
-            let position = chunk_start + i;
-            let q_slice = &mut q[i * q_width..(i + 1) * q_width];
-            // 7. per-head q_norm (RMS, weighted).
-            if let Some(qnw) = &layer.q_norm_weight {
-                let mut tmp = vec![0.0_f32; q_width];
-                rms_norm_per_head_into(
-                    q_slice, qnw, self.num_attention_heads, head_dim, self.rms_norm_eps, &mut tmp,
-                );
-                q_slice.copy_from_slice(&tmp);
-            }
-            if !shared {
-                let k_slice = &mut k[i * kv_width..(i + 1) * kv_width];
-                // 8. per-head k_norm (RMS, weighted).
-                if let Some(knw) = &layer.k_norm_weight {
-                    let mut tmp = vec![0.0_f32; kv_width];
-                    rms_norm_per_head_into(
-                        k_slice, knw, num_kv_heads, head_dim, self.rms_norm_eps, &mut tmp,
-                    );
-                    k_slice.copy_from_slice(&tmp);
-                }
-                // 9. per-head v_norm (RMS, NO weight) — whenever q_norm present.
-                if layer.q_norm_weight.is_some() {
-                    let v_slice = &mut v[i * kv_width..(i + 1) * kv_width];
-                    let mut tmp = vec![0.0_f32; kv_width];
-                    rms_norm_per_head_no_weight_into(
-                        v_slice, num_kv_heads, head_dim, self.rms_norm_eps, &mut tmp,
-                    );
-                    v_slice.copy_from_slice(&tmp);
-                }
-            }
-            // 10-11. RoPE on Q (and K unless shared) at this token's position.
-            apply_rope_partial_in_place(
-                q_slice, position, self.num_attention_heads, head_dim, layer.partial_dim, &layer.rope,
-            )?;
-            if !shared {
-                let k_slice = &mut k[i * kv_width..(i + 1) * kv_width];
-                apply_rope_partial_in_place(
-                    k_slice, position, num_kv_heads, head_dim, layer.partial_dim, &layer.rope,
-                )?;
-            }
+        // position, PARALLELIZED over tokens (each token's q/k/v slices are
+        // independent). Math is identical to the previous sequential loop and to
+        // `forward_attention`. The q/k/v norms run in-place via a per-token scratch
+        // `tmp` (allocated inside the closure, per token, not pooled).
+        let q_norm_weight = layer.q_norm_weight.as_ref();
+        let k_norm_weight = layer.k_norm_weight.as_ref();
+        let q = &mut scratch.q[..batch * q_width];
+        if shared {
+            // Only Q is normed/RoPE'd; K/V are unused on shared layers.
+            q.par_chunks_mut(q_width)
+                .enumerate()
+                .try_for_each(|(i, q_slice)| -> Result<()> {
+                    let position = chunk_start + i;
+                    if let Some(qnw) = q_norm_weight {
+                        let mut tmp = vec![0.0_f32; q_width];
+                        rms_norm_per_head_into(
+                            q_slice, qnw, self.num_attention_heads, head_dim, self.rms_norm_eps,
+                            &mut tmp,
+                        );
+                        q_slice.copy_from_slice(&tmp);
+                    }
+                    apply_rope_partial_in_place(
+                        q_slice, position, self.num_attention_heads, head_dim, layer.partial_dim,
+                        &layer.rope,
+                    )
+                })?;
+        } else {
+            let k = &mut scratch.k[..batch * kv_width];
+            let v = &mut scratch.v[..batch * kv_width];
+            q.par_chunks_mut(q_width)
+                .zip(k.par_chunks_mut(kv_width))
+                .zip(v.par_chunks_mut(kv_width))
+                .enumerate()
+                .try_for_each(|(i, ((q_slice, k_slice), v_slice))| -> Result<()> {
+                    let position = chunk_start + i;
+                    // 7. per-head q_norm (RMS, weighted).
+                    if let Some(qnw) = q_norm_weight {
+                        let mut tmp = vec![0.0_f32; q_width];
+                        rms_norm_per_head_into(
+                            q_slice, qnw, self.num_attention_heads, head_dim, self.rms_norm_eps,
+                            &mut tmp,
+                        );
+                        q_slice.copy_from_slice(&tmp);
+                    }
+                    // 8. per-head k_norm (RMS, weighted).
+                    if let Some(knw) = k_norm_weight {
+                        let mut tmp = vec![0.0_f32; kv_width];
+                        rms_norm_per_head_into(
+                            k_slice, knw, num_kv_heads, head_dim, self.rms_norm_eps, &mut tmp,
+                        );
+                        k_slice.copy_from_slice(&tmp);
+                    }
+                    // 9. per-head v_norm (RMS, NO weight) — whenever q_norm present.
+                    if q_norm_weight.is_some() {
+                        let mut tmp = vec![0.0_f32; kv_width];
+                        rms_norm_per_head_no_weight_into(
+                            v_slice, num_kv_heads, head_dim, self.rms_norm_eps, &mut tmp,
+                        );
+                        v_slice.copy_from_slice(&tmp);
+                    }
+                    // 10-11. RoPE on Q and K at this token's position.
+                    apply_rope_partial_in_place(
+                        q_slice, position, self.num_attention_heads, head_dim, layer.partial_dim,
+                        &layer.rope,
+                    )?;
+                    apply_rope_partial_in_place(
+                        k_slice, position, num_kv_heads, head_dim, layer.partial_dim, &layer.rope,
+                    )
+                })?;
         }
 
         // 12. Q scale (see forward_attention: 1.0 for Gemma-4, else 1/sqrt(d)).
@@ -508,19 +563,20 @@ impl G4CpuExecutor {
             let layer_state = &mut state.layers[layer_idx];
             for i in 0..batch {
                 layer_state.push(
-                    &k[i * kv_width..(i + 1) * kv_width],
-                    &v[i * kv_width..(i + 1) * kv_width],
+                    &scratch.k[i * kv_width..(i + 1) * kv_width],
+                    &scratch.v[i * kv_width..(i + 1) * kv_width],
                 )?;
             }
         }
 
         // 14. PER-POSITION attention: token i attends to KV positions
         // [window_start .. chunk_start+i+1). Read the (now fully-populated) KV
-        // buffer for this layer (own) or its parent (shared).
+        // buffer for this layer (own) or its parent (shared). Writes
+        // attn_context[..batch*q_width] (fully overwritten by the par_chunks).
         let parent_idx = layer.kv_shared_from.unwrap_or(layer_idx);
         let kv_state = &state.layers[parent_idx];
-        let mut attn_context = vec![0.0_f32; batch * q_width];
-        attn_context
+        let q = &scratch.q[..batch * q_width];
+        scratch.attn_context[..batch * q_width]
             .par_chunks_mut(q_width)
             .enumerate()
             .try_for_each(|(i, ctx)| -> Result<()> {
@@ -541,13 +597,20 @@ impl G4CpuExecutor {
                 )
             })?;
 
-        // 15. BATCHED o_proj.
-        let mut attn_out = vec![0.0_f32; batch * hidden_size];
-        layer.o_proj.matmul_into(&attn_context, batch, &mut attn_out)?;
+        // 15. BATCHED o_proj → proj_out[..batch*hidden] (fully written).
+        layer.o_proj.matmul_into(
+            &scratch.attn_context[..batch * q_width],
+            batch,
+            &mut scratch.proj_out[..batch * hidden_size],
+        )?;
 
         // 16-17. post_attention sublayer norm (PrePost) + residual add, per token.
-        let mut residual = vec![0.0_f32; batch * hidden_size];
-        residual
+        // Reads main_a (hidden) + proj_out (attn_out), writes main_b (residual,
+        // fully overwritten by the per-token add_into).
+        let G4PrefillScratch { main_a, main_b, proj_out, .. } = &mut *scratch;
+        let hidden = &main_a[..batch * hidden_size];
+        let attn_out = &proj_out[..batch * hidden_size];
+        main_b[..batch * hidden_size]
             .par_chunks_mut(hidden_size)
             .zip(hidden.par_chunks(hidden_size))
             .zip(attn_out.par_chunks(hidden_size))
@@ -560,69 +623,95 @@ impl G4CpuExecutor {
                     add_into(h, a, res)
                 }
             })?;
-        Ok(residual)
+        Ok(())
     }
 
     /// Batched dense MLP sublayer (steps 18-25) over `batch` tokens. gate/up/down
     /// projections are BATCHED (`matmul_into`); pre/post norms, GeGLU, PLE
     /// additive, residual and layer_scalar are per-token. Math mirrors
-    /// `forward_dense_mlp` exactly. Returns `hidden_out[batch, hidden]`.
+    /// `forward_dense_mlp` exactly.
+    ///
+    /// Buffers come from the reusable `scratch` pool (no per-call alloc/zero):
+    /// reads `scratch.main_b[..batch*hidden]` (residual), writes the layer output
+    /// `hidden_out` into `scratch.main_a[..batch*hidden]`. Each scratch region is
+    /// FULLY OVERWRITTEN before any read — `normed` by the pre-FFN rms, `gate`
+    /// /`up` by the projections, `swiglu` by GeGLU, `proj_out` by the down proj,
+    /// `main_a` by the post-FFN norm+residual add (which writes ALL of main_a
+    /// before PLE's `+=` reads it).
     #[allow(clippy::too_many_arguments)]
     fn forward_dense_mlp_batched(
         &self,
+        scratch: &mut G4PrefillScratch,
         layer: &G4CpuLayer,
-        mlp: &G4DenseMlp,
         layer_idx: usize,
         batch: usize,
         per_layer_inputs: &[f32],
         ple_row: usize,
-        residual: &[f32],
-    ) -> Result<Vec<f32>> {
+    ) -> Result<()> {
         let hidden_size = self.hidden_size;
+        let mlp = layer.mlp.as_ref().expect("forward_dense_mlp_batched on non-dense layer");
         let inter = mlp.gate_proj.rows();
 
-        // 18. pre_feedforward_layernorm (RMS), per token.
-        let mut post_normed = vec![0.0_f32; batch * hidden_size];
-        post_normed
-            .par_chunks_mut(hidden_size)
-            .zip(residual.par_chunks(hidden_size))
-            .for_each(|(out, r)| {
-                rms_norm_into(r, &layer.pre_mlp_norm_weight, self.rms_norm_eps, out);
-            });
+        // 18. pre_feedforward_layernorm (RMS), per token. Reads main_b (residual),
+        // writes normed[..batch*hidden] (fully overwritten).
+        {
+            let residual = &scratch.main_b[..batch * hidden_size];
+            let normed = &mut scratch.normed[..batch * hidden_size];
+            normed
+                .par_chunks_mut(hidden_size)
+                .zip(residual.par_chunks(hidden_size))
+                .for_each(|(out, r)| {
+                    rms_norm_into(r, &layer.pre_mlp_norm_weight, self.rms_norm_eps, out);
+                });
+        }
 
-        // 19. BATCHED gate / up.
-        let mut gate = vec![0.0_f32; batch * inter];
-        let mut up = vec![0.0_f32; batch * inter];
-        mlp.gate_proj.matmul_into(&post_normed, batch, &mut gate)?;
-        mlp.up_proj.matmul_into(&post_normed, batch, &mut up)?;
+        // 19. BATCHED gate / up → gate[..batch*inter], up[..batch*inter] (fully written).
+        {
+            let normed = &scratch.normed[..batch * hidden_size];
+            mlp.gate_proj.matmul_into(normed, batch, &mut scratch.gate[..batch * inter])?;
+            mlp.up_proj.matmul_into(normed, batch, &mut scratch.up[..batch * inter])?;
+        }
 
-        // 20. GeGLU-tanh activation, per token.
-        let mut swiglu = vec![0.0_f32; batch * inter];
-        swiglu
-            .par_chunks_mut(inter)
-            .zip(gate.par_chunks(inter))
-            .zip(up.par_chunks(inter))
-            .try_for_each(|((s, g), u)| -> Result<()> { geglu_into(g, u, s) })?;
+        // 20. GeGLU-tanh activation, per token → swiglu[..batch*inter] (fully written).
+        {
+            let G4PrefillScratch { gate, up, swiglu, .. } = &mut *scratch;
+            let gate = &gate[..batch * inter];
+            let up = &up[..batch * inter];
+            swiglu[..batch * inter]
+                .par_chunks_mut(inter)
+                .zip(gate.par_chunks(inter))
+                .zip(up.par_chunks(inter))
+                .try_for_each(|((s, g), u)| -> Result<()> { geglu_into(g, u, s) })?;
+        }
 
-        // 21. BATCHED down.
-        let mut mlp_out = vec![0.0_f32; batch * hidden_size];
-        mlp.down_proj.matmul_into(&swiglu, batch, &mut mlp_out)?;
+        // 21. BATCHED down → proj_out[..batch*hidden] (fully written).
+        mlp.down_proj.matmul_into(
+            &scratch.swiglu[..batch * inter],
+            batch,
+            &mut scratch.proj_out[..batch * hidden_size],
+        )?;
 
-        // 22-23. post_feedforward sublayer norm (PrePost) + residual add, per token (parallel).
-        let mut hidden_out = vec![0.0_f32; batch * hidden_size];
-        hidden_out
-            .par_chunks_mut(hidden_size)
-            .zip(residual.par_chunks(hidden_size))
-            .zip(mlp_out.par_chunks(hidden_size))
-            .try_for_each(|((out, r), m)| -> Result<()> {
-                if let Some(post_norm) = &layer.post_mlp_sublayer_norm {
-                    let mut m_normed = vec![0.0_f32; hidden_size];
-                    rms_norm_into(m, post_norm, self.rms_norm_eps, &mut m_normed);
-                    add_into(r, &m_normed, out)
-                } else {
-                    add_into(r, m, out)
-                }
-            })?;
+        // 22-23. post_feedforward sublayer norm (PrePost) + residual add, per token
+        // (parallel). Reads main_b (residual) + proj_out (mlp_out), writes main_a
+        // (hidden_out, fully overwritten before the PLE += read below).
+        {
+            let G4PrefillScratch { main_a, main_b, proj_out, .. } = &mut *scratch;
+            let residual = &main_b[..batch * hidden_size];
+            let mlp_out = &proj_out[..batch * hidden_size];
+            main_a[..batch * hidden_size]
+                .par_chunks_mut(hidden_size)
+                .zip(residual.par_chunks(hidden_size))
+                .zip(mlp_out.par_chunks(hidden_size))
+                .try_for_each(|((out, r), m)| -> Result<()> {
+                    if let Some(post_norm) = &layer.post_mlp_sublayer_norm {
+                        let mut m_normed = vec![0.0_f32; hidden_size];
+                        rms_norm_into(m, post_norm, self.rms_norm_eps, &mut m_normed);
+                        add_into(r, &m_normed, out)
+                    } else {
+                        add_into(r, m, out)
+                    }
+                })?;
+        }
 
         // 24. PLE additive (BEFORE layer_scalar) — BATCHED (input_gate/projection
         // run as VNNI GEMMs over all tokens instead of per-token matvecs).
@@ -635,17 +724,17 @@ impl G4CpuExecutor {
                 ple_row,
                 batch,
                 self.rms_norm_eps,
-                &mut hidden_out,
+                &mut scratch.main_a[..batch * hidden_size],
             )?;
         }
 
         // 25. layer_scalar, per token (parallel).
         if let Some(scalar) = layer.layer_scalar {
-            hidden_out
+            scratch.main_a[..batch * hidden_size]
                 .par_chunks_mut(hidden_size)
                 .for_each(|h| simd::scale_in_place(h, scalar));
         }
-        Ok(hidden_out)
+        Ok(())
     }
 
     /// Dense MLP sublayer (steps 18-25).
@@ -951,7 +1040,10 @@ mod tests {
             final_norm: vec_seed(&mut s, hidden, 1.0),
             lm_head: bf16_mat(&mut s, vocab, hidden),
             layers,
-            kv_context_size: 256,
+            // Large enough that the multi-chunk test can exceed PREFILL_MAX_BATCH
+            // (512) and genuinely cross a chunk boundary, exercising scratch-pool
+            // reuse across chunks.
+            kv_context_size: 2048,
             ple,
             max_intermediate: inter,
         }
@@ -1009,12 +1101,15 @@ mod tests {
     }
 
     /// Multi-chunk path (prompt longer than PREFILL_MAX_BATCH) must also match
-    /// per-token, proving cross-chunk KV causality is preserved.
+    /// per-token, proving cross-chunk KV causality is preserved AND that the
+    /// reusable scratch pool is correctly re-overwritten on every chunk (stale
+    /// data from a prior chunk must never leak).
     #[test]
     fn forward_batched_multi_chunk_matches_per_token() {
         let exec = build_exec();
-        // 70 tokens > PREFILL_MAX_BATCH (64) → 2 chunks.
-        let prompt: Vec<usize> = (0..70).map(|i| (i * 3 + 1) % 11).collect();
+        // 1100 tokens > 2 * PREFILL_MAX_BATCH (512) → 3 chunks (512+512+76),
+        // crossing two chunk boundaries so the scratch pool is reused across them.
+        let prompt: Vec<usize> = (0..1100).map(|i| (i * 3 + 1) % 11).collect();
 
         let mut ref_state = exec.new_state();
         let mut ref_last = Vec::new();

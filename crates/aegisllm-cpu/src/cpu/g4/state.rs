@@ -24,9 +24,8 @@ pub(crate) struct G4CpuExecutor {
     pub(crate) kv_context_size: usize,
     /// PLE global apparatus (E4B / E2B); None for dense 31B and 26B-A4B.
     pub(crate) ple: Option<G4PleGlobal>,
-    /// Largest expert/dense intermediate size, for scratch sizing (reserved
-    /// for the persistent-scratch / batched-prefill follow-up).
-    #[allow(dead_code)]
+    /// Largest expert/dense intermediate size, for batched-prefill scratch
+    /// sizing (`new_prefill_scratch`).
     pub(crate) max_intermediate: usize,
 }
 
@@ -148,6 +147,43 @@ pub(crate) struct G4LayerKvState {
     pub(crate) kv_width: usize,
 }
 
+/// Reusable per-chunk scratch for batched prefill. Every buffer is allocated
+/// ONCE (sized to `PREFILL_MAX_BATCH * width`) and reused across ALL layers and
+/// chunks, so the hot prefill loop performs ZERO per-layer/per-chunk buffer
+/// allocation or zero-init. Each field is a DISTINCT pool slot; buffers that are
+/// live simultaneously in the same expression occupy different slots (verified
+/// in `forward.rs`). Every region a slot exposes is FULLY OVERWRITTEN by the
+/// first writer before any read (matmul_into / rms_norm_into / geglu_into /
+/// add_into all overwrite their whole output), so stale content from a prior
+/// layer/chunk is never observed — the reuse is semantically identical to a
+/// fresh `vec![0.0; ..]`.
+#[derive(Debug)]
+pub(crate) struct G4PrefillScratch {
+    /// Ping-pong "main" buffers (hidden-width per token). `main_a` / `main_b`
+    /// alternate as the per-layer hidden input and the attention `residual` /
+    /// MLP `hidden_out` output.
+    pub(crate) main_a: Vec<f32>,
+    pub(crate) main_b: Vec<f32>,
+    /// hidden-width: attention `input_normed` and MLP `post_normed`.
+    pub(crate) normed: Vec<f32>,
+    /// q_width: Q projection output (post norm/RoPE).
+    pub(crate) q: Vec<f32>,
+    /// kv_width: K projection output.
+    pub(crate) k: Vec<f32>,
+    /// kv_width: V projection output.
+    pub(crate) v: Vec<f32>,
+    /// q_width: per-position attention context.
+    pub(crate) attn_context: Vec<f32>,
+    /// hidden-width: o_proj output (`attn_out`) and MLP down-proj output (`mlp_out`).
+    pub(crate) proj_out: Vec<f32>,
+    /// intermediate-width: MLP gate projection.
+    pub(crate) gate: Vec<f32>,
+    /// intermediate-width: MLP up projection.
+    pub(crate) up: Vec<f32>,
+    /// intermediate-width: GeGLU activation output.
+    pub(crate) swiglu: Vec<f32>,
+}
+
 impl G4LayerKvState {
     pub(crate) fn push(&mut self, key: &[f32], value: &[f32]) -> Result<()> {
         if key.len() != self.kv_width || value.len() != self.kv_width {
@@ -190,6 +226,39 @@ impl G4CpuExecutor {
             position: 0,
             layers,
             per_layer_inputs: vec![0.0; ple_len],
+        }
+    }
+
+    /// Allocate the batched-prefill scratch pool ONCE, sized to the max width any
+    /// layer needs at `max_batch` tokens. Reused across all layers and chunks of
+    /// a single `forward_batched` call so the hot loop never allocates or
+    /// zero-inits a per-layer buffer. Widths:
+    ///   * main_a/main_b/normed/proj_out — `hidden_size`
+    ///   * q/attn_context               — `max(num_attention_heads * head_dim)`
+    ///   * k/v                          — `max(num_kv_heads * head_dim)`
+    ///   * gate/up/swiglu               — `max_intermediate`
+    pub(crate) fn new_prefill_scratch(&self, max_batch: usize) -> G4PrefillScratch {
+        let hidden = self.hidden_size;
+        let mut q_width = 0usize;
+        let mut kv_width = 0usize;
+        for layer in &self.layers {
+            q_width = q_width.max(self.num_attention_heads * layer.layer_head_dim);
+            kv_width = kv_width.max(layer.layer_num_kv_heads * layer.layer_head_dim);
+        }
+        let inter = self.max_intermediate;
+        let z = |w: usize| vec![0.0_f32; max_batch * w];
+        G4PrefillScratch {
+            main_a: z(hidden),
+            main_b: z(hidden),
+            normed: z(hidden),
+            q: z(q_width),
+            k: z(kv_width),
+            v: z(kv_width),
+            attn_context: z(q_width),
+            proj_out: z(hidden),
+            gate: z(inter),
+            up: z(inter),
+            swiglu: z(inter),
         }
     }
 }
