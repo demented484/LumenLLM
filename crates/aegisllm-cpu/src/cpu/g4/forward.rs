@@ -206,19 +206,20 @@ impl G4CpuExecutor {
                 simd::scale_in_place(dst, self.embed_scale);
             }
 
-            // 3. PLE token-entry: per-token per_layer_inputs[batch, num_layers*ple_dim].
-            // Each row is fully written by compute_per_layer_inputs before any read.
+            // 3. PLE token-entry: per_layer_inputs[batch, num_layers*ple_dim].
+            // BATCHED: the model_projection runs as one VNNI GEMM over all tokens
+            // (was a per-token matvec ×batch — ~30% of prefill on E2B).
             if let Some(ple_g) = &self.ple {
-                for i in 0..batch {
-                    ple::compute_per_layer_inputs(
-                        ple_g,
-                        chunk[i],
-                        &scratch.main_a[i * hidden_size..(i + 1) * hidden_size],
-                        num_layers,
-                        self.rms_norm_eps,
-                        &mut per_layer_inputs[i * ple_row..(i + 1) * ple_row],
-                    )?;
-                }
+                ple::compute_per_layer_inputs_batched(
+                    ple_g,
+                    chunk,
+                    &scratch.main_a[..batch * hidden_size],
+                    batch,
+                    hidden_size,
+                    num_layers,
+                    self.rms_norm_eps,
+                    &mut per_layer_inputs[..batch * ple_row],
+                )?;
             }
 
             let timing = std::env::var("AEGIS_G4_PREFILL_TIMING").is_ok();

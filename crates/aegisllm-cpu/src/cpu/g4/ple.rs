@@ -106,6 +106,65 @@ pub(crate) fn apply_ple_contribution(
     Ok(())
 }
 
+/// Batched PLE token-entry — the prefill equivalent of `compute_per_layer_inputs`
+/// over `batch` tokens. Identical math, but the expensive `model_projection`
+/// (`[num_layers*ple_dim, hidden]`) runs as ONE batched VNNI GEMM over all tokens
+/// instead of a per-token matvec, and the per-row RMS-norm + combine parallelize.
+/// `hidden` is `[batch, hidden_size]`; `out` is `[batch, num_layers*ple_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_per_layer_inputs_batched(
+    ple: &G4PleGlobal,
+    token_ids: &[usize],
+    hidden: &[f32],
+    batch: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    eps: f32,
+    out: &mut [f32],
+) -> Result<()> {
+    let ple_dim = ple.ple_dim;
+    let row_len = num_layers * ple_dim;
+
+    // 2. context[batch, row_len] = hidden[batch, hidden] @ model_projection.T — BATCHED.
+    let mut context = vec![0.0_f32; batch * row_len];
+    super::linear::bf16_matmul_fast(
+        ple.model_projection.weight_bytes(),
+        row_len,
+        hidden_size,
+        hidden,
+        batch,
+        &mut context,
+    );
+
+    // 1,3,4 per token (parallel): token identity + scale, scale context, RMS-norm
+    // each [ple_dim] row into `out`, then combine. Each `out` row fully written.
+    out.par_chunks_mut(row_len)
+        .zip(context.par_chunks_mut(row_len))
+        .enumerate()
+        .try_for_each(|(t, (out_row, ctx_row))| -> Result<()> {
+            // 1. token identity: embed_tokens_per_layer[token, :] * sqrt(ple_dim).
+            let mut token_identity = ple.embed_table.row(token_ids[t])?;
+            simd::scale_in_place(&mut token_identity, ple.embed_scale_per_layer);
+            // 2. scale context by 1/sqrt(hidden).
+            simd::scale_in_place(ctx_row, ple.model_projection_scale);
+            // 3. RMS-norm each [ple_dim] row → out_row (context_normed).
+            for layer in 0..num_layers {
+                let base = layer * ple_dim;
+                rms_norm_into(
+                    &ctx_row[base..base + ple_dim],
+                    &ple.projection_norm,
+                    eps,
+                    &mut out_row[base..base + ple_dim],
+                );
+            }
+            // 4. out = (token_identity + context_normed) * combine_scale.
+            for i in 0..row_len {
+                out_row[i] = (token_identity[i] + out_row[i]) * ple.combine_scale;
+            }
+            Ok(())
+        })
+}
+
 /// Batched PLE contribution over `batch` tokens — the prefill equivalent of
 /// `apply_ple_contribution`. Same math, but the two projections run as batched
 /// `matmul_into` GEMMs (the fast BF16-VNNI path) instead of per-token `matvec`,
