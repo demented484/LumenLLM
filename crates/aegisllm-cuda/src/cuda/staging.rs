@@ -5,6 +5,18 @@ use super::runtime::{CudaRuntime, map_cuda_err};
 use super::types::{HostResidentMxfp4, HostResidentWeights};
 use aegisllm_base::error::{AegisError, Result};
 
+/// Diagnostic: total bytes the staging pool has issued via H2D (packed + scales
+/// + native-mxfp4). Incremented on every transfer. Read deltas around a decode
+/// step to measure actual per-token streaming volume. Gated by the reader, not
+/// here, so the counter is always live (a relaxed add is free).
+pub(crate) static STAGING_H2D_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn count_h2d(bytes: usize) {
+    STAGING_H2D_BYTES.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// One physical staging slot in VRAM. Holds the packed/scales (and optionally
 /// repacked native-MXFP4) bytes for ONE in-flight host-resident layer.
 ///
@@ -187,6 +199,8 @@ impl LinearStagingPool {
                 hw.scales.len()
             )));
         }
+
+        count_h2d(packed_bytes + scale_bytes);
 
         // Block transfer stream until the kernel that previously read this slot
         // has completed. Without this the H2D could clobber bytes mid-read.
@@ -386,6 +400,7 @@ impl LinearStagingPool {
                 hw.scales.len()
             )));
         }
+        count_h2d(packed_bytes + scale_bytes);
         // Synchronous (single-stream) path with the same source-type dispatch
         // as `prepare_async`: pinned source → direct DMA, unpinned (mmap) →
         // CPU memcpy through the bounce buffer first.

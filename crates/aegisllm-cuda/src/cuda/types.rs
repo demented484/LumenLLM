@@ -206,8 +206,7 @@ impl DeviceNvfp4Linear {
     }
 
     /// Borrow the packed + scales host bytes for a host-resident weight.
-    /// Returns `None` for VRAM-resident weights or when `host_weights` was
-    /// dropped (e.g. weights now live in the VRAM expert cache). Used by
+    /// Returns `None` for VRAM-resident weights (no host copy exists). Used by
     /// grouped MoE bulk staging to concatenate active experts' weights
     /// into the bulk VRAM buffers.
     pub fn host_packed_scales_bytes(&self) -> Option<Result<(&[u8], &[u8])>> {

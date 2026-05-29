@@ -329,6 +329,14 @@ impl CudaLlamaExecutor {
         let dec_timing =
             std::env::var("AEGIS_DECODE_TIMING").ok().is_some_and(|v| !v.is_empty());
         let t_step_start = if dec_timing { Some(std::time::Instant::now()) } else { None };
+        // Real per-token H2D streaming volume: snapshot the staging-pool byte
+        // counter at step entry; the delta at the end is exactly what this token
+        // streamed (NVFP4 experts, BF16-streamed layers, etc.).
+        let h2d_bytes_start = if dec_timing {
+            Some(crate::cuda::staging::STAGING_H2D_BYTES.load(std::sync::atomic::Ordering::Relaxed))
+        } else {
+            None
+        };
 
         if state.position >= self.kv_context_size {
             return Err(AegisError::InvalidPlan(format!(
@@ -445,7 +453,10 @@ impl CudaLlamaExecutor {
                 aegisllm_base::executor::generation::apply_logit_softcap(&mut logits, cap);
             }
             if let (Some(t0), Some(t_cpu)) = (t_step_start, t_cpu_done) {
-                report_decode_split(t0, t_cpu);
+                let h2d = crate::cuda::staging::STAGING_H2D_BYTES
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_sub(h2d_bytes_start.unwrap_or(0));
+                report_decode_split(t0, t_cpu, h2d);
             }
             return aegisllm_base::executor::generation::sample_next_token(&logits, sampling);
         }
@@ -453,7 +464,10 @@ impl CudaLlamaExecutor {
         // Greedy (no soft-cap): download the argmax result (also synchronizes the stream).
         let token = self.runtime.download_u32(&state.sampled_token)?;
         if let (Some(t0), Some(t_cpu)) = (t_step_start, t_cpu_done) {
-            report_decode_split(t0, t_cpu);
+            let h2d = crate::cuda::staging::STAGING_H2D_BYTES
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .wrapping_sub(h2d_bytes_start.unwrap_or(0));
+            report_decode_split(t0, t_cpu, h2d);
         }
         token
             .first()
@@ -469,19 +483,27 @@ impl CudaLlamaExecutor {
 /// `t_cpu_done` is the time the CPU spent blocked waiting for the GPU to
 /// finish (download_* synchronously drains the stream), so it's a lower
 /// bound on extra GPU work past the CPU-issuing window.
-fn report_decode_split(t0: std::time::Instant, t_cpu_done: std::time::Instant) {
+fn report_decode_split(t0: std::time::Instant, t_cpu_done: std::time::Instant, h2d_bytes: u64) {
     let total = t_cpu_done.elapsed() + (t_cpu_done - t0);
     let cpu_issuing_ms = (t_cpu_done - t0).as_secs_f64() * 1000.0;
     let gpu_wait_ms = t_cpu_done.elapsed().as_secs_f64() * 1000.0;
     let total_ms = total.as_secs_f64() * 1000.0;
     let pct = |x: f64| -> f64 { if total_ms > 0.0 { x / total_ms * 100.0 } else { 0.0 } };
+    // H2D streamed this token + the sustained rate over the whole step (lower
+    // bound on achieved PCIe bandwidth; if decode is transfer-bound this ≈ the
+    // real link rate). MiB and GB/s (1e9) so it compares directly to the
+    // ~55 GB/s PCIe-5.0-x16 ceiling.
+    let mib = h2d_bytes as f64 / (1024.0 * 1024.0);
+    let gbps = if total_ms > 0.0 { h2d_bytes as f64 / (total_ms / 1000.0) / 1e9 } else { 0.0 };
     eprintln!(
-        "[DECODE-TIMING] total={:>5.2}ms  cpu_issuing={:>5.2}ms ({:>4.1}%)  gpu_wait={:>5.2}ms ({:>4.1}%)",
+        "[DECODE-TIMING] total={:>5.2}ms  cpu_issuing={:>5.2}ms ({:>4.1}%)  gpu_wait={:>5.2}ms ({:>4.1}%)  h2d={:>7.1} MiB ({:>5.1} GB/s)",
         total_ms,
         cpu_issuing_ms,
         pct(cpu_issuing_ms),
         gpu_wait_ms,
         pct(gpu_wait_ms),
+        mib,
+        gbps,
     );
 }
 
