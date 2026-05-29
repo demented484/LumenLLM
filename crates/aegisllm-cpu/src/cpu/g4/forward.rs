@@ -16,7 +16,9 @@
 //!     (batching the two-stream MoE combine is deferred); dense + PLE models
 //!     (E2B/E4B) are fully batched.
 
-use super::attention::{g4_attention_decode_into, G4DecodeAttnRequest};
+use super::attention::{
+    g4_attention_decode_into, g4_attention_prefill_into, G4DecodeAttnRequest, G4PrefillAttnRequest,
+};
 use super::moe::router_softmax_topk_normalized;
 use super::norm::{rms_norm_per_head_into, rms_norm_per_head_no_weight_into};
 use super::ple;
@@ -572,30 +574,30 @@ impl G4CpuExecutor {
         // 14. PER-POSITION attention: token i attends to KV positions
         // [window_start .. chunk_start+i+1). Read the (now fully-populated) KV
         // buffer for this layer (own) or its parent (shared). Writes
-        // attn_context[..batch*q_width] (fully overwritten by the par_chunks).
+        // attn_context[..batch*q_width] (fully overwritten). The VECTORIZED
+        // batched path computes all `batch` queries' attention in one call
+        // (SIMD Q·Kᵀ scores + softmax + scores·V per (query, head),
+        // parallelized over (query, head)). Bit-closely matches looping
+        // `g4_attention_decode_into` per query (same scale/mask/window/GQA;
+        // softmax is two-pass max-subtract vs the decode path's online form).
         let parent_idx = layer.kv_shared_from.unwrap_or(layer_idx);
         let kv_state = &state.layers[parent_idx];
         let q = &scratch.q[..batch * q_width];
-        scratch.attn_context[..batch * q_width]
-            .par_chunks_mut(q_width)
-            .enumerate()
-            .try_for_each(|(i, ctx)| -> Result<()> {
-                let seq_len = chunk_start + i + 1;
-                g4_attention_decode_into(
-                    G4DecodeAttnRequest {
-                        keys: &kv_state.keys,
-                        values: &kv_state.values,
-                        seq_len,
-                        query: &q[i * q_width..(i + 1) * q_width],
-                        num_attention_heads: self.num_attention_heads,
-                        num_kv_heads,
-                        head_dim,
-                        window_size: layer.window_size,
-                        scale: attn_scale,
-                    },
-                    ctx,
-                )
-            })?;
+        g4_attention_prefill_into(
+            G4PrefillAttnRequest {
+                keys: &kv_state.keys,
+                values: &kv_state.values,
+                queries: q,
+                chunk_start,
+                batch,
+                num_attention_heads: self.num_attention_heads,
+                num_kv_heads,
+                head_dim,
+                window_size: layer.window_size,
+                scale: attn_scale,
+            },
+            &mut scratch.attn_context[..batch * q_width],
+        )?;
 
         // 15. BATCHED o_proj → proj_out[..batch*hidden] (fully written).
         layer.o_proj.matmul_into(
