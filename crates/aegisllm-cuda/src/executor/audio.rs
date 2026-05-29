@@ -422,8 +422,13 @@ impl AudioTower {
         // padding convention (HF uses asymmetric manual padding; this uses
         // symmetric pad=1) and the CumulativeGroupNorm cumulative-over-time
         // statistics against an HF dump before trusting downstream values.
-        let (mut state, t_out) = self.subsample_forward(mel, n_frames)?;
+        let (mut state, t_out) = self.subsample_forward(runtime, mel, n_frames)?;
         // state: [t_out, hidden] row-major f32.
+
+        // GPU-verify cross-dump: AEGIS_AUDIO_DUMP=<dir> writes each stage as
+        // raw f32 LE so a Python harness can diff against the HF reference.
+        let dump_dir = std::env::var("AEGIS_AUDIO_DUMP").ok();
+        dump_stage(&dump_dir, "subsample", &state);
 
         let log = std::env::var("AEGIS_AUDIO_PROGRESS").is_ok();
 
@@ -458,6 +463,8 @@ impl AudioTower {
             // 5. norm_out (RMSNorm).
             self.rms_norm_inplace(runtime, &mut state, t_out, &layer.norm_out, eps)?;
 
+            dump_stage(&dump_dir, &format!("layer{li:02}"), &state);
+
             if log {
                 eprintln!(
                     "  audio layer {:>2}/{}: {:.3}s",
@@ -481,19 +488,32 @@ impl AudioTower {
                 }
             }
         }
+        // `proj` here = output_proj(+bias) output [t_out, 1536], which matches the
+        // HF Gemma4AudioModel tower output (embed_audio is applied below, outside
+        // the tower in HF). Dump it for the cross-dump comparison.
+        dump_stage(&dump_dir, "proj", &proj);
         // embed_audio: [t_out, output_proj_dims] @ embed_audio.T → [t_out, text_hidden].
         let out = self.matmul_host(runtime, &proj, t_out, &self.embed_audio)?;
+        dump_stage(&dump_dir, "final", &out);
         Ok(out)
     }
 
-    /// CPU subsample conv stack. Returns (flattened [t_out, hidden] f32, t_out).
-    fn subsample_forward(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize)> {
+    /// CPU subsample conv stack. Returns (input_proj([t_out, hidden]) f32, t_out).
+    fn subsample_forward(
+        &self,
+        runtime: &crate::cuda::CudaRuntime,
+        mel: &[f32],
+        n_frames: usize,
+    ) -> Result<(Vec<f32>, usize)> {
         let s = &self.shape;
+        let dump_dir = std::env::var("AEGIS_AUDIO_DUMP").ok();
         // layer0: input [1, T0=n_frames, F0=n_mel_bins] → [C1, T1, F1].
         let (x0, c1, t1, f1) =
-            conv2d_norm_relu(mel, 1, n_frames, s.n_mel_bins, &self.subsample0)?;
+            conv2d_norm_relu(mel, 1, n_frames, s.n_mel_bins, &self.subsample0, s.rms_norm_eps)?;
+        dump_stage(&dump_dir, "ss_conv0", &x0); // [C1,T1,F1]
         // layer1: input [C1, T1, F1] → [C2, T2, F2].
-        let (x1, c2, t2, f2) = conv2d_norm_relu(&x0, c1, t1, f1, &self.subsample1)?;
+        let (x1, c2, t2, f2) = conv2d_norm_relu(&x0, c1, t1, f1, &self.subsample1, s.rms_norm_eps)?;
+        dump_stage(&dump_dir, "ss_conv1", &x1); // [C2,T2,F2]
         // permute [C2, T2, F2] → [T2, F2, C2], flatten → [T2, F2*C2].
         let flat_dim = f2 * c2;
         let mut flat = vec![0f32; t2 * flat_dim];
@@ -515,7 +535,12 @@ impl AudioTower {
                 self.input_proj.cols
             )));
         }
-        Ok((flat, t2))
+        // input_proj_linear: [t2, flat_dim] @ input_proj.T → [t2, hidden]. This
+        // was MISSING — the conv output was returned raw, so the whole tower ran
+        // on un-projected features (subsample cosine vs HF ~0.05).
+        dump_stage(&std::env::var("AEGIS_AUDIO_DUMP").ok(), "ss_flat", &flat);
+        let proj = self.matmul_host(runtime, &flat, t2, &self.input_proj)?;
+        Ok((proj, t2))
     }
 
     /// matmul host helper: input host f32 [batch, in] → host f32 [batch, rows].
@@ -891,6 +916,7 @@ fn conv2d_norm_relu(
     t_in: usize,
     f_in: usize,
     block: &AudioSubsampleConvBlock,
+    eps: f32,
 ) -> Result<(Vec<f32>, usize, usize, usize)> {
     let k = 3usize;
     let stride = 2usize;
@@ -941,36 +967,53 @@ fn conv2d_norm_relu(
         }
     }
 
-    // CumulativeGroupNorm: cumulative-over-time mean/var across (channel, freq)
-    // for each time index, scaled by norm_weight[channel], then ReLU.
-    let eps = 1.0e-3f32; // TODO(gpu-verify): confirm group-norm eps (HF default).
+    // HF `Gemma4AudioSubSampleConvProjectionLayer`: nn.LayerNorm(out_channels,
+    // eps=rms_norm_eps, bias=False) applied OVER THE CHANNEL dim per (t, f)
+    // position (via permute [B,C,T,F]→[B,T,F,C]→LN(C)→permute back), then ReLU.
+    // (The prior "CumulativeGroupNorm over time" was a gemma3n mis-port and made
+    // the subsample output near-orthogonal to HF — cosine ~0.05.)
+    // PyTorch LayerNorm uses biased variance (÷C). Scale by norm_weight[channel].
     let mut out = vec![0f32; out_ch * t_out * f_out];
-    let mut run_sum = 0f64;
-    let mut run_sumsq = 0f64;
-    let mut run_count = 0f64;
-    let per_t = (out_ch * f_out) as f64;
+    let c = out_ch as f64;
     for ot in 0..t_out {
-        // accumulate this time slice's sum/sumsq across all channels & freqs.
-        for oc in 0..out_ch {
-            for of in 0..f_out {
-                let val = conv[(oc * t_out + ot) * f_out + of] as f64;
-                run_sum += val;
-                run_sumsq += val * val;
+        for of in 0..f_out {
+            let mut mean = 0f64;
+            for oc in 0..out_ch {
+                mean += conv[(oc * t_out + ot) * f_out + of] as f64;
             }
-        }
-        run_count += per_t;
-        let mean = run_sum / run_count;
-        let var = (run_sumsq / run_count) - mean * mean;
-        let inv_std = 1.0 / (var + eps as f64).sqrt();
-        for oc in 0..out_ch {
-            for of in 0..f_out {
+            mean /= c;
+            let mut var = 0f64;
+            for oc in 0..out_ch {
+                let d = conv[(oc * t_out + ot) * f_out + of] as f64 - mean;
+                var += d * d;
+            }
+            var /= c;
+            let inv_std = 1.0 / (var + eps as f64).sqrt();
+            for oc in 0..out_ch {
                 let idx = (oc * t_out + ot) * f_out + of;
                 let normed = ((conv[idx] as f64 - mean) * inv_std) as f32;
-                let scaled = normed * block.norm_weight[oc];
-                out[idx] = scaled.max(0.0); // ReLU
+                out[idx] = (normed * block.norm_weight[oc]).max(0.0); // * weight, ReLU
             }
         }
     }
 
     Ok((out, out_ch, t_out, f_out))
+}
+
+/// GPU-verify cross-dump helper: when `dir` is Some, write `data` (row-major
+/// f32) as raw little-endian f32 to `<dir>/<name>.bin`. No-op when None.
+/// Paired with bench/audio_compare.py which diffs against the HF reference.
+fn dump_stage(dir: &Option<String>, name: &str, data: &[f32]) {
+    let Some(dir) = dir else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for v in data {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let path = format!("{dir}/{name}.bin");
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        eprintln!("[audio-dump] failed to write {path}: {e}");
+    } else {
+        eprintln!("[audio-dump] wrote {path} ({} f32)", data.len());
+    }
 }
