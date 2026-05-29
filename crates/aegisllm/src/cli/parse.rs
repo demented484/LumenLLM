@@ -209,6 +209,10 @@ fn parse_serve(args: &[String]) -> Result<Command> {
         host: "127.0.0.1".into(),
         port: 1337,
         api: "openai".into(),
+        api_keys: std::env::var("AEGIS_API_KEY")
+            .ok()
+            .map(|v| v.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect())
+            .unwrap_or_default(),
         engine: crate::params::EngineConfigFragment {
             model_path: PathBuf::new(),
             policy: PlacementPolicy::auto_for(&inventory),

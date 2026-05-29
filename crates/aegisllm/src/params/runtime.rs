@@ -9,6 +9,9 @@ pub struct ServeConfig {
     pub host: String,
     pub port: u16,
     pub api: String,
+    /// Accepted API keys (from `server-parameters.api-keys` + `AEGIS_API_KEY`).
+    /// Empty → server is open (no auth). Non-empty → /v1/* requests must match.
+    pub api_keys: Vec<String>,
     pub engine: EngineConfigFragment,
 }
 

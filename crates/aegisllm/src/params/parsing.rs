@@ -34,10 +34,30 @@ impl ParametersFile {
             .and_then(|server| server.server_api.clone())
             .unwrap_or_else(|| "openai".into());
 
+        // API keys: config `server-parameters.api-keys` + `AEGIS_API_KEY` env
+        // (comma-separated). Deduped; empty → server runs open (local use).
+        let mut api_keys: Vec<String> = self
+            .server
+            .as_ref()
+            .and_then(|server| server.api_keys.clone())
+            .unwrap_or_default();
+        if let Ok(env_keys) = std::env::var("AEGIS_API_KEY") {
+            api_keys.extend(
+                env_keys
+                    .split(',')
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty()),
+            );
+        }
+        api_keys.retain(|k| !k.is_empty());
+        api_keys.sort();
+        api_keys.dedup();
+
         Ok(ServeConfig {
             host,
             port,
             api,
+            api_keys,
             engine: self.into_engine_fragment(default_policy)?,
         })
     }

@@ -17,6 +17,39 @@ struct HttpRequest {
     method: String,
     path: String,
     body: Vec<u8>,
+    /// Presented API credential: the bearer token from `Authorization: Bearer <k>`
+    /// (OpenAI) or the `x-api-key: <k>` value (Anthropic). None when absent.
+    auth: Option<String>,
+}
+
+/// Extract the API credential from raw HTTP headers: `Authorization: Bearer <k>`
+/// (OpenAI) or `x-api-key: <k>` (Anthropic). Accepts either so one configured key
+/// works across both API shapes. Returns None when neither header is present.
+fn extract_credential(headers: &str) -> Option<String> {
+    headers.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        let name = name.trim();
+        let value = value.trim();
+        if name.eq_ignore_ascii_case("authorization") {
+            value
+                .strip_prefix("Bearer ")
+                .or_else(|| value.strip_prefix("bearer "))
+                .map(|t| t.trim().to_string())
+        } else if name.eq_ignore_ascii_case("x-api-key") {
+            Some(value.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Authorization decision: open when no keys are configured, otherwise the
+/// presented credential must exactly match one configured key.
+fn credential_authorized(api_keys: &[String], credential: Option<&str>) -> bool {
+    if api_keys.is_empty() {
+        return true;
+    }
+    credential.is_some_and(|c| api_keys.iter().any(|k| k == c))
 }
 
 #[derive(Debug, Default)]
@@ -63,10 +96,13 @@ struct ServerState {
     /// Cached parser kind (Gemma vs None) — avoids re-parsing the chat
     /// template on every response.
     parser_kind: aegisllm_base::chat_parse::ParserKind,
+    /// Accepted API keys. Empty → server is open (no auth). Non-empty → every
+    /// /v1/* generation request must present a matching key.
+    api_keys: Vec<String>,
 }
 
 impl ServerState {
-    fn new(engine: &AegisEngine) -> Self {
+    fn new(engine: &AegisEngine, api_keys: Vec<String>) -> Self {
         // Try to build a TextProcessor for the loaded model so we can cache
         // single-token stop markers and the parser kind. If construction
         // fails (missing tokenizer.json etc.), fall back to empty/None —
@@ -80,7 +116,14 @@ impl ServerState {
             active_generations: Arc::new(AtomicI64::new(0)),
             tool_call_stop_token_ids: stop_ids,
             parser_kind: parser,
+            api_keys,
         }
+    }
+
+    /// True when the request is authorized: either no keys are configured
+    /// (open server) or the presented credential matches a configured key.
+    fn authorized(&self, credential: Option<&str>) -> bool {
+        credential_authorized(&self.api_keys, credential)
     }
 
     #[cfg(test)]
@@ -90,6 +133,7 @@ impl ServerState {
             active_generations: Arc::new(AtomicI64::new(0)),
             tool_call_stop_token_ids: Vec::new(),
             parser_kind: aegisllm_base::chat_parse::ParserKind::None,
+            api_keys: Vec::new(),
         }
     }
 
@@ -147,13 +191,19 @@ pub fn serve_http(
     host: String,
     port: u16,
     api: String,
+    api_keys: Vec<String>,
     engine: AegisEngine,
     readiness: ExecutorReadiness,
     default_sampling: SamplingConfig,
 ) -> Result<()> {
     let api = normalize_api_compatibility(&api)?;
     let listener = TcpListener::bind(format!("{host}:{port}"))?;
-    let state = ServerState::new(&engine);
+    if api_keys.is_empty() {
+        eprintln!("serve: WARNING — no API keys configured; server is OPEN (set server-parameters.api-keys or AEGIS_API_KEY to require auth)");
+    } else {
+        eprintln!("serve: API-key auth enabled ({} key(s))", api_keys.len());
+    }
+    let state = ServerState::new(&engine, api_keys);
     eprintln!(
         "serve: listening on http://{}:{} api={} runnable={} selected={}",
         host,
@@ -206,6 +256,21 @@ fn handle_http_connection(
         let body = metrics_prometheus(state);
         return write_text_response(stream, 200, "text/plain; version=0.0.4; charset=utf-8", &body);
     }
+    // API-key auth — the single choke point covering BOTH streaming and
+    // non-streaming. Protects inference endpoints (/v1/* and the Google
+    // generateContent paths); health/ready/metrics/root + OPTIONS preflight stay
+    // open. No-op when no keys are configured (open server).
+    let needs_auth = request.method != "OPTIONS"
+        && (request.path.starts_with("/v1/") || request.path.starts_with("/v1beta/models/"));
+    if needs_auth && !state.authorized(request.auth.as_deref()) {
+        return write_json_response(
+            stream,
+            401,
+            serde_json::json!({
+                "error": { "message": "missing or invalid API key", "type": "authentication_error" }
+            }),
+        );
+    }
     // Detect SSE streaming: stream:true in body, or Google streamGenerateContent path
     let is_streaming = request.method == "POST"
         && (request.path.ends_with(":streamGenerateContent")
@@ -229,6 +294,8 @@ fn route_http_request(
     default_sampling: SamplingConfig,
     state: &ServerState,
 ) -> (u16, serde_json::Value) {
+    // (API-key auth is enforced upstream in handle_http_connection, covering both
+    // streaming and non-streaming paths.)
     match (request.method.as_str(), request.path.as_str()) {
         ("GET", "/") | ("GET", "/health") | ("GET", "/healthz") => (
             200,
@@ -1227,6 +1294,10 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
             "http body exceeds 16 MiB limit: {content_length} bytes"
         )));
     }
+    // Extract the API credential here, BEFORE the body-read loop mutably borrows
+    // `buffer` (`headers` borrows `buffer`, so it must be released first). `auth`
+    // is owned (Option<String>) and survives the loop.
+    let auth = extract_credential(&headers);
     let body_start = header_end + 4;
     let total_len = body_start + content_length;
     while buffer.len() < total_len {
@@ -1241,10 +1312,12 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
             "http body truncated: expected {content_length} bytes"
         )));
     }
+
     Ok(HttpRequest {
         method,
         path,
         body: buffer[body_start..total_len].to_vec(),
+        auth,
     })
 }
 
@@ -1285,6 +1358,40 @@ fn normalize_api_compatibility(api: &str) -> Result<ServerApiCompatibility> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_key_extract_credential_both_header_shapes() {
+        assert_eq!(
+            extract_credential("POST /v1/chat/completions\r\nAuthorization: Bearer sk-abc\r\ncontent-type: application/json\r\n"),
+            Some("sk-abc".to_string())
+        );
+        assert_eq!(
+            extract_credential("POST /v1/messages\r\nx-api-key: sk-def\r\n"),
+            Some("sk-def".to_string())
+        );
+        // case-insensitive header name + lowercase bearer scheme
+        assert_eq!(
+            extract_credential("POST /v1/x\r\nAUTHORIZATION: bearer sk-xyz\r\n"),
+            Some("sk-xyz".to_string())
+        );
+        assert_eq!(
+            extract_credential("POST /v1/x\r\ncontent-type: application/json\r\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn api_key_authorization_decision() {
+        // No keys configured → server is open.
+        assert!(credential_authorized(&[], None));
+        assert!(credential_authorized(&[], Some("whatever")));
+        // Keys configured → credential must match exactly.
+        let keys = vec!["sk-abc".to_string(), "sk-def".to_string()];
+        assert!(!credential_authorized(&keys, None), "missing key must be rejected");
+        assert!(!credential_authorized(&keys, Some("sk-wrong")), "wrong key must be rejected");
+        assert!(credential_authorized(&keys, Some("sk-abc")));
+        assert!(credential_authorized(&keys, Some("sk-def")));
+    }
 
     #[test]
     fn openai_compatible_aliases_normalize_to_openai() {

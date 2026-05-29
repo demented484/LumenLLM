@@ -331,6 +331,7 @@ pub fn run_env() -> Result<()> {
                 config.host,
                 config.port,
                 config.api,
+                config.api_keys,
                 engine,
                 readiness,
                 default_sampling,

@@ -152,6 +152,12 @@ pub struct ServerSection {
     pub port: Option<u16>,
     #[serde(rename = "server-api")]
     pub server_api: Option<String>,
+    /// API keys accepted by the server. When non-empty, every /v1/* generation
+    /// request must present a matching key (OpenAI: `Authorization: Bearer <key>`;
+    /// Anthropic: `x-api-key: <key>`). Empty/absent → server is open (local use).
+    /// The `AEGIS_API_KEY` env var (comma-separated) is merged in at parse time.
+    #[serde(rename = "api-keys")]
+    pub api_keys: Option<Vec<String>>,
 }
 
 // NOTE: no `#[serde(deny_unknown_fields)]` here — ModelSection is `#[serde(flatten)]`
