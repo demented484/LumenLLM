@@ -111,3 +111,100 @@ pub fn head_dim_for_layer(layer_idx: usize, config: &HfConfig) -> Option<usize> 
 pub fn sliding_window(config: &HfConfig) -> usize {
     config.sliding_window.unwrap_or(DEFAULT_WINDOW).max(1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::detect_architecture;
+
+    /// Build an `HfConfig` matching google/gemma-4-31B's text config (dense
+    /// variant: no PLE, no MoE, no layer_scalar). Verifies the architecture
+    /// plumbing derives the right per-layer metadata WITHOUT the checkpoint.
+    fn gemma4_31b_config() -> HfConfig {
+        // 60 layers, 5 sliding : 1 full, full at i%6==5 (last layer 59 is full).
+        let layer_types = (0..60)
+            .map(|i| if i % 6 == 5 { "full_attention" } else { "sliding_attention" }.to_string())
+            .collect::<Vec<_>>();
+        HfConfig {
+            architectures: Some(vec!["Gemma4ForConditionalGeneration".into()]),
+            model_type: "gemma4_text".into(),
+            hidden_size: 5376,
+            intermediate_size: Some(21504),
+            num_hidden_layers: 60,
+            num_attention_heads: 32,
+            num_key_value_heads: Some(16),
+            num_global_key_value_heads: Some(4),
+            head_dim: Some(256),
+            global_head_dim: Some(512),
+            sliding_window: Some(1024),
+            layer_types: Some(layer_types),
+            partial_rotary_factor: Some(0.25),
+            final_logit_softcapping: Some(30.0),
+            // Dense: PLE off, MoE off.
+            hidden_size_per_layer_input: None,
+            enable_moe_block: Some(false),
+            num_experts: None,
+            num_kv_shared_layers: Some(0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn gemma4_31b_dense_is_detected_as_gemma4() {
+        let cfg = gemma4_31b_config();
+        let arch = detect_architecture(&cfg).expect("Gemma4ForConditionalGeneration -> gemma4");
+        assert_eq!(arch.name(), "gemma4");
+    }
+
+    #[test]
+    fn gemma4_31b_per_layer_attention_geometry() {
+        let cfg = gemma4_31b_config();
+        let arch = Gemma4Architecture;
+        for layer in 0..cfg.num_hidden_layers {
+            let is_global = layer % 6 == 5;
+            assert_eq!(is_global_layer(layer, &cfg), is_global, "layer {layer} global?");
+            // head_dim: sliding 256, global 512.
+            assert_eq!(
+                head_dim_for_layer(layer, &cfg),
+                Some(if is_global { 512 } else { 256 }),
+                "layer {layer} head_dim"
+            );
+            // Per-layer KV head count derivation (mirrors graph::build_llama_style):
+            // global layers use num_global_key_value_heads (4), sliding use 16.
+            let base_kv = cfg.num_key_value_heads.unwrap();
+            let layer_kv = if is_global_layer(layer, &cfg) {
+                cfg.num_global_key_value_heads.unwrap_or(base_kv)
+            } else {
+                base_kv
+            };
+            assert_eq!(layer_kv, if is_global { 4 } else { 16 }, "layer {layer} kv heads");
+            // Only global layers use partial RoPE; both are FullCausal vs SlidingWindow.
+            match arch.attention_pattern(layer, &cfg) {
+                AttentionPattern::FullCausal => assert!(is_global),
+                AttentionPattern::SlidingWindow { size } => {
+                    assert!(!is_global);
+                    assert_eq!(size, 1024);
+                }
+                other => panic!("gemma4 layer {layer} unexpected pattern {other:?}"),
+            }
+        }
+        // Last layer is global (Gemma-4 change vs Gemma 3).
+        assert!(is_global_layer(59, &cfg));
+    }
+
+    #[test]
+    fn gemma4_31b_dense_has_no_moe_or_ple() {
+        let cfg = gemma4_31b_config();
+        let arch = Gemma4Architecture;
+        // Dense: every layer is a plain decoder (sliding or global), never MoE.
+        for layer in 0..cfg.num_hidden_layers {
+            assert!(
+                !matches!(arch.layer_kind(layer, &cfg), LayerKind::MoEDecoder { .. }),
+                "layer {layer} must not be MoE for the dense 31B"
+            );
+        }
+        // Embedding scale = sqrt(hidden), lm_head softcap = 30.
+        assert_eq!(arch.embed_scale(&cfg), Some((5376f32).sqrt()));
+        assert_eq!(arch.lm_head_softcap(&cfg), Some(30.0));
+    }
+}
