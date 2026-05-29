@@ -345,12 +345,6 @@ impl CudaRuntime {
         batch: usize,
         output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
-        if matrix.is_host_resident() {
-            return Err(AegisError::InvalidPlan(format!(
-                "batched bf16 matmul does not support host-resident matrix `{}`; load to VRAM",
-                matrix.name
-            )));
-        }
         let total_in = checked_len("bf16 matmul input", batch, matrix.cols)?;
         let total_out = checked_len("bf16 matmul output", batch, matrix.rows)?;
         if input.len() < total_in || output.len() < total_out {
@@ -360,6 +354,38 @@ impl CudaRuntime {
                 output.len(), batch, matrix.rows, total_out
             )));
         }
+        // Host-resident (store=ram, all-layer offload): stream the pinned host
+        // weights into a transient VRAM scratch and run the kernel on cuda:0 —
+        // the batched analogue of `matvec_bf16_host_resident_device`. The alloc
+        // is freed on return, preserving the user's `store=ram` intent (weights
+        // are NOT permanently promoted to VRAM). Peak transient VRAM = rows*cols*2.
+        let total_w = checked_len("bf16 matmul weights", matrix.rows, matrix.cols)?;
+        let staged: Option<DeviceBuffer<u16>> = if matrix.is_host_resident() {
+            let host = matrix.host_values.as_ref().ok_or_else(|| {
+                AegisError::InvalidPlan(format!(
+                    "host-resident batched matmul called on non-host-resident `{}`",
+                    matrix.name
+                ))
+            })?;
+            let weights_host = host.values();
+            if weights_host.len() < total_w {
+                return Err(AegisError::InvalidPlan(format!(
+                    "bf16 batched host matmul: pinned host weights for `{}` have {} u16, need {}*{}={}",
+                    matrix.name, weights_host.len(), matrix.rows, matrix.cols, total_w
+                )));
+            }
+            let mut weights_dev = self.alloc_u16(total_w)?;
+            self.stream
+                .memcpy_htod(&weights_host[..total_w], &mut weights_dev.slice)
+                .map_err(map_cuda_err("htod bf16 batched host-resident upload"))?;
+            Some(weights_dev)
+        } else {
+            None
+        };
+        let weights = match &staged {
+            Some(buf) => &buf.slice,
+            None => &matrix.values,
+        };
         let rows = u32_arg("rows", matrix.rows)?;
         let cols = u32_arg("cols", matrix.cols)?;
         let batch_u32 = u32_arg("batch", batch)?;
@@ -372,7 +398,7 @@ impl CudaRuntime {
         unsafe {
             self.stream
                 .launch_builder(&self.kernels.bf16_matmul_reference_batched)
-                .arg(&matrix.values)
+                .arg(weights)
                 .arg(&input.slice)
                 .arg(&rows)
                 .arg(&cols)
