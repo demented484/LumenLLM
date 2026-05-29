@@ -162,6 +162,24 @@ fn silu_scalar(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+// ── GeGLU (Gemma-4 / Qwen MLP activation) ────────────────────────────────────
+// out = gelu_pytorch_tanh(gate) * up, matching HF `gelu_pytorch_tanh`:
+//   0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+
+#[inline(always)]
+pub fn gelu_tanh_scalar(x: f32) -> f32 {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_56; // sqrt(2/pi)
+    let inner = SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x);
+    0.5 * x * (1.0 + inner.tanh())
+}
+
+pub fn geglu_into_simd(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    let len = gate.len().min(up.len()).min(out.len());
+    for i in 0..len {
+        out[i] = gelu_tanh_scalar(gate[i]) * up[i];
+    }
+}
+
 // ── RoPE pair ────────────────────────────────────────────────────────────────
 
 pub fn rope_apply_pair(row: &mut [f32], cos_table: &[f32], sin_table: &[f32]) {
