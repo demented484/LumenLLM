@@ -761,72 +761,109 @@ impl AudioTower {
         )?;
         let q = runtime.download_f32(&q_dev)?;
 
-        // ── Relative position bias term (term_bd). ──
-        // HF builds a sinusoidal timing signal over relative positions
-        // [max_backward .. -max_forward], projects via relative_k_proj-derived
-        // pos_proj, and applies a relative-shift. For this first pass we compute
-        // a simplified content-only attention (term_ac) and leave term_bd as a
-        // TODO. This is the single biggest numeric gap in the audio path.
+        // ── Relative position bias (matrix_bd), ported exactly from HF
+        // `Gemma4AudioAttention` (transformers .../models/gemma4/modeling_gemma4.py).
         //
-        // TODO(gpu-verify): implement the full relative-position bias.
-        //   max_backward = attention_context_left - 1 (= 12)
-        //   max_forward  = attention_context_right     (= 0)
-        //   pos_indices  = arange(max_backward, -max_forward-1, -1)
-        //   sin_emb      = timing_signal_1d(pos_indices)            [F_span, hidden]
-        //   proj         = sin_emb @ relative_k_proj.T              [F_span, hidden]
-        //   term_bd[i,j] = sum_d Q[i,d] * proj[rel(i,j), d]  (then _relative_shift)
-        // Until then attention uses content scores only (term_ac).
-        let _rel_k = &attn.relative_k_proj;
-
-        // ── Chunked-local masked attention (term_ac + softcap + softmax · V). ──
-        // chunk = attention_chunk_size; each query at frame i attends to keys in
-        // [chunk_start - context_left, chunk_end + context_right) where the chunk
-        // is floor(i/chunk)*chunk .. that+chunk. context_right=0 → strictly causal
-        // within the right edge.
-        // TODO(gpu-verify): exact block/context window semantics vs HF
-        // _convert_to_block / _extract_block_context. This implements the
-        // equivalent per-query allowed-key set directly.
+        // HF builds a sinusoidal timing signal `position_embeddings` once per
+        // forward (`Gemma4AudioRelPositionalEncoding`), projects it with the
+        // per-layer `relative_k_proj`, and adds the block-shifted bias to the
+        // content score before the tanh softcap. We reproduce that here on the
+        // CPU, but in the equivalent per-query sliding-window form (verified
+        // bit-for-bit against the HF module — see hand-off notes).
+        //
+        // Derivation (chunk=12, ctx_left=13 → max_past=12, ctx_right=0 →
+        // max_future=0, context_size = chunk+max_past+max_future = 24):
+        //   * The chunked block mask + sliding_window_mask_function(left=max_past,
+        //     right=max_future) reduce, for each query i, to the key set
+        //     {j : 0 <= i - j < max_past}  (i.e. j in [i-(max_past-1) .. i]).
+        //   * Within HF's blocked layout, the rel-shifted bias for query i and
+        //     key j uses pos-embedding row p = c - ci = max_past - (i - j), and
+        //     for every valid key (0 <= i-j < max_past) this p lands in
+        //     [1 .. max_past] ⊂ [0, P) with P = context_size//2 + 1, so the bias
+        //     is always defined and no explicit `_rel_shift` padding is needed.
+        //   * matrix_bd[i,j] = sum_d Q_scaled[i,d] * relk[p, head, d], where
+        //     Q_scaled is the SAME query already multiplied by
+        //     q_scale·softplus(per_dim_scale) above (HF uses query_states for both
+        //     matrix_ac and matrix_bd).
         let chunk = s.attention_chunk_size.max(1);
-        let ctx_left = s.attention_context_left;
-        let ctx_right = s.attention_context_right;
+        let max_past = s.attention_context_left.saturating_sub(1); // ctx_left - 1
+        let max_future = s.attention_context_right;
+        let context_size = chunk + max_past + max_future;
         let cap = s.attention_logit_cap;
         // HF Gemma4AudioAttention scales keys by k_scale = log(1+e)/log(2) ≈ 1.8946
         // (queries already carry q_scale·softplus(per_dim_scale)). This was missing.
         let k_scale = (1.0f32 + std::f32::consts::E).ln() / 2.0f32.ln();
 
+        // ── Sinusoidal relative-position encoding (Gemma4AudioRelPositionalEncoding). ──
+        // position_ids = arange(context_size//2, -1, -1)  → length P = context_size//2 + 1
+        // inv_timescales[j] = exp(-j * log(10000)/(num_timescales-1)),  num_timescales = hidden/2
+        // pos_embed[p] = [ sin(pid*inv) ... , cos(pid*inv) ... ]   (length = hidden)
+        let p_count = context_size / 2 + 1;
+        let num_timescales = h / 2;
+        let log_inc = (10000.0f64).ln() / ((num_timescales as f64 - 1.0).max(1.0));
+        let mut pos_embed = vec![0f32; p_count * h];
+        for p in 0..p_count {
+            // position_ids[p] = (context_size//2) - p   (arange counting down from ctx//2 to 0)
+            let pid = (context_size / 2) as f64 - p as f64;
+            for jj in 0..num_timescales {
+                let inv = (-(jj as f64) * log_inc).exp();
+                let ang = pid * inv;
+                pos_embed[p * h + jj] = ang.sin() as f32;
+                pos_embed[p * h + num_timescales + jj] = ang.cos() as f32;
+            }
+        }
+        // relative_k_proj(pos_embed): [P, hidden] @ relative_k_proj.T → [P, hidden]
+        // then reshape to [P, nh, hd]. relative_k_proj weight is [hidden, hidden]
+        // (nn.Linear(hidden, nh*hd), no bias).
+        let relk = self.matmul_host(runtime, &pos_embed, p_count, &attn.relative_k_proj)?;
+
+        // ── Chunked-local masked attention (matrix_ac + matrix_bd → softcap → softmax · V). ──
+        // Per-query sliding window {j : 0 <= i - j < max_past} ∩ [i-(max_past-1) .. i+max_future].
         let mut attn_out = vec![0f32; batch * h];
         for head in 0..nh {
             for i in 0..batch {
-                let chunk_idx = i / chunk;
-                let chunk_start = chunk_idx * chunk;
-                let chunk_end = (chunk_start + chunk).min(batch);
-                // allowed key window for this block. HF max_past_horizon =
-                // ctx_left-1 (NOT ctx_left), max_future_horizon = ctx_right.
-                let lo = chunk_start.saturating_sub(ctx_left.saturating_sub(1));
-                let hi = (chunk_end + ctx_right).min(batch);
-                // scores over [lo, hi).
-                let mut scores = Vec::with_capacity(hi - lo);
+                // Valid keys: i - j in [-max_future+1 .. max_past-1] with the HF
+                // sliding rule (dist>=0 & dist<max_past) | (dist<0 & -dist<max_future).
+                // For Gemma-4 audio max_future=0, so this is j in [i-(max_past-1) .. i].
+                let lo = i.saturating_sub(max_past.saturating_sub(1));
+                let hi = (i + max_future).min(batch.saturating_sub(1));
+                let mut scores = Vec::with_capacity(hi + 1 - lo);
+                let mut idxs = Vec::with_capacity(hi + 1 - lo);
                 let mut max_s = f32::NEG_INFINITY;
-                for j in lo..hi {
-                    let mut dot = 0f32;
-                    for d in 0..hd {
-                        dot += q[i * h + head * hd + d] * (k[j * h + head * hd + d] * k_scale);
+                for j in lo..=hi {
+                    let dist = i as isize - j as isize;
+                    // HF sliding_window_mask_function(left=max_past, right=max_future).
+                    let valid = (dist >= 0 && (dist as usize) < max_past)
+                        || (dist < 0 && ((-dist) as usize) < max_future);
+                    if !valid {
+                        continue;
                     }
-                    // tanh logit softcap: cap * tanh(score / cap).
-                    // TODO(gpu-verify): confirm the softcap is applied to the
-                    // RAW dot product BEFORE adding the (currently missing)
-                    // rel-pos bias term_bd and before the max-subtract softmax,
-                    // and that cap = attention_logit_cap (=50). HF applies
-                    // softcap to (term_ac + term_bd); here term_bd is omitted.
+                    // matrix_ac: content score (key carries k_scale).
+                    let mut ac = 0f32;
+                    for d in 0..hd {
+                        ac += q[i * h + head * hd + d] * (k[j * h + head * hd + d] * k_scale);
+                    }
+                    // matrix_bd: rel-pos bias. p = max_past - dist (== c - ci in HF
+                    // blocked coords); always in [0, P) for valid keys.
+                    let mut bd = 0f32;
+                    let p = (max_past as isize - dist) as usize;
+                    if p < p_count {
+                        for d in 0..hd {
+                            bd += q[i * h + head * hd + d] * relk[p * h + head * hd + d];
+                        }
+                    }
+                    // tanh logit softcap applied to (matrix_ac + matrix_bd).
+                    let raw = ac + bd;
                     let capped = if cap > 0.0 {
-                        cap * (dot / cap).tanh()
+                        cap * (raw / cap).tanh()
                     } else {
-                        dot
+                        raw
                     };
                     if capped > max_s {
                         max_s = capped;
                     }
                     scores.push(capped);
+                    idxs.push(j);
                 }
                 // softmax.
                 let mut sum = 0f32;
@@ -838,7 +875,7 @@ impl AudioTower {
                 // weighted V.
                 for d in 0..hd {
                     let mut acc = 0f32;
-                    for (idx, j) in (lo..hi).enumerate() {
+                    for (idx, &j) in idxs.iter().enumerate() {
                         acc += scores[idx] * inv * v[j * h + head * hd + d];
                     }
                     attn_out[i * h + head * hd + d] = acc;
