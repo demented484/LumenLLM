@@ -6,9 +6,7 @@ use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::generation::SamplingConfig;
 use aegisllm_base::planning::placement::{
     ComputePlacement, LayerSelector, PlacementPolicy, PlacementRule, StoragePlacement,
-    WeightQuantOverride,
 };
-use aegisllm_base::tensor::layout::{LinearLayoutChoice, LinearLayoutPolicy, MaterializationPolicy};
 use aegisllm_base::tensor::quant::KvCacheQuantization;
 
 use super::file::*;
@@ -153,14 +151,6 @@ impl ParametersFile {
             if let Some(compute) = attn.compute.as_deref() {
                 policy.attention_compute_override = Some(parse_compute(compute, cuda_device)?);
             }
-            if let Some(q) = attn.attention_quantization.as_deref() {
-                policy.attention_quantization = WeightQuantOverride::parse(q).ok_or_else(|| {
-                    AegisError::InvalidConfig(format!(
-                        "unsupported attention-quantization `{q}` \
-                         (use one of: default, fp8, mxint4, int4, int8)"
-                    ))
-                })?;
-            }
             // `attention.compute-quantization` — precision the attention
             // KERNEL runs in. Parsed here; the FP8/KV compatibility check
             // runs after `hidden-layers.kv-cache` is parsed (kv_quantization
@@ -203,15 +193,6 @@ impl ParametersFile {
                     });
                 }
             }
-            if let Some(q) = hidden_layers.shared_mlp_quantization.as_deref() {
-                policy.shared_mlp_quantization = WeightQuantOverride::parse(q).ok_or_else(|| {
-                    AegisError::InvalidConfig(format!(
-                        "unsupported shared-MLP-quantization `{q}` \
-                         (use one of: default, fp8, mxint4, int4, int8)"
-                    ))
-                })?;
-            }
-
             // ── weights sub-section ────────────────────────────────────────────
             if let Some(weights) = hidden_layers.weights {
                 let primary_store = weights.store
@@ -331,19 +312,7 @@ impl ParametersFile {
             )));
         }
 
-        if let Some(layout) = self.model.linear_layout {
-            apply_linear_layout_section(&mut policy.linear_layout, layout)?;
-        }
         if let Some(other) = &self.model.other {
-            if let Some(value) = other.cpu_linear_layout.as_deref() {
-                policy.linear_layout.cpu = LinearLayoutChoice::parse(value)?;
-            }
-            if let Some(value) = other.cuda_linear_layout.as_deref() {
-                policy.linear_layout.cuda = LinearLayoutChoice::parse(value)?;
-            }
-            if let Some(value) = other.linear_materialize.as_deref() {
-                policy.linear_layout.materialization = MaterializationPolicy::parse(value)?;
-            }
             if !explicit_cuda_prefill_attention && let Some(value) = other.flash_attention {
                 cuda_runtime.prefill_attention = if value {
                     CudaPrefillAttentionKernel::Auto
@@ -376,8 +345,14 @@ impl ParametersFile {
         //    Mirrors the optional vision/audio sections (a model dependency belongs
         //    in the config). An explicit `--draft-model` flag overrides this in
         //    `parse_engine_flags`.
+        // The draft accepts the full model placement block (DraftSection flattens
+        // ModelSection) for config symmetry, but an EAGLE/MTP draft shares the
+        // target's KV cache and runs on the target's device, so only path +
+        // num-draft-tokens are honored today (it loads VRAM-resident on the target
+        // device — see load_draft_model). The other placement fields are accepted
+        // but inherited from the target.
         let (draft_model, num_draft_tokens) = match self.draft {
-            Some(d) => (Some(d.path), d.num_draft_tokens.unwrap_or(4).max(1)),
+            Some(d) => (Some(d.model.path), d.num_draft_tokens.unwrap_or(4).max(1)),
             None => (None, 4),
         };
 
@@ -421,64 +396,6 @@ fn retarget_compute(compute: ComputePlacement, device: usize) -> ComputePlacemen
     }
 }
 
-fn apply_linear_layout_section(
-    policy: &mut LinearLayoutPolicy,
-    layout: LinearLayoutSection,
-) -> Result<()> {
-    if let Some(mode) = layout.mode.as_deref() {
-        let choice = LinearLayoutChoice::parse(mode)?;
-        policy.cpu = choice;
-        policy.cuda = choice;
-    }
-    if let Some(cpu) = layout.cpu.as_deref() {
-        policy.cpu = LinearLayoutChoice::parse(cpu)?;
-    }
-    if let Some(cuda) = layout.cuda.as_deref() {
-        policy.cuda = LinearLayoutChoice::parse(cuda)?;
-    }
-    if let Some(materialize) = layout.materialize.as_deref() {
-        policy.materialization = MaterializationPolicy::parse(materialize)?;
-    }
-    if let Some(value) = layout.max_extra_memory {
-        policy.max_extra_memory_bytes = parse_optional_bytes(value)?;
-    }
-    Ok(())
-}
-
-fn parse_optional_bytes(value: serde_json::Value) -> Result<Option<u64>> {
-    match value {
-        serde_json::Value::Null => Ok(None),
-        serde_json::Value::String(value) if value.eq_ignore_ascii_case("auto") => Ok(None),
-        serde_json::Value::String(value) => parse_bytes_string(&value).map(Some),
-        serde_json::Value::Number(value) => value.as_u64().map(Some).ok_or_else(|| {
-            AegisError::InvalidConfig("max-extra-memory must be a positive integer".into())
-        }),
-        other => Err(AegisError::InvalidConfig(format!(
-            "unsupported max-extra-memory value `{other}`"
-        ))),
-    }
-}
-
-fn parse_bytes_string(value: &str) -> Result<u64> {
-    let raw = value.trim().to_ascii_lowercase();
-    let (digits, multiplier) = if let Some(number) = raw.strip_suffix("gib") {
-        (number.trim(), 1024_u64.pow(3))
-    } else if let Some(number) = raw.strip_suffix("gb") {
-        (number.trim(), 1_000_000_000)
-    } else if let Some(number) = raw.strip_suffix("mib") {
-        (number.trim(), 1024_u64.pow(2))
-    } else if let Some(number) = raw.strip_suffix("mb") {
-        (number.trim(), 1_000_000)
-    } else {
-        (raw.as_str(), 1)
-    };
-    let value = digits
-        .parse::<u64>()
-        .map_err(|_| AegisError::InvalidConfig(format!("invalid byte value `{}`", value.trim())))?;
-    value
-        .checked_mul(multiplier)
-        .ok_or_else(|| AegisError::InvalidConfig(format!("byte value `{}` overflows", value)))
-}
 
 pub fn parse_storage(value: &str, default_device: usize) -> Result<StoragePlacement> {
     match value.to_ascii_lowercase().as_str() {

@@ -160,15 +160,48 @@
     }
 
     #[test]
-    fn attention_compute_quant_bf16_distinct_from_weight_quant() {
-        // `compute-quantization` and `attention-quantization` are independent
-        // knobs: one selects the kernel precision, the other the weight quant.
+    fn draft_section_accepts_full_model_block() {
+        // The draft section flattens the full ModelSection (path + placement) and
+        // adds num-draft-tokens. Verify it parses and the path + token count flow
+        // into the fragment.
+        let params: ParametersFile = serde_json::from_value(serde_json::json!({
+            "model": { "path": "/tmp/target" },
+            "draft": {
+                "path": "/tmp/draft-assistant",
+                "compute": "cuda:0",
+                "store": "vram",
+                "input-layer":  { "compute": "cuda:0", "store": "ram" },
+                "output-layer": { "compute": "cuda:0", "store": "vram" },
+                "hidden-layers": {
+                    "compute": "cuda:0", "store": "vram",
+                    "kv-cache": { "context-size": 4096, "type-k": "f16", "type-v": "f16" }
+                },
+                "attention": { "compute": "cuda:0", "store": "vram", "compute-quantization": "bf16" },
+                "num-draft-tokens": 6
+            }
+        }))
+        .expect("draft section with full model block should parse");
+
+        let fragment = params
+            .into_engine_fragment(PlacementPolicy::auto_for(&HardwareInventory::detect()))
+            .expect("fragment");
+        assert_eq!(
+            fragment.draft_model.as_deref(),
+            Some(std::path::Path::new("/tmp/draft-assistant"))
+        );
+        assert_eq!(fragment.num_draft_tokens, 6);
+    }
+
+    #[test]
+    fn attention_compute_quant_bf16_parses() {
+        // `compute-quantization` selects the attention KERNEL precision. (The
+        // weight-requant knobs attention-quantization/shared-MLP-quantization were
+        // removed from the schema; checkpoint-native precision is loaded as-is.)
         let params: ParametersFile = serde_json::from_value(serde_json::json!({
             "model": {
                 "path": "/tmp/model",
                 "attention": {
-                    "compute-quantization": "bf16",
-                    "attention-quantization": "fp8"
+                    "compute-quantization": "bf16"
                 }
             }
         }))
@@ -181,12 +214,6 @@
         assert_eq!(
             fragment.cuda.attention_compute_quant,
             AttentionComputeQuant::Bf16
-        );
-        // weight quant stays on its own field, untouched.
-        use aegisllm_base::planning::placement::WeightQuantOverride;
-        assert_eq!(
-            fragment.policy.attention_quantization,
-            WeightQuantOverride::Fp8
         );
     }
 

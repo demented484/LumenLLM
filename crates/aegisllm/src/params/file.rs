@@ -64,14 +64,22 @@ pub struct ParametersFile {
     pub cuda: Option<CudaSection>,
 }
 
-/// Speculative-decoding draft model. The draft runs on the same compute device
-/// as the target and shares its KV cache, so it has no separate `compute`/`store`
-/// (it inherits the model section's placement).
+/// Speculative-decoding draft model. Accepts the SAME placement block as the
+/// primary `model` (path, store, compute, input-layer, output-layer, attention,
+/// hidden-layers, ...) — flattened in — plus `num-draft-tokens`, so the draft is
+/// configured exactly like the target.
+///
+/// NOTE on what the engine honors: the draft is an EAGLE/MTP model — tiny
+/// (~152 MiB), and it SHARES the target's KV cache while running interleaved on
+/// the target's device. So it is pinned to the target's device and has NO
+/// separate KV cache. The meaningful knobs are `path`, `num-draft-tokens`, and
+/// `store`/`compute` (where the draft's own weights live). The `hidden-layers`
+/// `kv-cache` and per-section attention sub-fields are accepted for config
+/// symmetry but inherited from the target (the draft does not own a KV cache).
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct DraftSection {
-    /// Path to the EAGLE/MTP draft checkpoint (e.g. the gemma-4 *-assistant model).
-    pub path: PathBuf,
+    #[serde(flatten)]
+    pub model: ModelSection,
     /// Tokens proposed per speculative round. Defaults to 4 when unset.
     #[serde(rename = "num-draft-tokens")]
     pub num_draft_tokens: Option<usize>,
@@ -113,15 +121,6 @@ pub struct AttentionSection {
     pub mechanism: Option<String>,
     pub store: Option<String>,
     pub compute: Option<String>,
-    /// Re-quantize the attention Q/K/V/O projection **weights** at load
-    /// time. One of: "bf16" (default), "nvfp4", "fp8", "int8", "int4".
-    /// Same semantics as `hidden-layers.shared-MLP-quantization`.
-    ///
-    /// NOTE: this is the *weight* quantization. To pick the precision the
-    /// attention KERNEL runs in, use `compute-quantization` below — the two
-    /// are independent knobs.
-    #[serde(rename = "attention-quantization")]
-    pub attention_quantization: Option<String>,
     /// Precision the prefill/decode attention KERNEL runs in.
     /// One of:
     ///   * "default" — historical dispatch (env gates only); bit-equivalent
@@ -135,7 +134,6 @@ pub struct AttentionSection {
     ///                 because the FP8 kernel reads FP8 K/V directly.
     ///
     /// This is the attention *compute* path — distinct from
-    /// `attention-quantization` (weight quant) and from
     /// `hidden-layers.kv-cache.type-k/type-v` (KV storage dtype).
     #[serde(rename = "compute-quantization")]
     pub compute_quantization: Option<String>,
@@ -156,8 +154,12 @@ pub struct ServerSection {
     pub server_api: Option<String>,
 }
 
+// NOTE: no `#[serde(deny_unknown_fields)]` here — ModelSection is `#[serde(flatten)]`
+// into DraftSection (which adds `num-draft-tokens`), and serde flatten is
+// incompatible with deny_unknown_fields. Typos are still caught by the leaf
+// sections (attention, hidden-layers, kv-cache, …) which keep deny_unknown_fields,
+// and by ParametersFile's deny_unknown_fields at the top level.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct ModelSection {
     pub path: PathBuf,
     pub store: Option<String>,
@@ -174,8 +176,6 @@ pub struct ModelSection {
     pub attention: Option<AttentionSection>,
     #[serde(rename = "hidden-layers")]
     pub hidden_layers: Option<HiddenLayersSection>,
-    #[serde(rename = "linear-layout")]
-    pub linear_layout: Option<LinearLayoutSection>,
     #[serde(rename = "other-parameters")]
     pub other: Option<OtherSection>,
 }
@@ -192,14 +192,6 @@ pub struct HiddenLayersSection {
     /// When both `store` and `weights.store` are present, `weights.store`
     /// wins (longer form is more specific).
     pub store: Option<String>,
-    /// Re-quantize the shared expert (always-active MLP) at load time.
-    /// One of: "bf16" (default — keep as stored), "nvfp4", "fp8", "int8",
-    /// "int4". The checkpoint stores it as BF16; setting this to e.g.
-    /// `"nvfp4"` runs a load-time quantizer (per-block absmax, no
-    /// calibration) so the weights live in VRAM in the requested format
-    /// and use the matching tensor-core GEMM during inference.
-    #[serde(rename = "shared-MLP-quantization")]
-    pub shared_mlp_quantization: Option<String>,
     pub weights: Option<HiddenLayerWeightsSection>,
     #[serde(rename = "kv-cache")]
     pub kv_cache: Option<HiddenLayerKvCacheSection>,
@@ -257,24 +249,7 @@ pub struct OtherSection {
     pub ubatch_size: Option<usize>,
     #[serde(rename = "flash-attention")]
     pub flash_attention: Option<bool>,
-    #[serde(rename = "cpu-linear-layout")]
-    pub cpu_linear_layout: Option<String>,
-    #[serde(rename = "cuda-linear-layout")]
-    pub cuda_linear_layout: Option<String>,
-    #[serde(rename = "linear-materialize")]
-    pub linear_materialize: Option<String>,
     pub threads: Option<usize>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct LinearLayoutSection {
-    pub mode: Option<String>,
-    pub cpu: Option<String>,
-    pub cuda: Option<String>,
-    pub materialize: Option<String>,
-    #[serde(rename = "max-extra-memory")]
-    pub max_extra_memory: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
