@@ -858,6 +858,12 @@ impl CudaLlamaExecutor {
                 stat_rounds += 1;
                 stat_proposed += kk;
                 stat_accepted += m;
+                if stat_rounds <= 3 {
+                    eprintln!(
+                        "[spec-dbg] round {} base_pos={} proposals={:?} target_preds={:?} accepted={}",
+                        stat_rounds, base_pos, proposals, &preds[..kk.min(preds.len())], m,
+                    );
+                }
             }
 
             // KV/position rewind: only positions [base_pos, base_pos+m] are valid
