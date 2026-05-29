@@ -1,3 +1,4 @@
+use super::g4::{G4CpuExecutor, G4CpuState};
 use super::state::{CpuLlamaExecutor, CpuLlamaState};
 use aegisllm_base::artifact::ModelArtifact;
 use aegisllm_base::backend::BackendKind;
@@ -7,14 +8,39 @@ use aegisllm_base::executor::traits::{
     GenerationState, ModelExecutorBackend,
 };
 use aegisllm_base::graph::ModelGraph;
+use aegisllm_base::model::detect_architecture;
 use aegisllm_base::planning::placement::{ComputePlacement, ResolvedPlacement, StoragePlacement};
 use aegisllm_base::planning::runtime::RuntimePlan;
 use aegisllm_base::text::TextProcessor;
 
+/// Architecture-specific CPU backend. Selected at load time from the model
+/// descriptor — Gemma-4 routes to the new `G4CpuExecutor`; everything else
+/// (Llama / Qwen / Nemotron text) keeps the existing Llama-style path.
+/// The Gemma-4 variants are boxed because they carry substantially more
+/// per-layer state (PrePost norms, q/k/v norms, PLE/MoE), keeping the enum
+/// small for the common Llama path.
+#[derive(Debug)]
+// Llama is the established inline hot path; the Gemma-4 variant is already
+// boxed. The residual size delta is the inline Llama executor itself, which we
+// deliberately keep un-boxed to avoid touching the existing path.
+#[allow(clippy::large_enum_variant)]
+enum CpuBackend {
+    Llama(CpuLlamaExecutor),
+    Gemma4(Box<G4CpuExecutor>),
+}
+
+/// Runtime state for the active backend variant.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+enum CpuState {
+    Llama(CpuLlamaState),
+    Gemma4(Box<G4CpuState>),
+}
+
 #[derive(Debug)]
 pub struct CpuReferenceExecutor {
     text: TextProcessor,
-    cpu: CpuLlamaExecutor,
+    cpu: CpuBackend,
 }
 
 impl CpuReferenceExecutor {
@@ -34,9 +60,22 @@ impl CpuReferenceExecutor {
         runtime: &RuntimePlan,
     ) -> Result<Self> {
         validate_cpu_placement(placement)?;
+        // Architecture is decided here (downstream of executor selection, which
+        // is purely placement-driven). Gemma-4 uses the PrePost/PLE/MoE forward;
+        // all other text decoders keep the Llama-style path.
+        let is_gemma4 = detect_architecture(&artifact.config)
+            .map(|arch| arch.name() == "gemma4")
+            .unwrap_or(false);
+        let cpu = if is_gemma4 {
+            CpuBackend::Gemma4(Box::new(G4CpuExecutor::from_artifact(
+                artifact, graph, placement, runtime,
+            )?))
+        } else {
+            CpuBackend::Llama(CpuLlamaExecutor::from_artifact(artifact, graph, placement, runtime)?)
+        };
         Ok(Self {
             text: TextProcessor::from_artifact(artifact)?,
-            cpu: CpuLlamaExecutor::from_artifact(artifact, graph, placement, runtime)?,
+            cpu,
         })
     }
 }
@@ -55,17 +94,26 @@ impl GenerationBackendPrimitives for CpuReferenceExecutor {
     }
 
     fn new_sequence_state(&self) -> Result<Box<dyn GenerationState>> {
-        Ok(Box::new(self.cpu.new_state()))
+        Ok(match &self.cpu {
+            CpuBackend::Llama(m) => Box::new(CpuState::Llama(m.new_state())),
+            CpuBackend::Gemma4(m) => Box::new(CpuState::Gemma4(Box::new(m.new_state()))),
+        })
     }
 
     fn forward_hidden(&self, state: &mut dyn GenerationState, token_id: usize) -> Result<()> {
-        let state = cpu_state_mut(state)?;
-        self.cpu.forward_hidden(state, token_id).map(|_| ())
+        match (&self.cpu, cpu_state_mut(state)?) {
+            (CpuBackend::Llama(m), CpuState::Llama(s)) => m.forward_hidden(s, token_id).map(|_| ()),
+            (CpuBackend::Gemma4(m), CpuState::Gemma4(s)) => m.forward_hidden(s, token_id).map(|_| ()),
+            _ => Err(state_mismatch()),
+        }
     }
 
     fn forward_logits(&self, state: &mut dyn GenerationState, token_id: usize) -> Result<Vec<f32>> {
-        let state = cpu_state_mut(state)?;
-        self.cpu.forward_logits(state, token_id)
+        match (&self.cpu, cpu_state_mut(state)?) {
+            (CpuBackend::Llama(m), CpuState::Llama(s)) => m.forward_logits(s, token_id),
+            (CpuBackend::Gemma4(m), CpuState::Gemma4(s)) => m.forward_logits(s, token_id),
+            _ => Err(state_mismatch()),
+        }
     }
 
     fn prefill_prompt(
@@ -74,9 +122,16 @@ impl GenerationBackendPrimitives for CpuReferenceExecutor {
         prompt_tokens: &[usize],
         sampling: &aegisllm_base::generation::SamplingConfig,
     ) -> Result<usize> {
-        let state = cpu_state_mut(state)?;
-        self.cpu.prefill_prompt(state, prompt_tokens, sampling)
+        match (&self.cpu, cpu_state_mut(state)?) {
+            (CpuBackend::Llama(m), CpuState::Llama(s)) => m.prefill_prompt(s, prompt_tokens, sampling),
+            (CpuBackend::Gemma4(m), CpuState::Gemma4(s)) => m.prefill_prompt(s, prompt_tokens, sampling),
+            _ => Err(state_mismatch()),
+        }
     }
+}
+
+fn state_mismatch() -> AegisError {
+    AegisError::InvalidPlan("CPU executor backend/state variant mismatch".into())
 }
 
 impl ModelExecutorBackend for CpuReferenceExecutor {
@@ -87,10 +142,10 @@ impl ModelExecutorBackend for CpuReferenceExecutor {
     }
 }
 
-fn cpu_state_mut(state: &mut dyn GenerationState) -> Result<&mut CpuLlamaState> {
+fn cpu_state_mut(state: &mut dyn GenerationState) -> Result<&mut CpuState> {
     state
         .as_any_mut()
-        .downcast_mut::<CpuLlamaState>()
+        .downcast_mut::<CpuState>()
         .ok_or_else(|| AegisError::InvalidPlan("CPU executor received foreign state".into()))
 }
 

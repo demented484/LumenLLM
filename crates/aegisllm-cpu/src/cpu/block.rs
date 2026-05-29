@@ -37,6 +37,22 @@ impl CpuLayerBlockExecutor {
         runtime: &RuntimePlan,
         selected_layers: &BTreeSet<usize>,
     ) -> Result<Self> {
+        // The hybrid CPU-layer block path is Llama-style only: it does NOT
+        // implement the Gemma-4 PrePost norms, per-head q/k/v norm, partial
+        // RoPE, per-layer head_dim/kv, PLE, or MoE. Running a Gemma-4 model
+        // through it would silently miscompute, so reject it loudly. The
+        // pure-CPU Gemma-4 forward (compute=cpu for ALL regions) is handled by
+        // `G4CpuExecutor`; a hybrid Gemma-4 per-layer path is a follow-up.
+        if aegisllm_base::model::detect_architecture(&artifact.config)
+            .map(|arch| arch.name() == "gemma4")
+            .unwrap_or(false)
+        {
+            return Err(AegisError::Unsupported(
+                "hybrid CPU-layer execution is not yet implemented for Gemma-4; \
+                 run Gemma-4 fully on CPU (all regions compute=cpu) or fully on GPU"
+                    .into(),
+            ));
+        }
         let region_placements = placement.region_map();
         let runtime_layouts = runtime_linear_layouts_by_region(runtime);
         let mut loader = TensorStorageLoader::new();
