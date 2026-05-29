@@ -1014,6 +1014,26 @@ fn draft_sparse_head_argmax(
 ) -> Result<usize> {
     let head = &draft.centroid_head;
 
+    // A/B DIAGNOSTIC (AEGIS_DRAFT_DENSE_HEAD=1): bypass the centroid mask and do a
+    // FULL dense tied-lm_head argmax over the whole vocab. If accept rate jumps vs
+    // the sparse head, the centroid SELECTION is the bug (right token missing from
+    // the top-k candidate set). If it stays ~equal, the centroid head is fine and
+    // the draft-hidden quality (RoPE/attention/layers) is the bug.
+    if std::env::var("AEGIS_DRAFT_DENSE_HEAD").is_ok() {
+        let vocab = draft.embed_tokens.rows;
+        let mut logits = rt.alloc_f32(vocab)?;
+        rt.matvec_bf16_reference_device(
+            &draft.embed_tokens, &dstate.scratch.final_hidden, &mut logits,
+        )?;
+        let h = rt.download_f32(&logits)?;
+        let mut best = 0usize;
+        let mut bv = f32::NEG_INFINITY;
+        for (i, &v) in h.iter().enumerate() {
+            if v > bv { bv = v; best = i; }
+        }
+        return Ok(best);
+    }
+
     // 1. Centroid scores.
     rt.matvec_bf16_reference_device(
         &head.centroids,
