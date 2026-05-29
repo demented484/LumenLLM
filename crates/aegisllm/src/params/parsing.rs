@@ -371,11 +371,23 @@ impl ParametersFile {
             }
         }
 
+        // ── `draft` — optional EAGLE/MTP speculative-decoding draft model.
+        //    PRESENT → spec-decode enabled with this draft; ABSENT → plain decode.
+        //    Mirrors the optional vision/audio sections (a model dependency belongs
+        //    in the config). An explicit `--draft-model` flag overrides this in
+        //    `parse_engine_flags`.
+        let (draft_model, num_draft_tokens) = match self.draft {
+            Some(d) => (Some(d.path), d.num_draft_tokens.unwrap_or(4).max(1)),
+            None => (None, 4),
+        };
+
         Ok(EngineConfigFragment {
             model_path,
             policy,
             cuda: cuda_runtime,
             generation,
+            draft_model,
+            num_draft_tokens,
         })
     }
 }

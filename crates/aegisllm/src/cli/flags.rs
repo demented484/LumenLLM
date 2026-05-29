@@ -57,14 +57,19 @@ pub(super) fn parse_engine_flags(args: &[String]) -> Result<ParsedEngineFlags> {
     let mut cuda_linear_layout = None;
     let mut linear_materialize = None;
     let mut cuda_runtime = CudaRuntimeConfig::from_env();
-    // Speculative decoding (EAGLE/MTP draft). Env fallback so tooling can opt
-    // in without a CLI flag; an explicit `--draft-model` overrides it.
-    let mut draft_model: Option<PathBuf> = std::env::var_os("AEGIS_DRAFT_MODEL").map(PathBuf::from);
-    let mut num_draft_tokens: usize = std::env::var("AEGIS_NUM_DRAFT_TOKENS")
+    // Speculative decoding (EAGLE/MTP draft). PRECEDENCE: explicit `--draft-model`
+    // flag > config `draft` section > `AEGIS_DRAFT_MODEL` env. The config is the
+    // canonical place (it mirrors the optional vision/audio sections — the draft is
+    // a model dependency, not a runtime knob); the flag/env are quick overrides.
+    let draft_env: Option<PathBuf> = std::env::var_os("AEGIS_DRAFT_MODEL").map(PathBuf::from);
+    let num_draft_env: Option<usize> = std::env::var("AEGIS_NUM_DRAFT_TOKENS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .unwrap_or(4);
+        .filter(|&n| n >= 1);
+    let mut draft_config: Option<PathBuf> = None;
+    let mut num_draft_config: Option<usize> = None;
+    let mut draft_flag: Option<PathBuf> = None;
+    let mut num_draft_flag: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -80,6 +85,11 @@ pub(super) fn parse_engine_flags(args: &[String]) -> Result<ParsedEngineFlags> {
                 loaded_policy = Some(fragment.policy);
                 loaded_generation = Some(fragment.generation);
                 cuda_runtime = fragment.cuda;
+                // Config `draft` section → spec-decode (overridden by --draft-model below).
+                if fragment.draft_model.is_some() {
+                    draft_config = fragment.draft_model;
+                    num_draft_config = Some(fragment.num_draft_tokens);
+                }
             }
             "--model" => model_path = Some(take_value(args, &mut i, flag)?.into()),
             "--ctx-size" => {
@@ -136,10 +146,10 @@ pub(super) fn parse_engine_flags(args: &[String]) -> Result<ParsedEngineFlags> {
                     ))
                 })?)
             }
-            "--draft-model" => draft_model = Some(PathBuf::from(take_value(args, &mut i, flag)?)),
+            "--draft-model" => draft_flag = Some(PathBuf::from(take_value(args, &mut i, flag)?)),
             "--num-draft-tokens" => {
                 let value: usize = parse_value(args, &mut i, flag)?;
-                num_draft_tokens = value.max(1);
+                num_draft_flag = Some(value.max(1));
             }
             other => {
                 return Err(AegisError::InvalidConfig(format!(
@@ -215,6 +225,14 @@ pub(super) fn parse_engine_flags(args: &[String]) -> Result<ParsedEngineFlags> {
     } else if explicit_global_weight_placement {
         policy.rules.clear();
     }
+
+    // Resolve spec-decode precedence: explicit flag > config section > env.
+    let draft_model = draft_flag.or(draft_config).or(draft_env);
+    let num_draft_tokens = num_draft_flag
+        .or(num_draft_config)
+        .or(num_draft_env)
+        .unwrap_or(4)
+        .max(1);
 
     Ok(ParsedEngineFlags {
         model_path,

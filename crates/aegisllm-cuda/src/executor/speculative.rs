@@ -62,6 +62,76 @@ pub(super) fn default_num_draft_tokens() -> usize {
         .unwrap_or(4)
 }
 
+// ───────────────────────── draft numeric-trace dump ──────────────────────────
+//
+// WORKSTREAM A (draft-trace): when `AEGIS_DRAFT_TRACE=<dir>` is set, the FIRST
+// `draft_step` call (round 0, step 0) writes raw little-endian f32 `.bin` of
+// every intermediate draft hidden state into `<dir>`. Paired with the vLLM
+// gemma4_mtp.py `GEMMA4_MTP_TRACE` dump and `bench/draft_trace_compare.py`,
+// which cosine/max-rel diffs each stage and prints the FIRST one that diverges
+// (localizing the numeric bug: pre_projection vs a specific layer vs
+// attention-within-a-layer). NO-op unless the env var is set.
+
+thread_local! {
+    /// Counts `draft_step` invocations on this thread. The dump fires only when
+    /// this is 0 (the very first draft step = round 0, step 0).
+    static DRAFT_STEP_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Returns `Some(dir)` only for round-0/step-0 when `AEGIS_DRAFT_TRACE` is set,
+/// and increments the per-thread step counter. Call EXACTLY once at the top of
+/// `draft_step`.
+fn draft_trace_dir_first_step() -> Option<String> {
+    let n = DRAFT_STEP_CALLS.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    if n != 0 {
+        return None;
+    }
+    std::env::var("AEGIS_DRAFT_TRACE").ok()
+}
+
+/// Download a device f32 buffer's first `len` elements and write them as raw
+/// little-endian f32 to `<dir>/<name>.bin`. No-op when `dir` is None. Mirrors
+/// `audio::dump_stage` but downloads from device first and truncates to `len`
+/// (device scratch buffers are often over-allocated past the logical width).
+fn draft_dump_device(
+    dir: &Option<String>,
+    name: &str,
+    rt: &crate::cuda::CudaRuntime,
+    buf: &DeviceBuffer<f32>,
+    len: usize,
+) {
+    let Some(dir) = dir else { return };
+    let host = match rt.download_f32(buf) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[draft-trace] download {name} failed: {e}");
+            return;
+        }
+    };
+    let n = len.min(host.len());
+    draft_dump_slice(&Some(dir.clone()), name, &host[..n]);
+}
+
+/// Write a host f32 slice as raw little-endian f32 to `<dir>/<name>.bin`.
+fn draft_dump_slice(dir: &Option<String>, name: &str, data: &[f32]) {
+    let Some(dir) = dir else { return };
+    let _ = std::fs::create_dir_all(dir);
+    let mut bytes = Vec::with_capacity(data.len() * 4);
+    for v in data {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let path = format!("{dir}/{name}.bin");
+    if let Err(e) = std::fs::write(&path, &bytes) {
+        eprintln!("[draft-trace] failed to write {path}: {e}");
+    } else {
+        eprintln!("[draft-trace] wrote {path} ({} f32)", data.len());
+    }
+}
+
 /// Raw fields parsed from the draft's `config.json`. The draft uses a
 /// `gemma4_assistant` model_type whose nested `text_config` carries the
 /// decoder shape; the top-level carries the centroid head config. We parse
@@ -678,6 +748,12 @@ impl CudaLlamaExecutor {
         let rt = &self.runtime;
         let eps = draft.rms_norm_eps;
         let bb = draft.backbone_hidden;
+        let dh = draft.draft_hidden;
+
+        // WORKSTREAM A (draft-trace): active only on round-0/step-0 when
+        // AEGIS_DRAFT_TRACE=<dir> is set. Increments the per-thread call counter
+        // exactly once here.
+        let trace = draft_trace_dir_first_step();
 
         // Borrow disjoint state fields.
         let CudaLlamaState {
@@ -696,19 +772,30 @@ impl CudaLlamaExecutor {
         //    TODO(gpu-verify): confirm the pre_projection token-embed half is
         //    the TARGET embed_tokens and whether the Gemma sqrt(hidden) embed
         //    scale belongs here.
+        // TRACE: the target feedback hidden (state.hidden) is the conditioning
+        // input to pre_projection's second half — dump it BEFORE it is consumed.
+        draft_dump_device(&trace, "input_state_hidden", rt, hidden, bb);
         rt.bf16_row_to_f32_device(&self.embed_tokens, token, &mut dstate.scratch.draft_embed)?;
         if let Some(scale) = self.embed_scale {
             rt.scale_f32_device(scale, &mut dstate.scratch.draft_embed)?;
         }
+        // TRACE: the (target-embed, scaled) draft token embedding — first half of
+        // the pre_projection input. vLLM `inputs_embeds` (= embed_tokens*normalizer).
+        draft_dump_device(&trace, "draft_embed", rt, &dstate.scratch.draft_embed, bb);
 
         // 2. pre_projection input = concat(token_embed, target_hidden).
         rt.copy_f32_d2d_range(&dstate.scratch.draft_embed, 0, &mut dstate.scratch.pre_proj_input, 0, bb)?;
         rt.copy_f32_d2d_range(hidden, 0, &mut dstate.scratch.pre_proj_input, bb, bb)?;
+        // TRACE: the 5120-wide concat fed into pre_projection (vLLM `combined`).
+        draft_dump_device(&trace, "pre_proj_input", rt, &dstate.scratch.pre_proj_input, 2 * bb);
         rt.matvec_bf16_reference_device(
             &draft.pre_projection,
             &dstate.scratch.pre_proj_input,
             &mut dstate.scratch.hidden,
         )?;
+        // TRACE: pre_projection output = the initial draft hidden (vLLM
+        // `hidden_states` post `pre_projection`, before any layer).
+        draft_dump_device(&trace, "pre_proj_out", rt, &dstate.scratch.hidden, dh);
 
         // 3. Decode position/seq_len, then the 4 Q-only layers vs target KV.
         //
@@ -736,15 +823,21 @@ impl CudaLlamaExecutor {
         rt.copy_u32_to_device(&[seq_len as u32], decode_seq_len)?;
         draft_forward_layers(
             self, draft, dstate, layers, decode_position, decode_seq_len, draft_position, seq_len,
+            &trace,
         )?;
 
         // 4. final_norm → final_hidden, then post_projection + sparse head.
         rt.rms_norm_device(&dstate.scratch.hidden, &draft.final_norm, eps, &mut dstate.scratch.final_hidden)?;
+        // TRACE: final-normed draft hidden (vLLM `draft_hidden_states` = norm output).
+        draft_dump_device(&trace, "final_hidden", rt, &dstate.scratch.final_hidden, dh);
         rt.matvec_bf16_reference_device(
             &draft.post_projection,
             &dstate.scratch.final_hidden,
             &mut dstate.scratch.backbone_out,
         )?;
+        // TRACE: post_projection output, the backbone-width feedback for the next
+        // step (vLLM `backbone_hidden_states`).
+        draft_dump_device(&trace, "backbone_out", rt, &dstate.scratch.backbone_out, bb);
         draft_sparse_head_argmax(rt, draft, dstate)
     }
 
@@ -809,6 +902,24 @@ impl CudaLlamaExecutor {
             let base_pos = state.position;
             let mut proposals: Vec<usize> = Vec::with_capacity(num_draft);
             let mut draft_input = next;
+            // Feed the draft the POST-final-norm target hidden. The gemma4-MTP draft's
+            // pre_projection was trained on the normed last hidden: vLLM feeds
+            // final_norm(target_hidden) (verified: cos 0.988 vs HF post-norm), while
+            // aegisllm was feeding the PRE-norm residual (cos 0.44 vs vLLM, rms 1.1 vs
+            // 4.0) → ~38% accept. Normalize state.hidden IN PLACE for this round's
+            // FIRST draft step; subsequent steps overwrite state.hidden with the
+            // draft's backbone_out feedback (already in normed/predicted space), so we
+            // normalize only the round-entry target hidden. state.hidden is recomputed
+            // by verify_batched after the round, so this in-place edit is safe.
+            {
+                let CudaLlamaState { ref mut hidden, ref mut scratch, .. } = *state;
+                self.runtime.rms_norm_device(
+                    hidden, &self.final_norm, self.rms_norm_eps, &mut scratch.final_hidden,
+                )?;
+                self.runtime.copy_prefix_f32_device(
+                    &scratch.final_hidden, hidden, self.hidden_size,
+                )?;
+            }
             let t_draft = std::time::Instant::now();
             for _k in 0..num_draft {
                 // CONSTANT draft position (vLLM gemma4 MTP `constant_draft_positions`):
@@ -951,6 +1062,10 @@ fn draft_forward_layers(
     decode_seq_len: &DeviceBuffer<u32>,
     position: usize,
     seq_len: usize,
+    // WORKSTREAM A (draft-trace): Some(dir) only on round-0/step-0. Each layer's
+    // post-attention residual and final output are dumped, so the compare can
+    // localize a divergence down to attention-vs-MLP within a single layer.
+    trace: &Option<String>,
 ) -> Result<()> {
     let rt = &exec.runtime;
     let eps = draft.rms_norm_eps;
@@ -981,7 +1096,28 @@ fn draft_forward_layers(
             position,
             seq_len,
         )?;
+        // TRACE: post-attention residual = hidden + (post-normed) attn-out, i.e.
+        // vLLM's `hidden_states = post_attention_layernorm(attn) + residual`
+        // (gemma4_mtp.py L333-334). Diverging HERE but not at pre_proj isolates
+        // the bug to this layer's ATTENTION (q_proj/q_norm/RoPE/attn/o_proj).
+        draft_dump_device(
+            trace,
+            &format!("layer{li:02}_post_attn"),
+            rt,
+            &dstate.decoder_scratch.residual,
+            draft_hidden,
+        );
         super::mlp::forward_mlp_device(rt, layer, li, None, &mut dstate.decoder_scratch, eps)?;
+        // TRACE: full layer output (post-MLP, post-scalar) = vLLM layer return
+        // value (gemma4_mtp.py L341-343). Diverging HERE but matching at
+        // post_attn isolates the bug to this layer's MLP.
+        draft_dump_device(
+            trace,
+            &format!("layer{li:02}_out"),
+            rt,
+            &dstate.decoder_scratch.hidden_out,
+            draft_hidden,
+        );
         // Move the layer output (decoder_scratch.hidden_out) into the running
         // draft hidden for the next layer.
         rt.copy_prefix_f32_device(

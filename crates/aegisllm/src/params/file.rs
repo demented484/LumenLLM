@@ -54,7 +54,27 @@ pub struct ParametersFile {
     /// input. ABSENT → the audio tower is NOT loaded even when the checkpoint
     /// contains one. `{compute,store}` default to the model section's values.
     pub audio: Option<ModalitySection>,
+    /// EAGLE/MTP speculative-decoding draft model. Schema v2: top-level, optional.
+    /// PRESENT → load the draft model alongside the target and enable
+    /// speculative decoding. ABSENT → plain (non-speculative) decode. This
+    /// mirrors the optional `vision`/`audio` sections: the draft is a model
+    /// dependency, so it belongs in the config, not in CLI flags. An explicit
+    /// `--draft-model` flag still overrides the config for quick experiments.
+    pub draft: Option<DraftSection>,
     pub cuda: Option<CudaSection>,
+}
+
+/// Speculative-decoding draft model. The draft runs on the same compute device
+/// as the target and shares its KV cache, so it has no separate `compute`/`store`
+/// (it inherits the model section's placement).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DraftSection {
+    /// Path to the EAGLE/MTP draft checkpoint (e.g. the gemma-4 *-assistant model).
+    pub path: PathBuf,
+    /// Tokens proposed per speculative round. Defaults to 4 when unset.
+    #[serde(rename = "num-draft-tokens")]
+    pub num_draft_tokens: Option<usize>,
 }
 
 /// Placement for an optional modality tower (vision / audio). Mere presence of

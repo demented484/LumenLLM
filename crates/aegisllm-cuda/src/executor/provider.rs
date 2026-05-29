@@ -209,6 +209,19 @@ impl CudaExecutorProvider {
         if prompt_tokens.is_empty() {
             return Err(AegisError::InvalidConfig("prompt produced no tokens".into()));
         }
+        // Draft-trace harness: dump the EXACT chat-templated prompt token ids so the
+        // vLLM reference can be driven with prompt_token_ids and feed the target an
+        // identical context (otherwise input_state_hidden diverges at stage 0).
+        // No-op unless AEGIS_DRAFT_TRACE is set.
+        if let Ok(dir) = std::env::var("AEGIS_DRAFT_TRACE") {
+            let _ = std::fs::create_dir_all(&dir);
+            let ids: Vec<String> = prompt_tokens.iter().map(|t| t.to_string()).collect();
+            let path = format!("{dir}/prompt_token_ids.json");
+            match std::fs::write(&path, format!("[{}]", ids.join(","))) {
+                Ok(()) => eprintln!("[draft-trace] wrote {path} ({} tokens)", prompt_tokens.len()),
+                Err(e) => eprintln!("[draft-trace] failed to write {path}: {e}"),
+            }
+        }
         let mut state = self.new_sequence_state()?;
         if let Some(ref injection) = request.image_injection {
             self.set_image_injection(state.as_mut(), injection)?;

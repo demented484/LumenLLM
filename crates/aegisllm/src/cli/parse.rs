@@ -214,6 +214,8 @@ fn parse_serve(args: &[String]) -> Result<Command> {
             policy: PlacementPolicy::auto_for(&inventory),
             cuda: CudaRuntimeConfig::from_env(),
             generation: SamplingConfig::default(),
+            draft_model: None,
+            num_draft_tokens: 4,
         },
     });
     if let Some(host) = host {
