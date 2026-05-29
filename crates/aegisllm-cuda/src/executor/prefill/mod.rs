@@ -313,4 +313,116 @@ impl CudaLlamaExecutor {
         print_prefill_stage_timings(state.prefill_timings);
         Ok(next)
     }
+
+    /// Speculative-decode BATCHED VERIFY. Runs ONE target forward over the
+    /// `verify_tokens` = `[last_committed, prop0, .., prop_{K-1}]` (K+1 tokens)
+    /// at positions `[base_pos, base_pos+K]` via the chunked-prefill machinery,
+    /// and returns the K+1 per-position greedy argmax predictions. Does NOT
+    /// advance `state.position` or sample — the caller computes the accept
+    /// length and rewinds `state.position` to `base_pos + accepted + 1`
+    /// (rejected-tail KV slots are positionally overwritten next round; no
+    /// explicit truncation needed because the KV is position-addressed).
+    ///
+    /// `prefill.hidden` is left holding the K+1 hidden rows so the caller can
+    /// `copy_row` the correction's conditioning hidden into `state.hidden`.
+    pub(super) fn verify_batched(
+        &self,
+        state: &mut CudaLlamaState,
+        verify_tokens: &[usize],
+        base_pos: usize,
+    ) -> Result<Vec<usize>> {
+        let prefill = state
+            .prefill
+            .as_mut()
+            .ok_or_else(|| AegisError::InvalidPlan("spec verify: prefill scratch missing".into()))?;
+        let batch_meta = prefill.prepare_dense_batch(
+            &self.runtime,
+            verify_tokens,
+            base_pos,
+            self.kv_context_size,
+            self.embed_tokens.rows,
+        )?;
+        let n = batch_meta.num_prefill_tokens;
+        // embed + Gemma-4 sqrt(hidden) scale (mirrors prefill_prompt_chunked).
+        self.runtime.bf16_rows_to_f32_device(
+            &self.embed_tokens, &prefill.tokens, n, &mut prefill.hidden,
+        )?;
+        if let Some(scale) = self.embed_scale {
+            let total = n.checked_mul(self.hidden_size).ok_or_else(|| {
+                AegisError::InvalidPlan("spec verify embed_scale overflow".into())
+            })?;
+            self.runtime.scale_f32_device_len(scale, &mut prefill.hidden, total)?;
+        }
+        // PLE per-token compute (no-op for non-PLE models). verify_tokens are
+        // plain text tokens — no image/audio injection needed.
+        if let Some(ref ple) = self.ple {
+            crate::executor::ple::compute_per_layer_inputs_prefill_chunk(
+                &self.runtime, ple, verify_tokens, self.hidden_size,
+                self.layers.len(), prefill, self.rms_norm_eps,
+            )?;
+        }
+        let staging_ptr = state.scratch.staging_pool
+            .as_deref_mut().map_or(std::ptr::null_mut(), |p| p as *mut _);
+        let kv_staging_ptr = state.scratch.kv_staging
+            .as_deref_mut().map_or(std::ptr::null_mut(), |p| p as *mut _);
+        let n_layers = self.layers.len();
+        for layer_idx in 0..self.layers.len() {
+            let layer = &self.layers[layer_idx];
+            let (left, right) = state.layers.split_at_mut(layer_idx);
+            let layer_state = &mut right[0];
+            let kv_shared_override = layer
+                .kv_shared_from
+                .and_then(|parent_idx| left.get(parent_idx).map(|s| &s.kv));
+            forward_cuda_layer_prefill_chunk_device(
+                &self.runtime,
+                layer,
+                layer_idx,
+                self.ple.as_ref(),
+                n_layers,
+                kv_shared_override,
+                layer_state,
+                prefill,
+                CudaPrefillForwardParams {
+                    rms_norm_eps: self.rms_norm_eps,
+                    start_position: batch_meta.start_position,
+                    batch: n,
+                    num_sequences: batch_meta.num_sequences,
+                    dense_metadata: batch_meta.dense_metadata,
+                    num_attention_heads: self.num_attention_heads,
+                    num_kv_heads: self.num_kv_heads,
+                    head_dim: self.head_dim,
+                    kv_context_size: self.kv_context_size,
+                    staging_ptr,
+                    kv_staging_ptr,
+                },
+                &mut state.prefill_timings,
+            )?;
+        }
+        // ── Per-row logits: final_norm (batched) → lm_head (batched) → argmax. ──
+        // No new kernels; greedy argmax is invariant under the tanh logit
+        // softcap so we skip it. prefill.hidden = [n, hidden] from the loop.
+        let mut normed = self.runtime.alloc_f32(n * self.hidden_size)?;
+        self.runtime.rms_norm_batched_device(
+            &prefill.hidden, &self.final_norm, n, self.rms_norm_eps, &mut normed,
+        )?;
+        let vocab = self.lm_head.rows;
+        let mut logits = self.runtime.alloc_f32(n * vocab)?;
+        self.runtime
+            .matmul_bf16_reference_batched_device(&self.lm_head, &normed, n, &mut logits)?;
+        let host = self.runtime.download_f32(&logits)?;
+        let mut preds = Vec::with_capacity(n);
+        for row in 0..n {
+            let slice = &host[row * vocab..(row + 1) * vocab];
+            let mut best = 0usize;
+            let mut best_v = f32::NEG_INFINITY;
+            for (j, &v) in slice.iter().enumerate() {
+                if v > best_v {
+                    best_v = v;
+                    best = j;
+                }
+            }
+            preds.push(best);
+        }
+        Ok(preds)
+    }
 }

@@ -726,7 +726,12 @@ impl CudaLlamaExecutor {
         // numeric bug in the spec path; verify against a reference EAGLE trace
         // and change to `draft_position` if the draft must exclude the
         // not-yet-written current position.
-        let seq_len = draft_position + 1;
+        // Constant seq_len = draft_position (the last target position). The draft
+        // is Q-only and never writes the slot at `draft_position`, so it attends
+        // the target KV span [0, draft_position) — the fully-written committed
+        // context. (Was draft_position + 1, which attended one not-yet-written
+        // stale ring-buffer slot.) Paired with the constant-position change above.
+        let seq_len = draft_position;
         rt.copy_u32_to_device(&[draft_position as u32], decode_position)?;
         rt.copy_u32_to_device(&[seq_len as u32], decode_seq_len)?;
         draft_forward_layers(
@@ -773,6 +778,9 @@ impl CudaLlamaExecutor {
     ) -> Result<Vec<usize>> {
         let greedy = SamplingConfig { temperature: 0.0, top_k: 1, top_p: 1.0, min_p: 0.0 };
         let num_draft = self.num_draft_tokens.max(1);
+        let spec_stats = std::env::var("AEGIS_SPEC_STATS").is_ok();
+        let (mut stat_rounds, mut stat_proposed, mut stat_accepted) = (0usize, 0usize, 0usize);
+        let stat_t0 = std::time::Instant::now();
 
         let mut next = self.prefill_prompt(state, prompt_tokens, &greedy)?;
         let mut generated: Vec<usize> = Vec::new();
@@ -800,8 +808,14 @@ impl CudaLlamaExecutor {
             let base_pos = state.position;
             let mut proposals: Vec<usize> = Vec::with_capacity(num_draft);
             let mut draft_input = next;
-            for k in 0..num_draft {
-                let proposed = self.draft_step(state, draft_input, base_pos + k)?;
+            for _k in 0..num_draft {
+                // CONSTANT draft position (vLLM gemma4 MTP `constant_draft_positions`):
+                // every draft step predicts from the SAME (last target) position —
+                // positions/seq_lens do NOT advance between steps. The EAGLE
+                // hidden-state feedback (backbone_out → state.hidden) is what carries
+                // "how far ahead", not the position. (Was base_pos + k, which made
+                // the draft RoPE/attention-window wrong → ~12% accept rate.)
+                let proposed = self.draft_step(state, draft_input, base_pos)?;
                 // Seed next draft step's backbone hidden.
                 let bb = self.draft.as_ref().unwrap().backbone_hidden;
                 // SAFETY of split: backbone_out lives on state.draft, hidden is
@@ -822,60 +836,85 @@ impl CudaLlamaExecutor {
                 }
             }
 
-            // ── Target verification: run one target forward per proposal. ──
-            // state.position is still base_pos (the draft round did NOT advance
-            // it — draft attention reads target KV but the override path skips
-            // KV store). So the forwards below fill positions base_pos,
-            // base_pos+1, ... exactly as a non-spec run.
-            //
-            // Invariant on `next`: the current `next` was ALREADY pushed to
-            // `generated` at the top of this outer iteration. `next` must NEVER
-            // be pushed again here. Each target forward produces `target_tok`,
-            // the prediction for the FOLLOWING position. When we accept it and
-            // there is still another proposal to verify, we push `target_tok`
-            // now (it is strictly followed by another verified token) and feed
-            // it as the next `verify_input`. When `target_tok` is the LAST
-            // accepted/verified token of the round (final proposal accepted, or
-            // a mismatch correction), we leave it UNPUSHED in `next` so the next
-            // outer iteration pushes it exactly once. This avoids the
-            // double-push that would duplicate the final accepted token.
-            let mut verify_input = next;
-            let n_proposals = proposals.len();
-            for k in 0..n_proposals {
-                self.forward_hidden(state, verify_input)?;
-                let target_tok = self.sample_next_from_current_hidden(state, &greedy)?;
-                let accepted = target_tok == proposals[k];
-                // `target_tok` is the last token this round when it is a
-                // mismatch correction OR the final accepted proposal.
-                let is_last = !accepted || k + 1 == n_proposals;
-                if is_eos(target_tok) {
-                    // EOS: surface as the pending `next` (the outer loop's
-                    // is_eos check terminates without emitting it).
-                    next = target_tok;
+            // ── BATCHED target verification: ONE forward over [next, prop0..]. ──
+            // state.position is still base_pos. verify_batched runs the K+1-token
+            // batched (chunked-prefill) forward at positions [base_pos, base_pos+K],
+            // writing K+1 target KV slots, and returns the K+1 per-position greedy
+            // argmaxes. preds[i] is the target's prediction AFTER verify_tokens[i],
+            // i.e. the token for position base_pos+i+1.
+            let mut verify_tokens = Vec::with_capacity(proposals.len() + 1);
+            verify_tokens.push(next);
+            verify_tokens.extend_from_slice(&proposals);
+            let preds = self.verify_batched(state, &verify_tokens, base_pos)?;
+            let kk = proposals.len();
+
+            // Accept length m = longest prefix where target argmax == proposal.
+            // preds[m] is the correction (m<kk) or the free bonus (m==kk).
+            let mut m = 0usize;
+            while m < kk && preds[m] == proposals[m] {
+                m += 1;
+            }
+            if spec_stats {
+                stat_rounds += 1;
+                stat_proposed += kk;
+                stat_accepted += m;
+            }
+
+            // KV/position rewind: only positions [base_pos, base_pos+m] are valid
+            // (next + m accepted proposals); the rejected tail [base_pos+m+1 ..
+            // base_pos+K] is stale and gets positionally overwritten next round.
+            // No truncate op needed — KV is position-addressed. The NEXT token to
+            // write is the correction at base_pos+m+1.
+            state.position = base_pos + m + 1;
+            // Next draft round's backbone hidden = row m (the correction's
+            // conditioning hidden). Wrong row only lowers accept rate, not
+            // correctness — but feed the right one.
+            {
+                let CudaLlamaState { ref mut hidden, ref prefill, .. } = *state;
+                let prefill = prefill.as_ref().ok_or_else(|| {
+                    AegisError::InvalidPlan("spec verify: prefill scratch missing post-verify".into())
+                })?;
+                self.runtime
+                    .copy_row_f32_device(&prefill.hidden, m, self.hidden_size, hidden)?;
+            }
+
+            // Emit committed tokens: proposals[0..m] (accepted), then preds[m]
+            // (correction/bonus) left UNPUSHED in `next` (the outer loop pushes it
+            // next iteration — preserves the push-once contract). Same EOS/stop
+            // semantics as the per-token path.
+            for j in 0..=m {
+                let tok = if j < m { proposals[j] } else { preds[m] };
+                if is_eos(tok) {
+                    // EOS: surface as pending `next`; outer loop terminates without emit.
+                    next = tok;
                     break;
                 }
-                if request.stop_token_ids.contains(&target_tok) {
-                    // Stop tokens are emitted (matches the outer-loop stop path)
-                    // and terminate generation.
-                    generated.push(target_tok);
+                if request.stop_token_ids.contains(&tok) {
+                    generated.push(tok);
                     break 'outer;
                 }
-                if is_last {
-                    // Final token of the round (accepted-tail or mismatch
-                    // correction). Hand it to `next`, UNPUSHED — the next outer
-                    // iteration pushes it (or terminates on it).
-                    next = target_tok;
+                if j == m {
+                    // Final token of the round — hand to `next`, UNPUSHED.
+                    next = tok;
                     break;
                 }
-                // Accepted, and strictly followed by another verified token:
-                // safe to emit now.
+                // Accepted proposal strictly followed by another verified token.
                 if generated.len() >= request.max_tokens {
                     break 'outer;
                 }
-                generated.push(target_tok);
-                verify_input = target_tok;
-                next = target_tok;
+                generated.push(tok);
             }
+        }
+        if spec_stats {
+            let dt = stat_t0.elapsed().as_secs_f64();
+            let acc_rate = if stat_proposed > 0 { stat_accepted as f64 / stat_proposed as f64 } else { 0.0 };
+            let toks_per_round = if stat_rounds > 0 { (generated.len() as f64) / stat_rounds as f64 } else { 0.0 };
+            eprintln!(
+                "[spec-stats] generated={} rounds={} proposed={} accepted={} accept_rate={:.1}% \
+                 tokens/round={:.2} decode={:.2}s {:.1} tok/s (num_draft={})",
+                generated.len(), stat_rounds, stat_proposed, stat_accepted, acc_rate * 100.0,
+                toks_per_round, dt, generated.len() as f64 / dt, num_draft,
+            );
         }
         Ok(generated)
     }
