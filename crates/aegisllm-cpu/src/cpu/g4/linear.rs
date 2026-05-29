@@ -11,6 +11,18 @@
 use crate::cpu::CpuNvfp4Linear;
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::executor::tensors::Bf16Matrix;
+use rayon::prelude::*;
+
+/// Fast BF16×f32 GEMV: `out[r] = Σ_c W[r,c]*input[c]`, parallel over output rows,
+/// each row a SIMD bf16-widen+FMA dot (no full-matrix f32 copy). `bytes` is the
+/// row-major `[rows, cols]` LE-BF16 weight; `out.len()` == rows.
+fn bf16_matvec_fast(bytes: &[u8], cols: usize, input: &[f32], out: &mut [f32]) {
+    let row_bytes = cols * 2;
+    out.par_iter_mut().enumerate().for_each(|(r, o)| {
+        let row = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        *o = crate::cpu::simd::dot_bf16_f32(row, input);
+    });
+}
 
 #[derive(Debug)]
 pub(crate) enum CpuLinear {
@@ -39,7 +51,18 @@ impl CpuLinear {
     /// Single-vector projection: `out[r] = Σ_c W[r,c] * input[c]`.
     pub(crate) fn matvec_into(&self, input: &[f32], out: &mut [f32]) -> Result<()> {
         match self {
-            Self::Bf16(m) => m.matvec_into(input, out),
+            Self::Bf16(m) => {
+                if input.len() != m.cols || out.len() != m.rows {
+                    return Err(AegisError::InvalidPlan(format!(
+                        "bf16 matvec shape mismatch for {}: input={} cols={} output={} rows={}",
+                        m.name(), input.len(), m.cols, out.len(), m.rows
+                    )));
+                }
+                // Fast path: rayon over rows + SIMD bf16-widen+FMA dot, reading the
+                // BF16 weights once from DRAM (no per-call full-matrix f32 copy).
+                bf16_matvec_fast(m.weight_bytes(), m.cols, input, out);
+                Ok(())
+            }
             Self::Nvfp4(l) => l.matvec_into(input, out),
         }
     }
@@ -65,10 +88,11 @@ impl CpuLinear {
                         cols
                     )));
                 }
+                let bytes = m.weight_bytes();
                 for token in 0..batch {
                     let in_row = &input[token * cols..(token + 1) * cols];
                     let out_row = &mut out[token * rows..(token + 1) * rows];
-                    m.matvec_into(in_row, out_row)?;
+                    bf16_matvec_fast(bytes, cols, in_row, out_row);
                 }
                 Ok(())
             }

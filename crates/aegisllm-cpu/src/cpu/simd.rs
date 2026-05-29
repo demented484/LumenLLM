@@ -37,6 +37,48 @@ pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     arch().dispatch(DotF32 { a: &a[..len], b: &b[..len] })
 }
 
+// ── bf16 widen + dot ──────────────────────────────────────────────────────────
+//
+// A BF16 value is the top 16 bits of the equivalent f32 bit pattern, so widening
+// is exact: `f32::from_bits((bf16 as u32) << 16)`. We never materialize the whole
+// weight matrix as f32 — instead we widen one BF16 weight row (or a small K-block)
+// into a reusable f32 scratch, then SIMD-dot it against the f32 input. Callers
+// reuse one row's scratch across an entire GEMM batch, so each weight byte is read
+// from DRAM exactly once (the cache-blocking win on a memory-bound kernel).
+
+/// Widen `cols` little-endian BF16 values (raw bytes, `2*cols` long) into the f32
+/// `out` slice (`cols` long). Pure shift + reinterpret — the loop auto-vectorizes
+/// and is bounded by the 2-byte/elem DRAM read, which is the bandwidth we want to
+/// hit. This is the ONLY BF16→f32 expansion in the fast path.
+#[inline]
+pub fn widen_bf16_row_into(row_bytes: &[u8], out: &mut [f32]) {
+    let n = out.len().min(row_bytes.len() / 2);
+    let pairs = &row_bytes[..n * 2];
+    for (dst, chunk) in out[..n].iter_mut().zip(pairs.chunks_exact(2)) {
+        let bits = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
+        *dst = f32::from_bits(bits << 16);
+    }
+}
+
+/// Fused BF16×f32 dot: widen one BF16 weight row in small K-blocks (kept in L1)
+/// and SIMD-FMA each block against the matching slice of the f32 input, so a row
+/// is never fully materialized as f32 and the reduction is vectorized. Used by the
+/// single-token GEMV path where there is no batch to amortize a full-row widen.
+pub fn dot_bf16_f32(row_bytes: &[u8], input: &[f32]) -> f32 {
+    const BLOCK: usize = 256; // 1 KiB f32 scratch — comfortably L1-resident.
+    let cols = input.len().min(row_bytes.len() / 2);
+    let mut acc = 0.0_f32;
+    let mut scratch = [0.0_f32; BLOCK];
+    let mut col = 0;
+    while col < cols {
+        let len = (cols - col).min(BLOCK);
+        widen_bf16_row_into(&row_bytes[col * 2..(col + len) * 2], &mut scratch[..len]);
+        acc += dot_f32(&scratch[..len], &input[col..col + len]);
+        col += len;
+    }
+    acc
+}
+
 // ── scale in place ───────────────────────────────────────────────────────────
 
 struct ScaleInPlace<'a> {
@@ -284,6 +326,29 @@ mod tests {
 
     const LENGTHS: &[usize] = &[0, 1, 7, 16, 17, 31, 1024, 4096];
     const SEED: u64 = 0xDEAD_BEEF_1234_5678;
+
+    #[test]
+    fn dot_bf16_f32_matches_widened_reference() {
+        let mut rng = SmallRng::seed_from_u64(SEED);
+        for &cols in &[1usize, 7, 16, 31, 256, 257, 1024, 2560] {
+            // Build BF16 weight bytes (top-16-bits truncation of random f32) + f32 input.
+            let mut bytes = Vec::with_capacity(cols * 2);
+            let mut widened = vec![0f32; cols];
+            for w in widened.iter_mut() {
+                let f: f32 = rng.gen_range(-2.0..2.0);
+                let bf = (f.to_bits() >> 16) as u16; // truncate to bf16
+                bytes.extend_from_slice(&bf.to_le_bytes());
+                *w = f32::from_bits((bf as u32) << 16);
+            }
+            let input = rand_vec(&mut rng, cols);
+            let fast = dot_bf16_f32(&bytes, &input);
+            let reference = dot_f32(&widened, &input); // dot of explicitly-widened weights
+            assert!(
+                (fast - reference).abs() <= 1e-3 * (reference.abs() + 1.0),
+                "cols={cols}: fast={fast} reference={reference}"
+            );
+        }
+    }
 
     fn rand_vec(rng: &mut SmallRng, n: usize) -> Vec<f32> {
         (0..n).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect()

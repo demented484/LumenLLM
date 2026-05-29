@@ -79,6 +79,18 @@ impl Bf16Matrix {
         Ok(out)
     }
 
+    /// Raw little-endian BF16 weight bytes, row-major `[rows, cols]`
+    /// (`2 * rows * cols` bytes). Exposed so the CPU fast path can widen rows
+    /// in-register without copying the whole matrix to f32.
+    pub fn weight_bytes(&self) -> &[u8] {
+        self.tensor.as_bytes()
+    }
+
+    /// The matrix's display name (for shape-mismatch diagnostics).
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn matvec_into(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
         if input.len() != self.cols {
             return Err(AegisError::InvalidPlan(format!(
