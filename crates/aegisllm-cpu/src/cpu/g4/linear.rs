@@ -116,6 +116,15 @@ const COL_LANES: usize = 16; // f32 lanes in a ZMM == token columns per block
 /// MR=6 keeps MR*NB (≤24) accumulators + NB input panels inside the 32 ZMM file;
 /// MR≥8 spills and tanks throughput (measured on Zen 4).
 const MR: usize = 6;
+/// Column-blocks per N-tile in the large-batch kernel: NB_TILE=4 → 64 tokens per
+/// N-block. The `[MR][NB_TILE]` f32 accumulator grid is `6*4 = 24` ZMM, plus 4
+/// input panels + 1 weight broadcast = 29 ≤ 32 — stays register-resident.
+const NB_TILE: usize = 4;
+/// K-pairs per K-block in the large-batch kernel (cache blocking for the WIDE
+/// case). A K-block slices the weight panel to `MR * 2*KC_PAIRS * 2` bytes; with
+/// KC_PAIRS=1024 (=2048 cols) that's `6*2048*2 = 24 KiB`, fitting the 32 KiB L1d
+/// so the slice stays L1-resident while sweeping all N-blocks of the panel.
+const KC_PAIRS: usize = 1024;
 
 #[inline]
 fn col_blocks(batch: usize) -> usize {
@@ -399,59 +408,264 @@ unsafe fn bf16_matmul_vnni(
     let tiles_per_chunk = micro_tiles.div_ceil(nthreads);
     let chunk_rows = (tiles_per_chunk * MR).max(MR);
 
-    // Dispatch the column-block count to a const generic so the inner panel loop
-    // and the `MR*NB` accumulator array are fully unrolled into ZMM registers
-    // (a runtime `nb` keeps the accumulators in memory and tanks throughput).
-    macro_rules! dispatch_nb {
-        ($nb:literal) => {
-            temp.par_chunks_mut(chunk_rows * batch)
-                .enumerate()
-                .for_each(|(ci, tchunk)| {
-                    let r_base = ci * chunk_rows;
-                    let chunk_n = tchunk.len() / batch;
-                    let mut ro = 0;
-                    // SAFETY: avx512f+avx512bf16 verified by caller; in bounds.
-                    unsafe {
-                        while ro + MR <= chunk_n {
-                            let dst = &mut tchunk[ro * batch..(ro + MR) * batch];
-                            kernel_strip::<MR, $nb>(
-                                wu16, r_base + ro, cols, kpairs, &packed, batch, dst,
-                            );
-                            ro += MR;
+    if nb <= NB_TILE {
+        // Small batch (≤ NB_TILE*16 = 64 tokens): the whole token range fits one
+        // N-block, so the existing single-pass kernel already reads each weight
+        // panel from DRAM exactly once. Dispatch `nb` to a const generic so the
+        // `MR*nb` accumulators + `nb` panels stay register-resident (a runtime
+        // `nb` keeps the accumulators in memory and tanks throughput).
+        macro_rules! dispatch_nb {
+            ($nb:literal) => {
+                temp.par_chunks_mut(chunk_rows * batch)
+                    .enumerate()
+                    .for_each(|(ci, tchunk)| {
+                        let r_base = ci * chunk_rows;
+                        let chunk_n = tchunk.len() / batch;
+                        let mut ro = 0;
+                        // SAFETY: avx512f+avx512bf16 verified by caller; in bounds.
+                        unsafe {
+                            while ro + MR <= chunk_n {
+                                let dst = &mut tchunk[ro * batch..(ro + MR) * batch];
+                                kernel_strip::<MR, $nb>(
+                                    wu16, r_base + ro, cols, kpairs, &packed, batch, dst,
+                                );
+                                ro += MR;
+                            }
+                            while ro < chunk_n {
+                                let dst = &mut tchunk[ro * batch..(ro + 1) * batch];
+                                kernel_strip::<1, $nb>(
+                                    wu16, r_base + ro, cols, kpairs, &packed, batch, dst,
+                                );
+                                ro += 1;
+                            }
                         }
-                        while ro < chunk_n {
-                            let dst = &mut tchunk[ro * batch..(ro + 1) * batch];
-                            kernel_strip::<1, $nb>(
-                                wu16, r_base + ro, cols, kpairs, &packed, batch, dst,
-                            );
-                            ro += 1;
-                        }
+                    })
+            };
+        }
+        match nb {
+            1 => dispatch_nb!(1),
+            2 => dispatch_nb!(2),
+            3 => dispatch_nb!(3),
+            _ => dispatch_nb!(4),
+        }
+    } else {
+        // Large batch (> 64 tokens): a single kernel that reads each weight panel
+        // from DRAM ONCE and reuses it across ALL N-blocks. For each MR-row panel
+        // (rayon over panels), sweep the `nb` 16-token blocks in NB_TILE-wide
+        // N-blocks; the panel (or, when wide, each KC_PAIRS K-slice of it) stays
+        // L1/L2-resident so N-blocks after the first hit cache instead of DRAM.
+        temp.par_chunks_mut(chunk_rows * batch)
+            .enumerate()
+            .for_each(|(ci, tchunk)| {
+                let r_base = ci * chunk_rows;
+                let chunk_n = tchunk.len() / batch;
+                let mut ro = 0;
+                // SAFETY: avx512f+avx512bf16 verified by caller; in bounds.
+                unsafe {
+                    while ro + MR <= chunk_n {
+                        let dst = &mut tchunk[ro * batch..(ro + MR) * batch];
+                        kernel_strip_large::<MR>(
+                            wu16, r_base + ro, cols, kpairs, &packed, nb, batch, dst,
+                        );
+                        ro += MR;
                     }
-                })
-        };
-    }
-    match nb {
-        1 => {
-            dispatch_nb!(1)
-        }
-        2 => {
-            dispatch_nb!(2)
-        }
-        3 => {
-            dispatch_nb!(3)
-        }
-        4 => {
-            dispatch_nb!(4)
-        }
-        // batch ≤ 64 → nb ≤ 4 in the prefill path; wider batches fall back to the
-        // portable f32 kernel rather than growing the register-resident tile.
-        _ => {
-            bf16_matmul_f32_fallback(weight, rows, cols, input, batch, out);
-            return;
-        }
+                    while ro < chunk_n {
+                        let dst = &mut tchunk[ro * batch..(ro + 1) * batch];
+                        kernel_strip_large::<1>(
+                            wu16, r_base + ro, cols, kpairs, &packed, nb, batch, dst,
+                        );
+                        ro += 1;
+                    }
+                }
+            });
     }
 
     transpose_into(&temp, rows, batch, out);
+}
+
+/// Large-batch micro-kernel: `MR` weight rows over ALL `nb` 16-token column-blocks
+/// (`batch` tokens), reading the weight panel from DRAM ONCE and reusing it across
+/// every N-block. Writes `tchunk` (row-major `[MR, batch]`).
+///
+/// Loop nest (mirrors llama.cpp's blocked GEMM order so the panel stays cached):
+///   for N-block (NB_TILE=4 col-blocks = 64 tokens):
+///       acc[MR][nb_this] = 0                    ← ZMM-resident across all K
+///       for kc-block (KC_PAIRS k-pairs):        ← cache blocking for wide cols
+///           for kp in kc-range:
+///               load nb_this input panels; broadcast each row's weight word; dpbf16
+///       store acc → tchunk
+///
+/// The accumulator grid for an N-block persists in registers across all kc-blocks
+/// (so a wide row's partials are summed before being written out). Because the
+/// weight panel — or, when `cols > 2*KC_PAIRS`, each KC_PAIRS slice of it — is
+/// touched again on the next N-block while still cache-resident, DRAM reads it
+/// once per panel regardless of `batch`. Full NB_TILE-wide N-blocks pin the panel
+/// count at compile time (NB_TILE accumulators + panels); the final partial
+/// N-block (`batch % 64 != 0`) is handled by the const-generic `kernel_strip`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bf16")]
+unsafe fn kernel_strip_large<const MR: usize>(
+    wu16: &[u16],
+    r0: usize,
+    cols: usize,
+    kpairs: usize,
+    packed: &[u16],
+    nb: usize,
+    batch: usize,
+    tchunk: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    // SAFETY: target_feature verified by caller; all indexing stays within
+    // `wu16` (rows*cols), `packed` (kpairs*nb*32) and `tchunk` (MR*batch);
+    // stores past `batch` in the final 16-lane block are masked.
+    unsafe {
+        let packed_ptr = packed.as_ptr();
+        let wptr = wu16.as_ptr();
+
+        // Sweep full NB_TILE-wide N-blocks (64 tokens each). Only count groups of
+        // NB_TILE FULLY-16-wide column-blocks: `full16 = batch / 16` is the number
+        // of complete 16-token blocks, so `full16 / NB_TILE` N-blocks are entirely
+        // in-bounds (16-lane unmasked stores). Any leftover full blocks plus the
+        // final partial block (`batch % 16 != 0`) go to the masked tail — this is
+        // why the split is on `full16`, NOT `nb`: when `nb % NB_TILE == 0` but
+        // `batch % 16 != 0`, the last block is partial yet sits in the final
+        // NB_TILE group, and an unmasked store there would write past `batch`.
+        let full16 = batch / COL_LANES;
+        let full_nblocks = full16 / NB_TILE;
+        for nblk in 0..full_nblocks {
+            let blk0 = nblk * NB_TILE; // first 16-token column-block of this N-block
+            let mut acc = [[_mm512_setzero_ps(); NB_TILE]; MR];
+
+            // K-blocking: each kc-block touches a KC_PAIRS-pair slice of the panel
+            // (≤ 24 KiB), L1-resident while we sweep this N-block's K range. For
+            // narrow `cols` (≤ 2*KC_PAIRS) this is a single pass over K.
+            let mut kc0 = 0;
+            while kc0 < kpairs {
+                let kc1 = (kc0 + KC_PAIRS).min(kpairs);
+                for kp in kc0..kc1 {
+                    // Load this N-block's NB_TILE input panels for k-pair `kp`.
+                    let mut b_panels = [_mm512_setzero_si512(); NB_TILE];
+                    for (j, panel) in b_panels.iter_mut().enumerate() {
+                        let off = (kp * nb + blk0 + j) * 32;
+                        *panel = _mm512_loadu_si512(packed_ptr.add(off) as *const _);
+                    }
+                    for r in 0..MR {
+                        let widx = (r0 + r) * cols + 2 * kp;
+                        let word: u32 = if 2 * kp + 1 < cols {
+                            (wptr.add(widx) as *const u32).read_unaligned()
+                        } else {
+                            *wptr.add(widx) as u32
+                        };
+                        let a_bh: __m512bh = std::mem::transmute(_mm512_set1_epi32(word as i32));
+                        for j in 0..NB_TILE {
+                            let b_bh: __m512bh = std::mem::transmute(b_panels[j]);
+                            acc[r][j] = _mm512_dpbf16_ps(acc[r][j], a_bh, b_bh);
+                        }
+                    }
+                }
+                kc0 = kc1;
+            }
+
+            // Store this N-block's 64 token columns (no partial block — every full
+            // N-block ends within `batch`, so all NB_TILE blocks are 16 wide).
+            for (r, acc_row) in acc.iter().enumerate() {
+                let trow_base = r * batch + blk0 * COL_LANES;
+                for (j, a) in acc_row.iter().enumerate() {
+                    _mm512_storeu_ps(tchunk.as_mut_ptr().add(trow_base + j * COL_LANES), *a);
+                }
+            }
+        }
+
+        // Tail: any leftover column-blocks after the full NB_TILE groups
+        // (`nb - full_nblocks*NB_TILE`, which is 1..=NB_TILE — the leftover full
+        // blocks plus the possibly-partial final block). The const-generic tail
+        // kernel masks the final block's store; its weight re-read is a single
+        // panel over a short token range, negligible vs the full-N-block sweeps.
+        let tail_blocks = nb - full_nblocks * NB_TILE;
+        if tail_blocks != 0 {
+            let blk0 = full_nblocks * NB_TILE;
+            let col0 = blk0 * COL_LANES;
+            match tail_blocks {
+                1 => kernel_strip_tail::<MR, 1>(
+                    wu16, r0, cols, kpairs, packed, nb, blk0, batch, col0, tchunk,
+                ),
+                2 => kernel_strip_tail::<MR, 2>(
+                    wu16, r0, cols, kpairs, packed, nb, blk0, batch, col0, tchunk,
+                ),
+                3 => kernel_strip_tail::<MR, 3>(
+                    wu16, r0, cols, kpairs, packed, nb, blk0, batch, col0, tchunk,
+                ),
+                _ => kernel_strip_tail::<MR, 4>(
+                    wu16, r0, cols, kpairs, packed, nb, blk0, batch, col0, tchunk,
+                ),
+            }
+        }
+    }
+}
+
+/// Tail handler for the large-batch kernel: computes `TB` (1..=3) trailing 16-token
+/// column-blocks starting at global block `blk0` (token column `col0`) for `MR`
+/// rows, writing into `tchunk[r*batch + col0 ..]` with the final block masked to
+/// `batch`. Same VNNI math as `kernel_strip`, but indexed against the full-batch
+/// packing (`kp*nb + blk0 + j`) and writing at the column offset.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bf16")]
+unsafe fn kernel_strip_tail<const MR: usize, const TB: usize>(
+    wu16: &[u16],
+    r0: usize,
+    cols: usize,
+    kpairs: usize,
+    packed: &[u16],
+    nb: usize,
+    blk0: usize,
+    batch: usize,
+    col0: usize,
+    tchunk: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    // SAFETY: target_feature verified by caller; indexing stays within `packed`
+    // (kpairs*nb*32), `wu16` (rows*cols) and `tchunk` (MR*batch); the final
+    // 16-lane store is masked to the live token count.
+    unsafe {
+        let packed_ptr = packed.as_ptr();
+        let wptr = wu16.as_ptr();
+        let mut acc = [[_mm512_setzero_ps(); TB]; MR];
+        for kp in 0..kpairs {
+            let mut b_panels = [_mm512_setzero_si512(); TB];
+            for (j, panel) in b_panels.iter_mut().enumerate() {
+                let off = (kp * nb + blk0 + j) * 32;
+                *panel = _mm512_loadu_si512(packed_ptr.add(off) as *const _);
+            }
+            for r in 0..MR {
+                let widx = (r0 + r) * cols + 2 * kp;
+                let word: u32 = if 2 * kp + 1 < cols {
+                    (wptr.add(widx) as *const u32).read_unaligned()
+                } else {
+                    *wptr.add(widx) as u32
+                };
+                let a_bh: __m512bh = std::mem::transmute(_mm512_set1_epi32(word as i32));
+                for j in 0..TB {
+                    let b_bh: __m512bh = std::mem::transmute(b_panels[j]);
+                    acc[r][j] = _mm512_dpbf16_ps(acc[r][j], a_bh, b_bh);
+                }
+            }
+        }
+        for (r, acc_row) in acc.iter().enumerate() {
+            let trow_base = r * batch + col0;
+            for (j, a) in acc_row.iter().enumerate() {
+                let cglob = col0 + j * COL_LANES;
+                let n = (batch - cglob).min(COL_LANES);
+                let dst = tchunk.as_mut_ptr().add(trow_base + j * COL_LANES);
+                if n == COL_LANES {
+                    _mm512_storeu_ps(dst, *a);
+                } else {
+                    let mask: u16 = ((1u32 << n) - 1) as u16;
+                    _mm512_mask_storeu_ps(dst, mask, *a);
+                }
+            }
+        }
+    }
 }
 
 /// Compute `MR` weight rows × `NB` column-blocks (`NB*16` token columns) into
@@ -613,6 +827,20 @@ mod tests {
             (128, 256, 64),
             (1536, 256, 40),
             (64, 1536, 31),
+            // Large-batch (> 64) coverage: exercises kernel_strip_large + the
+            // partial-N-block tail and K-blocking (wide cols=6144 > 2*KC_PAIRS).
+            (256, 512, 128),  // exact 2 N-blocks
+            (200, 300, 200),  // batch not a multiple of 64 (tail = 8 tokens)
+            (300, 6144, 256), // wide cols → K-blocking, batch=256
+            (1536, 6144, 512), // E2B `down` at full large batch
+            (6144, 1536, 512), // E2B `gate/up` at full large batch
+            (130, 257, 333),  // odd rows/cols + batch not %16 and not %64
+            // Tail-masking edge cases for kernel_strip_large's full/tail split:
+            (96, 128, 250),   // nb=16 (nb%NB_TILE==0) but batch%16!=0 → partial
+            //                   block sits in the last NB_TILE group; must be MASKED.
+            (96, 128, 180),   // full16=11 → tail_blocks=4 (3 full + 1 partial block)
+            (96, 128, 240),   // full16=15 → tail_blocks=3, all 16-wide
+            (96, 128, 49),    // small >64: nb=4 full + ... actually nb=4 → small path
         ];
         for &(rows, cols, batch) in shapes {
             let (bytes, widened) = make_bf16_weight(&mut rng, rows, cols);
@@ -750,6 +978,30 @@ mod tests {
             let gemv_secs = t.elapsed().as_secs_f64() / iters as f64;
             let gemv_gflops = flops / gemv_secs / 1e9;
 
+            // Prior large-batch strategy: split into ≤64-token VNNI sub-calls.
+            // This re-reads the WHOLE weight from DRAM once per 64-token chunk —
+            // the bandwidth waste the single-large-batch kernel removes. (For
+            // batch ≤ 64 it's a single call == the new path.)
+            let split64 = |bytes: &[u8], out: &mut [f32]| {
+                let mut b0 = 0;
+                while b0 < batch {
+                    let n = (batch - b0).min(64);
+                    let in_chunk = &input[b0 * cols..(b0 + n) * cols];
+                    let out_chunk = &mut out[b0 * rows..(b0 + n) * rows];
+                    bf16_matmul_fast(bytes, rows, cols, in_chunk, n, out_chunk);
+                    b0 += n;
+                }
+            };
+            for _ in 0..3 {
+                split64(&bytes, &mut out);
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                split64(&bytes, &mut out);
+            }
+            let split_secs = t.elapsed().as_secs_f64() / iters as f64;
+            let split_gflops = flops / split_secs / 1e9;
+
             // warm up + time the portable f32-widen blocked fallback
             for _ in 0..3 {
                 bf16_matmul_f32_fallback(&bytes, rows, cols, &input, batch, &mut out);
@@ -788,15 +1040,15 @@ mod tests {
 
                 println!(
                     "[{name}] rows={rows} cols={cols} batch={batch}  \
-                     prior-GEMV-loop={gemv_gflops:7.1}  \
-                     f32-blocked={f32_gflops:7.1}  \
-                     bf16-VNNI={v_gflops:7.1} GFLOP/s  \
-                     (VNNI vs GEMV {:.2}x, VNNI vs f32 {:.2}x)  \
-                     pack={pack_us:.1}us ({:.0}% of VNNI step)",
-                    v_gflops / gemv_gflops,
-                    v_gflops / f32_gflops,
+                     GEMV-loop={gemv_gflops:7.1}  \
+                     VNNI-64split(before)={split_gflops:7.1}  \
+                     VNNI-large(after)={v_gflops:7.1} GFLOP/s  \
+                     (after vs 64split {:.2}x)  \
+                     pack={pack_us:.1}us ({:.0}% of step)",
+                    v_gflops / split_gflops,
                     pack_us / (v_secs * 1e6) * 100.0
                 );
+                let _ = f32_gflops;
             } else {
                 println!(
                     "[{name}] rows={rows} cols={cols} batch={batch}  \
@@ -807,8 +1059,22 @@ mod tests {
         }
 
         println!();
-        // E2B MLP shapes (batch=64).
-        bench_shape("gate/up", 6144, 1536, 64);
-        bench_shape("down", 1536, 6144, 64);
+        // E2B MLP shapes across the large-batch range. The batch ≥ 256 numbers
+        // are the ones that matter (weight-DRAM-read amortized over many tokens);
+        // a flat/rising curve toward bf16 peak (~1.9 TFLOP/s) confirms the weight
+        // is read from DRAM ONCE per panel rather than once per 64-token sub-call.
+        for &batch in &[64usize, 128, 256, 512] {
+            bench_shape("gate/up", 6144, 1536, batch);
+        }
+        for &batch in &[64usize, 128, 256, 512] {
+            bench_shape("down", 1536, 6144, batch);
+        }
+        // A weight that does NOT fit L3 (144 MiB ≫ 32 MiB): here the old 64-split
+        // RE-READS the weight from DRAM per chunk while the large-batch kernel
+        // reads it ONCE — the gap is the DRAM-read-once win the E2B shapes hide
+        // (their 18.9 MiB weight stays L3-resident across the split chunks).
+        for &batch in &[256usize, 512] {
+            bench_shape("L3-spill", 12288, 6144, batch);
+        }
     }
 }
