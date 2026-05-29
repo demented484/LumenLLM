@@ -62,6 +62,24 @@ impl Bf16Matrix {
         })
     }
 
+    /// Build a `Bf16Matrix` directly from raw little-endian BF16 bytes
+    /// (`[rows, cols]` row-major, `2 * rows * cols` bytes), backed by RAM.
+    /// Used to construct synthetic matrices in unit tests without a model
+    /// artifact; production loads go through `from_tensor`.
+    pub fn from_bf16_bytes(name: String, rows: usize, cols: usize, bytes: Vec<u8>) -> Self {
+        debug_assert_eq!(bytes.len(), rows * cols * 2);
+        Self {
+            name: name.clone(),
+            rows,
+            cols,
+            tensor: LoadedHostTensor {
+                name,
+                storage: crate::tensor::storage::HostTensorStorage::Ram(bytes),
+                shard_path: std::path::PathBuf::new(),
+            },
+        }
+    }
+
     pub fn row(&self, row: usize) -> Result<Vec<f32>> {
         if row >= self.rows {
             return Err(AegisError::InvalidPlan(format!(

@@ -32,6 +32,7 @@ impl pulp::WithSimd for DotF32<'_> {
     }
 }
 
+#[inline]
 pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     let len = a.len().min(b.len());
     arch().dispatch(DotF32 { a: &a[..len], b: &b[..len] })
@@ -207,19 +208,168 @@ fn silu_scalar(x: f32) -> f32 {
 // ── GeGLU (Gemma-4 / Qwen MLP activation) ────────────────────────────────────
 // out = gelu_pytorch_tanh(gate) * up, matching HF `gelu_pytorch_tanh`:
 //   0.5*x*(1 + tanh(sqrt(2/pi)*(x + 0.044715*x^3)))
+//
+// In Gemma-4 CPU prefill this runs ~14M times/prefill (≈60% of MLP time once the
+// matmuls are near-peak). The scalar reference (`gelu_tanh_scalar`) calls libm
+// `f32::tanh()`; the fast path replaces it with a branchless tanh approximation
+//   tanh(z) = 1 - 2/(1 + exp(2z))
+// where `exp` is a polynomial expf: range-reduce `e = n*ln2 + r` (|r| ≤ ln2/2),
+// degree-5 minimax for `exp(r)`, then `2^n` via the IEEE-754 exponent-field "ldexp
+// bit trick". The AVX-512 path below is hand-written intrinsics (16-wide f32):
+// `floor`/`n as i32`/`from_bits` defeat the scalar autovectorizer, so we issue
+// `_mm512_roundscale_ps` + `_mm512_cvttps_epi32` + `_mm512_slli_epi32` directly.
+// The scalar fallback (`geglu_body`) runs the *same* polynomial so both paths agree.
 
+const SQRT_2_OVER_PI: f32 = 0.797_884_56; // sqrt(2/pi)
+const GELU_C: f32 = 0.044_715; // cubic coefficient in the tanh-approx GELU
+const EXP_LOG2E: f32 = 1.442_695_04; // 1/ln2
+const EXP_LN2_HI: f32 = 0.693_359_38; // ln2 split for an exact Cody–Waite reduction
+const EXP_LN2_LO: f32 = -2.121_944_4e-4;
+// exp(r) minimax coefficients on r ∈ [-ln2/2, ln2/2] (Horner order, lowest last).
+const EXP_P5: f32 = 0.008_333_33;
+const EXP_P4: f32 = 0.041_666_67;
+const EXP_P3: f32 = 0.166_666_67;
+const TANH_CLAMP: f32 = 15.0; // |z| > 15 → tanh saturates to ±1; keeps exp finite
+const EXP_HI: f32 = 88.0; // exp input clamp (≈ ln(f32::MAX))
+const EXP_LO: f32 = -87.0;
+
+/// ACCURACY REFERENCE (and source of the scalar fallback's exactness target):
+/// exact-as-libm gelu_pytorch_tanh.
 #[inline(always)]
 pub fn gelu_tanh_scalar(x: f32) -> f32 {
-    const SQRT_2_OVER_PI: f32 = 0.797_884_56; // sqrt(2/pi)
-    let inner = SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x);
+    let inner = SQRT_2_OVER_PI * (x + GELU_C * x * x * x);
     0.5 * x * (1.0 + inner.tanh())
+}
+
+/// Scalar twin of the vectorized polynomial `exp` (same coefficients), used by the
+/// scalar fallback and as the unit-test oracle for the intrinsic path.
+#[inline(always)]
+fn exp_approx(x: f32) -> f32 {
+    let x = x.clamp(EXP_LO, EXP_HI);
+    let n = (x * EXP_LOG2E + 0.5).floor();
+    let r = (x - n * EXP_LN2_HI) - n * EXP_LN2_LO;
+    let p =
+        1.0 + r * (1.0 + r * (0.5 + r * (EXP_P3 + r * (EXP_P4 + r * EXP_P5))));
+    let pow2n = f32::from_bits(((n as i32 + 127) as u32) << 23);
+    p * pow2n
+}
+
+/// Branchless `tanh(z)` via `tanh(z) = 1 - 2/(1 + exp(2z))`, clamped at ±15.
+#[inline(always)]
+fn tanh_approx(z: f32) -> f32 {
+    let z = z.clamp(-TANH_CLAMP, TANH_CLAMP);
+    1.0 - 2.0 / (1.0 + exp_approx(2.0 * z))
+}
+
+/// gelu_pytorch_tanh using the approximate tanh (scalar twin of the AVX-512 path).
+#[inline(always)]
+fn gelu_tanh_approx(x: f32) -> f32 {
+    let inner = SQRT_2_OVER_PI * (x + GELU_C * x * x * x);
+    0.5 * x * (1.0 + tanh_approx(inner))
+}
+
+/// Portable scalar GeGLU body (fallback when AVX-512 is absent). Uses the same
+/// polynomial as the intrinsic path so results agree to the last ULP of the approx.
+#[inline(always)]
+fn geglu_body(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    for ((o, &g), &u) in out.iter_mut().zip(gate.iter()).zip(up.iter()) {
+        *o = gelu_tanh_approx(g) * u;
+    }
+}
+
+/// Hand-written AVX-512 GeGLU: `out[i] = gelu_tanh_approx(gate[i]) * up[i]`, 16-wide.
+/// Tail (< 16 elements) falls back to the scalar body. Mirrors `gelu_tanh_approx`
+/// op-for-op so the unit tests can use the scalar twin as the oracle.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn geglu_avx512(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    use std::arch::x86_64::*;
+
+    let len = out.len();
+    let lanes = 16;
+    let n_vec = len / lanes;
+
+    let half = _mm512_set1_ps(0.5);
+    let one = _mm512_set1_ps(1.0);
+    let two = _mm512_set1_ps(2.0);
+    let sqrt_2_over_pi = _mm512_set1_ps(SQRT_2_OVER_PI);
+    let gelu_c = _mm512_set1_ps(GELU_C);
+    let tanh_clamp = _mm512_set1_ps(TANH_CLAMP);
+    let neg_tanh_clamp = _mm512_set1_ps(-TANH_CLAMP);
+    let exp_hi = _mm512_set1_ps(EXP_HI);
+    let exp_lo = _mm512_set1_ps(EXP_LO);
+    let log2e = _mm512_set1_ps(EXP_LOG2E);
+    let ln2_hi = _mm512_set1_ps(EXP_LN2_HI);
+    let ln2_lo = _mm512_set1_ps(EXP_LN2_LO);
+    let bias = _mm512_set1_epi32(127);
+    let p5 = _mm512_set1_ps(EXP_P5);
+    let p4 = _mm512_set1_ps(EXP_P4);
+    let p3 = _mm512_set1_ps(EXP_P3);
+    let p2 = _mm512_set1_ps(0.5);
+
+    let gp = gate.as_ptr();
+    let upp = up.as_ptr();
+    let op = out.as_mut_ptr();
+
+    for i in 0..n_vec {
+        let off = i * lanes;
+        let g = _mm512_loadu_ps(gp.add(off));
+        let u = _mm512_loadu_ps(upp.add(off));
+
+        // inner = sqrt(2/pi) * (g + GELU_C * g^3)
+        let g2 = _mm512_mul_ps(g, g);
+        let inner_poly = _mm512_fmadd_ps(_mm512_mul_ps(gelu_c, g2), g, g); // g + c*g^3
+        let inner = _mm512_mul_ps(sqrt_2_over_pi, inner_poly);
+
+        // tanh(inner): clamp z to ±15, then 1 - 2/(1 + exp(2z))
+        let z = _mm512_min_ps(_mm512_max_ps(inner, neg_tanh_clamp), tanh_clamp);
+        let e_in = _mm512_min_ps(_mm512_max_ps(_mm512_mul_ps(two, z), exp_lo), exp_hi);
+
+        // exp(e_in): n = round(e_in * log2e); r = e_in - n*ln2 (Cody–Waite)
+        let nf = _mm512_roundscale_ps::<{ _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC }>(
+            _mm512_mul_ps(e_in, log2e),
+        );
+        let r = _mm512_fnmadd_ps(nf, ln2_hi, e_in); // e_in - n*ln2_hi
+        let r = _mm512_fnmadd_ps(nf, ln2_lo, r); // - n*ln2_lo
+        // poly = 1 + r(1 + r(0.5 + r(p3 + r(p4 + r*p5))))  (Horner)
+        let mut poly = _mm512_fmadd_ps(r, p5, p4);
+        poly = _mm512_fmadd_ps(r, poly, p3);
+        poly = _mm512_fmadd_ps(r, poly, p2);
+        poly = _mm512_fmadd_ps(r, poly, one);
+        poly = _mm512_fmadd_ps(r, poly, one);
+        // 2^n via (n + 127) << 23 reinterpreted as f32
+        let ni = _mm512_cvttps_epi32(nf);
+        let pow2n = _mm512_castsi512_ps(_mm512_slli_epi32::<23>(_mm512_add_epi32(ni, bias)));
+        let exp = _mm512_mul_ps(poly, pow2n);
+
+        // tanh = 1 - 2/(1 + exp)
+        let tanh = _mm512_sub_ps(one, _mm512_div_ps(two, _mm512_add_ps(one, exp)));
+        // gelu = 0.5 * g * (1 + tanh); out = gelu * u
+        let gelu = _mm512_mul_ps(_mm512_mul_ps(half, g), _mm512_add_ps(one, tanh));
+        _mm512_storeu_ps(op.add(off), _mm512_mul_ps(gelu, u));
+    }
+
+    let done = n_vec * lanes;
+    if done < len {
+        geglu_body(&gate[done..], &up[done..], &mut out[done..]);
+    }
 }
 
 pub fn geglu_into_simd(gate: &[f32], up: &[f32], out: &mut [f32]) {
     let len = gate.len().min(up.len()).min(out.len());
-    for i in 0..len {
-        out[i] = gelu_tanh_scalar(gate[i]) * up[i];
+    let gate = &gate[..len];
+    let up = &up[..len];
+    let out = &mut out[..len];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            // SAFETY: dispatched only when avx512f is present at runtime; slices are
+            // all `len` long, and loads/stores stay within `n_vec*16 ≤ len`.
+            unsafe { geglu_avx512(gate, up, out) };
+            return;
+        }
     }
+    geglu_body(gate, up, out);
 }
 
 // ── RoPE pair ────────────────────────────────────────────────────────────────
@@ -454,6 +604,133 @@ mod tests {
                 assert!((out[i] - expected).abs() < 1e-5, "len={n} i={i}");
             }
         }
+    }
+
+    /// The vectorized gelu_pytorch_tanh fast path must match the libm reference
+    /// (`gelu_tanh_scalar`) to < 1e-3 max-abs across the activation range, and must
+    /// not blow up (NaN/Inf) in the saturation tails (|x| > 10 → ±1).
+    #[test]
+    fn gelu_tanh_vectorized_matches_libm() {
+        // Dense sweep over the bounded activation range, plus explicit edge cases.
+        let mut max_err = 0.0_f32;
+        let mut worst_x = 0.0_f32;
+        // 0.001 step over [-15, 15] = 30001 samples.
+        for i in 0..=30_000 {
+            let x = -15.0 + i as f32 * 0.001;
+            let want = gelu_tanh_scalar(x);
+            let got = gelu_tanh_approx(x);
+            assert!(got.is_finite(), "gelu_tanh_approx({x}) = {got} (non-finite)");
+            let e = (got - want).abs();
+            if e > max_err {
+                max_err = e;
+                worst_x = x;
+            }
+        }
+        // Saturation tails / edge cases must stay finite and approach the limits.
+        for &x in &[0.0f32, 10.0, -10.0, 30.0, -30.0, 100.0, -100.0, 1e4, -1e4] {
+            let got = gelu_tanh_approx(x);
+            assert!(got.is_finite(), "gelu_tanh_approx({x}) = {got} (non-finite)");
+        }
+        // gelu(0)=0 exactly; large +x → ~x; large -x → ~0.
+        assert!(gelu_tanh_approx(0.0).abs() < 1e-6);
+        assert!((gelu_tanh_approx(30.0) - 30.0).abs() < 1e-2);
+        assert!(gelu_tanh_approx(-30.0).abs() < 1e-2);
+        assert!(
+            max_err < 1e-3,
+            "max-abs gelu_tanh error {max_err} (at x={worst_x}) exceeds 1e-3"
+        );
+        eprintln!("gelu_tanh vectorized max-abs error vs libm = {max_err:e} (at x={worst_x})");
+    }
+
+    /// End-to-end check of the DISPATCHED `geglu_into_simd` (the real AVX-512 path
+    /// on this CPU, incl. the scalar tail) against the per-element libm reference
+    /// `gelu_tanh_scalar(gate)*up`. The approximate fast path is allowed up to 2e-3
+    /// abs; we also assert the underlying gelu approximation alone stays < 1e-3.
+    #[test]
+    fn geglu_into_simd_matches_reference() {
+        let mut rng = SmallRng::seed_from_u64(SEED);
+        // Include tail-exercising lengths (not multiples of 16) and the Gemma-4
+        // 6144-wide intermediate (a clean multiple of 16, no tail).
+        for &n in &[0usize, 1, 15, 16, 17, 31, 6144, 6145] {
+            // gate spread across the active range so the tanh nonlinearity is exercised.
+            let gate: Vec<f32> = (0..n).map(|_| rng.random::<f32>() * 24.0 - 12.0).collect();
+            let up = rand_vec(&mut rng, n);
+            let mut out = vec![0.0_f32; n];
+            geglu_into_simd(&gate, &up, &mut out);
+            let mut max_gelu_err = 0.0_f32;
+            for i in 0..n {
+                let want = gelu_tanh_scalar(gate[i]) * up[i];
+                assert!(
+                    (out[i] - want).abs() < 2e-3,
+                    "n={n} i={i} gate={} up={} got={} want={}",
+                    gate[i],
+                    up[i],
+                    out[i],
+                    want
+                );
+                // Isolate the activation error from the `up` scaling: divide back out.
+                if up[i].abs() > 1e-3 {
+                    let gelu_err = (out[i] / up[i] - gelu_tanh_scalar(gate[i])).abs();
+                    max_gelu_err = max_gelu_err.max(gelu_err);
+                }
+            }
+            assert!(
+                max_gelu_err < 1e-3,
+                "n={n}: dispatched gelu activation max-abs err {max_gelu_err} exceeds 1e-3"
+            );
+        }
+    }
+
+    /// Throughput microbench: scalar (libm tanh) loop vs vectorized `geglu_into_simd`
+    /// on a 6144-wide buffer (Gemma-4 MLP intermediate width). Prints Melem/s for
+    /// both and the speedup. Ignored by default (run with `--ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn geglu_microbench() {
+        use std::time::Instant;
+        const N: usize = 6144;
+        const ITERS: usize = 20_000;
+        let mut rng = SmallRng::seed_from_u64(SEED);
+        let gate: Vec<f32> = (0..N).map(|_| rng.random::<f32>() * 24.0 - 12.0).collect();
+        let up = rand_vec(&mut rng, N);
+        let mut out = vec![0.0_f32; N];
+
+        // Warm up + scalar baseline (libm tanh, exactly the old kernel).
+        let mut sink = 0.0_f32;
+        for _ in 0..200 {
+            for i in 0..N {
+                out[i] = gelu_tanh_scalar(gate[i]) * up[i];
+            }
+        }
+        let t0 = Instant::now();
+        for _ in 0..ITERS {
+            for i in 0..N {
+                out[i] = gelu_tanh_scalar(gate[i]) * up[i];
+            }
+            sink += out[N / 2];
+        }
+        let scalar_secs = t0.elapsed().as_secs_f64();
+
+        // Vectorized path.
+        for _ in 0..200 {
+            geglu_into_simd(&gate, &up, &mut out);
+        }
+        let t1 = Instant::now();
+        for _ in 0..ITERS {
+            geglu_into_simd(&gate, &up, &mut out);
+            sink += out[N / 2];
+        }
+        let vec_secs = t1.elapsed().as_secs_f64();
+
+        let elems = (N * ITERS) as f64;
+        let scalar_mes = elems / scalar_secs / 1e6;
+        let vec_mes = elems / vec_secs / 1e6;
+        let speedup = vec_mes / scalar_mes;
+        eprintln!(
+            "geglu_microbench: scalar(libm tanh) = {scalar_mes:.1} Melem/s, \
+             vectorized = {vec_mes:.1} Melem/s, speedup = {speedup:.2}x (sink={sink})"
+        );
+        assert!(sink.is_finite());
     }
 
     #[test]

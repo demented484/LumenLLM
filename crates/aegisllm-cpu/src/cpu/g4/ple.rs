@@ -20,6 +20,7 @@ use super::state::{G4PleGlobal, G4PleLayer};
 use crate::cpu::math::rms_norm_into;
 use crate::cpu::simd;
 use aegisllm_base::error::Result;
+use rayon::prelude::*;
 
 /// Compute `per_layer_inputs` for one decode token into `out_per_layer_inputs`
 /// (`[num_layers * ple_dim]`).
@@ -102,5 +103,74 @@ pub(crate) fn apply_ple_contribution(
 
     // 6. hidden_out += contrib_normed.
     simd::add_in_place(hidden_out, &contrib_normed);
+    Ok(())
+}
+
+/// Batched PLE contribution over `batch` tokens — the prefill equivalent of
+/// `apply_ple_contribution`. Same math, but the two projections run as batched
+/// `matmul_into` GEMMs (the fast BF16-VNNI path) instead of per-token `matvec`,
+/// the gelu·per_layer_input fuses through the vectorized `geglu_into_simd`, and
+/// the post-norm + residual add parallelize over tokens. `hidden_out` is
+/// `[batch, hidden]`; `per_layer_inputs` is `[batch, num_layers*ple_dim]`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_ple_contribution_batched(
+    layer_ple: &G4PleLayer,
+    ple: &G4PleGlobal,
+    layer_idx: usize,
+    per_layer_inputs: &[f32],
+    ple_row: usize,
+    batch: usize,
+    eps: f32,
+    hidden_out: &mut [f32],
+) -> Result<()> {
+    let ple_dim = ple.ple_dim;
+    let gate_dim = layer_ple.input_gate.rows;
+    let hidden = layer_ple.projection.rows;
+    let base = layer_idx * ple_dim;
+
+    // 1. gate[batch, gate_dim] = input_gate @ hidden_out[batch, hidden]. PLE
+    // weights are raw `Bf16Matrix`, so drive the batched VNNI kernel directly.
+    let mut gate = vec![0.0_f32; batch * gate_dim];
+    super::linear::bf16_matmul_fast(
+        layer_ple.input_gate.weight_bytes(),
+        gate_dim,
+        layer_ple.input_gate.cols,
+        hidden_out,
+        batch,
+        &mut gate,
+    );
+
+    // 2-3. gated = gelu_pytorch_tanh(gate) * per_layer_inputs[layer_idx] — the
+    // vectorized GeGLU fuses both steps; parallel over tokens. (gate_dim==ple_dim.)
+    let mut gated = vec![0.0_f32; batch * gate_dim];
+    gated
+        .par_chunks_mut(gate_dim)
+        .enumerate()
+        .for_each(|(t, out)| {
+            let g = &gate[t * gate_dim..t * gate_dim + gate_dim];
+            let pli = &per_layer_inputs[t * ple_row + base..t * ple_row + base + ple_dim];
+            simd::geglu_into_simd(g, pli, out);
+        });
+
+    // 4. contrib[batch, hidden] = projection @ gated[batch, gate_dim].
+    let mut contrib = vec![0.0_f32; batch * hidden];
+    super::linear::bf16_matmul_fast(
+        layer_ple.projection.weight_bytes(),
+        hidden,
+        layer_ple.projection.cols,
+        &gated,
+        batch,
+        &mut contrib,
+    );
+
+    // 5-6. contrib = rms_norm(contrib, post_norm); hidden_out += contrib (per token, parallel).
+    hidden_out
+        .par_chunks_mut(hidden)
+        .zip(contrib.par_chunks(hidden))
+        .for_each(|(out, c)| {
+            let mut cn = vec![0.0_f32; hidden];
+            rms_norm_into(c, &layer_ple.post_norm, eps, &mut cn);
+            simd::add_in_place(out, &cn);
+        });
     Ok(())
 }

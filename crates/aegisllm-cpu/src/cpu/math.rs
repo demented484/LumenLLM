@@ -55,8 +55,11 @@ mod tests {
         let mut out = [0.0f32; 4];
         geglu_into(&gate, &up, &mut out).unwrap();
         for i in 0..4 {
+            // `geglu_into_simd` uses a vectorized tanh approximation; the libm
+            // `gelu_tanh_scalar` reference is matched only to the kernel's accuracy
+            // target (< 2e-3 abs), not bit-exactly.
             let want = simd::gelu_tanh_scalar(gate[i]) * up[i];
-            assert!((out[i] - want).abs() < 1e-6);
+            assert!((out[i] - want).abs() < 2e-3);
         }
     }
 }
