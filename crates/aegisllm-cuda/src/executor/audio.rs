@@ -790,6 +790,9 @@ impl AudioTower {
         let ctx_left = s.attention_context_left;
         let ctx_right = s.attention_context_right;
         let cap = s.attention_logit_cap;
+        // HF Gemma4AudioAttention scales keys by k_scale = log(1+e)/log(2) ≈ 1.8946
+        // (queries already carry q_scale·softplus(per_dim_scale)). This was missing.
+        let k_scale = (1.0f32 + std::f32::consts::E).ln() / 2.0f32.ln();
 
         let mut attn_out = vec![0f32; batch * h];
         for head in 0..nh {
@@ -797,8 +800,9 @@ impl AudioTower {
                 let chunk_idx = i / chunk;
                 let chunk_start = chunk_idx * chunk;
                 let chunk_end = (chunk_start + chunk).min(batch);
-                // allowed key window for this query.
-                let lo = chunk_start.saturating_sub(ctx_left);
+                // allowed key window for this block. HF max_past_horizon =
+                // ctx_left-1 (NOT ctx_left), max_future_horizon = ctx_right.
+                let lo = chunk_start.saturating_sub(ctx_left.saturating_sub(1));
                 let hi = (chunk_end + ctx_right).min(batch);
                 // scores over [lo, hi).
                 let mut scores = Vec::with_capacity(hi - lo);
@@ -806,7 +810,7 @@ impl AudioTower {
                 for j in lo..hi {
                     let mut dot = 0f32;
                     for d in 0..hd {
-                        dot += q[i * h + head * hd + d] * k[j * h + head * hd + d];
+                        dot += q[i * h + head * hd + d] * (k[j * h + head * hd + d] * k_scale);
                     }
                     // tanh logit softcap: cap * tanh(score / cap).
                     // TODO(gpu-verify): confirm the softcap is applied to the
