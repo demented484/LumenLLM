@@ -32,10 +32,13 @@ use rayon::prelude::*;
 /// Smallest prefill where the batched-GEMM path is worth its setup. Below this,
 /// per-token `forward_hidden` is comparable and avoids the extra buffers.
 const PREFILL_BATCH_THRESHOLD: usize = 4;
-/// Max tokens per batched chunk: bigger = more weight-reuse amortization but more
-/// scratch RAM (≈ batch * intermediate floats per projection). Chunks are
-/// processed in order so the position-indexed KV cache keeps causal semantics.
-const PREFILL_MAX_BATCH: usize = 64;
+/// Max tokens per batched chunk: bigger amortizes per-chunk overhead (buffer
+/// allocs, attention setup) over more tokens and matches llama.cpp's large-batch
+/// prompt processing; the large-batch GEMM (`bf16_matmul_fast`) keeps each weight
+/// panel cache-resident across all tokens. Cost is scratch RAM (≈ batch *
+/// intermediate floats per projection). Chunks are processed in order so the
+/// position-indexed KV cache keeps causal semantics.
+const PREFILL_MAX_BATCH: usize = 512;
 
 impl G4CpuExecutor {
     pub(crate) fn prefill_prompt(
