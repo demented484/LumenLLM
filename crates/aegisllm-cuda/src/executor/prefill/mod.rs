@@ -407,8 +407,20 @@ impl CudaLlamaExecutor {
         )?;
         let vocab = self.lm_head.rows;
         let mut logits = self.runtime.alloc_f32(n * vocab)?;
-        self.runtime
-            .matmul_bf16_reference_batched_device(&self.lm_head, &normed, n, &mut logits)?;
+        // Prefer cuBLASLt BF16 tensor cores for the K+1-row lm_head over the
+        // full 262144 vocab — the F32 reference batched matvec (1 block/row,
+        // no tensor cores) dominates the per-round spec-decode overhead. Falls
+        // back to the reference kernel for host-resident lm_head.
+        if self.runtime.cublaslt_bf16_enabled_for(&self.lm_head) {
+            let mut in_bf16 = self.runtime.alloc_u16(n * self.hidden_size)?;
+            let mut out_bf16 = self.runtime.alloc_u16(n * vocab)?;
+            self.runtime.matmul_bf16_cublaslt_device(
+                &self.lm_head, &normed, n, &mut in_bf16, &mut out_bf16, &mut logits,
+            )?;
+        } else {
+            self.runtime
+                .matmul_bf16_reference_batched_device(&self.lm_head, &normed, n, &mut logits)?;
+        }
         let host = self.runtime.download_f32(&logits)?;
         let mut preds = Vec::with_capacity(n);
         for row in 0..n {
