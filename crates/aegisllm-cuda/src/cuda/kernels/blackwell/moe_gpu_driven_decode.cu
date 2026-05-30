@@ -148,11 +148,17 @@ extern "C" __global__ void aegis_moe_gather_experts(
 
     const unsigned int tid = threadIdx.x;
     const unsigned int nthreads = blockDim.x;
+    // Each (slot,proj) copy is SPLIT across gridDim.z CTAs (blockIdx.z = chunk):
+    // the per-projection weights (~1MB) are large and a single CTA per (slot,proj)
+    // = only 3*top_k CTAs leaves most SMs idle, starving the PCIe read of
+    // concurrent requests (the 14.5 GB/s zero-copy bottleneck). Spreading the copy
+    // over (3*top_k*gridDim.z) CTAs keeps more SMs issuing mapped-host loads in
+    // flight → higher effective PCIe bandwidth. Bit-identical (same bytes copied).
+    const unsigned int chunk = blockIdx.z;
+    const unsigned int nchunks = gridDim.z;
 
-    // Copy packed bytes. Use uint4 (16B) chunks where both src and dst are
-    // 16B-aligned (NVFP4 packed rows and the VRAM bulk slots are well aligned),
-    // else fall back to per-byte. The source is mapped-host: coalesced reads
-    // over PCIe land in VRAM — bandwidth-friendly streaming.
+    // Copy packed bytes. uint4 (16B) where both src+dst are 16B-aligned, else
+    // per-byte. Source is mapped-host: coalesced reads over PCIe land in VRAM.
     {
         const bool aligned16 =
             ((reinterpret_cast<unsigned long long>(src_packed) & 0xF) == 0) &&
@@ -161,28 +167,30 @@ extern "C" __global__ void aegis_moe_gather_experts(
             const unsigned int n16 = packed_bytes / 16u;
             const uint4* s4 = reinterpret_cast<const uint4*>(src_packed);
             uint4* d4 = reinterpret_cast<uint4*>(dst_packed);
-            for (unsigned int i = tid; i < n16; i += nthreads) {
+            for (unsigned int i = chunk * nthreads + tid; i < n16; i += nchunks * nthreads) {
                 d4[i] = s4[i];
             }
-            for (unsigned int i = n16 * 16u + tid; i < packed_bytes; i += nthreads) {
-                dst_packed[i] = src_packed[i];
+            if (chunk == 0u) {
+                for (unsigned int i = n16 * 16u + tid; i < packed_bytes; i += nthreads) {
+                    dst_packed[i] = src_packed[i];
+                }
             }
         } else {
-            for (unsigned int i = tid; i < packed_bytes; i += nthreads) {
+            for (unsigned int i = chunk * nthreads + tid; i < packed_bytes; i += nchunks * nthreads) {
                 dst_packed[i] = src_packed[i];
             }
         }
     }
-    // Copy scale bytes (small).
-    for (unsigned int i = tid; i < scale_bytes; i += nthreads) {
-        dst_scale[i] = src_scale[i];
-    }
-
-    // First thread records the per-slot scales for the GEMV/quantize kernels.
-    if (tid == 0u) {
-        const unsigned int slot_proj = slot * 3u + proj;
-        slot_in_scale[slot_proj] = in_s;
-        slot_out_scale[slot_proj] = out_s;
+    // Scale bytes (small) + the per-slot scalar scales: only chunk 0.
+    if (chunk == 0u) {
+        for (unsigned int i = tid; i < scale_bytes; i += nthreads) {
+            dst_scale[i] = src_scale[i];
+        }
+        if (tid == 0u) {
+            const unsigned int slot_proj = slot * 3u + proj;
+            slot_in_scale[slot_proj] = in_s;
+            slot_out_scale[slot_proj] = out_s;
+        }
     }
 }
 

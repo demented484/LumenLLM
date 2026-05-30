@@ -55,9 +55,13 @@ impl CudaRuntime {
         let up_scale_b = tables.up_scale_bytes as u32;
         let down_packed_b = tables.down_packed_bytes as u32;
         let down_scale_b = tables.down_scale_bytes as u32;
-        // 256 threads stream the (large) packed bytes per (slot, projection).
+        // 256 threads stream the (large) packed bytes per (slot, projection),
+        // SPLIT across GATHER_CHUNKS CTAs on the z-axis so more SMs issue
+        // mapped-host loads concurrently → higher effective PCIe bandwidth (the
+        // 24-CTA grid left ~2/3 of the SMs idle). 3*top_k*8 = 192 CTAs for top_k=8.
+        const GATHER_CHUNKS: u32 = 8;
         let cfg = LaunchConfig {
-            grid_dim: (3, top_k_u32, 1),
+            grid_dim: (3, top_k_u32, GATHER_CHUNKS),
             block_dim: (256, 1, 1),
             shared_mem_bytes: 0,
         };
