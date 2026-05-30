@@ -445,10 +445,13 @@ fn forward_moe_decode_device(
     )?;
     // GPU-driven decode: the routed experts are gathered from device-mapped
     // host RAM by a GPU kernel reading the on-device top-k buffer — NO dtoh of
-    // the top-k, NO host parse, NO host-issued per-expert copies. Eligible only
-    // when this layer's device tables were built (arena device-mapped at load)
-    // AND the opt-in env is set. Otherwise fall back to the host-streamed path.
-    let gpu_driven = moe.device_tables.is_some() && crate::executor::full::gpu_driven_moe_requested();
+    // the top-k, NO host parse, NO host-issued per-expert copies. Keyed purely on
+    // this layer's device tables having been built — which only happens at load
+    // when AEGIS_GPU_DRIVEN_MOE is set AND the arena device-mapped AND every
+    // expert resolved a host device pointer. Avoids an env syscall per MoE layer
+    // in the (non-graphed first) decode step. Otherwise the host-streamed path
+    // runs unchanged.
+    let gpu_driven = moe.device_tables.is_some();
     if !gpu_driven {
         // Record compute-stream completion; transfer stream waits on it before
         // issuing the dtoh.
