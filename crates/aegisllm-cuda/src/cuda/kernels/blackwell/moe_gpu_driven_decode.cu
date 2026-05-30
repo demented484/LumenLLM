@@ -288,3 +288,181 @@ extern "C" __global__ void aegis_axpy_f32_topk_weight(
         out[idx] += alpha * src[idx];
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// BATCHED (grouped-over-experts) decode MoE kernels. The per-slot path above
+// issues top_k×[3 quant + 3 GEMV + 1 geglu + 1 axpy] tiny serial launches per
+// MoE layer; these collapse each STAGE into ONE launch with the expert/slot on
+// grid.y (0..top_k). Per-(slot,row,element) scalar math is byte-identical to the
+// single-expert kernels above, so output stays bit-identical; only the Rust
+// for-loop moves onto a grid axis. All shapes are fixed → graph-capturable.
+// Opt-in via AEGIS_BATCHED_DECODE_MOE (executor/mlp.rs).
+// ════════════════════════════════════════════════════════════════════════════
+
+// 1. BATCHED INPUT-QUANT over top_k slots. Identical 16-group math to
+// aegis_nvfp4_quantize_input_dptr. `input_stride`=0 for gate/up (every slot
+// quantizes the SAME shared `hidden` vector, each with its own scale) or =the
+// per-slot swiglu stride for down. `output` is per-slot at `output_stride`.
+// Scale = slot_in_scale[slot*3 + proj_off].
+extern "C" __global__ void aegis_nvfp4_quantize_input_batched_dptr(
+    const float* __restrict__ input,
+    const unsigned int input_stride,
+    const unsigned int len,
+    const unsigned int output_stride,
+    const float* __restrict__ slot_in_scale,
+    const unsigned int proj_off,
+    const unsigned int top_k,
+    float* __restrict__ output
+) {
+    const unsigned int slot = blockIdx.y;
+    if (slot >= top_k) {
+        return;
+    }
+    const unsigned int base = blockIdx.x * 16u;
+    const unsigned int lane = threadIdx.x;
+    if (lane >= 16u || base + lane >= len) {
+        return;
+    }
+    const float* in = input + size_t(slot) * input_stride;
+    float* out = output + size_t(slot) * output_stride;
+    const float input_scale = slot_in_scale[slot * 3u + proj_off];
+    if (!(input_scale > 0.0f)) {
+        out[base + lane] = in[base + lane];
+        return;
+    }
+    const float inv = 1.0f / input_scale;
+    float amax = 0.0f;
+    for (unsigned int j = 0u; j < 16u && base + j < len; ++j) {
+        amax = fmaxf(amax, fabsf(in[base + j] * inv));
+    }
+    if (amax == 0.0f) {
+        out[base + lane] = 0.0f;
+        return;
+    }
+    const float block_scale = decode_ue4m3_half(fp32_to_ue4m3_halfbits(amax / 6.0f));
+    const unsigned int nibble = best_nvfp4_index(in[base + lane] * inv, block_scale);
+    out[base + lane] = float(decode_nvfp4_nibble(nibble)) * block_scale * input_scale;
+}
+
+// 2. BATCHED PREQUANTIZED GEMV over top_k slots. Identical accumulation +
+// tree-reduction math to aegis_nvfp4_linear_prequantized_dptr. The single-expert
+// kernel got PRE-SLICED packed/scales views; this one derives the slot/proj base
+// itself from the slot-major bulk layout (slot k = [gate,up,down] back-to-back),
+// so it is byte-identical on the same input bytes. Output per (slot,row).
+extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_dptr(
+    const unsigned char* __restrict__ bulk_packed,
+    const unsigned char* __restrict__ bulk_scales,
+    const unsigned int per_slot_packed,
+    const unsigned int per_slot_scale,
+    const unsigned int proj_packed_off,
+    const unsigned int proj_scale_off,
+    const float* __restrict__ input,
+    const unsigned int input_stride,
+    const unsigned int rows,
+    const unsigned int cols,
+    const float* __restrict__ slot_out_scale,
+    const unsigned int proj_off,
+    const unsigned int output_stride,
+    const unsigned int top_k,
+    float* __restrict__ output
+) {
+    const unsigned int slot = blockIdx.y;
+    if (slot >= top_k) {
+        return;
+    }
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const unsigned int packed_cols = cols / 2u;
+    const unsigned int scale_cols = cols / 16u;
+    const unsigned char* packed = bulk_packed + size_t(slot) * per_slot_packed + proj_packed_off;
+    const unsigned char* scales = bulk_scales + size_t(slot) * per_slot_scale + proj_scale_off;
+    const unsigned char* packed_row = packed + size_t(row) * packed_cols;
+    const unsigned char* scale_row = scales + size_t(row) * scale_cols;
+    const float* in = input + size_t(slot) * input_stride;
+    extern __shared__ float partial[];
+
+    float sum = 0.0f;
+    for (unsigned int block_idx = tid; block_idx < scale_cols; block_idx += blockDim.x) {
+        const float block_scale = decode_ue4m3_half(scale_row[block_idx]);
+        const unsigned int input_base = block_idx * 16u;
+        const unsigned int packed_base = block_idx * 8u;
+        for (unsigned int j = 0u; j < 8u; ++j) {
+            const unsigned int byte = packed_row[packed_base + j];
+            const unsigned int lo_col = input_base + 2u*j;
+            const unsigned int hi_col = lo_col + 1u;
+            sum += float(decode_nvfp4_nibble(byte & 0x0Fu)) * block_scale * in[lo_col];
+            sum += float(decode_nvfp4_nibble(byte >> 4)) * block_scale * in[hi_col];
+        }
+    }
+
+    partial[tid] = sum;
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            partial[tid] += partial[tid + stride];
+        }
+        __syncthreads();
+    }
+    if (tid == 0u) {
+        output[size_t(slot) * output_stride + row] = partial[0] * slot_out_scale[slot * 3u + proj_off];
+    }
+}
+
+// 3. BATCHED strided GeGLU over top_k slots. Identical gelu_pytorch_tanh literals
+// + op order to aegis_geglu_tanh_batched (sampling.cu), but per-slot strided so it
+// works with the over-allocated [top_k * inter_stride] scratch. Renamed to avoid a
+// duplicate-symbol collision with sampling.cu's aegis_geglu_tanh_batched (both .cu
+// files compile into one NVRTC translation unit).
+extern "C" __global__ void aegis_moe_geglu_tanh_batched_slots(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    const unsigned int len,
+    const unsigned int stride,
+    const unsigned int top_k,
+    float* __restrict__ output
+) {
+    const unsigned int slot = blockIdx.y;
+    if (slot >= top_k) {
+        return;
+    }
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < len) {
+        const size_t off = size_t(slot) * stride + idx;
+        const float x = gate[off];
+        const float k = 0.7978845608028654f;
+        const float k2 = 0.044715f;
+        const float inner = k * (x + k2 * x * x * x);
+        const float gelu = 0.5f * x * (1.0f + tanhf(inner));
+        output[off] = gelu * up[off];
+    }
+}
+
+// 4. BATCHED WEIGHTED ACCUMULATE: out[i] = sum_{k=0..top_k-1} w[k] * expert_out[k][i].
+// Replaces the top_k serial aegis_axpy_f32_topk_weight launches. Each thread folds
+// the slots in FIXED ascending order with `acc += w * e` as a SINGLE expression —
+// under the module's --fmad=true this fuses to one fma per step, matching the
+// single-expression axpy (`out[idx] += alpha * src[idx]`) exactly. Do NOT split
+// into separate mul/add or use fmaf (would change rounding vs the per-slot path).
+// `out[i] = acc` overwrites (acc absorbs the routed_acc=0 init).
+extern "C" __global__ void aegis_moe_weighted_accumulate(
+    float* __restrict__ out,
+    const float* __restrict__ expert_out,
+    const unsigned int output_stride,
+    const unsigned int* __restrict__ packed_topk,
+    const unsigned int top_k,
+    const unsigned int len
+) {
+    const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= len) {
+        return;
+    }
+    float acc = 0.0f;
+    for (unsigned int k = 0u; k < top_k; ++k) {
+        const float w = __uint_as_float(packed_topk[k * 2u + 1u]);
+        acc += w * expert_out[size_t(k) * output_stride + idx];
+    }
+    out[idx] = acc;
+}

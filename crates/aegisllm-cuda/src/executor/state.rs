@@ -199,6 +199,14 @@ pub(super) struct CudaMoEScratch {
     pub(super) expert_up: DeviceBuffer<f32>,
     pub(super) expert_swiglu: DeviceBuffer<f32>,
     pub(super) expert_out: DeviceBuffer<f32>,
+    // BATCHED decode MoE (AEGIS_BATCHED_DECODE_MOE): [max_top_k * width] staging
+    // for all top_k experts at once (slot on grid.y). Separate from the per-slot
+    // buffers above so the default path is untouched. See executor/mlp.rs.
+    pub(super) expert_gate_b: DeviceBuffer<f32>,
+    pub(super) expert_up_b: DeviceBuffer<f32>,
+    pub(super) expert_swiglu_b: DeviceBuffer<f32>,
+    pub(super) expert_out_b: DeviceBuffer<f32>,
+    pub(super) quant_b: DeviceBuffer<f32>,
     /// Decode-side counterpart to `CudaMoEPrefillScratch.gather_shared_gate_up_fused`.
     /// Sized to `2 * max_expert_intermediate` floats — fits one token's worth
     /// of `[gate_logits, up_logits]` produced by the fused matvec when the

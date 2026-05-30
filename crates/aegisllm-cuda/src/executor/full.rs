@@ -1330,6 +1330,15 @@ impl CudaLlamaExecutor {
                             .runtime
                             .alloc_f32(2 * max_expert_intermediate)?,
                         quant_expert: self.runtime.alloc_f32(max_input)?,
+                        // ── BATCHED decode MoE scratch (AEGIS_BATCHED_DECODE_MOE) ──
+                        // Separate [max_top_k * width] buffers so the per-slot path
+                        // (default) keeps its exact single-expert buffers + .len()
+                        // semantics (no regression). Sub-MiB, allocated once.
+                        expert_gate_b: self.runtime.alloc_f32(max_top_k * max_expert_intermediate)?,
+                        expert_up_b: self.runtime.alloc_f32(max_top_k * max_expert_intermediate)?,
+                        expert_swiglu_b: self.runtime.alloc_f32(max_top_k * max_expert_intermediate)?,
+                        expert_out_b: self.runtime.alloc_f32(max_top_k * self.hidden_size)?,
+                        quant_b: self.runtime.alloc_f32(max_top_k * max_input)?,
                         mxfp4_expert: self
                             .runtime
                             .alloc_u8(CudaRuntime::mxfp4_vector_bytes(max_input)?)?,

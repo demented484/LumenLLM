@@ -7,6 +7,17 @@ use crate::cuda::{CudaRuntime, DeviceBuffer};
 use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::error::{AegisError, Result};
 
+/// Opt-in (default OFF): batch the GPU-driven decode MoE expert GEMVs over all
+/// top_k experts (slot on grid.y) instead of the per-slot serial loop. Removes
+/// 56 launches/layer and fills the GPU; only beneficial when experts are
+/// VRAM-resident (fast gather). Output is bit-identical to the per-slot path.
+/// Read once (decode hot path) — env lookup is not per-token.
+fn batched_decode_moe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("AEGIS_BATCHED_DECODE_MOE").is_ok())
+}
+
 pub(super) fn forward_mlp_device(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
@@ -631,11 +642,88 @@ fn forward_moe_decode_device(
                 unsafe { &mut *sout },
             )?;
         }
-        // 2) Per-slot GEMVs reading the gathered bulk buffer + device scales.
+        // 2) GEMVs reading the gathered bulk buffer + device scales.
         // Expert projection shapes are uniform across experts (we use the first).
         let gate = &moe.experts[0].gate_proj;
         let up = &moe.experts[0].up_proj;
         let down = &moe.experts[0].down_proj;
+        if batched_decode_moe_enabled() {
+            // BATCHED path: collapse the top_k×[3 quant + 3 GEMV + 1 geglu +
+            // 1 axpy] tiny serial launches into 9 launches/layer with the
+            // expert/slot on grid.y. Per-(slot,row,element) math is identical to
+            // the per-slot loop below (bit-identical output); only the for-loop
+            // moves onto a grid axis, raising GPU fill + removing 56 launches.
+            let tk = active_top_k;
+            // Per-slot strides = the batched buffers' per-slot alloc widths
+            // (sized [max_top_k * width] in full.rs). Derive max_top_k from
+            // packed_topk_device ([max_top_k*2]).
+            let max_top_k = moe_scratch.packed_topk_device.len() / 2;
+            let inter_stride = moe_scratch.expert_gate_b.len() / max_top_k; // = max_expert_intermediate
+            let quant_stride = moe_scratch.quant_b.len() / max_top_k; // = max_input
+            let hidden_stride = down.rows; // = hidden_size (expert_out_b per-slot alloc width)
+            let bp = moe_scratch.bulk_expert_packed.as_ref().unwrap() as *const DeviceBuffer<u8>;
+            let bs = moe_scratch.bulk_expert_scales.as_ref().unwrap() as *const DeviceBuffer<u8>;
+            // GATE: batched quant of the shared hidden (input_stride=0) → batched GEMV
+            runtime.quantize_nvfp4_input_batched_dptr_device(
+                hidden_out, 0, gate.cols, quant_stride,
+                &moe_scratch.slot_in_scale, 0, tk, &mut moe_scratch.quant_b,
+            )?;
+            runtime.matvec_nvfp4_prequantized_batched_dptr_device(
+                unsafe { &*bp }, unsafe { &*bs }, per_slot_packed, per_slot_scale,
+                0, 0,
+                &moe_scratch.quant_b, quant_stride, gate.rows, gate.cols,
+                &moe_scratch.slot_out_scale, 0, inter_stride, tk, &mut moe_scratch.expert_gate_b,
+            )?;
+            // UP
+            runtime.quantize_nvfp4_input_batched_dptr_device(
+                hidden_out, 0, up.cols, quant_stride,
+                &moe_scratch.slot_in_scale, 1, tk, &mut moe_scratch.quant_b,
+            )?;
+            runtime.matvec_nvfp4_prequantized_batched_dptr_device(
+                unsafe { &*bp }, unsafe { &*bs }, per_slot_packed, per_slot_scale,
+                tables.gate_packed_bytes, tables.gate_scale_bytes,
+                &moe_scratch.quant_b, quant_stride, up.rows, up.cols,
+                &moe_scratch.slot_out_scale, 1, inter_stride, tk, &mut moe_scratch.expert_up_b,
+            )?;
+            // GEGLU (batched, strided over slots)
+            {
+                let eg = &moe_scratch.expert_gate_b as *const DeviceBuffer<f32>;
+                let eu = &moe_scratch.expert_up_b as *const DeviceBuffer<f32>;
+                // SAFETY: eg/eu (read) are distinct from expert_swiglu_b (write).
+                runtime.geglu_tanh_batched_slots_device(
+                    unsafe { &*eg }, unsafe { &*eu }, gate.rows, inter_stride, tk,
+                    &mut moe_scratch.expert_swiglu_b,
+                )?;
+            }
+            // DOWN: batched quant of per-slot swiglu (input_stride=inter_stride) → batched GEMV
+            {
+                let es = &moe_scratch.expert_swiglu_b as *const DeviceBuffer<f32>;
+                // SAFETY: es (read) is distinct from quant_b (write).
+                runtime.quantize_nvfp4_input_batched_dptr_device(
+                    unsafe { &*es }, inter_stride, down.cols, quant_stride,
+                    &moe_scratch.slot_in_scale, 2, tk, &mut moe_scratch.quant_b,
+                )?;
+            }
+            runtime.matvec_nvfp4_prequantized_batched_dptr_device(
+                unsafe { &*bp }, unsafe { &*bs }, per_slot_packed, per_slot_scale,
+                tables.gate_packed_bytes + tables.up_packed_bytes,
+                tables.gate_scale_bytes + tables.up_scale_bytes,
+                &moe_scratch.quant_b, quant_stride, down.rows, down.cols,
+                &moe_scratch.slot_out_scale, 2, hidden_stride, tk, &mut moe_scratch.expert_out_b,
+            )?;
+            // WEIGHTED ACCUMULATE: routed_acc = Σ_k w[k]·expert_out[k]
+            // (fixed ascending fold + single-expr FMA = bit-identical to the
+            //  serial axpy chain; routed_acc was zeroed earlier — overwrite here).
+            {
+                let eo = &moe_scratch.expert_out_b as *const DeviceBuffer<f32>;
+                let ptk = &moe_scratch.packed_topk_device as *const DeviceBuffer<u32>;
+                // SAFETY: eo/ptk (read) are distinct from routed_acc (write).
+                runtime.moe_weighted_accumulate_device(
+                    &mut moe_scratch.routed_acc, unsafe { &*eo }, hidden_stride,
+                    unsafe { &*ptk }, tk, down.rows,
+                )?;
+            }
+        } else {
         for k in 0..active_top_k {
             let packed_base = k * per_slot_packed;
             let scale_base = k * per_slot_scale;
@@ -704,6 +792,7 @@ fn forward_moe_decode_device(
                 )?;
             }
         }
+        } // end per-slot fallback (else of batched_decode_moe_enabled)
     }
 
     // ── Coalesced expert H2D (decode PCIe-saturation fix) ────────────────
