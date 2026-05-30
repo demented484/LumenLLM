@@ -593,6 +593,24 @@ fn forward_moe_decode_device(
                 "GPU-driven MoE decode requires the bulk expert buffers to be allocated".into(),
             ));
         }
+        // Slot-major byte layout: slot k holds gate, up, down back-to-back at
+        // their uniform strides (matches the gather kernel).
+        let per_slot_packed =
+            tables.gate_packed_bytes + tables.up_packed_bytes + tables.down_packed_bytes;
+        let per_slot_scale =
+            tables.gate_scale_bytes + tables.up_scale_bytes + tables.down_scale_bytes;
+        // Account the gathered PCIe traffic in the shared H2D counter so
+        // AEGIS_DECODE_TIMING's MiB/token + GB/s stay meaningful (the gather reads
+        // device-mapped host directly, bypassing the staging pool that normally
+        // increments this). Same bytes/token as the host path — only the path
+        // (in-graph gather over mapped host vs host-issued memcpy) differs.
+        // NOTE: under CUDA-graph REPLAY this Rust code doesn't run, so the
+        // counter only ticks on the capture token; the per-token PCIe volume is
+        // unchanged across replays, it just isn't re-counted host-side.
+        crate::cuda::staging::STAGING_H2D_BYTES.fetch_add(
+            ((per_slot_packed + per_slot_scale) * top_k) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // 1) Gather: device-mapped host → bulk VRAM + per-slot scale arrays.
         {
             let bp = moe_scratch.bulk_expert_packed.as_mut().unwrap() as *mut DeviceBuffer<u8>;
@@ -614,12 +632,6 @@ fn forward_moe_decode_device(
             )?;
         }
         // 2) Per-slot GEMVs reading the gathered bulk buffer + device scales.
-        // Slot-major byte layout matches the gather kernel: slot k holds
-        // gate, up, down back-to-back at their uniform strides.
-        let per_slot_packed =
-            tables.gate_packed_bytes + tables.up_packed_bytes + tables.down_packed_bytes;
-        let per_slot_scale =
-            tables.gate_scale_bytes + tables.up_scale_bytes + tables.down_scale_bytes;
         // Expert projection shapes are uniform across experts (we use the first).
         let gate = &moe.experts[0].gate_proj;
         let up = &moe.experts[0].up_proj;
