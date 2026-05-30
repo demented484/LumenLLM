@@ -1711,10 +1711,15 @@ fn build_moe_device_tables(
     if moe.experts.is_empty() {
         return Ok(None);
     }
-    // Eligibility: every expert's three projections must be host-resident with
-    // a device-mapped arena pointer. (VRAM-cached experts have no host pointer.)
+    // Eligibility: every expert's three projections must expose a device
+    // gather-source pointer — either a device-mapped host arena pointer
+    // (StagedHostToDevice → PCIe zero-copy) OR a VRAM-resident plain
+    // PackedSource pointer (VramResident → VRAM->VRAM gather, no PCIe). The
+    // latter is what makes graphed GPU-driven decode fast: with experts in
+    // VRAM the gather costs ~1ms instead of ~50ms, while the GPU router top-k
+    // removes the per-layer CPU round-trip entirely.
     let first = &moe.experts[0];
-    if !first.gate_proj.is_host_resident() {
+    if first.gate_proj.gather_source_ptrs(runtime.stream()).is_none() {
         return Ok(None);
     }
     // Uniform per-projection byte strides (assert by checking the first expert;
@@ -1752,15 +1757,15 @@ fn build_moe_device_tables(
         {
             return Ok(None);
         }
-        let (gp, gs) = match e.gate_proj.host_device_mapped_ptrs() {
+        let (gp, gs) = match e.gate_proj.gather_source_ptrs(runtime.stream()) {
             Some(p) => p,
             None => return Ok(None),
         };
-        let (upp, ups) = match e.up_proj.host_device_mapped_ptrs() {
+        let (upp, ups) = match e.up_proj.gather_source_ptrs(runtime.stream()) {
             Some(p) => p,
             None => return Ok(None),
         };
-        let (dpp, dps) = match e.down_proj.host_device_mapped_ptrs() {
+        let (dpp, dps) = match e.down_proj.gather_source_ptrs(runtime.stream()) {
             Some(p) => p,
             None => return Ok(None),
         };

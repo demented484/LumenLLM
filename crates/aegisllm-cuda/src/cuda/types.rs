@@ -237,6 +237,37 @@ impl DeviceNvfp4Linear {
         let host = self.host_weights.as_ref()?;
         Some((host.packed.device_ptr()?, host.scales.device_ptr()?))
     }
+
+    /// Device-accessible `(packed_ptr, scales_ptr)` for the GPU-driven MoE
+    /// decode gather, regardless of residency:
+    ///   - host-resident (StagedHostToDevice): the device-mapped arena pointer
+    ///     (PCIe reads, ~14.5 GB/s zero-copy in the gather kernel);
+    ///   - VRAM-resident (VramResident): the device pointer of the `packed`/
+    ///     `scales` `CudaSlice`s, which hold the SAME plain NVFP4 PackedSource
+    ///     bytes the per-expert GEMV reads — so the gather becomes a VRAM->VRAM
+    ///     copy (~700 GB/s) with NO PCIe traffic. This is the lever that makes
+    ///     fully-GPU-driven (graphed, no CPU router round-trip) decode fast.
+    /// Returns `None` for cutlass-prepacked / native-MXFP4 layouts (the gather's
+    /// fixed slot layout assumes plain packed+scales) and for the dropped-host
+    /// edge where neither a host arena nor real VRAM bytes are available.
+    pub fn gather_source_ptrs(
+        &self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Option<(u64, u64)> {
+        use cudarc::driver::DevicePtr;
+        if let Some(host) = self.host_weights.as_ref() {
+            // Host-resident: read from the device-mapped pinned arena.
+            return Some((host.packed.device_ptr()?, host.scales.device_ptr()?));
+        }
+        // VRAM-resident: only the plain PackedSource layout matches the gather +
+        // dptr-GEMV byte contract. Repacked layouts have no plain `packed`/`scales`.
+        if self.native_mxfp4.is_some() || self.cutlass_nvfp4.is_some() {
+            return None;
+        }
+        let (pp, _g1) = self.packed.device_ptr(stream);
+        let (sp, _g2) = self.scales.device_ptr(stream);
+        Some((pp, sp))
+    }
 }
 
 #[derive(Debug)]
