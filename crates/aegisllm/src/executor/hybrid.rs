@@ -347,19 +347,38 @@ impl HybridExecutorProvider {
                 // g4_state directly inside forward_dense_layer_host.
                 let per_layer_inputs: Vec<f32> =
                     g4.per_layer_inputs_snapshot(g4_state).to_vec();
-                for (layer, backend) in self.schedule.iter().copied().enumerate() {
-                    hidden = match backend {
+                // Walk the schedule, dispatching each maximal CONTIGUOUS run of
+                // GPU layers as ONE block (upload hidden once, run the whole run
+                // on-device, download once) instead of per-layer host round-trips
+                // — the per-layer path made the GPU layers ~as slow as CPU because
+                // every layer re-uploaded + downloaded the hidden with a blocking
+                // sync. CPU layers run one at a time (they already work on the host
+                // hidden; no transfer to batch).
+                let n = self.schedule.len();
+                let mut layer = 0usize;
+                while layer < n {
+                    match self.schedule[layer] {
                         HybridLayerBackend::Cpu => {
-                            g4.forward_dense_layer_host(g4_state, layer, position, &hidden)?
+                            hidden = g4.forward_dense_layer_host(g4_state, layer, position, &hidden)?;
+                            layer += 1;
                         }
-                        HybridLayerBackend::Cuda => cuda.forward_g4_layer_host(
-                            &mut state.cuda,
-                            layer,
-                            position,
-                            &hidden,
-                            &per_layer_inputs,
-                        )?,
-                    };
+                        HybridLayerBackend::Cuda => {
+                            let start = layer;
+                            while layer < n
+                                && matches!(self.schedule[layer], HybridLayerBackend::Cuda)
+                            {
+                                layer += 1;
+                            }
+                            let block: Vec<usize> = (start..layer).collect();
+                            hidden = cuda.forward_g4_layers_block_host(
+                                &mut state.cuda,
+                                &block,
+                                position,
+                                &hidden,
+                                &per_layer_inputs,
+                            )?;
+                        }
+                    }
                 }
                 g4.advance_position(g4_state);
                 state.position += 1;
