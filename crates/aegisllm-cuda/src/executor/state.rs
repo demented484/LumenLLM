@@ -194,6 +194,29 @@ pub(super) struct CudaMoEScratch {
     pub(super) router_indexed: Vec<(usize, f32)>,
     pub(super) router_top_indices: Vec<usize>,
     pub(super) router_top_weights: Vec<f32>,
+    /// Coalesced expert-weight staging for decode. After the router picks the
+    /// top-k expert indices, the active experts' NVFP4 packed/scales bytes for
+    /// ALL three projections (gate/up/down) are concatenated into these two
+    /// contiguous VRAM buffers via back-to-back `copy_host_u8_to_device_at_offset_async`
+    /// transfers on the transfer stream — ONE saturated H2D burst per MoE layer
+    /// instead of `top_k × 3` tiny interleaved transfers via the staging pool.
+    /// The per-expert GEMVs then read views into these buffers, producing
+    /// bit-identical output to the per-expert staged path (same weights, same
+    /// kernel, same order). `None` when no MoE layer has host-resident
+    /// (StagedHostToDevice) experts (e.g. VRAM-resident expert cache) — in that
+    /// case decode keeps the per-expert path (no H2D to coalesce).
+    pub(super) bulk_expert_packed: Option<DeviceBuffer<u8>>,
+    pub(super) bulk_expert_scales: Option<DeviceBuffer<u8>>,
+    /// Transfer→compute fence: recorded on the transfer stream after a layer's
+    /// bulk H2D burst; the compute stream waits on it before the expert GEMVs.
+    pub(super) bulk_expert_event: cudarc::driver::CudaEvent,
+    /// Compute→transfer fence (WAR hazard): recorded on the compute stream after
+    /// a layer's expert GEMVs finish reading the bulk buffer; the NEXT layer's
+    /// burst makes the transfer stream wait on it before overwriting the shared
+    /// buffer. `bulk_expert_primed` guards the first-layer wait (the event has
+    /// no recorded workload until the first GEMV pass completes).
+    pub(super) bulk_expert_compute_event: cudarc::driver::CudaEvent,
+    pub(super) bulk_expert_primed: bool,
 }
 
 /// Wraps `CudaGraph` so that `CudaLlamaState` satisfies `Send`.

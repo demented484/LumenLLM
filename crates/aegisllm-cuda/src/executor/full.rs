@@ -1162,6 +1162,53 @@ impl CudaLlamaExecutor {
                     let packed_topk_device = self.runtime.alloc_u32(packed_topk_words)?;
                     let packed_topk_pinned = self.runtime.alloc_pinned_u32(packed_topk_words)?;
                     let event_topk_ready = self.runtime.alloc_event()?;
+                    // Coalesced decode expert staging: worst-case is `top_k`
+                    // experts × (gate + up + down) bytes for the MoE layer with
+                    // the largest per-expert footprint. Only allocated when at
+                    // least one MoE layer has host-resident (StagedHostToDevice)
+                    // routed experts — VRAM-resident experts have no H2D to
+                    // coalesce and keep the per-expert decode path.
+                    let mut any_host_resident_experts = false;
+                    let mut max_bulk_packed = 0usize;
+                    let mut max_bulk_scales = 0usize;
+                    for l in self.layers.iter() {
+                        if let Some(ref m) = l.moe {
+                            let host_resident = m
+                                .experts
+                                .first()
+                                .map(|e| e.gate_proj.is_host_resident())
+                                .unwrap_or(false);
+                            if !host_resident {
+                                continue;
+                            }
+                            any_host_resident_experts = true;
+                            // Per-expert footprint is uniform within a layer
+                            // (all experts share gate/up/down shapes); take the
+                            // first expert and multiply by top_k.
+                            if let Some(e) = m.experts.first() {
+                                let per_expert_packed = e.gate_proj.packed_bytes
+                                    + e.up_proj.packed_bytes
+                                    + e.down_proj.packed_bytes;
+                                let per_expert_scales = e.gate_proj.scale_bytes
+                                    + e.up_proj.scale_bytes
+                                    + e.down_proj.scale_bytes;
+                                max_bulk_packed =
+                                    max_bulk_packed.max(per_expert_packed * m.top_k);
+                                max_bulk_scales =
+                                    max_bulk_scales.max(per_expert_scales * m.top_k);
+                            }
+                        }
+                    }
+                    let (bulk_expert_packed, bulk_expert_scales) = if any_host_resident_experts {
+                        (
+                            Some(self.runtime.alloc_u8(max_bulk_packed.max(1))?),
+                            Some(self.runtime.alloc_u8(max_bulk_scales.max(1))?),
+                        )
+                    } else {
+                        (None, None)
+                    };
+                    let bulk_expert_event = self.runtime.alloc_event()?;
+                    let bulk_expert_compute_event = self.runtime.alloc_event()?;
                     Some(Box::new(CudaMoEScratch {
                         router_logits: self.runtime.alloc_f32(max_num_experts)?,
                         router_input_scratch: self.runtime.alloc_f32(self.hidden_size)?,
@@ -1191,6 +1238,11 @@ impl CudaLlamaExecutor {
                         router_indexed: Vec::with_capacity(max_num_experts),
                         router_top_indices: Vec::with_capacity(max_top_k),
                         router_top_weights: Vec::with_capacity(max_top_k),
+                        bulk_expert_packed,
+                        bulk_expert_scales,
+                        bulk_expert_event,
+                        bulk_expert_compute_event,
+                        bulk_expert_primed: false,
                     }))
                 } else {
                     None

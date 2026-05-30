@@ -1687,6 +1687,51 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Pre-quantized NVFP4 matvec (M=1, decode) where packed/scales come from
+    /// **byte offsets into a caller-owned bulk VRAM buffer**. Used by the
+    /// coalesced decode MoE path: all active experts' weights for a layer are
+    /// concatenated into one buffer via a single saturated H2D burst, then each
+    /// expert's GEMV reads a view into that buffer here. Numerically identical
+    /// to `matvec_nvfp4_prequantized_device` — same kernel, same dequant, same
+    /// accumulation order; only the source pointer (a sub-view of the bulk
+    /// buffer) differs.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matvec_nvfp4_prequantized_bulk_views_device(
+        &self,
+        bulk_packed: &DeviceBuffer<u8>,
+        bulk_scales: &DeviceBuffer<u8>,
+        packed_offset: usize,
+        packed_bytes: usize,
+        scales_offset: usize,
+        scale_bytes: usize,
+        rows: usize,
+        cols: usize,
+        output_scale: f32,
+        quantized_input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if packed_offset + packed_bytes > bulk_packed.slice.len()
+            || scales_offset + scale_bytes > bulk_scales.slice.len()
+        {
+            return Err(AegisError::InvalidPlan(format!(
+                "bulk view out of bounds: packed {}+{}>{}  scales {}+{}>{}",
+                packed_offset, packed_bytes, bulk_packed.slice.len(),
+                scales_offset, scale_bytes, bulk_scales.slice.len(),
+            )));
+        }
+        let packed_view = bulk_packed.slice.slice(packed_offset..packed_offset + packed_bytes);
+        let scales_view = bulk_scales.slice.slice(scales_offset..scales_offset + scale_bytes);
+        self.launch_nvfp4_prequantized_views(
+            &packed_view,
+            &scales_view,
+            rows,
+            cols,
+            output_scale,
+            &quantized_input.slice,
+            &mut output.slice,
+        )
+    }
+
     /// Pre-quantized batched NVFP4 matvec where packed/scales come from a staging view.
     pub(crate) fn launch_nvfp4_prequantized_batched_views(
         &self,

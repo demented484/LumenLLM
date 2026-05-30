@@ -553,30 +553,171 @@ fn forward_moe_decode_device(
     // Routed experts → routed_acc (separate accumulator so it does not alias
     // with `moe_acc` which already holds the shared-MLP output).
     runtime.zero_f32_device(&mut moe_scratch.routed_acc)?;
-    for i in 0..active_top_k {
-        let expert_idx = moe_scratch.router_top_indices[i];
-        let weight = moe_scratch.router_top_weights[i];
-        let expert = &moe.experts[expert_idx];
-        matvec_nvfp4_device_with_scratch(
-            runtime, &expert.gate_proj, hidden_out,
-            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
-            &mut moe_scratch.expert_gate,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
-        matvec_nvfp4_device_with_scratch(
-            runtime, &expert.up_proj, hidden_out,
-            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
-            &mut moe_scratch.expert_up,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
-        runtime.geglu_tanh_device(&moe_scratch.expert_gate, &moe_scratch.expert_up, &mut moe_scratch.expert_swiglu)?;
-        matvec_nvfp4_device_with_scratch(
-            runtime, &expert.down_proj, &moe_scratch.expert_swiglu,
-            &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
-            &mut moe_scratch.expert_out,
-            if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-        )?;
-        runtime.axpy_f32_device(weight, &moe_scratch.expert_out, &mut moe_scratch.routed_acc)?;
+
+    // ── Coalesced expert H2D (decode PCIe-saturation fix) ────────────────
+    //
+    // Per token, the routed experts of every MoE layer must be streamed from
+    // host RAM. The old structure issued `top_k × 3` (gate/up/down) tiny
+    // (~3.2 MB) H2D transfers through the 4-slot staging pool, with a kernel
+    // launch interleaved between each — leaving the PCIe link idle between
+    // bursts and capping throughput at ~28 GB/s on a 55 GB/s link.
+    //
+    // Mirror the PREFILL grouped path's bulk staging: concatenate the active
+    // experts' packed+scales bytes for all three projections into one
+    // contiguous VRAM buffer with back-to-back `copy_host_u8_to_device_at_offset_async`
+    // calls on the transfer stream (no interleaved kernels/syncs → the driver
+    // pipelines them into one saturated burst), then run the per-expert GEMVs
+    // reading views into that buffer. Same bytes/token, but as one large burst
+    // per layer instead of 24 stop-start transfers. Output is bit-identical:
+    // same weights, same `nvfp4_prequant` kernel, same per-expert input
+    // quantization + accumulation order.
+    //
+    // Gated on host-resident experts AND the bulk buffers being allocated.
+    // VRAM-resident experts (cache) have no H2D and keep the per-expert path.
+    let experts_host_resident = moe
+        .experts
+        .first()
+        .map(|e| e.gate_proj.is_host_resident())
+        .unwrap_or(false);
+    let bulk_ready = experts_host_resident
+        && moe_scratch.bulk_expert_packed.is_some()
+        && moe_scratch.bulk_expert_scales.is_some()
+        && std::env::var("AEGIS_DECODE_BULK_MOE_DISABLE").is_err();
+
+    if bulk_ready {
+        // Build the per-expert/per-projection byte-offset layout host-side and
+        // issue all H2Ds in one burst. Layout (contiguous): for each active
+        // expert e in router order → gate(e), up(e), down(e).
+        // `proj_meta[i] = (gate_off, up_off, down_off)` byte offsets into the
+        // bulk buffers; sizes are uniform within a layer.
+        // WAR hazard: the bulk buffer is reused across all MoE layers in this
+        // token. Block the transfer stream until the PREVIOUS layer's expert
+        // GEMVs have finished reading it (skip on the first layer — the event
+        // has no recorded workload yet). Without this the burst could clobber
+        // the buffer mid-read on the compute stream.
+        if moe_scratch.bulk_expert_primed {
+            runtime.transfer_wait_event(&moe_scratch.bulk_expert_compute_event)?;
+        }
+        let bulk_packed = moe_scratch.bulk_expert_packed.as_mut().unwrap();
+        let bulk_scales = moe_scratch.bulk_expert_scales.as_mut().unwrap();
+        let mut packed_off = 0usize;
+        let mut scales_off = 0usize;
+        // (gate_p, gate_s, up_p, up_s, down_p, down_s) byte offsets per expert.
+        let mut layout: Vec<[usize; 6]> = Vec::with_capacity(active_top_k);
+        for i in 0..active_top_k {
+            let expert = &moe.experts[moe_scratch.router_top_indices[i]];
+            let mut slot = [0usize; 6];
+            let projs = [&expert.gate_proj, &expert.up_proj, &expert.down_proj];
+            for (pi, proj) in projs.iter().enumerate() {
+                let (pb, sb) = proj
+                    .host_packed_scales_bytes()
+                    .ok_or_else(|| AegisError::InvalidPlan(format!(
+                        "decode bulk MoE: expert proj `{}` is not host-resident",
+                        proj.name
+                    )))??;
+                slot[pi * 2] = packed_off;
+                slot[pi * 2 + 1] = scales_off;
+                runtime.copy_host_u8_to_device_at_offset_async(pb, bulk_packed, packed_off)?;
+                runtime.copy_host_u8_to_device_at_offset_async(sb, bulk_scales, scales_off)?;
+                packed_off += pb.len();
+                scales_off += sb.len();
+            }
+            layout.push(slot);
+        }
+        // Account the burst in the shared H2D counter so AEGIS_DECODE_TIMING's
+        // MiB/token + GB/s reading stays accurate (these bytes bypass the
+        // staging pool, which is what increments the counter on the per-expert
+        // path). Total bytes/token is unchanged vs the per-expert path — same
+        // experts, same weights — only the transfer shape (one burst vs 24
+        // tiny transfers) differs, so MiB/token should match while GB/s rises.
+        crate::cuda::staging::STAGING_H2D_BYTES.fetch_add(
+            (packed_off + scales_off) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // One transfer→compute fence for the whole burst.
+        runtime.record_into_transfer(&moe_scratch.bulk_expert_event)?;
+        runtime.compute_wait_event(&moe_scratch.bulk_expert_event)?;
+
+        // Per-expert GEMVs reading the resident bulk buffers. Compute is tiny;
+        // identical sequence to the per-expert path (quantize input with the
+        // linear's own input_scale, then prequantized matvec).
+        let bulk_packed = moe_scratch.bulk_expert_packed.as_ref().unwrap();
+        let bulk_scales = moe_scratch.bulk_expert_scales.as_ref().unwrap();
+        for i in 0..active_top_k {
+            let expert = &moe.experts[moe_scratch.router_top_indices[i]];
+            let weight = moe_scratch.router_top_weights[i];
+            let off = layout[i];
+            // gate
+            runtime.quantize_nvfp4_input_device(
+                hidden_out, expert.gate_proj.input_scale, &mut moe_scratch.quant_expert,
+            )?;
+            runtime.matvec_nvfp4_prequantized_bulk_views_device(
+                bulk_packed, bulk_scales,
+                off[0], expert.gate_proj.packed_bytes,
+                off[1], expert.gate_proj.scale_bytes,
+                expert.gate_proj.rows, expert.gate_proj.cols,
+                expert.gate_proj.output_scale,
+                &moe_scratch.quant_expert, &mut moe_scratch.expert_gate,
+            )?;
+            // up
+            runtime.quantize_nvfp4_input_device(
+                hidden_out, expert.up_proj.input_scale, &mut moe_scratch.quant_expert,
+            )?;
+            runtime.matvec_nvfp4_prequantized_bulk_views_device(
+                bulk_packed, bulk_scales,
+                off[2], expert.up_proj.packed_bytes,
+                off[3], expert.up_proj.scale_bytes,
+                expert.up_proj.rows, expert.up_proj.cols,
+                expert.up_proj.output_scale,
+                &moe_scratch.quant_expert, &mut moe_scratch.expert_up,
+            )?;
+            runtime.geglu_tanh_device(
+                &moe_scratch.expert_gate, &moe_scratch.expert_up, &mut moe_scratch.expert_swiglu,
+            )?;
+            // down
+            runtime.quantize_nvfp4_input_device(
+                &moe_scratch.expert_swiglu, expert.down_proj.input_scale, &mut moe_scratch.quant_expert,
+            )?;
+            runtime.matvec_nvfp4_prequantized_bulk_views_device(
+                bulk_packed, bulk_scales,
+                off[4], expert.down_proj.packed_bytes,
+                off[5], expert.down_proj.scale_bytes,
+                expert.down_proj.rows, expert.down_proj.cols,
+                expert.down_proj.output_scale,
+                &moe_scratch.quant_expert, &mut moe_scratch.expert_out,
+            )?;
+            runtime.axpy_f32_device(weight, &moe_scratch.expert_out, &mut moe_scratch.routed_acc)?;
+        }
+        // Signal the compute stream is done reading the bulk buffer, so the
+        // next layer's burst can safely overwrite it.
+        runtime.record_into_compute(&moe_scratch.bulk_expert_compute_event)?;
+        moe_scratch.bulk_expert_primed = true;
+    } else {
+        for i in 0..active_top_k {
+            let expert_idx = moe_scratch.router_top_indices[i];
+            let weight = moe_scratch.router_top_weights[i];
+            let expert = &moe.experts[expert_idx];
+            matvec_nvfp4_device_with_scratch(
+                runtime, &expert.gate_proj, hidden_out,
+                &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
+                &mut moe_scratch.expert_gate,
+                if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
+            )?;
+            matvec_nvfp4_device_with_scratch(
+                runtime, &expert.up_proj, hidden_out,
+                &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
+                &mut moe_scratch.expert_up,
+                if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
+            )?;
+            runtime.geglu_tanh_device(&moe_scratch.expert_gate, &moe_scratch.expert_up, &mut moe_scratch.expert_swiglu)?;
+            matvec_nvfp4_device_with_scratch(
+                runtime, &expert.down_proj, &moe_scratch.expert_swiglu,
+                &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
+                &mut moe_scratch.expert_out,
+                if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
+            )?;
+            runtime.axpy_f32_device(weight, &moe_scratch.expert_out, &mut moe_scratch.routed_acc)?;
+        }
     }
 
     // Step 7: post_feedforward_layernorm_2(routed_acc) → expert_out (stream2)
