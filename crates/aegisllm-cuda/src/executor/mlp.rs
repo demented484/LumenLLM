@@ -579,10 +579,17 @@ fn forward_moe_decode_device(
         .first()
         .map(|e| e.gate_proj.is_host_resident())
         .unwrap_or(false);
+    // OPT-IN (default OFF): measured a REGRESSION (36→25 tps, 28→19 GB/s) — the
+    // per-expert path already overlaps transfer+compute via the 4-slot staging
+    // pool, while this bulk path serializes a whole-layer transfer then compute
+    // (+ a cross-layer WAR fence) and never became a single transfer. The decode
+    // bottleneck is CPU launch/sync orchestration (~89% cpu_issuing), not the
+    // transfer shape; the real fix is a grouped single-launch GEMM. Kept behind
+    // a flag for A/B until that lands.
     let bulk_ready = experts_host_resident
         && moe_scratch.bulk_expert_packed.is_some()
         && moe_scratch.bulk_expert_scales.is_some()
-        && std::env::var("AEGIS_DECODE_BULK_MOE_DISABLE").is_err();
+        && std::env::var("AEGIS_DECODE_BULK_MOE_ENABLE").is_ok();
 
     if bulk_ready {
         // Build the per-expert/per-projection byte-offset layout host-side and
