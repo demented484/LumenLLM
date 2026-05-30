@@ -39,6 +39,10 @@ pub struct CudaLayerBlockExecutor {
     /// with the full executor (the hybrid does the embed on CPU, so this is
     /// informational, but kept so a future GPU-side embed path can reuse it).
     pub(super) embed_scale: Option<f32>,
+    /// Pinned host arena backing any host-resident weights this executor loads
+    /// (the Gemma-4 PLE table + any store=ram GPU layer). Held so the arena —
+    /// and its `cuMemHostRegister` pinning — outlives the weights that DMA from it.
+    _host_arena: std::sync::Arc<crate::cuda::host_arena::PinnedArena>,
 }
 
 #[derive(Debug)]
@@ -68,8 +72,28 @@ impl CudaLayerBlockExecutor {
         selected_layers: &BTreeSet<usize>,
     ) -> Result<Self> {
         let cuda = CudaRuntime::new_with_config(device, cuda_config)?;
-        let cuda_weights = cuda.weight_loader();
         let region_placements = placement.region_map();
+        // Host arena for any host-resident weights THIS CUDA executor loads: the
+        // always-host-resident Gemma-4 PLE table + any selected GPU layer with
+        // store=ram. Sized only for this executor's regions (the selected GPU
+        // layers) — the CPU layers and CPU bookends (embed/final_norm/lm_head)
+        // are loaded by the CPU executor, not here. Without the arena, the
+        // host-resident BF16 PLE-table load errors in the weight loader (this was
+        // the P3 hybrid blocker).
+        let arena_regions: std::collections::BTreeMap<
+            &RegionId,
+            &aegisllm_base::planning::placement::RegionPlacement,
+        > = region_placements
+            .iter()
+            .filter(|(id, _)| selected_layers.iter().any(|&l| id.0 == format!("layer.{l}")))
+            .map(|(id, pl)| (*id, *pl))
+            .collect();
+        let host_arena_capacity =
+            super::full::compute_host_arena_capacity(artifact, graph, &arena_regions);
+        let host_arena = std::sync::Arc::new(
+            crate::cuda::host_arena::PinnedArena::new(&cuda, host_arena_capacity)?,
+        );
+        let cuda_weights = cuda.weight_loader_with_arena(host_arena.clone());
         let runtime_layouts = runtime_layouts_by_region(runtime);
         let mut loader = TensorStorageLoader::new();
         let mut layers = BTreeMap::new();
@@ -206,6 +230,12 @@ impl CudaLayerBlockExecutor {
             .embed_scale
             .or_else(|| ple.as_ref().map(|_| (graph.hidden_size as f32).sqrt()));
 
+        // Register the now-filled arena with cuMemHostRegister so staging-pool
+        // DMAs (and the PLE table reads) take the direct-pinned path. Mirrors
+        // full.rs's post-load pin. No device-map: the hybrid GPU layers don't use
+        // the GPU-driven MoE gather (that path is full-executor only).
+        host_arena.pin_now()?;
+
         Ok(Self {
             runtime: cuda,
             hidden_size: graph.hidden_size,
@@ -219,6 +249,7 @@ impl CudaLayerBlockExecutor {
             total_num_layers: graph.num_layers,
             ple,
             embed_scale,
+            _host_arena: host_arena,
         })
     }
 

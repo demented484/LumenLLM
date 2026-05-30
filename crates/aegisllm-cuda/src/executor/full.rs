@@ -1822,7 +1822,7 @@ fn build_moe_device_tables(
 /// Returned value is at least 1 to satisfy `PinnedArena::new`'s non-zero
 /// capacity check. When no region is host-resident (everything fits in
 /// VRAM) the arena is allocated tiny and never used.
-fn compute_host_arena_capacity(
+pub(crate) fn compute_host_arena_capacity(
     artifact: &aegisllm_base::artifact::ModelArtifact,
     graph: &aegisllm_base::graph::ModelGraph,
     region_placements: &std::collections::BTreeMap<
