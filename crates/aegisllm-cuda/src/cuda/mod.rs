@@ -5,6 +5,8 @@ pub(crate) mod host_arena;
 mod kernels;
 pub(crate) mod loader;
 pub(crate) mod owned_pinned;
+#[cfg(test)]
+mod pcie_bench;
 pub(crate) mod registered_shards;
 mod repack;
 pub(crate) mod runtime;
