@@ -175,9 +175,14 @@ impl CudaRuntime {
                 slot_out_scale.len()
             )));
         }
-        if quantized_input.len() != cols || output.len() != rows {
+        // Buffers may be OVER-allocated (expert_gate/up/swiglu are sized to
+        // max_expert_intermediate = max(routed moe_inter, shared_expert inter),
+        // and quant_expert to max_input). The kernel reads exactly `cols` and
+        // writes exactly `rows` (grid_dim = rows); downstream ops read the valid
+        // prefix. So require AT LEAST the needed size, not an exact match.
+        if quantized_input.len() < cols || output.len() < rows {
             return Err(AegisError::InvalidPlan(format!(
-                "dptr bulk gemv shape mismatch: input={} need {cols}, output={} need {rows}",
+                "dptr bulk gemv shape too small: input={} need {cols}, output={} need {rows}",
                 quantized_input.len(), output.len()
             )));
         }

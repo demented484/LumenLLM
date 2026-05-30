@@ -26,7 +26,6 @@
 // routing weight — the scales are merely sourced from device arrays indexed by
 // slot instead of launch-time scalar args.
 
-#include <stdint.h>
 
 // ── Top-k packed-record layout (matches router_softmax_topk_packed) ─────────
 //   packed_topk[2*k]     = expert index (u32)
@@ -59,23 +58,23 @@
 // (0=gate,1=up,2=down). Threads stream the packed bytes (and the much smaller
 // scales) as 16-byte (uint4) chunks where aligned, else byte-wise tail.
 extern "C" __global__ void aegis_moe_gather_experts(
-    const uint32_t* __restrict__ packed_topk,     // [top_k*2] (idx,wbits) on device
-    const uint32_t top_k,
-    const uint32_t num_experts,
+    const unsigned int* __restrict__ packed_topk,     // [top_k*2] (idx,wbits) on device
+    const unsigned int top_k,
+    const unsigned int num_experts,
     // packed device pointers (host device-mapped), one per expert per proj
-    const uint64_t* __restrict__ gate_packed_ptrs,
-    const uint64_t* __restrict__ up_packed_ptrs,
-    const uint64_t* __restrict__ down_packed_ptrs,
-    const uint64_t* __restrict__ gate_scale_ptrs,
-    const uint64_t* __restrict__ up_scale_ptrs,
-    const uint64_t* __restrict__ down_scale_ptrs,
+    const unsigned long long* __restrict__ gate_packed_ptrs,
+    const unsigned long long* __restrict__ up_packed_ptrs,
+    const unsigned long long* __restrict__ down_packed_ptrs,
+    const unsigned long long* __restrict__ gate_scale_ptrs,
+    const unsigned long long* __restrict__ up_scale_ptrs,
+    const unsigned long long* __restrict__ down_scale_ptrs,
     // per-projection byte strides (uniform across experts within a layer)
-    const uint32_t gate_packed_bytes,
-    const uint32_t gate_scale_bytes,
-    const uint32_t up_packed_bytes,
-    const uint32_t up_scale_bytes,
-    const uint32_t down_packed_bytes,
-    const uint32_t down_scale_bytes,
+    const unsigned int gate_packed_bytes,
+    const unsigned int gate_scale_bytes,
+    const unsigned int up_packed_bytes,
+    const unsigned int up_scale_bytes,
+    const unsigned int down_packed_bytes,
+    const unsigned int down_scale_bytes,
     // per-expert scalar tables
     const float* __restrict__ gate_in_scale,
     const float* __restrict__ up_in_scale,
@@ -89,35 +88,35 @@ extern "C" __global__ void aegis_moe_gather_experts(
     float* __restrict__ slot_in_scale,    // [top_k*3]  (gate,up,down per slot)
     float* __restrict__ slot_out_scale    // [top_k*3]
 ) {
-    const uint32_t slot = blockIdx.y;
-    const uint32_t proj = blockIdx.x;   // 0=gate, 1=up, 2=down
+    const unsigned int slot = blockIdx.y;
+    const unsigned int proj = blockIdx.x;   // 0=gate, 1=up, 2=down
     if (slot >= top_k || proj >= 3u) return;
 
-    const uint32_t expert = packed_topk[slot * 2u];
+    const unsigned int expert = packed_topk[slot * 2u];
     if (expert >= num_experts) return;
 
     // Resolve this projection's source pointers + strides + scales.
-    uint64_t src_packed_u64;
-    uint64_t src_scale_u64;
-    uint32_t packed_bytes;
-    uint32_t scale_bytes;
+    unsigned long long src_packed_u64;
+    unsigned long long src_scale_u64;
+    unsigned int packed_bytes;
+    unsigned int scale_bytes;
     float in_s;
     float out_s;
     // Slot-major byte offset within the bulk buffers. Slot k holds gate, up,
     // down back-to-back, each at its own (uniform) stride.
-    uint32_t packed_dst_off;
-    uint32_t scale_dst_off;
+    unsigned int packed_dst_off;
+    unsigned int scale_dst_off;
     {
-        const uint32_t gate_packed = gate_packed_bytes;
-        const uint32_t up_packed   = up_packed_bytes;
-        const uint32_t down_packed = down_packed_bytes;
-        const uint32_t gate_scale  = gate_scale_bytes;
-        const uint32_t up_scale    = up_scale_bytes;
-        const uint32_t down_scale  = down_scale_bytes;
-        const uint32_t per_slot_packed = gate_packed + up_packed + down_packed;
-        const uint32_t per_slot_scale  = gate_scale + up_scale + down_scale;
-        const uint32_t slot_packed_base = slot * per_slot_packed;
-        const uint32_t slot_scale_base  = slot * per_slot_scale;
+        const unsigned int gate_packed = gate_packed_bytes;
+        const unsigned int up_packed   = up_packed_bytes;
+        const unsigned int down_packed = down_packed_bytes;
+        const unsigned int gate_scale  = gate_scale_bytes;
+        const unsigned int up_scale    = up_scale_bytes;
+        const unsigned int down_scale  = down_scale_bytes;
+        const unsigned int per_slot_packed = gate_packed + up_packed + down_packed;
+        const unsigned int per_slot_scale  = gate_scale + up_scale + down_scale;
+        const unsigned int slot_packed_base = slot * per_slot_packed;
+        const unsigned int slot_scale_base  = slot * per_slot_scale;
         if (proj == 0u) {
             src_packed_u64 = gate_packed_ptrs[expert];
             src_scale_u64  = gate_scale_ptrs[expert];
@@ -147,8 +146,8 @@ extern "C" __global__ void aegis_moe_gather_experts(
     unsigned char* dst_packed = bulk_packed + packed_dst_off;
     unsigned char* dst_scale  = bulk_scales + scale_dst_off;
 
-    const uint32_t tid = threadIdx.x;
-    const uint32_t nthreads = blockDim.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int nthreads = blockDim.x;
 
     // Copy packed bytes. Use uint4 (16B) chunks where both src and dst are
     // 16B-aligned (NVFP4 packed rows and the VRAM bulk slots are well aligned),
@@ -156,32 +155,32 @@ extern "C" __global__ void aegis_moe_gather_experts(
     // over PCIe land in VRAM — bandwidth-friendly streaming.
     {
         const bool aligned16 =
-            ((reinterpret_cast<uintptr_t>(src_packed) & 0xF) == 0) &&
-            ((reinterpret_cast<uintptr_t>(dst_packed) & 0xF) == 0);
+            ((reinterpret_cast<unsigned long long>(src_packed) & 0xF) == 0) &&
+            ((reinterpret_cast<unsigned long long>(dst_packed) & 0xF) == 0);
         if (aligned16) {
-            const uint32_t n16 = packed_bytes / 16u;
+            const unsigned int n16 = packed_bytes / 16u;
             const uint4* s4 = reinterpret_cast<const uint4*>(src_packed);
             uint4* d4 = reinterpret_cast<uint4*>(dst_packed);
-            for (uint32_t i = tid; i < n16; i += nthreads) {
+            for (unsigned int i = tid; i < n16; i += nthreads) {
                 d4[i] = s4[i];
             }
-            for (uint32_t i = n16 * 16u + tid; i < packed_bytes; i += nthreads) {
+            for (unsigned int i = n16 * 16u + tid; i < packed_bytes; i += nthreads) {
                 dst_packed[i] = src_packed[i];
             }
         } else {
-            for (uint32_t i = tid; i < packed_bytes; i += nthreads) {
+            for (unsigned int i = tid; i < packed_bytes; i += nthreads) {
                 dst_packed[i] = src_packed[i];
             }
         }
     }
     // Copy scale bytes (small).
-    for (uint32_t i = tid; i < scale_bytes; i += nthreads) {
+    for (unsigned int i = tid; i < scale_bytes; i += nthreads) {
         dst_scale[i] = src_scale[i];
     }
 
     // First thread records the per-slot scales for the GEMV/quantize kernels.
     if (tid == 0u) {
-        const uint32_t slot_proj = slot * 3u + proj;
+        const unsigned int slot_proj = slot * 3u + proj;
         slot_in_scale[slot_proj] = in_s;
         slot_out_scale[slot_proj] = out_s;
     }
@@ -279,8 +278,8 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_dptr(
 extern "C" __global__ void aegis_axpy_f32_topk_weight(
     float* __restrict__ out,
     const float* __restrict__ src,
-    const uint32_t* __restrict__ packed_topk,
-    const uint32_t slot,
+    const unsigned int* __restrict__ packed_topk,
+    const unsigned int slot,
     const unsigned int len
 ) {
     const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
