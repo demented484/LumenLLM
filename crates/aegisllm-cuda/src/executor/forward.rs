@@ -389,8 +389,16 @@ impl CudaLlamaExecutor {
             // For non-greedy we'll download logits from state.logits; the argmax is a no-op for us.
             self.runtime.replay_decode_graph(&graph.0)?;
         } else {
+            // Normally staged (host-resident) layers inhibit graph capture
+            // because their per-token H2D memcpy can't be captured. The
+            // GPU-driven MoE decode path replaces that host memcpy with an
+            // in-graph gather kernel reading the on-device top-k, so when
+            // `moe_decode_gpu_driven_graphable` is set the staged-layers gate is
+            // overridden (staging there is ONLY the now-graphable MoE experts).
+            let staged_layers_block_capture =
+                self.has_staged_layers && !self.moe_decode_gpu_driven_graphable;
             let can_capture = seq_len <= CUDA_GRAPH_ATTN_MAX_SEQ_LEN
-                && !self.has_staged_layers
+                && !staged_layers_block_capture
                 && !self.has_staged_kv
                 && state.decode_graph.is_none();
             if can_capture {

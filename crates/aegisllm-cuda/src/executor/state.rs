@@ -299,6 +299,12 @@ pub(super) struct CudaLlamaExecutor {
     pub(super) has_staged_layers: bool,
     /// True when any layer has host-resident KV; inhibits CUDA Graph capture.
     pub(super) has_staged_kv: bool,
+    /// True when the ONLY thing making layers "staged" is GPU-driven MoE experts
+    /// (device-mapped-host gather, not host H2D), and KV is VRAM-resident. When
+    /// set, the decode graph is allowed to capture even though `has_staged_layers`
+    /// is true — the per-token control flow is a fixed kernel sequence reading
+    /// the on-device top-k, so it replays correctly. See `forward.rs` gate.
+    pub(super) moe_decode_gpu_driven_graphable: bool,
     /// Tail tier: KV store for layers >= `kv_first_n_layers` (or all layers when
     /// `kv_first_n_layers` is `None`).
     pub(super) kv_store: StoragePlacement,

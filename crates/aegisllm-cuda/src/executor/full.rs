@@ -600,6 +600,52 @@ impl CudaLlamaExecutor {
                 nl, h, q_w, kv_w, hd,
             );
         }
+        // GPU-driven MoE decode is graph-capturable iff the *only* thing that
+        // makes any layer "staged" is its MoE experts, and every such layer is
+        // armed with device tables (so the gather kernel — not a host memcpy —
+        // streams the weights). If any NON-expert weight is host-resident, or
+        // any host-resident-expert layer lacks device tables, a host H2D would
+        // still sit in the decode loop and break capture, so we leave the graph
+        // gated off. KV must be VRAM-resident too (host-staged KV does its own
+        // per-token H2D). Requires the opt-in env (so the table-build ran).
+        let moe_decode_gpu_driven_graphable = device_mapped
+            && gpu_driven_moe_requested()
+            && !has_staged_kv
+            && layers.iter().all(|layer| {
+                // No host-resident dense / attention / shared weights.
+                let non_expert_staged = [
+                    &layer.q_proj, &layer.k_proj, &layer.v_proj, &layer.o_proj,
+                    &layer.gate_proj, &layer.up_proj, &layer.down_proj,
+                ].iter().any(|l| l.is_host_resident())
+                    || layer.qkv_proj.as_ref().is_some_and(|l| l.is_host_resident())
+                    || layer.moe.as_ref().is_some_and(|moe| {
+                        moe.shared_expert.as_ref().is_some_and(|se| {
+                            se.gate_proj.is_host_resident()
+                                || se.up_proj.is_host_resident()
+                                || se.down_proj.is_host_resident()
+                        })
+                    });
+                if non_expert_staged {
+                    return false;
+                }
+                // Any MoE layer with host-resident experts must be GPU-driven.
+                match layer.moe.as_ref() {
+                    Some(moe) => {
+                        let experts_staged = moe.experts.iter().any(|e| {
+                            e.gate_proj.is_host_resident()
+                                || e.up_proj.is_host_resident()
+                                || e.down_proj.is_host_resident()
+                        });
+                        !experts_staged || moe.device_tables.is_some()
+                    }
+                    None => true,
+                }
+            });
+        if moe_decode_gpu_driven_graphable {
+            eprintln!(
+                "load-timing: GPU-driven MoE decode is graph-capturable (decode graph enabled)"
+            );
+        }
         Ok(Self {
             runtime: cuda,
             hidden_size: graph.hidden_size,
@@ -619,6 +665,7 @@ impl CudaLlamaExecutor {
             ple,
             has_staged_layers,
             has_staged_kv,
+            moe_decode_gpu_driven_graphable,
             kv_store,
             kv_first_n_layers,
             kv_first_store,
