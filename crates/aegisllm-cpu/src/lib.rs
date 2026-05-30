@@ -8,7 +8,7 @@ pub use attention::{
     ReferenceAttentionDecodeRequest, ReferenceAttentionPrefillRequest,
     reference_attention_decode_f32_into, reference_attention_prefill_f32_into,
 };
-pub use cpu::{CpuNvfp4Linear, CpuReferenceExecutor, CpuRuntime};
+pub use cpu::{CpuNvfp4Linear, CpuReferenceExecutor, CpuRuntime, G4CpuExecutor, G4CpuState};
 pub use materialization::{
     LinearMaterializationCache, LinearMaterializationKey, LinearMaterializationStats,
 };

@@ -528,6 +528,125 @@ impl CudaLayerBlockExecutor {
         self.runtime.download_f32(&state.hidden)
     }
 
+    /// Hybrid Gemma-4 DENSE per-layer forward (CPU+GPU heterogeneous path).
+    ///
+    /// Runs ONE Gemma-4 dense decoder layer on the GPU, reusing the EXACT
+    /// full-model per-layer math (`forward_attention_device` + the full
+    /// `forward_mlp_device` WITH PLE) — no duplicated kernels. The shared PLE
+    /// feed `per_layer_inputs` (computed once per token on the CPU) is uploaded
+    /// to `state.scratch.per_layer_inputs` so this layer's on-device PLE additive
+    /// is bit-identical to the all-GPU path; `layer_scalar` is applied on-device
+    /// (inside `forward_mlp_device`), BEFORE the PLE additive — wait: PLE additive
+    /// runs BEFORE layer_scalar (see mlp.rs), matching HF `Gemma4DecoderLayer`.
+    ///
+    /// `per_layer_inputs` is `[total_num_layers * ple_dim]` (empty/ignored for
+    /// non-PLE models). KV-share (`layer.kv_shared_from`) reads the PARENT
+    /// layer's KV cache, which the hybrid guarantees is co-located on this same
+    /// device (the parent is GPU-scheduled and present in `state.layers`).
+    ///
+    /// Mirrors the per-layer body of `forward_layers_device` but for a single
+    /// layer via the block-executor state.
+    #[allow(dead_code)]
+    pub fn forward_g4_layer_host(
+        &self,
+        state: &mut CudaLayerBlockState,
+        layer_idx: usize,
+        position: usize,
+        hidden: &[f32],
+        per_layer_inputs: &[f32],
+    ) -> Result<Vec<f32>> {
+        if hidden.len() != self.hidden_size {
+            return Err(AegisError::InvalidPlan(format!(
+                "hybrid CUDA G4 layer input mismatch: expected {}, got {}",
+                self.hidden_size,
+                hidden.len()
+            )));
+        }
+        let layer = self.layers.get(&layer_idx).ok_or_else(|| {
+            AegisError::InvalidPlan(format!("missing CUDA hybrid G4 layer `{layer_idx}`"))
+        })?;
+        if layer.moe.is_some() {
+            return Err(AegisError::Unsupported(format!(
+                "hybrid Gemma-4 layer `{layer_idx}` is MoE; the per-layer CPU+GPU hybrid \
+                 supports DENSE Gemma-4 (E2B/E4B) only"
+            )));
+        }
+        // Upload the token's hidden + the shared PLE feed for THIS step. The PLE
+        // feed is the same vector the CPU computed at token entry, so on-device
+        // PLE matches the CPU-side PLE additive exactly.
+        state.hidden = self.runtime.upload_f32(hidden)?;
+        if self.ple.is_some() && !per_layer_inputs.is_empty() {
+            self.runtime
+                .upload_f32_slice_to_device(per_layer_inputs, &mut state.scratch.per_layer_inputs)?;
+        }
+        self.runtime
+            .copy_u32_to_device(&[position as u32], &mut state.p_position)?;
+        self.runtime
+            .copy_u32_to_device(&[(position + 1) as u32], &mut state.p_seq_len)?;
+
+        // Borrow the layer's mutable KV state and (for shared layers) the
+        // parent's immutable KV cache from the same BTreeMap. The two indices
+        // are distinct (parent < layer_idx by construction), so the regions do
+        // not alias; raw pointers express this to the borrow checker (same
+        // pattern as the full-model split-borrow). The parent's KV is on THIS
+        // device — guaranteed by the hybrid's co-location validation.
+        let kv_shared_parent = layer.kv_shared_from;
+        let layers_ptr: *mut std::collections::BTreeMap<usize, CudaLayerState> = &mut state.layers;
+        let parent_kv: Option<*const super::state::CudaKvCache> = match kv_shared_parent {
+            Some(parent_idx) => {
+                let parent = unsafe { &*layers_ptr }.get(&parent_idx).ok_or_else(|| {
+                    AegisError::InvalidPlan(format!(
+                        "hybrid G4 KV-share: parent layer `{parent_idx}` of layer `{layer_idx}` \
+                         is not on this CUDA device (co-locate the parent and child)"
+                    ))
+                })?;
+                Some(&parent.kv as *const _)
+            }
+            None => None,
+        };
+        let layer_state = unsafe { &mut *layers_ptr }.get_mut(&layer_idx).ok_or_else(|| {
+            AegisError::InvalidPlan(format!("missing CUDA hybrid G4 layer state `{layer_idx}`"))
+        })?;
+        // SAFETY: `parent_kv` points at a DIFFERENT map entry (parent_idx !=
+        // layer_idx), so it does not alias `layer_state`. The reference lives
+        // only for this call. forward_attention_device reads it immutably.
+        let kv_shared_override = parent_kv.map(|p| unsafe { &*p });
+
+        super::attention::forward_attention_device(
+            &self.runtime,
+            layer,
+            layer_state,
+            kv_shared_override,
+            &state.hidden,
+            &mut state.scratch,
+            &state.p_position,
+            &state.p_seq_len,
+            self.rms_norm_eps,
+            self.num_attention_heads,
+            layer.layer_num_kv_heads,
+            layer.layer_head_dim,
+            self.kv_context_size,
+            layer.rope,
+            None,
+            position,
+            position + 1,
+        )?;
+        // Full Gemma-4 MLP WITH PLE additive + layer_scalar (on-device), exactly
+        // as the all-GPU path runs it. `self.ple.as_ref()` is the loaded global
+        // apparatus; `forward_mlp_device` reads `scratch.per_layer_inputs` (just
+        // uploaded) for this layer's additive contribution.
+        super::mlp::forward_mlp_device(
+            &self.runtime,
+            layer,
+            layer_idx,
+            self.ple.as_ref(),
+            &mut state.scratch,
+            self.rms_norm_eps,
+        )?;
+        std::mem::swap(&mut state.hidden, &mut state.scratch.hidden_out);
+        self.runtime.download_f32(&state.hidden)
+    }
+
     #[allow(dead_code)]
     fn forward_layer_device(
         &self,

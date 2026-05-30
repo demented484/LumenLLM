@@ -201,6 +201,34 @@ pub struct HiddenLayersSection {
     pub weights: Option<HiddenLayerWeightsSection>,
     #[serde(rename = "kv-cache")]
     pub kv_cache: Option<HiddenLayerKvCacheSection>,
+    /// Arbitrary per-layer-range placement, e.g. a 4-way CPU/GPU split:
+    /// ```jsonc
+    /// "ranges": [
+    ///   { "start": 0,  "end": 17, "store": "vram", "compute": "cuda:0" },
+    ///   { "start": 17, "end": 42, "store": "ram",  "compute": "cpu" }
+    /// ]
+    /// ```
+    /// Each entry resolves to a `PlacementRule { selector: Range{start,end}, .. }`
+    /// (half-open `[start, end)`). Ranges are applied in array order AFTER the
+    /// `weights` first-N rule, so a later range overrides an earlier one for any
+    /// layer it covers. This is the only way to express a layer split that is
+    /// not first-N (e.g. layers 17..42 on CPU). Coexists with `weights`/`store`/
+    /// `compute`: omit it and the legacy first-N/shorthand path is unchanged.
+    pub ranges: Option<Vec<HiddenLayerRangeSection>>,
+}
+
+/// One `[start, end)` layer range with its own store/compute placement.
+/// At least one of `store` / `compute` must be set (an empty entry is a no-op
+/// and rejected at parse time). `compute` falls back to the enclosing
+/// `hidden-layers.compute` when unset; `store` has no fallback here (it inherits
+/// the resolved per-layer store from earlier rules / `model.store`).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HiddenLayerRangeSection {
+    pub start: usize,
+    pub end: usize,
+    pub store: Option<String>,
+    pub compute: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]

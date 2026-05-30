@@ -89,6 +89,126 @@ impl G4CpuExecutor {
         self.final_logits(&hidden)
     }
 
+    // ── Per-layer hybrid block API (CPU+GPU heterogeneous Gemma-4 dense) ──────
+    //
+    // These expose the SAME per-token math `forward_hidden` runs, but split so a
+    // hybrid scheduler can interleave CPU-computed and GPU-computed layers in a
+    // single forward. The token-entry work (embed + scale + PLE feed) runs ONCE
+    // per token on the CPU and the resulting `per_layer_inputs` is shared with
+    // BOTH the CPU and GPU layer paths (the GPU path uploads the same vector), so
+    // every layer's PLE additive uses a bit-identical feed.
+
+    /// Number of decoder layers (used by the hybrid to build the schedule and to
+    /// size the shared PLE feed).
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// `hidden_size`, exposed so the hybrid can size cross-device transfer buffers.
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// `Some(parent_idx)` when layer `layer_idx` reads its K/V from another layer
+    /// (Gemma-4 E2B/E4B KV-share); `None` for own-KV layers. The hybrid uses this
+    /// to validate that a shared layer is co-located with its KV parent.
+    pub fn kv_shared_parent(&self, layer_idx: usize) -> Option<usize> {
+        self.layers.get(layer_idx).and_then(|l| l.kv_shared_from)
+    }
+
+    /// True when layer `layer_idx` is a dense (non-MoE) layer. The hybrid only
+    /// supports dense Gemma-4 (E2B/E4B); MoE (26B-A4B) is rejected upstream.
+    pub fn layer_is_dense(&self, layer_idx: usize) -> bool {
+        self.layers.get(layer_idx).map(|l| l.moe.is_none()).unwrap_or(false)
+    }
+
+    /// True when ANY layer is MoE. The hybrid rejects MoE Gemma-4 (26B) with a
+    /// clear message; only dense E2B/E4B is wired.
+    pub fn has_moe_layer(&self) -> bool {
+        self.layers.iter().any(|l| l.moe.is_some())
+    }
+
+    /// Token entry for the hybrid path: embed lookup + Gemma-4 embed scale +
+    /// PLE token-entry compute (writes `state.per_layer_inputs`). Returns the
+    /// scaled embedding `hidden` (input to layer 0). Mirrors the head of
+    /// `forward_hidden` exactly. Does NOT advance `state.position` (the hybrid
+    /// advances position once after all layers, like `forward_hidden`).
+    pub fn token_entry_host(
+        &self,
+        state: &mut G4CpuState,
+        token_id: usize,
+    ) -> Result<Vec<f32>> {
+        if state.position >= self.kv_context_size {
+            return Err(AegisError::InvalidPlan(format!(
+                "kv cache context exhausted: position={} context={}",
+                state.position, self.kv_context_size
+            )));
+        }
+        let mut hidden = self.embed_tokens.row(token_id)?;
+        simd::scale_in_place(&mut hidden, self.embed_scale);
+        if let Some(ple_g) = &self.ple {
+            ple::compute_per_layer_inputs(
+                ple_g,
+                token_id,
+                &hidden,
+                self.layers.len(),
+                self.rms_norm_eps,
+                &mut state.per_layer_inputs,
+            )?;
+        }
+        Ok(hidden)
+    }
+
+    /// A read-only snapshot of `state.per_layer_inputs` (the shared PLE feed).
+    /// The hybrid uploads this to the GPU so GPU-computed layers apply the same
+    /// PLE additive. Empty for non-PLE models.
+    pub fn per_layer_inputs_snapshot<'s>(&self, state: &'s G4CpuState) -> &'s [f32] {
+        &state.per_layer_inputs
+    }
+
+    /// Run ONE dense Gemma-4 layer on the CPU: attention sublayer + dense MLP
+    /// (with the per-layer PLE additive + layer_scalar). Reads/advances the
+    /// per-layer KV cache for own-KV layers; reads the parent's KV for shared
+    /// layers. Bit-identical to the corresponding iteration of `forward_hidden`.
+    /// Rejects MoE layers (hybrid is dense-only).
+    pub fn forward_dense_layer_host(
+        &self,
+        state: &mut G4CpuState,
+        layer_idx: usize,
+        position: usize,
+        hidden: &[f32],
+    ) -> Result<Vec<f32>> {
+        let layer = self.layers.get(layer_idx).ok_or_else(|| {
+            AegisError::InvalidPlan(format!("g4 hybrid: missing CPU layer `{layer_idx}`"))
+        })?;
+        if layer.moe.is_some() {
+            return Err(AegisError::Unsupported(format!(
+                "hybrid Gemma-4 layer `{layer_idx}` is MoE; the per-layer CPU+GPU hybrid \
+                 supports DENSE Gemma-4 (E2B/E4B) only. Run the 26B MoE fully on one device."
+            )));
+        }
+        let seq_len = position + 1;
+        let residual = self.forward_attention(state, layer, layer_idx, position, seq_len, hidden)?;
+        let mlp = layer.mlp.as_ref().ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "g4 hybrid: dense layer `{layer_idx}` has neither MLP nor MoE"
+            ))
+        })?;
+        self.forward_dense_mlp(layer, mlp, layer_idx, &state.per_layer_inputs, &residual)
+    }
+
+    /// final_norm → lm_head → optional softcap, for the hybrid (logits always
+    /// produced on CPU in the MVP). Public wrapper over the private `final_logits`.
+    pub fn final_logits_host(&self, hidden: &[f32]) -> Result<Vec<f32>> {
+        self.final_logits(hidden)
+    }
+
+    /// Advance the decode position by one (called by the hybrid after all layers
+    /// for a token have run, mirroring `forward_hidden`'s `state.position += 1`).
+    pub fn advance_position(&self, state: &mut G4CpuState) {
+        state.position += 1;
+    }
+
     /// final_norm (RMS) → lm_head → optional logit softcap. Shared by the
     /// per-token decode path and the batched-prefill last-position path.
     fn final_logits(&self, hidden: &[f32]) -> Result<Vec<f32>> {

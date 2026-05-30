@@ -8,8 +8,14 @@ use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::executor::tensors::Bf16Matrix;
 
 /// Top-level Gemma-4 CPU executor.
+///
+/// Public so the hybrid (CPU+GPU heterogeneous) executor in the `aegisllm`
+/// crate can hold one and drive its per-layer block API (`token_entry_host`,
+/// `forward_dense_layer_host`, `final_logits_host`) for the CPU-scheduled
+/// layers of a Gemma-4 dense forward. Fields stay crate-private; the hybrid
+/// only touches the public method surface.
 #[derive(Debug)]
-pub(crate) struct G4CpuExecutor {
+pub struct G4CpuExecutor {
     pub(crate) hidden_size: usize,
     pub(crate) num_attention_heads: usize,
     pub(crate) rms_norm_eps: f32,
@@ -129,6 +135,9 @@ pub(crate) struct G4PleLayer {
 
 // ── Runtime state ──────────────────────────────────────────────────────────
 
+/// Per-sequence runtime state for `G4CpuExecutor`. Public for the hybrid
+/// executor (which owns the CPU-side state for a heterogeneous forward).
+/// Fields stay crate-private.
 #[derive(Debug)]
 pub struct G4CpuState {
     pub(crate) position: usize,
@@ -202,7 +211,7 @@ impl G4LayerKvState {
 }
 
 impl G4CpuExecutor {
-    pub(crate) fn new_state(&self) -> G4CpuState {
+    pub fn new_state(&self) -> G4CpuState {
         let cap_tokens = self.kv_context_size.min(256);
         let layers = self
             .layers

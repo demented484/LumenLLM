@@ -20,4 +20,7 @@ mod ple;
 mod rope;
 mod state;
 
-pub(crate) use state::{G4CpuExecutor, G4CpuState};
+// `G4CpuExecutor` / `G4CpuState` are `pub` (their fields stay crate-private) so
+// the hybrid (CPU+GPU) executor in the `aegisllm` crate can own one and drive
+// the per-layer block API (`token_entry_host`, `forward_dense_layer_host`, …).
+pub use state::{G4CpuExecutor, G4CpuState};

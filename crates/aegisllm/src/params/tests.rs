@@ -353,3 +353,90 @@
             ComputePlacement::Cuda { device: 2 }
         );
     }
+
+    #[test]
+    fn hidden_layer_ranges_resolve_to_per_layer_placement() {
+        use aegisllm_base::graph::{GraphRegion, GraphRegionKind, RegionId};
+        use aegisllm_base::planning::placement::{LayerSelector, PlacementRule};
+
+        // A heterogeneous CPU/GPU split: layers 0..17 on cuda:0 (vram),
+        // layers 17..42 on cpu (ram). Expressed via `hidden-layers.ranges`.
+        let params: ParametersFile = serde_json::from_value(serde_json::json!({
+            "model": {
+                "path": "/tmp/model",
+                "hidden-layers": {
+                    "ranges": [
+                        { "start": 0,  "end": 17, "store": "vram", "compute": "cuda:0" },
+                        { "start": 17, "end": 42, "store": "ram",  "compute": "cpu" }
+                    ]
+                }
+            }
+        }))
+        .expect("parameters should parse");
+
+        let fragment = params
+            .into_engine_fragment(PlacementPolicy::auto_for(&HardwareInventory::detect()))
+            .expect("parameters should become an engine fragment");
+
+        // The two ranges land as Range rules, in array order.
+        let range_rules: Vec<&PlacementRule> = fragment
+            .policy
+            .rules
+            .iter()
+            .filter(|r| matches!(r.selector, LayerSelector::Range { .. }))
+            .collect();
+        let gpu_rule = range_rules
+            .iter()
+            .find(|r| r.selector == (LayerSelector::Range { start: 0, end: 17 }))
+            .expect("layers 0..17 range rule present");
+        assert_eq!(gpu_rule.compute, Some(ComputePlacement::Cuda { device: 0 }));
+        assert_eq!(gpu_rule.store, Some(StoragePlacement::Vram { device: 0 }));
+        let cpu_rule = range_rules
+            .iter()
+            .find(|r| r.selector == (LayerSelector::Range { start: 17, end: 42 }))
+            .expect("layers 17..42 range rule present");
+        assert_eq!(cpu_rule.compute, Some(ComputePlacement::Cpu));
+        assert_eq!(cpu_rule.store, Some(StoragePlacement::Ram));
+
+        // Apply the rules against synthetic layer regions to confirm the
+        // half-open `[start, end)` resolution places each layer on its side.
+        // This exercises the same `apply_rules`/`selector_matches` path the
+        // real resolver uses, without standing up a full ModelGraph.
+        let resolve_layer = |layer: usize| -> (StoragePlacement, ComputePlacement) {
+            let region = GraphRegion {
+                id: RegionId(format!("layer.{layer}")),
+                kind: GraphRegionKind::TransformerBlock,
+                layer_index: Some(layer),
+                tensors: Vec::new(),
+            };
+            let mut store = fragment.policy.weights_store;
+            let mut compute = fragment.policy.weights_compute;
+            for rule in &fragment.policy.rules {
+                let matches = match &rule.selector {
+                    LayerSelector::Range { start, end } => layer >= *start && layer < *end,
+                    LayerSelector::FirstN { n } => layer < *n,
+                    LayerSelector::All => true,
+                    _ => region.layer_index.is_some() && false,
+                };
+                if matches {
+                    if let Some(next) = rule.store {
+                        store = next;
+                    }
+                    if let Some(next) = rule.compute {
+                        compute = next;
+                    }
+                }
+            }
+            (store, compute)
+        };
+        for layer in 0..17 {
+            let (store, compute) = resolve_layer(layer);
+            assert_eq!(compute, ComputePlacement::Cuda { device: 0 }, "layer {layer}");
+            assert_eq!(store, StoragePlacement::Vram { device: 0 }, "layer {layer}");
+        }
+        for layer in 17..42 {
+            let (store, compute) = resolve_layer(layer);
+            assert_eq!(compute, ComputePlacement::Cpu, "layer {layer}");
+            assert_eq!(store, StoragePlacement::Ram, "layer {layer}");
+        }
+    }

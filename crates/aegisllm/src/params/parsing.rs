@@ -256,6 +256,48 @@ impl ParametersFile {
                 }
             }
 
+            // ── ranges sub-section ─────────────────────────────────────────────
+            // Arbitrary per-layer-range placement (e.g. a heterogeneous CPU/GPU
+            // split: layers 0..17 on cuda, 17..42 on cpu). Each entry becomes a
+            // `LayerSelector::Range { start, end }` rule, pushed in array order
+            // AFTER the first-N `weights` rule so later ranges win for overlapping
+            // layers. `compute` inherits `hidden-layers.compute` when unset.
+            if let Some(ranges) = hidden_layers.ranges {
+                for range in ranges {
+                    if range.end <= range.start {
+                        return Err(AegisError::InvalidConfig(format!(
+                            "hidden-layers.ranges entry has end ({}) <= start ({}); \
+                             ranges are half-open [start, end)",
+                            range.end, range.start
+                        )));
+                    }
+                    let store = range.store
+                        .as_deref()
+                        .map(|s| parse_storage(s, cuda_device))
+                        .transpose()?;
+                    let compute = range.compute
+                        .as_deref()
+                        .map(|c| parse_compute(c, cuda_device))
+                        .transpose()?
+                        .or(parent_compute);
+                    if store.is_none() && compute.is_none() {
+                        return Err(AegisError::InvalidConfig(format!(
+                            "hidden-layers.ranges entry [{}, {}) sets neither store nor \
+                             compute (and no hidden-layers.compute fallback); nothing to apply",
+                            range.start, range.end
+                        )));
+                    }
+                    policy.rules.push(PlacementRule {
+                        selector: LayerSelector::Range {
+                            start: range.start,
+                            end: range.end,
+                        },
+                        store,
+                        compute,
+                    });
+                }
+            }
+
             // ── kv-cache sub-section ───────────────────────────────────────────
             if let Some(kv) = hidden_layers.kv_cache {
                 if let Some(context_size) = kv.context_size {

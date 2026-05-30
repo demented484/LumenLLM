@@ -21,7 +21,7 @@ use aegisllm_base::tensor::storage::{TensorResidencyPlan, TensorStorageLoader};
 use std::collections::BTreeMap;
 
 impl G4CpuExecutor {
-    pub(crate) fn from_artifact(
+    pub fn from_artifact(
         artifact: &ModelArtifact,
         graph: &ModelGraph,
         placement: &ResolvedPlacement,
