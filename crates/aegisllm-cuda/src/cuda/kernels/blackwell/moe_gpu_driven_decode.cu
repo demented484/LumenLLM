@@ -435,12 +435,16 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_dptr_warp(
     const unsigned int top_k,
     float* __restrict__ output
 ) {
+    // block=(128,1,1) grid=(rows, top_k, 1): 128 threads (4 warps) per (slot,row),
+    // warp-shuffle reduction + single-barrier 4-partial combine (see
+    // aegis_nvfp4_gemv_warp). Same coalesced loads + K-parallelism as the naive
+    // batched_dptr kernel, minus the 7 extra barriers.
     const unsigned int slot = blockIdx.y;
     if (slot >= top_k) {
         return;
     }
-    const unsigned int row = blockIdx.x * blockDim.y + threadIdx.y;
-    const unsigned int lane = threadIdx.x;
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;             // 0..127
     if (row >= rows) {
         return;
     }
@@ -453,7 +457,7 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_dptr_warp(
     const float* in = input + size_t(slot) * input_stride;
 
     float sum = 0.0f;
-    for (unsigned int block_idx = lane; block_idx < scale_cols; block_idx += 32u) {
+    for (unsigned int block_idx = tid; block_idx < scale_cols; block_idx += 128u) {
         const float block_scale = decode_ue4m3_half(scale_row[block_idx]);
         const unsigned int input_base = block_idx * 16u;
         const unsigned int packed_base = block_idx * 8u;
@@ -470,8 +474,15 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_dptr_warp(
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum += __shfl_xor_sync(0xffffffffu, sum, (unsigned int)offset, 32);
     }
-    if (lane == 0u) {
-        output[size_t(slot) * output_stride + row] = sum * slot_out_scale[slot * 3u + proj_off];
+    __shared__ float warp_sums[4];
+    const unsigned int warp_id = tid >> 5;
+    if ((tid & 31u) == 0u) {
+        warp_sums[warp_id] = sum;
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        output[size_t(slot) * output_stride + row] =
+            (warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3]) * slot_out_scale[slot * 3u + proj_off];
     }
 }
 

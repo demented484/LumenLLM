@@ -382,8 +382,8 @@ impl CudaRuntime {
         let fast = super::linear::fast_decode_gemv_enabled();
         let cfg = if fast {
             LaunchConfig {
-                grid_dim: ((rows as u32 + 7) / 8, top_k as u32, 1),
-                block_dim: (32, 8, 1),
+                grid_dim: (rows as u32, top_k as u32, 1),
+                block_dim: (128, 1, 1),
                 shared_mem_bytes: 0,
             }
         } else {

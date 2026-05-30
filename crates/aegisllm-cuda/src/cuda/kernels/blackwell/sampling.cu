@@ -31,6 +31,44 @@ extern "C" __global__ void aegis_bf16_matvec_reference(
     }
 }
 
+// Fast BF16 M=1 matvec: same 128 threads/row + coalesced loads as
+// aegis_bf16_matvec_reference, but the 8-step __syncthreads tree is replaced by a
+// per-warp shuffle reduction + a single-barrier combine of the 4 warp partials.
+// f32 accumulate (numerically equivalent; only the reduction order differs).
+// grid=(rows,1,1) block=(128,1,1) shmem=0. Used for the dense/shared-MLP and
+// lm_head matvecs (every model + dense E4B).
+extern "C" __global__ void aegis_bf16_matvec_warp(
+    const unsigned short* matrix,
+    const float* input,
+    const unsigned int rows,
+    const unsigned int cols,
+    float* output
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;             // 0..127
+    if (row >= rows) {
+        return;
+    }
+    const unsigned short* matrix_row = matrix + size_t(row) * cols;
+    float sum = 0.0f;
+    for (unsigned int col = tid; col < cols; col += 128u) {
+        sum += bf16_to_float(matrix_row[col]) * input[col];
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, (unsigned int)offset, 32);
+    }
+    __shared__ float warp_sums[4];
+    const unsigned int warp_id = tid >> 5;
+    if ((tid & 31u) == 0u) {
+        warp_sums[warp_id] = sum;
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        output[row] = warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3];
+    }
+}
+
 extern "C" __global__ void aegis_argmax_f32_blocks(
     const float* input,
     const unsigned int len,

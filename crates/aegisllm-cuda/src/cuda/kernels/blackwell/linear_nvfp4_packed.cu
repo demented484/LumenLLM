@@ -126,8 +126,13 @@ extern "C" __global__ void aegis_nvfp4_gemv_warp(
     const float output_scale,
     float* output
 ) {
-    const unsigned int row = blockIdx.x * blockDim.y + threadIdx.y;
-    const unsigned int lane = threadIdx.x;            // 0..31, one warp per row
+    // block = (128,1,1), grid = (rows,1,1): 128 threads (4 warps) cooperate on ONE
+    // row — SAME K-parallelism + coalesced byte loads as the naive kernel, but the
+    // 8-step __syncthreads tree is replaced by a per-warp shuffle reduction + ONE
+    // barrier combine of the 4 warp partials. f32 accumulate (numerically
+    // equivalent to the naive kernel; only the reduction order differs).
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;             // 0..127
     if (row >= rows) {
         return;
     }
@@ -137,7 +142,7 @@ extern "C" __global__ void aegis_nvfp4_gemv_warp(
     const unsigned char* scale_row = scales + size_t(row) * scale_cols;
 
     float sum = 0.0f;
-    for (unsigned int block_idx = lane; block_idx < scale_cols; block_idx += 32u) {
+    for (unsigned int block_idx = tid; block_idx < scale_cols; block_idx += 128u) {
         const float block_scale = decode_ue4m3_half(scale_row[block_idx]);
         const unsigned int input_base = block_idx * 16u;
         const unsigned int packed_base = block_idx * 8u;
@@ -154,8 +159,14 @@ extern "C" __global__ void aegis_nvfp4_gemv_warp(
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum += __shfl_xor_sync(0xffffffffu, sum, (unsigned int)offset, 32);
     }
-    if (lane == 0u) {
-        output[row] = sum * output_scale;
+    __shared__ float warp_sums[4];
+    const unsigned int warp_id = tid >> 5;
+    if ((tid & 31u) == 0u) {
+        warp_sums[warp_id] = sum;
+    }
+    __syncthreads();
+    if (tid == 0u) {
+        output[row] = (warp_sums[0] + warp_sums[1] + warp_sums[2] + warp_sums[3]) * output_scale;
     }
 }
 
