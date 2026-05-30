@@ -445,8 +445,17 @@ fn load_cuda_moe(
     // rayon parallelism then hides per-tensor `File::open` overhead
     // across the ~384 expert tensors per layer. Combined this brings
     // load throughput from ~500 MB/s (QD=1) to multi-GB/s.
+    // Host-resident (streamed) experts read packed NVFP4 bytes and run the
+    // prequantized GEMV (native_mxfp4 is None for the streamed path), so the
+    // planned NativeTensorCore on-device repack is irrelevant here — those bytes
+    // are the same PackedSource layout. Treat both as prefetch-eligible so the
+    // 26B experts (planned NativeTensorCore) use the PARALLEL shard-buffered
+    // prefetch instead of the serial single-threaded per-expert path (~33s).
     let prefetch_eligible = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. })
-        && resident_layout == LinearResidentLayout::PackedSource
+        && matches!(
+            resident_layout,
+            LinearResidentLayout::PackedSource | LinearResidentLayout::NativeTensorCore
+        )
         && cuda.arena().is_some();
     if prefetch_eligible {
         let mut prefixes = Vec::with_capacity(num_experts * 3);

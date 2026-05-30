@@ -125,6 +125,37 @@ fn read_tensor_into_arena(
         len,
     })
 }
+
+/// Copy already-in-memory bytes into a fresh pinned-arena slot (no disk I/O).
+/// Used by the shard-buffer prefetch, which reads a whole shard sequentially
+/// once then slices the (scattered) expert tensors out of the buffer.
+fn copy_into_arena(arena: &ArenaHandle, src: &[u8]) -> Result<HostWeightBytes> {
+    let len = src.len();
+    let offset = arena.reserve(len)?;
+    // SAFETY: `reserve` exclusively claimed [offset, offset+len); disjoint from
+    // every other slot, so parallel copies into distinct slots do not alias.
+    let dst = unsafe { arena.slice_mut(offset, len) };
+    dst.copy_from_slice(src);
+    Ok(HostWeightBytes::Arena {
+        arena: arena.clone(),
+        offset,
+        len,
+    })
+}
+
+/// Free host RAM (Linux `MemAvailable`), used as a guard before buffering a
+/// whole ~9 GiB shard so a memory-tight host (32 GiB, OS + IDE + the growing
+/// pinned arena) doesn't OOM. `None` if /proc/meminfo can't be read.
+fn mem_available_bytes() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb.saturating_mul(1024));
+        }
+    }
+    None
+}
 use aegisllm_base::graph::{GraphRegion, TensorRole};
 use aegisllm_base::planning::cuda_nvfp4_kernel_family_for_layout;
 use aegisllm_base::planning::placement::{ComputePlacement, RegionPlacement, StoragePlacement};
@@ -170,6 +201,17 @@ pub struct CudaWeightLoader<'a> {
     /// the user's progress indicator can refresh between coarse `step`
     /// advances.
     status_sink: Option<LoadStatusSink>,
+    /// Single-shard read buffer for the expert prefetch. A layer's expert
+    /// tensors are SCATTERED across the whole shard (the safetensors layout is
+    /// not layer-grouped), so reading them per-tensor makes the NVMe seek
+    /// between non-adjacent offsets (~400 MB/s). Instead we read the WHOLE shard
+    /// once, sequentially (read_chunked_par over a contiguous file = a few large
+    /// sequential sub-reads → ~2 GB/s) into this buffer and memcpy each tensor
+    /// out of it. Holds one shard at a time (the old buffer is dropped before
+    /// the next is read); layers load in order so the cache hits across all
+    /// layers in a shard. RefCell: only touched serially (before the prefetch's
+    /// rayon fan-out, which captures the resulting `Arc` by value).
+    shard_cache: std::cell::RefCell<Option<(std::path::PathBuf, std::sync::Arc<Vec<u8>>)>>,
 }
 
 impl CudaRuntime {
@@ -179,6 +221,7 @@ impl CudaRuntime {
             arena: None,
             bounce: std::cell::RefCell::new(None),
             status_sink: None,
+            shard_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -191,6 +234,7 @@ impl CudaRuntime {
             arena: Some(arena),
             bounce: std::cell::RefCell::new(None),
             status_sink: None,
+            shard_cache: std::cell::RefCell::new(None),
         }
     }
 }
@@ -301,26 +345,105 @@ impl CudaWeightLoader<'_> {
                 "prefetch_host_nvfp4_pairs_par requires loader built with weight_loader_with_arena".into(),
             )
         })?;
-        prefixes
-            .par_iter()
-            .map(|prefix| -> Result<(HostWeightBytes, HostWeightBytes)> {
-                let weight = artifact
-                    .tensors
-                    .get(&format!("{prefix}.weight"))
-                    .ok_or_else(|| {
-                        AegisError::InvalidPlan(format!("missing `{prefix}.weight`"))
-                    })?;
-                let scales = artifact
-                    .tensors
-                    .get(&format!("{prefix}.weight_scale"))
-                    .ok_or_else(|| {
+        // Gather (weight, scale) TensorInfo pairs in `prefixes` order.
+        let pairs: Vec<(&TensorInfo, &TensorInfo)> = prefixes
+            .iter()
+            .map(|prefix| -> Result<(&TensorInfo, &TensorInfo)> {
+                let weight = artifact.tensors.get(&format!("{prefix}.weight")).ok_or_else(|| {
+                    AegisError::InvalidPlan(format!("missing `{prefix}.weight`"))
+                })?;
+                let scales =
+                    artifact.tensors.get(&format!("{prefix}.weight_scale")).ok_or_else(|| {
                         AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`"))
                     })?;
+                Ok((weight, scales))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // FAST PATH — whole-shard buffer. A layer's expert tensors live in one
+        // shard but are SCATTERED across it (the safetensors layout is not
+        // layer-grouped), so per-tensor reads make the NVMe seek (~400 MB/s).
+        // Read the whole shard ONCE sequentially (cached across all layers in
+        // that shard) and memcpy each tensor out of the buffer. ~2-4x faster
+        // cold expert load. Falls back to per-tensor reads on multi-shard layers
+        // or when host RAM is too tight to buffer the shard.
+        if !pairs.is_empty() {
+            let shard = pairs[0].0.shard_path.clone();
+            let one_shard =
+                pairs.iter().all(|(w, s)| w.shard_path == shard && s.shard_path == shard);
+            if one_shard {
+                if let Some(buf) = self.ensure_shard_buffered(&shard)? {
+                    return pairs
+                        .par_iter()
+                        .map(|(w, s)| -> Result<(HostWeightBytes, HostWeightBytes)> {
+                            let slice = |t: &TensorInfo| -> Result<HostWeightBytes> {
+                                let start = t.file_offsets.0 as usize;
+                                let len = t.data_len_bytes() as usize;
+                                copy_into_arena(arena, &buf[start..start + len])
+                            };
+                            Ok((slice(w)?, slice(s)?))
+                        })
+                        .collect::<Result<Vec<_>>>();
+                }
+            }
+        }
+
+        // FALLBACK — per-tensor parallel reads (multi-shard layer or low RAM).
+        pairs
+            .par_iter()
+            .map(|(weight, scales)| -> Result<(HostWeightBytes, HostWeightBytes)> {
                 let packed = read_tensor_into_arena(arena, weight)?;
                 let s = read_tensor_into_arena(arena, scales)?;
                 Ok((packed, s))
             })
             .collect::<Result<Vec<_>>>()
+    }
+
+    /// Ensure `path`'s whole shard is buffered in `shard_cache`; return the
+    /// buffer (or `None` to decline → caller falls back to per-tensor reads when
+    /// free host RAM is too tight). Reads the WHOLE shard sequentially via
+    /// read_chunked_par (a few large sequential sub-reads → ~NVMe ceiling). The
+    /// previous shard's buffer is dropped first so we never hold two at once.
+    fn ensure_shard_buffered(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<std::sync::Arc<Vec<u8>>>> {
+        if let Some((p, buf)) = self.shard_cache.borrow().as_ref() {
+            if p == path {
+                return Ok(Some(buf.clone()));
+            }
+        }
+        // Switching shards: drop the old buffer FIRST so its ~9 GiB is freed
+        // before the RAM check + the new allocation (never hold two at once, and
+        // don't let the old one's footprint trip the guard for the new shard).
+        *self.shard_cache.borrow_mut() = None;
+        let len = std::fs::metadata(path)
+            .map_err(|e| AegisError::InvalidPlan(format!("stat shard {}: {e}", path.display())))?
+            .len() as usize;
+        // RAM guard: shard buffer + margin for the OS/IDE and the still-growing
+        // pinned arena. Decline (fall back to per-tensor) when RAM is tight.
+        const MARGIN: u64 = 4 * 1024 * 1024 * 1024;
+        if let Some(avail) = mem_available_bytes() {
+            if avail < len as u64 + MARGIN {
+                return Ok(None);
+            }
+        }
+        let mut buf = vec![0u8; len];
+        let t = std::time::Instant::now();
+        read_chunked_par(path, 0, &mut buf)?;
+        if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            let s = t.elapsed().as_secs_f64().max(1e-9);
+            eprintln!(
+                "load-timing:   shard buffered {:.2} GiB in {:.2}s ({:.0} MiB/s) [{}]",
+                len as f64 / (1024.0 * 1024.0 * 1024.0),
+                s,
+                (len as f64 / (1024.0 * 1024.0)) / s,
+                path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+            );
+        }
+        let arc = std::sync::Arc::new(buf);
+        *self.shard_cache.borrow_mut() = Some((path.to_path_buf(), arc.clone()));
+        Ok(Some(arc))
     }
 
     /// Build a `DeviceNvfp4Linear` for a host-resident layer using
