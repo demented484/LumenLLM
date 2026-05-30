@@ -15,7 +15,7 @@ pub mod prefix_cache;
 mod provider;
 mod rope;
 mod speculative;
-mod state;
+pub(crate) mod state;
 pub mod vision;
 pub mod audio;
 

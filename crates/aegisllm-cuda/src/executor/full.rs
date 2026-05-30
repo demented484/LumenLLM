@@ -426,6 +426,36 @@ impl CudaLlamaExecutor {
             mib(arena_capacity_bytes),
             mib(arena_capacity_bytes.saturating_sub(arena_used_bytes)),
         );
+        // GPU-driven MoE decode: now that the arena is device-mapped, resolve
+        // each MoE layer's per-expert (packed,scales) device pointers + NVFP4
+        // scales into device tables the gather kernel will index by the
+        // on-device router top-k. Must happen while `layers`' experts still hold
+        // their arena `Arc` (they do — arena is dropped below but stays alive
+        // via those clones). On any per-layer failure we log and leave that
+        // layer's `device_tables = None` (host-streamed fallback).
+        let mut gpu_driven_layers = 0usize;
+        if device_mapped {
+            for layer in layers.iter_mut() {
+                if let Some(ref mut moe) = layer.moe {
+                    match build_moe_device_tables(&cuda, moe) {
+                        Ok(Some(tables)) => {
+                            moe.device_tables = Some(tables);
+                            gpu_driven_layers += 1;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "load-timing: GPU-driven MoE table build failed for a layer: {e:?}; \
+                                 that layer falls back to host-streamed decode"
+                            );
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "load-timing: GPU-driven MoE decode armed on {gpu_driven_layers} layer(s)"
+            );
+        }
         // Empty `RegisteredShards` placeholder — the executor still
         // owns the field for type-system reasons but we don't register
         // any shards (host-resident weights are in the arena instead).
@@ -1272,6 +1302,10 @@ impl CudaLlamaExecutor {
                         bulk_expert_event,
                         bulk_expert_compute_event,
                         bulk_expert_primed: false,
+                        // Per-slot NVFP4 scales for GPU-driven decode (gate/up/down
+                        // per top-k slot). Tiny; allocate to the max top_k.
+                        slot_in_scale: self.runtime.alloc_f32((max_top_k * 3).max(1))?,
+                        slot_out_scale: self.runtime.alloc_f32((max_top_k * 3).max(1))?,
                     }))
                 } else {
                     None
@@ -1615,6 +1649,108 @@ fn prefill_attention_split_scratch(
 /// both consult this so they can't disagree.
 pub(crate) fn gpu_driven_moe_requested() -> bool {
     std::env::var("AEGIS_GPU_DRIVEN_MOE").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
+/// Build the per-expert device-pointer + scale tables for one MoE layer's
+/// GPU-driven decode gather. Returns `Ok(None)` when this layer is not eligible
+/// (experts not host-resident, not device-mapped, or non-uniform per-projection
+/// byte strides across experts — the gather assumes uniform strides). Bit-
+/// identical to the staged path: same packed/scales bytes, same NVFP4 scales.
+fn build_moe_device_tables(
+    runtime: &CudaRuntime,
+    moe: &super::state::CudaMoE,
+) -> Result<Option<super::state::MoeDeviceTables>> {
+    use super::state::MoeDeviceTables;
+    if moe.experts.is_empty() {
+        return Ok(None);
+    }
+    // Eligibility: every expert's three projections must be host-resident with
+    // a device-mapped arena pointer. (VRAM-cached experts have no host pointer.)
+    let first = &moe.experts[0];
+    if !first.gate_proj.is_host_resident() {
+        return Ok(None);
+    }
+    // Uniform per-projection byte strides (assert by checking the first expert;
+    // verified per-expert in the fill loop below).
+    let gate_packed_bytes = first.gate_proj.packed_bytes;
+    let gate_scale_bytes = first.gate_proj.scale_bytes;
+    let up_packed_bytes = first.up_proj.packed_bytes;
+    let up_scale_bytes = first.up_proj.scale_bytes;
+    let down_packed_bytes = first.down_proj.packed_bytes;
+    let down_scale_bytes = first.down_proj.scale_bytes;
+
+    let n = moe.experts.len();
+    let mut gate_pp = Vec::with_capacity(n);
+    let mut up_pp = Vec::with_capacity(n);
+    let mut down_pp = Vec::with_capacity(n);
+    let mut gate_sp = Vec::with_capacity(n);
+    let mut up_sp = Vec::with_capacity(n);
+    let mut down_sp = Vec::with_capacity(n);
+    let mut gate_is = Vec::with_capacity(n);
+    let mut up_is = Vec::with_capacity(n);
+    let mut down_is = Vec::with_capacity(n);
+    let mut gate_os = Vec::with_capacity(n);
+    let mut up_os = Vec::with_capacity(n);
+    let mut down_os = Vec::with_capacity(n);
+
+    for e in &moe.experts {
+        // Per-expert byte strides must match the layer-uniform stride; if not,
+        // bail to the host path (the gather's fixed slot layout assumes uniform).
+        if e.gate_proj.packed_bytes != gate_packed_bytes
+            || e.gate_proj.scale_bytes != gate_scale_bytes
+            || e.up_proj.packed_bytes != up_packed_bytes
+            || e.up_proj.scale_bytes != up_scale_bytes
+            || e.down_proj.packed_bytes != down_packed_bytes
+            || e.down_proj.scale_bytes != down_scale_bytes
+        {
+            return Ok(None);
+        }
+        let (gp, gs) = match e.gate_proj.host_device_mapped_ptrs() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let (upp, ups) = match e.up_proj.host_device_mapped_ptrs() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let (dpp, dps) = match e.down_proj.host_device_mapped_ptrs() {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        gate_pp.push(gp);
+        gate_sp.push(gs);
+        up_pp.push(upp);
+        up_sp.push(ups);
+        down_pp.push(dpp);
+        down_sp.push(dps);
+        gate_is.push(e.gate_proj.input_scale);
+        up_is.push(e.up_proj.input_scale);
+        down_is.push(e.down_proj.input_scale);
+        gate_os.push(e.gate_proj.output_scale);
+        up_os.push(e.up_proj.output_scale);
+        down_os.push(e.down_proj.output_scale);
+    }
+
+    Ok(Some(MoeDeviceTables {
+        gate_packed_ptrs: runtime.upload_u64_slice(&gate_pp)?,
+        up_packed_ptrs: runtime.upload_u64_slice(&up_pp)?,
+        down_packed_ptrs: runtime.upload_u64_slice(&down_pp)?,
+        gate_scale_ptrs: runtime.upload_u64_slice(&gate_sp)?,
+        up_scale_ptrs: runtime.upload_u64_slice(&up_sp)?,
+        down_scale_ptrs: runtime.upload_u64_slice(&down_sp)?,
+        gate_in_scale: runtime.upload_f32(&gate_is)?,
+        up_in_scale: runtime.upload_f32(&up_is)?,
+        down_in_scale: runtime.upload_f32(&down_is)?,
+        gate_out_scale: runtime.upload_f32(&gate_os)?,
+        up_out_scale: runtime.upload_f32(&up_os)?,
+        down_out_scale: runtime.upload_f32(&down_os)?,
+        gate_packed_bytes,
+        gate_scale_bytes,
+        up_packed_bytes,
+        up_scale_bytes,
+        down_packed_bytes,
+        down_scale_bytes,
+    }))
 }
 
 /// Sum the bytes that will land in the pinned-host arena: every tensor

@@ -606,6 +606,9 @@ fn load_cuda_moe(
         top_k,
         num_experts,
         expert_intermediate_size,
+        // Populated post-load in `full.rs` when the expert arena is
+        // device-mapped (AEGIS_GPU_DRIVEN_MOE). Defaults to host-streamed decode.
+        device_tables: None,
     })
 }
 

@@ -122,6 +122,36 @@ pub(super) struct CudaMoEShared {
     pub(super) gate_up_fused: Option<DeviceBf16Matrix>,
 }
 
+/// GPU-driven MoE decode tables (built at load when the expert arena is
+/// device-mapped via `AEGIS_GPU_DRIVEN_MOE=1`). Per-projection device arrays of
+/// length `num_experts` holding each expert's device-mapped-host base pointer
+/// (packed + scales) and its NVFP4 input/output scales. The gather kernel reads
+/// the on-device router top-k index buffer, indexes these tables, and streams
+/// the selected experts' bytes into a fixed VRAM scratch in one launch — no CPU
+/// round-trip, graph-capturable. Per-projection byte strides are uniform across
+/// experts within a layer.
+#[derive(Debug)]
+pub(crate) struct MoeDeviceTables {
+    pub(crate) gate_packed_ptrs: DeviceBuffer<u64>,
+    pub(crate) up_packed_ptrs: DeviceBuffer<u64>,
+    pub(crate) down_packed_ptrs: DeviceBuffer<u64>,
+    pub(crate) gate_scale_ptrs: DeviceBuffer<u64>,
+    pub(crate) up_scale_ptrs: DeviceBuffer<u64>,
+    pub(crate) down_scale_ptrs: DeviceBuffer<u64>,
+    pub(crate) gate_in_scale: DeviceBuffer<f32>,
+    pub(crate) up_in_scale: DeviceBuffer<f32>,
+    pub(crate) down_in_scale: DeviceBuffer<f32>,
+    pub(crate) gate_out_scale: DeviceBuffer<f32>,
+    pub(crate) up_out_scale: DeviceBuffer<f32>,
+    pub(crate) down_out_scale: DeviceBuffer<f32>,
+    pub(crate) gate_packed_bytes: usize,
+    pub(crate) gate_scale_bytes: usize,
+    pub(crate) up_packed_bytes: usize,
+    pub(crate) up_scale_bytes: usize,
+    pub(crate) down_packed_bytes: usize,
+    pub(crate) down_scale_bytes: usize,
+}
+
 /// MoE data for one transformer layer.
 #[derive(Debug)]
 pub(super) struct CudaMoE {
@@ -145,6 +175,10 @@ pub(super) struct CudaMoE {
     pub(super) top_k: usize,
     pub(super) num_experts: usize,
     pub(super) expert_intermediate_size: usize,
+    /// GPU-driven decode tables; `Some` only when the expert arena was
+    /// device-mapped at load and this layer's experts are host-resident NVFP4.
+    /// `None` → decode uses the host-streamed staging-pool path.
+    pub(super) device_tables: Option<MoeDeviceTables>,
 }
 
 /// Extra scratch buffers allocated only when the model contains MoE layers.
@@ -217,6 +251,13 @@ pub(super) struct CudaMoEScratch {
     /// no recorded workload until the first GEMV pass completes).
     pub(super) bulk_expert_compute_event: cudarc::driver::CudaEvent,
     pub(super) bulk_expert_primed: bool,
+    /// GPU-driven decode: per-slot NVFP4 input/output scales (`[top_k * 3]`,
+    /// gate/up/down per slot) written by the gather kernel from the device
+    /// scale tables, then read by the device-scalar quantize + GEMV kernels.
+    /// Keeps the per-expert scales on-device so the launch sequence is fixed
+    /// (graph-capturable). 1-element stubs when GPU-driven decode is not armed.
+    pub(super) slot_in_scale: DeviceBuffer<f32>,
+    pub(super) slot_out_scale: DeviceBuffer<f32>,
 }
 
 /// Wraps `CudaGraph` so that `CudaLlamaState` satisfies `Send`.

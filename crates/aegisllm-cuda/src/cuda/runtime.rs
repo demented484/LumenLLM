@@ -19,6 +19,7 @@ mod graph;
 mod kv;
 mod linear;
 pub(crate) mod memory;
+mod moe_gpu_driven;
 mod ops;
 mod quant;
 mod sampling;

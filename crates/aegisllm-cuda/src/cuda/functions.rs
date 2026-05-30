@@ -193,6 +193,11 @@ pub(crate) struct CudaKernelFunctions {
     /// list (centroid-masked draft head). Registered alongside the sampling kernels.
     pub(crate) spec_sparse_lm_head_matvec: CudaFunction,
     pub(crate) axpy_f32: CudaFunction,
+    // ── GPU-driven MoE decode (device-mapped-host expert gather) ──
+    pub(crate) moe_gather_experts: CudaFunction,
+    pub(crate) nvfp4_quantize_input_dptr: CudaFunction,
+    pub(crate) nvfp4_prequant_dptr: CudaFunction,
+    pub(crate) axpy_f32_topk_weight: CudaFunction,
     pub(crate) zero_f32: CudaFunction,
     pub(crate) scale_f32: CudaFunction,
     pub(crate) mul_vec_inplace_f32: CudaFunction,
@@ -705,6 +710,10 @@ impl CudaKernelFunctions {
             argmax_finalize: load(&module, "aegis_argmax_f32_finalize")?,
             spec_sparse_lm_head_matvec: load(&module, "aegis_spec_sparse_lm_head_matvec")?,
             axpy_f32: load(&module, "aegis_axpy_f32")?,
+            moe_gather_experts: load(&module, "aegis_moe_gather_experts")?,
+            nvfp4_quantize_input_dptr: load(&module, "aegis_nvfp4_quantize_input_dptr")?,
+            nvfp4_prequant_dptr: load(&module, "aegis_nvfp4_linear_prequantized_dptr")?,
+            axpy_f32_topk_weight: load(&module, "aegis_axpy_f32_topk_weight")?,
             zero_f32: load(&module, "aegis_zero_f32")?,
             scale_f32: load(&module, "aegis_scale_f32")?,
             mul_vec_inplace_f32: load(&module, "aegis_mul_vec_inplace_f32")?,

@@ -3,7 +3,7 @@ use super::linear_ops::{
     matvec_nvfp4_prepared_device_reuse, native_mxfp4_enabled, prepare_nvfp4_input,
 };
 use super::state::{CudaLayer, CudaLinear, CudaMoE, CudaMoEScratch, CudaScratch};
-use crate::cuda::CudaRuntime;
+use crate::cuda::{CudaRuntime, DeviceBuffer};
 use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::error::{AegisError, Result};
 
@@ -443,23 +443,31 @@ fn forward_moe_decode_device(
         top_k,
         &mut moe_scratch.packed_topk_device,
     )?;
-    // Record compute-stream completion; transfer stream waits on it before
-    // issuing the dtoh.
-    runtime.record_into_compute(&moe_scratch.event_topk_ready)?;
-    runtime.transfer_wait_event(&moe_scratch.event_topk_ready)?;
-    // Single fused dtoh: `top_k * 8` bytes onto the pinned host buffer. The
-    // pinned slice's internal event is auto-recorded by cudarc after the copy
-    // completes; the host `as_slice()` call below synchronizes on it.
-    let packed_words = top_k.checked_mul(2).ok_or_else(|| {
-        aegisllm_base::error::AegisError::InvalidPlan(format!(
-            "MoE packed top-k overflow: top_k={top_k}"
-        ))
-    })?;
-    runtime.download_u32_to_pinned_async(
-        &moe_scratch.packed_topk_device,
-        &mut moe_scratch.packed_topk_pinned,
-        packed_words,
-    )?;
+    // GPU-driven decode: the routed experts are gathered from device-mapped
+    // host RAM by a GPU kernel reading the on-device top-k buffer — NO dtoh of
+    // the top-k, NO host parse, NO host-issued per-expert copies. Eligible only
+    // when this layer's device tables were built (arena device-mapped at load)
+    // AND the opt-in env is set. Otherwise fall back to the host-streamed path.
+    let gpu_driven = moe.device_tables.is_some() && crate::executor::full::gpu_driven_moe_requested();
+    if !gpu_driven {
+        // Record compute-stream completion; transfer stream waits on it before
+        // issuing the dtoh.
+        runtime.record_into_compute(&moe_scratch.event_topk_ready)?;
+        runtime.transfer_wait_event(&moe_scratch.event_topk_ready)?;
+        // Single fused dtoh: `top_k * 8` bytes onto the pinned host buffer. The
+        // pinned slice's internal event is auto-recorded by cudarc after the copy
+        // completes; the host `as_slice()` call below synchronizes on it.
+        let packed_words = top_k.checked_mul(2).ok_or_else(|| {
+            aegisllm_base::error::AegisError::InvalidPlan(format!(
+                "MoE packed top-k overflow: top_k={top_k}"
+            ))
+        })?;
+        runtime.download_u32_to_pinned_async(
+            &moe_scratch.packed_topk_device,
+            &mut moe_scratch.packed_topk_pinned,
+            packed_words,
+        )?;
+    }
 
     // Issue expert pre-norm BEFORE the host sync so it's queued behind shared
     // MLP launches. When `pre_feedforward_layernorm_2` is present this also
@@ -533,26 +541,155 @@ fn forward_moe_decode_device(
     // Host sync: wait for the packed dtoh, then parse the records into the
     // pooled top-k arrays. By this point the compute stream has dispatched
     // shared MLP gate_up / geglu / down_proj + post_norm_1 — enough work to
-    // hide the dtoh latency.
-    let packed_host = moe_scratch
-        .packed_topk_pinned
-        .as_slice()
-        .map_err(|e| aegisllm_base::error::AegisError::Unsupported(
-            format!("pinned packed topk slice sync failed: {e:?}"),
-        ))?;
-    moe_scratch.router_top_indices.clear();
-    moe_scratch.router_top_weights.clear();
-    for k in 0..top_k {
-        let idx_word = packed_host[k * 2];
-        let weight_word = packed_host[k * 2 + 1];
-        moe_scratch.router_top_indices.push(idx_word as usize);
-        moe_scratch.router_top_weights.push(f32::from_bits(weight_word));
+    // hide the dtoh latency. SKIPPED on the GPU-driven path: the top-k stays on
+    // the device and is consumed by the gather kernel; the host never sees it.
+    if !gpu_driven {
+        let packed_host = moe_scratch
+            .packed_topk_pinned
+            .as_slice()
+            .map_err(|e| aegisllm_base::error::AegisError::Unsupported(
+                format!("pinned packed topk slice sync failed: {e:?}"),
+            ))?;
+        moe_scratch.router_top_indices.clear();
+        moe_scratch.router_top_weights.clear();
+        for k in 0..top_k {
+            let idx_word = packed_host[k * 2];
+            let weight_word = packed_host[k * 2 + 1];
+            moe_scratch.router_top_indices.push(idx_word as usize);
+            moe_scratch.router_top_weights.push(f32::from_bits(weight_word));
+        }
     }
-    let active_top_k = moe_scratch.router_top_indices.len();
+    // On the host path `active_top_k` is the parsed count; on the GPU-driven
+    // path the router always selects exactly `top_k` experts (the kernel writes
+    // `top_k` records), so we process every slot.
+    let active_top_k = if gpu_driven { top_k } else { moe_scratch.router_top_indices.len() };
 
     // Routed experts → routed_acc (separate accumulator so it does not alias
     // with `moe_acc` which already holds the shared-MLP output).
     runtime.zero_f32_device(&mut moe_scratch.routed_acc)?;
+
+    // ── GPU-driven expert dispatch (device-mapped-host gather) ───────────────
+    // No CPU round-trip: a single gather kernel reads the on-device top-k index
+    // buffer, streams the selected experts' packed+scales from device-mapped
+    // host RAM into the bulk VRAM scratch (fixed slot-major layout) + writes the
+    // per-slot NVFP4 scales, then per-slot GEMVs read those. The whole sequence
+    // is FIXED (slot k → GEMV k) → graph-capturable. Bit-identical to the host
+    // path: same experts (the gather reads the same indices the host would have
+    // parsed), same weights/scales, same NVFP4 dequant + accumulation order.
+    if gpu_driven {
+        let tables = moe.device_tables.as_ref().expect("gpu_driven implies device_tables");
+        let (bulk_packed, bulk_scales) = match (
+            moe_scratch.bulk_expert_packed.as_ref(),
+            moe_scratch.bulk_expert_scales.as_ref(),
+        ) {
+            (Some(_), Some(_)) => (true, true),
+            _ => (false, false),
+        };
+        if !(bulk_packed && bulk_scales) {
+            return Err(AegisError::InvalidPlan(
+                "GPU-driven MoE decode requires the bulk expert buffers to be allocated".into(),
+            ));
+        }
+        // 1) Gather: device-mapped host → bulk VRAM + per-slot scale arrays.
+        {
+            let bp = moe_scratch.bulk_expert_packed.as_mut().unwrap() as *mut DeviceBuffer<u8>;
+            let bs = moe_scratch.bulk_expert_scales.as_mut().unwrap() as *mut DeviceBuffer<u8>;
+            // SAFETY: bp/bs/slot_*_scale are distinct fields of moe_scratch; we
+            // use raw pointers only to satisfy the borrow checker across the
+            // shared &mut moe_scratch.
+            let sin = &mut moe_scratch.slot_in_scale as *mut DeviceBuffer<f32>;
+            let sout = &mut moe_scratch.slot_out_scale as *mut DeviceBuffer<f32>;
+            runtime.moe_gather_experts_device(
+                &moe_scratch.packed_topk_device,
+                top_k,
+                num_experts,
+                tables,
+                unsafe { &mut *bp },
+                unsafe { &mut *bs },
+                unsafe { &mut *sin },
+                unsafe { &mut *sout },
+            )?;
+        }
+        // 2) Per-slot GEMVs reading the gathered bulk buffer + device scales.
+        // Slot-major byte layout matches the gather kernel: slot k holds
+        // gate, up, down back-to-back at their uniform strides.
+        let per_slot_packed =
+            tables.gate_packed_bytes + tables.up_packed_bytes + tables.down_packed_bytes;
+        let per_slot_scale =
+            tables.gate_scale_bytes + tables.up_scale_bytes + tables.down_scale_bytes;
+        // Expert projection shapes are uniform across experts (we use the first).
+        let gate = &moe.experts[0].gate_proj;
+        let up = &moe.experts[0].up_proj;
+        let down = &moe.experts[0].down_proj;
+        for k in 0..active_top_k {
+            let packed_base = k * per_slot_packed;
+            let scale_base = k * per_slot_scale;
+            let gate_p_off = packed_base;
+            let gate_s_off = scale_base;
+            let up_p_off = packed_base + tables.gate_packed_bytes;
+            let up_s_off = scale_base + tables.gate_scale_bytes;
+            let down_p_off = packed_base + tables.gate_packed_bytes + tables.up_packed_bytes;
+            let down_s_off = scale_base + tables.gate_scale_bytes + tables.up_scale_bytes;
+            let slot_gate = k * 3;
+            let slot_up = k * 3 + 1;
+            let slot_down = k * 3 + 2;
+            let bp = moe_scratch.bulk_expert_packed.as_ref().unwrap() as *const DeviceBuffer<u8>;
+            let bs = moe_scratch.bulk_expert_scales.as_ref().unwrap() as *const DeviceBuffer<u8>;
+            // SAFETY: bp/bs are read-only views; the GEMV writes only into
+            // distinct expert_* scratch fields. Raw ptrs avoid a borrow-checker
+            // conflict with the &mut field writes below.
+            // gate
+            runtime.quantize_nvfp4_input_dptr_device(
+                hidden_out, &moe_scratch.slot_in_scale, slot_gate, &mut moe_scratch.quant_expert,
+            )?;
+            runtime.matvec_nvfp4_prequantized_dptr_bulk_device(
+                unsafe { &*bp }, unsafe { &*bs },
+                gate_p_off, tables.gate_packed_bytes, gate_s_off, tables.gate_scale_bytes,
+                gate.rows, gate.cols,
+                &moe_scratch.slot_out_scale, slot_gate,
+                &moe_scratch.quant_expert, &mut moe_scratch.expert_gate,
+            )?;
+            // up
+            runtime.quantize_nvfp4_input_dptr_device(
+                hidden_out, &moe_scratch.slot_in_scale, slot_up, &mut moe_scratch.quant_expert,
+            )?;
+            runtime.matvec_nvfp4_prequantized_dptr_bulk_device(
+                unsafe { &*bp }, unsafe { &*bs },
+                up_p_off, tables.up_packed_bytes, up_s_off, tables.up_scale_bytes,
+                up.rows, up.cols,
+                &moe_scratch.slot_out_scale, slot_up,
+                &moe_scratch.quant_expert, &mut moe_scratch.expert_up,
+            )?;
+            runtime.geglu_tanh_device(
+                &moe_scratch.expert_gate, &moe_scratch.expert_up, &mut moe_scratch.expert_swiglu,
+            )?;
+            // down
+            runtime.quantize_nvfp4_input_dptr_device(
+                &moe_scratch.expert_swiglu, &moe_scratch.slot_in_scale, slot_down,
+                &mut moe_scratch.quant_expert,
+            )?;
+            runtime.matvec_nvfp4_prequantized_dptr_bulk_device(
+                unsafe { &*bp }, unsafe { &*bs },
+                down_p_off, tables.down_packed_bytes, down_s_off, tables.down_scale_bytes,
+                down.rows, down.cols,
+                &moe_scratch.slot_out_scale, slot_down,
+                &moe_scratch.quant_expert, &mut moe_scratch.expert_out,
+            )?;
+            // accumulate with the routing weight read from the device top-k buffer
+            {
+                let eo = &moe_scratch.expert_out as *const DeviceBuffer<f32>;
+                let ptk = &moe_scratch.packed_topk_device as *const DeviceBuffer<u32>;
+                // SAFETY: eo (read) and packed_topk_device (read) are distinct
+                // from routed_acc (write).
+                runtime.axpy_f32_topk_weight_device(
+                    &mut moe_scratch.routed_acc,
+                    unsafe { &*eo },
+                    unsafe { &*ptk },
+                    k,
+                )?;
+            }
+        }
+    }
 
     // ── Coalesced expert H2D (decode PCIe-saturation fix) ────────────────
     //
@@ -591,7 +728,9 @@ fn forward_moe_decode_device(
         && moe_scratch.bulk_expert_scales.is_some()
         && std::env::var("AEGIS_DECODE_BULK_MOE_ENABLE").is_ok();
 
-    if bulk_ready {
+    if gpu_driven {
+        // Routed experts already dispatched by the GPU-driven gather path above.
+    } else if bulk_ready {
         // Build the per-expert/per-projection byte-offset layout host-side and
         // issue all H2Ds in one burst. Layout (contiguous): for each active
         // expert e in router order → gate(e), up(e), down(e).

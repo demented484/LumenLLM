@@ -50,4 +50,10 @@ pub(crate) const BLACKWELL_FP4_KERNEL_SRC: &str = concat!(
     include_str!("kernels/blackwell/vision_ops.cu"),
     "\n",
     include_str!("kernels/blackwell/audio_ops.cu"),
+    "\n",
+    // GPU-driven MoE decode: device-mapped-host expert gather + device-scalar
+    // GEMV/quantize. Must follow linear_utils.cuh / linear_nvfp4_unpacked.cu
+    // (it reuses decode_ue4m3_half / fp32_to_ue4m3_halfbits / best_nvfp4_index
+    // / decode_nvfp4_nibble defined there).
+    include_str!("kernels/blackwell/moe_gpu_driven_decode.cu"),
 );
