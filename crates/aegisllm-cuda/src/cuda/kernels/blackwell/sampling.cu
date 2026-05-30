@@ -51,8 +51,30 @@ extern "C" __global__ void aegis_bf16_matvec_warp(
     }
     const unsigned short* matrix_row = matrix + size_t(row) * cols;
     float sum = 0.0f;
-    for (unsigned int col = tid; col < cols; col += 128u) {
-        sum += bf16_to_float(matrix_row[col]) * input[col];
+    if ((cols & 7u) == 0u) {
+        // Vectorized: 128-bit loads — 8 bf16 weights (uint4) + 8 f32 inputs
+        // (2x float4) per iteration. matrix_row is 16-byte aligned when cols%8==0
+        // (base is 256-aligned, row*cols is a multiple of 8 u16 = 16 bytes).
+        const unsigned int n8 = cols >> 3;
+        const uint4* mrow4 = reinterpret_cast<const uint4*>(matrix_row);
+        const float4* in4 = reinterpret_cast<const float4*>(input);
+        for (unsigned int g = tid; g < n8; g += 128u) {
+            const uint4 w = mrow4[g];
+            const float4 a = in4[g * 2u];
+            const float4 b = in4[g * 2u + 1u];
+            sum += bf16_to_float((unsigned short)(w.x & 0xFFFFu)) * a.x;
+            sum += bf16_to_float((unsigned short)(w.x >> 16))     * a.y;
+            sum += bf16_to_float((unsigned short)(w.y & 0xFFFFu)) * a.z;
+            sum += bf16_to_float((unsigned short)(w.y >> 16))     * a.w;
+            sum += bf16_to_float((unsigned short)(w.z & 0xFFFFu)) * b.x;
+            sum += bf16_to_float((unsigned short)(w.z >> 16))     * b.y;
+            sum += bf16_to_float((unsigned short)(w.w & 0xFFFFu)) * b.z;
+            sum += bf16_to_float((unsigned short)(w.w >> 16))     * b.w;
+        }
+    } else {
+        for (unsigned int col = tid; col < cols; col += 128u) {
+            sum += bf16_to_float(matrix_row[col]) * input[col];
+        }
     }
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {

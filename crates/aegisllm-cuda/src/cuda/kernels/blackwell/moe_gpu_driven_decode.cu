@@ -461,13 +461,22 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_dptr_warp(
         const float block_scale = decode_ue4m3_half(scale_row[block_idx]);
         const unsigned int input_base = block_idx * 16u;
         const unsigned int packed_base = block_idx * 8u;
+        // 128-bit loads (uint2 packed + 4x float4 input), bit-identical to the
+        // byte-by-byte loop (same products + order). See aegis_nvfp4_gemv_warp.
+        const uint2 pw = *reinterpret_cast<const uint2*>(packed_row + packed_base);
+        const float4* in4 = reinterpret_cast<const float4*>(in + input_base);
+        const float4 i0 = in4[0]; const float4 i1 = in4[1];
+        const float4 i2 = in4[2]; const float4 i3 = in4[3];
+        const float in_arr[16] = {
+            i0.x, i0.y, i0.z, i0.w, i1.x, i1.y, i1.z, i1.w,
+            i2.x, i2.y, i2.z, i2.w, i3.x, i3.y, i3.z, i3.w
+        };
         #pragma unroll
         for (unsigned int j = 0u; j < 8u; ++j) {
-            const unsigned int byte = packed_row[packed_base + j];
-            const unsigned int lo_col = input_base + 2u*j;
-            const unsigned int hi_col = lo_col + 1u;
-            sum += float(decode_nvfp4_nibble(byte & 0x0Fu)) * block_scale * in[lo_col];
-            sum += float(decode_nvfp4_nibble(byte >> 4)) * block_scale * in[hi_col];
+            const unsigned int byte = (j < 4u) ? ((pw.x >> (j * 8u)) & 0xFFu)
+                                               : ((pw.y >> ((j - 4u) * 8u)) & 0xFFu);
+            sum += float(decode_nvfp4_nibble(byte & 0x0Fu)) * block_scale * in_arr[2u*j];
+            sum += float(decode_nvfp4_nibble(byte >> 4)) * block_scale * in_arr[2u*j + 1u];
         }
     }
     #pragma unroll
