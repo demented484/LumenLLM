@@ -110,6 +110,11 @@ pub(super) fn matvec_nvfp4_device_with_scratch(
             runtime.quantize_mxfp4_input_device(input, mxfp4_input)?;
             return runtime.matvec_native_mxfp4_staged_device(linear, staging, mxfp4_input, output);
         }
+        // NOTE: quant is kept SEPARATE from the GEMV deliberately. For M=1 the input
+        // vector is shared across all output rows, so quantizing once (here) and
+        // reusing it is correct; folding the quant into the per-row GEMV would
+        // re-quantize the input `rows` times (measured slower). The cpu_issuing
+        // floor is the per-expert H2D staging, not these launches.
         runtime.quantize_nvfp4_input_device(input, linear.input_scale, quantized_input)?;
         return runtime.matvec_nvfp4_staged_prequantized_device(
             linear, staging, quantized_input, output,
