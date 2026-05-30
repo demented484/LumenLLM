@@ -1572,9 +1572,16 @@ impl CudaRuntime {
         quantized_input: &CudaSlice<f32>,
         output: &mut CudaSlice<f32>,
     ) -> Result<()> {
-        if quantized_input.len() != linear.cols || output.len() != linear.rows {
+        // Buffers may be OVER-allocated: the MoE expert scratch (expert_gate/up/
+        // swiglu) is sized to max_expert_intermediate = max(routed moe_inter 704,
+        // shared-expert inter 2112), and quant inputs to a max. The kernel reads
+        // exactly `cols` and writes exactly `rows` (grid = rows); the GEMV for a
+        // routed expert (rows=704) into a 2112-sized buffer writes only the first
+        // 704 rows and downstream reads the valid prefix. Require AT LEAST the
+        // needed size (was `==`, which rejected VRAM-resident routed experts).
+        if quantized_input.len() < linear.cols || output.len() < linear.rows {
             return Err(AegisError::InvalidPlan(format!(
-                "nvfp4 prequantized shape mismatch for {}: expected input={} output={}, got input={} output={}",
+                "nvfp4 prequantized shape too small for {}: need input={} output={}, got input={} output={}",
                 linear.name,
                 linear.cols,
                 linear.rows,
