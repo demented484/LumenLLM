@@ -6,6 +6,17 @@ use crate::cuda::staging::LinearStagingPool;
 use aegisllm_base::error::{AegisError, Result};
 use aegisllm_base::planning::runtime::KernelFamily;
 
+/// Opt-in (default OFF): route the M=1 NVFP4 decode GEMV through the fast
+/// warp-per-row kernel (aegis_nvfp4_gemv_warp) instead of the naive
+/// block-per-row + shared-mem-tree kernel. Profiled at ~10x off peak; the warp
+/// kernel removes the __syncthreads reduction and fixes thread utilization.
+/// f32-accurate (numerically equivalent, different reduction order). Read once.
+pub(crate) fn fast_decode_gemv_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("AEGIS_DECODE_GEMV_FAST").is_ok())
+}
+
 fn u32_arg(name: &str, value: usize) -> Result<u32> {
     u32::try_from(value).map_err(|_| {
         AegisError::InvalidPlan(format!(
@@ -1592,6 +1603,27 @@ impl CudaRuntime {
         let rows = linear.rows as u32;
         let cols = linear.cols as u32;
         let output_scale = linear.output_scale;
+        if fast_decode_gemv_enabled() {
+            let cfg = LaunchConfig {
+                grid_dim: ((linear.rows as u32 + 7) / 8, 1, 1),
+                block_dim: (32, 8, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_gemv_warp)
+                    .arg(&linear.packed)
+                    .arg(&linear.scales)
+                    .arg(quantized_input)
+                    .arg(&rows)
+                    .arg(&cols)
+                    .arg(&output_scale)
+                    .arg(output)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch nvfp4 gemv warp"))?;
+            return Ok(());
+        }
         let cfg = LaunchConfig {
             grid_dim: (linear.rows as u32, 1, 1),
             block_dim: (128, 1, 1),
@@ -1673,6 +1705,27 @@ impl CudaRuntime {
     ) -> Result<()> {
         let rows_u32 = rows as u32;
         let cols_u32 = cols as u32;
+        if fast_decode_gemv_enabled() {
+            let cfg = LaunchConfig {
+                grid_dim: ((rows as u32 + 7) / 8, 1, 1),
+                block_dim: (32, 8, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.nvfp4_gemv_warp)
+                    .arg(packed)
+                    .arg(scales)
+                    .arg(quantized_input)
+                    .arg(&rows_u32)
+                    .arg(&cols_u32)
+                    .arg(&output_scale)
+                    .arg(output)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch staged nvfp4 gemv warp"))?;
+            return Ok(());
+        }
         let cfg = LaunchConfig {
             grid_dim: (rows as u32, 1, 1),
             block_dim: (128, 1, 1),

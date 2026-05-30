@@ -376,10 +376,27 @@ impl CudaRuntime {
                 "batched gemv: slot_out_scale {} need {}", slot_out_scale.len(), top_k * 3
             )));
         }
-        let cfg = LaunchConfig {
-            grid_dim: (rows as u32, top_k as u32, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 128 * std::mem::size_of::<f32>() as u32,
+        // Fast warp-per-row kernel (mmvq-style, no shared-mem reduction) vs the
+        // naive block-per-row+tree kernel. Same ABI; only grid/block/shmem +
+        // kernel handle differ.
+        let fast = super::linear::fast_decode_gemv_enabled();
+        let cfg = if fast {
+            LaunchConfig {
+                grid_dim: ((rows as u32 + 7) / 8, top_k as u32, 1),
+                block_dim: (32, 8, 1),
+                shared_mem_bytes: 0,
+            }
+        } else {
+            LaunchConfig {
+                grid_dim: (rows as u32, top_k as u32, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 128 * std::mem::size_of::<f32>() as u32,
+            }
+        };
+        let kernel = if fast {
+            &self.kernels.nvfp4_prequant_batched_dptr_warp
+        } else {
+            &self.kernels.nvfp4_prequant_batched_dptr
         };
         let (psp, pss, ppo, pso, istride, rows_u, cols_u, proj_u, ostride, tk) = (
             per_slot_packed as u32, per_slot_scale as u32, proj_packed_off as u32,
@@ -388,7 +405,7 @@ impl CudaRuntime {
         );
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.nvfp4_prequant_batched_dptr)
+                .launch_builder(kernel)
                 .arg(&bulk_packed.slice)
                 .arg(&bulk_scales.slice)
                 .arg(&psp)

@@ -2,25 +2,19 @@
 #include <cuda_bf16.h>
 #include <mma.h>
 
+// Branchless e2m1 nibble -> integer code (the x0.5 magnitude factor is folded
+// into decode_ue4m3_half's block scale). Same 16 values as the old switch
+// {0,1,2,3,4,6,8,12, 0,-1,-2,-3,-4,-6,-8,-12} but with NO branch tree, so a warp
+// decoding 32 different nibbles does not serialize. e2m1 layout: bit3=sign,
+// bits2-1=exp(0..3), bit0=mantissa. magnitude (x2 of the true e2m1 value) =
+// exp==0 ? man : (2+man) << (exp-1).  Verified equal to the switch for all 16.
 extern "C" __device__ __forceinline__ int decode_nvfp4_nibble(unsigned int nibble) {
-    switch (nibble & 0xFu) {
-        case 0u: return 0;
-        case 1u: return 1;
-        case 2u: return 2;
-        case 3u: return 3;
-        case 4u: return 4;
-        case 5u: return 6;
-        case 6u: return 8;
-        case 7u: return 12;
-        case 8u: return 0;
-        case 9u: return -1;
-        case 10u: return -2;
-        case 11u: return -3;
-        case 12u: return -4;
-        case 13u: return -6;
-        case 14u: return -8;
-        default: return -12;
-    }
+    const unsigned int n = nibble & 0xFu;
+    const unsigned int exp = (n >> 1) & 0x3u;
+    const unsigned int man = n & 0x1u;
+    // exp==0: mag=man (0 or 1). exp>=1: mag=(2+man)<<(exp-1).
+    const int mag = (exp == 0u) ? int(man) : int((2u + man) << (exp - 1u));
+    return (n & 0x8u) ? -mag : mag;
 }
 
 extern "C" __device__ __forceinline__ float decode_ue4m3_half(unsigned int byte) {
@@ -30,9 +24,13 @@ extern "C" __device__ __forceinline__ float decode_ue4m3_half(unsigned int byte)
     }
     const int exponent = int((byte >> 3) & 0x0Fu);
     const float mantissa = float(byte & 0x07u);
+    // 2^(exponent-7) via direct IEEE-754 exponent-bit construction (exact for
+    // integer powers; bit-identical to exp2f(exponent-7) which is also exact)
+    // — removes the per-group transcendental call that dominated the GEMV ALU.
+    const float pow2 = __uint_as_float((unsigned int)((exponent - 7 + 127) << 23));
     const float raw = exponent == 0
         ? mantissa * 0.001953125f
-        : (1.0f + mantissa * 0.125f) * exp2f(float(exponent - 7));
+        : (1.0f + mantissa * 0.125f) * pow2;
     return raw * 0.5f;
 }
 

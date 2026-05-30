@@ -199,8 +199,11 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) nvfp4_prequant_dptr: CudaFunction,
     pub(crate) axpy_f32_topk_weight: CudaFunction,
     // Batched (grouped-over-experts) decode MoE — slot on grid.y.
+    // Fast M=1 NVFP4 GEMV (warp-per-row, no shared-mem reduction).
+    pub(crate) nvfp4_gemv_warp: CudaFunction,
     pub(crate) nvfp4_quantize_input_batched_dptr: CudaFunction,
     pub(crate) nvfp4_prequant_batched_dptr: CudaFunction,
+    pub(crate) nvfp4_prequant_batched_dptr_warp: CudaFunction,
     pub(crate) moe_geglu_tanh_batched_slots: CudaFunction,
     pub(crate) moe_weighted_accumulate: CudaFunction,
     pub(crate) zero_f32: CudaFunction,
@@ -719,8 +722,10 @@ impl CudaKernelFunctions {
             nvfp4_quantize_input_dptr: load(&module, "aegis_nvfp4_quantize_input_dptr")?,
             nvfp4_prequant_dptr: load(&module, "aegis_nvfp4_linear_prequantized_dptr")?,
             axpy_f32_topk_weight: load(&module, "aegis_axpy_f32_topk_weight")?,
+            nvfp4_gemv_warp: load(&module, "aegis_nvfp4_gemv_warp")?,
             nvfp4_quantize_input_batched_dptr: load(&module, "aegis_nvfp4_quantize_input_batched_dptr")?,
             nvfp4_prequant_batched_dptr: load(&module, "aegis_nvfp4_linear_prequantized_batched_dptr")?,
+            nvfp4_prequant_batched_dptr_warp: load(&module, "aegis_nvfp4_linear_prequantized_batched_dptr_warp")?,
             moe_geglu_tanh_batched_slots: load(&module, "aegis_moe_geglu_tanh_batched_slots")?,
             moe_weighted_accumulate: load(&module, "aegis_moe_weighted_accumulate")?,
             zero_f32: load(&module, "aegis_zero_f32")?,

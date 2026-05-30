@@ -102,6 +102,63 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized(
     }
 }
 
+// ── FAST M=1 NVFP4 GEMV (mmvq-style: warp-per-row) ──────────────────────────
+// Drop-in replacement for aegis_nvfp4_linear_prequantized (SAME args). Fixes the
+// two structural losses that made the naive kernel ~10x off peak (profiled):
+//   (1) the naive kernel uses a 128-thread block + a 7-step __syncthreads tree to
+//       produce ONE output scalar, with only cols/16 (=176 for cols=2816) work
+//       items spread over 128 threads → most threads idle + barrier-bound;
+//   (2) this kernel maps ONE WARP to one output row (8 warps/block = 8 rows), the
+//       32 lanes stride over the cols/16 NVFP4 groups (full utilization), and the
+//       cross-lane reduction is a 5-step warp-shuffle butterfly — ZERO __syncthreads,
+//       ZERO shared memory.
+// The per-element arithmetic is IDENTICAL to the naive kernel (f32 products, f32
+// accumulate, same decode_nvfp4_nibble / decode_ue4m3_half), so it is numerically
+// equivalent (only the f32 reduction ORDER differs: per-lane group subsets +
+// shuffle-tree vs per-thread + shared-tree → ~1e-6 reassociation, NOT a precision
+// downgrade like fp16/dp4a paths). grid=(ceil(rows/8),1,1) block=(32,8,1) shmem=0.
+extern "C" __global__ void aegis_nvfp4_gemv_warp(
+    const unsigned char* packed,
+    const unsigned char* scales,
+    const float* input,
+    const unsigned int rows,
+    const unsigned int cols,
+    const float output_scale,
+    float* output
+) {
+    const unsigned int row = blockIdx.x * blockDim.y + threadIdx.y;
+    const unsigned int lane = threadIdx.x;            // 0..31, one warp per row
+    if (row >= rows) {
+        return;
+    }
+    const unsigned int packed_cols = cols / 2u;
+    const unsigned int scale_cols = cols / 16u;
+    const unsigned char* packed_row = packed + size_t(row) * packed_cols;
+    const unsigned char* scale_row = scales + size_t(row) * scale_cols;
+
+    float sum = 0.0f;
+    for (unsigned int block_idx = lane; block_idx < scale_cols; block_idx += 32u) {
+        const float block_scale = decode_ue4m3_half(scale_row[block_idx]);
+        const unsigned int input_base = block_idx * 16u;
+        const unsigned int packed_base = block_idx * 8u;
+        #pragma unroll
+        for (unsigned int j = 0u; j < 8u; ++j) {
+            const unsigned int byte = packed_row[packed_base + j];
+            const unsigned int lo_col = input_base + 2u*j;
+            const unsigned int hi_col = lo_col + 1u;
+            sum += float(decode_nvfp4_nibble(byte & 0x0Fu)) * block_scale * input[lo_col];
+            sum += float(decode_nvfp4_nibble(byte >> 4)) * block_scale * input[hi_col];
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, (unsigned int)offset, 32);
+    }
+    if (lane == 0u) {
+        output[row] = sum * output_scale;
+    }
+}
+
 extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched(
     const unsigned char* packed,
     const unsigned char* scales,

@@ -411,6 +411,70 @@ extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_dptr(
     }
 }
 
+// 2b. BATCHED prequantized GEMV — FAST warp-per-row variant (mmvq-style).
+// Same ABI + slot-major bulk layout as aegis_nvfp4_linear_prequantized_batched_dptr,
+// but ONE WARP owns one (slot,row) output: 8 warps/block emit 8 rows, the 32 lanes
+// stride over the cols/16 NVFP4 groups, and the cross-lane reduction is a 5-step
+// warp-shuffle butterfly — ZERO __syncthreads, ZERO shared memory. f32-accurate
+// (numerically equivalent to the block-per-row kernel; only the reduction order
+// differs). grid=(ceil(rows/8), top_k, 1) block=(32,8,1) shmem=0.
+extern "C" __global__ void aegis_nvfp4_linear_prequantized_batched_dptr_warp(
+    const unsigned char* __restrict__ bulk_packed,
+    const unsigned char* __restrict__ bulk_scales,
+    const unsigned int per_slot_packed,
+    const unsigned int per_slot_scale,
+    const unsigned int proj_packed_off,
+    const unsigned int proj_scale_off,
+    const float* __restrict__ input,
+    const unsigned int input_stride,
+    const unsigned int rows,
+    const unsigned int cols,
+    const float* __restrict__ slot_out_scale,
+    const unsigned int proj_off,
+    const unsigned int output_stride,
+    const unsigned int top_k,
+    float* __restrict__ output
+) {
+    const unsigned int slot = blockIdx.y;
+    if (slot >= top_k) {
+        return;
+    }
+    const unsigned int row = blockIdx.x * blockDim.y + threadIdx.y;
+    const unsigned int lane = threadIdx.x;
+    if (row >= rows) {
+        return;
+    }
+    const unsigned int packed_cols = cols / 2u;
+    const unsigned int scale_cols = cols / 16u;
+    const unsigned char* packed = bulk_packed + size_t(slot) * per_slot_packed + proj_packed_off;
+    const unsigned char* scales = bulk_scales + size_t(slot) * per_slot_scale + proj_scale_off;
+    const unsigned char* packed_row = packed + size_t(row) * packed_cols;
+    const unsigned char* scale_row = scales + size_t(row) * scale_cols;
+    const float* in = input + size_t(slot) * input_stride;
+
+    float sum = 0.0f;
+    for (unsigned int block_idx = lane; block_idx < scale_cols; block_idx += 32u) {
+        const float block_scale = decode_ue4m3_half(scale_row[block_idx]);
+        const unsigned int input_base = block_idx * 16u;
+        const unsigned int packed_base = block_idx * 8u;
+        #pragma unroll
+        for (unsigned int j = 0u; j < 8u; ++j) {
+            const unsigned int byte = packed_row[packed_base + j];
+            const unsigned int lo_col = input_base + 2u*j;
+            const unsigned int hi_col = lo_col + 1u;
+            sum += float(decode_nvfp4_nibble(byte & 0x0Fu)) * block_scale * in[lo_col];
+            sum += float(decode_nvfp4_nibble(byte >> 4)) * block_scale * in[hi_col];
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, (unsigned int)offset, 32);
+    }
+    if (lane == 0u) {
+        output[size_t(slot) * output_stride + row] = sum * slot_out_scale[slot * 3u + proj_off];
+    }
+}
+
 // 3. BATCHED strided GeGLU over top_k slots. Identical gelu_pytorch_tanh literals
 // + op order to aegis_geglu_tanh_batched (sampling.cu), but per-slot strided so it
 // works with the over-allocated [top_k * inter_stride] scratch. Renamed to avoid a
