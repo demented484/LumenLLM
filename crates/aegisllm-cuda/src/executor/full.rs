@@ -388,10 +388,39 @@ impl CudaLlamaExecutor {
         let pin_t = std::time::Instant::now();
         let arena_used_bytes = host_arena.used();
         let arena_capacity_bytes = host_arena.capacity();
-        host_arena.pin_now()?;
+        // GPU-driven MoE decode (opt-in via AEGIS_GPU_DRIVEN_MOE=1) needs the
+        // expert arena DEVICE-MAPPED so a gather kernel can read host bytes
+        // directly over PCIe. Falls back to the plain PORTABLE pin (host streams
+        // via the staging pool) when the env is unset OR when device-map
+        // registration fails on this driver/arena (logged, not fatal).
+        let want_devicemap = gpu_driven_moe_requested();
+        let mut device_mapped = false;
+        if want_devicemap {
+            match host_arena.pin_now_devicemap() {
+                Ok(()) => {
+                    device_mapped = host_arena.is_device_mapped();
+                    if !device_mapped {
+                        eprintln!(
+                            "load-timing: arena device-map requested but device pointer is null; \
+                             falling back to host-streamed MoE decode"
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "load-timing: arena device-map (cuMemHostRegister DEVICEMAP) failed: {e:?}; \
+                         falling back to plain pin + host-streamed MoE decode"
+                    );
+                    host_arena.pin_now()?;
+                }
+            }
+        } else {
+            host_arena.pin_now()?;
+        }
         let mib = |b: usize| b as f64 / (1024.0 * 1024.0);
         eprintln!(
-            "load-timing: arena pin (cuMemHostRegister) {:>6.2}s  ({:>7.2} MiB pinned, {:>7.2} MiB capacity, {:>7.2} MiB unused tail saved)",
+            "load-timing: arena pin (cuMemHostRegister{}) {:>6.2}s  ({:>7.2} MiB pinned, {:>7.2} MiB capacity, {:>7.2} MiB unused tail saved)",
+            if device_mapped { " +DEVICEMAP" } else { "" },
             pin_t.elapsed().as_secs_f64(),
             mib(arena_used_bytes),
             mib(arena_capacity_bytes),
@@ -1576,6 +1605,16 @@ fn prefill_attention_split_scratch(
         acc_f32: acc_f32.max(1),
         stats_f32: rows.max(1),
     })
+}
+
+/// GPU-driven MoE decode: device-map the host expert arena and gather the
+/// routed experts' weights with a GPU kernel (no CPU round-trip), instead of
+/// the host-issued per-expert staging-pool H2D path. Opt-in (default OFF) via
+/// `AEGIS_GPU_DRIVEN_MOE=1`. Read in exactly one place at load (to choose the
+/// arena pin flags) and again in the decode path (to choose the gather path);
+/// both consult this so they can't disagree.
+pub(crate) fn gpu_driven_moe_requested() -> bool {
+    std::env::var("AEGIS_GPU_DRIVEN_MOE").is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
 /// Sum the bytes that will land in the pinned-host arena: every tensor

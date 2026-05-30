@@ -36,7 +36,7 @@
 //! `memcpy_htod` as a pinned source — the driver detects the
 //! registered pinning and uses the fast direct-DMA path.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use aegisllm_base::error::{AegisError, Result};
 use cudarc::driver::{CudaStream, HostSlice, SyncOnDrop, sys};
@@ -56,6 +56,14 @@ pub(crate) struct OwnedPinnedBuf {
     /// `cuMemHostUnregister` must be called with the exact pointer
     /// that was registered. `pin_now`/full-buffer pin leaves this 0.
     register_start: AtomicUsize,
+    /// Device-accessible pointer to the registered range, obtained via
+    /// `cuMemHostGetDevicePointer_v2` when the buffer is pinned with
+    /// `pin_range_devicemap`. 0 when the buffer was registered without
+    /// `CU_MEMHOSTREGISTER_DEVICEMAP` (the default `pin_now`/`pin_range`
+    /// path). This `CUdeviceptr` corresponds to the **host** address
+    /// `ptr + register_start`; callers that want the device pointer for an
+    /// arbitrary offset `o >= register_start` add `(o - register_start)`.
+    device_ptr: AtomicU64,
 }
 
 // SAFETY: the underlying pages are pinned for the lifetime of the
@@ -128,6 +136,7 @@ impl OwnedPinnedBuf {
             len: len_aligned,
             registered: AtomicBool::new(false),
             register_start: AtomicUsize::new(0),
+            device_ptr: AtomicU64::new(0),
         })
     }
 
@@ -153,6 +162,32 @@ impl OwnedPinnedBuf {
     /// pages we'll never read, costing free RAM that's not actually
     /// needed for inference.
     pub(crate) fn pin_range(&self, offset: usize, len: usize) -> Result<()> {
+        self.pin_range_with_flags(offset, len, sys::CU_MEMHOSTREGISTER_PORTABLE, false)
+    }
+
+    /// Like `pin_range`, but also passes `CU_MEMHOSTREGISTER_DEVICEMAP` so the
+    /// GPU can read the host pages directly, and then resolves the
+    /// device-accessible pointer for the registered range via
+    /// `cuMemHostGetDevicePointer_v2`. After this call `device_ptr()` returns a
+    /// non-zero `CUdeviceptr`. Used for the host-resident expert weight arena so
+    /// a GPU gather kernel can stream the selected experts' bytes from mapped
+    /// host RAM into a VRAM scratch in one launch — no CPU round-trip.
+    pub(crate) fn pin_range_devicemap(&self, offset: usize, len: usize) -> Result<()> {
+        self.pin_range_with_flags(
+            offset,
+            len,
+            sys::CU_MEMHOSTREGISTER_PORTABLE | sys::CU_MEMHOSTREGISTER_DEVICEMAP,
+            true,
+        )
+    }
+
+    fn pin_range_with_flags(
+        &self,
+        offset: usize,
+        len: usize,
+        flags: u32,
+        devicemap: bool,
+    ) -> Result<()> {
         if self.registered.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -167,17 +202,33 @@ impl OwnedPinnedBuf {
             self.registered.store(true, Ordering::Release);
             return Ok(());
         }
-        let r = unsafe {
-            sys::cuMemHostRegister_v2(
-                (self.ptr as *mut u8).add(start) as *mut _,
-                registered_len,
-                sys::CU_MEMHOSTREGISTER_PORTABLE,
-            )
-        };
+        let host_start = unsafe { (self.ptr as *mut u8).add(start) };
+        let r = unsafe { sys::cuMemHostRegister_v2(host_start as *mut _, registered_len, flags) };
         if r != sys::CUresult::CUDA_SUCCESS {
             return Err(AegisError::Unsupported(format!(
-                "OwnedPinnedBuf::pin_range({start}, {registered_len}): cuMemHostRegister failed: {r:?}"
+                "OwnedPinnedBuf::pin_range({start}, {registered_len}, flags={flags:#x}): cuMemHostRegister failed: {r:?}"
             )));
+        }
+        if devicemap {
+            // Resolve the device-accessible pointer for the registered host
+            // range. With UVA on a 64-bit Linux + recent driver this is
+            // typically equal to the host VA, but we must not assume that —
+            // always go through the API.
+            let mut dptr: sys::CUdeviceptr = 0;
+            let r = unsafe {
+                sys::cuMemHostGetDevicePointer_v2(&mut dptr, host_start as *mut _, 0)
+            };
+            if r != sys::CUresult::CUDA_SUCCESS {
+                // Roll back the registration so Drop doesn't double-unregister
+                // a range we can't actually use.
+                unsafe {
+                    let _ = sys::cuMemHostUnregister(host_start as *mut _);
+                }
+                return Err(AegisError::Unsupported(format!(
+                    "OwnedPinnedBuf::pin_range_devicemap({start}, {registered_len}): cuMemHostGetDevicePointer_v2 failed: {r:?}"
+                )));
+            }
+            self.device_ptr.store(dptr, Ordering::Release);
         }
         // Track the registered start so Drop can unregister at the
         // exact pointer we passed (cuMemHostUnregister wants the same
@@ -186,6 +237,21 @@ impl OwnedPinnedBuf {
         self.register_start
             .store(start, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// Device-accessible pointer (`CUdeviceptr`) for the registered range's
+    /// start (= host `ptr + register_start`). Returns 0 when the buffer was not
+    /// pinned with `pin_range_devicemap`. The device pointer for an arbitrary
+    /// host offset `o` is `device_ptr_base() + (o - register_start())`.
+    pub(crate) fn device_ptr_base(&self) -> u64 {
+        self.device_ptr.load(Ordering::Acquire)
+    }
+
+    /// Byte offset of the registered range's start within the buffer (the
+    /// page-aligned-down `start` from `pin_range*`). Combined with
+    /// `device_ptr_base()` this maps any host offset to its device pointer.
+    pub(crate) fn register_start(&self) -> usize {
+        self.register_start.load(Ordering::Acquire)
     }
 
     pub(crate) fn len(&self) -> usize {

@@ -93,6 +93,44 @@ impl PinnedArena {
         self._backing.pin_range(0, used)
     }
 
+    /// Like `pin_now`, but registers the used prefix with
+    /// `CU_MEMHOSTREGISTER_DEVICEMAP` so the GPU can read arena bytes directly.
+    /// After this returns, `device_ptr_at(offset)` yields a device-accessible
+    /// pointer into the arena. Used for the host-resident MoE expert arena so a
+    /// GPU gather kernel can stream the routed experts' weights from mapped host
+    /// RAM into VRAM in one launch (no CPU round-trip, graph-capturable).
+    ///
+    /// The arena base (offset 0) is page-aligned, so the registered range starts
+    /// at offset 0 and `device_ptr_at(o) == device_ptr_base + o`.
+    pub(crate) fn pin_now_devicemap(&self) -> Result<()> {
+        let used = self.used.load(Ordering::Relaxed);
+        self._backing.pin_range_devicemap(0, used)
+    }
+
+    /// `true` once the arena has been device-mapped (`pin_now_devicemap`
+    /// succeeded). When false, `device_ptr_at` returns `None`.
+    pub(crate) fn is_device_mapped(&self) -> bool {
+        self._backing.device_ptr_base() != 0
+    }
+
+    /// Device-accessible pointer (`CUdeviceptr` as u64) for the byte at
+    /// `offset` within the arena, or `None` if the arena was not device-mapped.
+    /// `offset` must lie within `[register_start, used)`; arena registration
+    /// starts at offset 0 so any valid tensor offset qualifies.
+    pub(crate) fn device_ptr_at(&self, offset: usize) -> Option<u64> {
+        let base = self._backing.device_ptr_base();
+        if base == 0 {
+            return None;
+        }
+        let reg_start = self._backing.register_start();
+        debug_assert!(
+            offset >= reg_start && offset <= self.capacity,
+            "PinnedArena::device_ptr_at offset {offset} out of registered range [{reg_start}, {cap}]",
+            cap = self.capacity,
+        );
+        Some(base + (offset - reg_start) as u64)
+    }
+
     /// Reserve `len` bytes and read them from `reader`. Returns the
     /// offset where the bytes were placed; combined with `len` this
     /// identifies the `slice` view callers will later use as the H2D

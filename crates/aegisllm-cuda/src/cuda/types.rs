@@ -152,6 +152,18 @@ impl HostWeightBytes {
     pub fn is_pinned(&self) -> bool {
         matches!(self, Self::Arena { .. } | Self::Pinned(_))
     }
+
+    /// Device-accessible pointer to these bytes, if they live in a
+    /// device-mapped arena (`pin_now_devicemap`). Returns `None` for `Pinned`
+    /// (not device-mapped), `Mmap`, and arenas that weren't device-mapped.
+    /// Used by the GPU-driven MoE decode gather kernel to read host-resident
+    /// expert weights directly over PCIe without a CPU round-trip.
+    pub fn device_ptr(&self) -> Option<u64> {
+        match self {
+            Self::Arena { arena, offset, .. } => arena.device_ptr_at(*offset),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -215,6 +227,15 @@ impl DeviceNvfp4Linear {
             (Ok(p), Ok(s)) => Ok((p, s)),
             (Err(e), _) | (_, Err(e)) => Err(e),
         })
+    }
+
+    /// Device-accessible `(packed_ptr, scales_ptr)` for a host-resident weight
+    /// whose bytes live in a device-mapped arena. Returns `None` when not
+    /// host-resident, or when the arena was not device-mapped. The GPU-driven
+    /// MoE decode gather kernel reads from these pointers over PCIe.
+    pub fn host_device_mapped_ptrs(&self) -> Option<(u64, u64)> {
+        let host = self.host_weights.as_ref()?;
+        Some((host.packed.device_ptr()?, host.scales.device_ptr()?))
     }
 }
 
