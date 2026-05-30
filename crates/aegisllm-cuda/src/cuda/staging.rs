@@ -62,14 +62,45 @@ pub(crate) struct StagingSlot {
 /// This structure was previously a single-slot, single-stream pool: every
 /// H2D blocked the compute stream and every kernel waited for the H2D, fully
 /// serialising 700+ small transfers per token.
-/// Number of staging slots in the pool. Larger pools allow more H2D
+/// Default number of staging slots in the pool. Larger pools allow more H2D
 /// transfers in flight on the transfer stream while compute eats earlier
 /// slots — useful when per-matvec compute is short relative to H2D, since
 /// the transfer stream can fill ahead and hide PCIe latency more aggressively.
-const STAGING_SLOT_COUNT: usize = 4;
+///
+/// ## Copy-engine saturation (offloaded-MoE decode)
+/// At decode the routed experts of every MoE layer stream `top_k × 3`
+/// (gate/up/down) tiny H2D transfers from RAM. With only 4 slots, slot `i` is
+/// reused after 4 transfers, so the 5th projection's H2D must `transfer_wait`
+/// on the 1st projection's GEMV completion (slot WAR fence) — the transfer
+/// stream stalls on compute *within the same token*, idling the copy engine
+/// between bursts and capping PCIe at ~28 GB/s on a ~56 GB/s link.
+///
+/// Raising the slot count to ≥ `top_k × 3` gives every projection of a layer
+/// its own slot, so all of a layer's H2Ds issue back-to-back on the transfer
+/// stream with NO same-token compute fence between them — the copy engine
+/// sees one saturated burst per layer. Cross-layer WAR fences still apply (a
+/// slot reused next layer waits on the prior layer's GEMV) but by then that
+/// GEMV is long done, so the wait is a no-op. Output is bit-identical: same
+/// slots, same kernels, same order — only the *number* of physical slots
+/// changes the overlap, never the math.
+///
+/// Opt-in via `AEGIS_STAGING_SLOTS=<n>` (default 4 → unchanged behaviour).
+const DEFAULT_STAGING_SLOT_COUNT: usize = 4;
+
+/// Resolve the configured slot count from `AEGIS_STAGING_SLOTS`, falling back
+/// to [`DEFAULT_STAGING_SLOT_COUNT`]. Clamped to ≥ 2 (double-buffering is the
+/// minimum for any transfer/compute overlap) and a sane upper bound so a typo
+/// can't allocate gigabytes of staging.
+fn configured_slot_count() -> usize {
+    std::env::var("AEGIS_STAGING_SLOTS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .map(|n| n.clamp(2, 64))
+        .unwrap_or(DEFAULT_STAGING_SLOT_COUNT)
+}
 
 pub(crate) struct LinearStagingPool {
-    slots: [StagingSlot; STAGING_SLOT_COUNT],
+    slots: Vec<StagingSlot>,
     /// Index of the slot the next `prepare_async` call will write into.
     next_slot: usize,
     /// Slot index returned from the most recent `prepare_async`. The caller is
@@ -81,7 +112,7 @@ pub(crate) struct LinearStagingPool {
 impl std::fmt::Debug for LinearStagingPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LinearStagingPool")
-            .field("slot_count", &STAGING_SLOT_COUNT)
+            .field("slot_count", &self.slots.len())
             .field("slot_packed_cap", &self.slots[0].packed.len())
             .field("slot_scales_cap", &self.slots[0].scales.len())
             .field(
@@ -136,15 +167,11 @@ impl LinearStagingPool {
                 transfer_event,
             })
         };
-        let slot_results: [Result<StagingSlot>; STAGING_SLOT_COUNT] =
-            std::array::from_fn(|_| alloc_slot());
-        let mut slot_vec: Vec<StagingSlot> = Vec::with_capacity(STAGING_SLOT_COUNT);
-        for r in slot_results { slot_vec.push(r?); }
-        let slots: [StagingSlot; STAGING_SLOT_COUNT] = slot_vec
-            .try_into()
-            .map_err(|_| AegisError::InvalidPlan(
-                "staging slot array conversion failed".into(),
-            ))?;
+        let slot_count = configured_slot_count();
+        let mut slots: Vec<StagingSlot> = Vec::with_capacity(slot_count);
+        for _ in 0..slot_count {
+            slots.push(alloc_slot()?);
+        }
         Ok(Self {
             slots,
             next_slot: 0,
