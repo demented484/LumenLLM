@@ -35,9 +35,13 @@ pub(super) struct CudaPrefillForwardParams {
     pub(super) kv_staging_ptr: *mut KvStagingPool,
 }
 
-/// Native-FP8 / BF16 batched projection for the Qwen full-attention prefill
-/// path. FP8-block → native tensor-core GEMM (no dequant); BF16 → batched
-/// reference matmul. Mirrors `gdn_proj_batched`.
+/// Native-FP8 / BF16 / NVFP4 batched projection for the Qwen full-attention
+/// prefill path. FP8-block → native tensor-core GEMM (no dequant); BF16 →
+/// batched reference matmul; NVFP4 → batched NVFP4 GEMM (the 35B-A3B case),
+/// using the supplied quant scratch + staging pool exactly like the
+/// non-gated NVFP4 dense-attention prefill path and the per-token decode
+/// path (`matvec_nvfp4_batched_device_with_scratch`). Mirrors `gdn_proj_batched`.
+#[allow(clippy::too_many_arguments)]
 fn qwen_attn_proj_batched(
     runtime: &CudaRuntime,
     linear: &CudaLinear,
@@ -45,6 +49,9 @@ fn qwen_attn_proj_batched(
     batch: usize,
     a_q: &mut DeviceBuffer<u8>,
     a_scale: &mut DeviceBuffer<f32>,
+    nvfp4_quant: &mut DeviceBuffer<f32>,
+    nvfp4_mxfp4: &mut DeviceBuffer<u8>,
+    staging_ptr: *mut LinearStagingPool,
     output: &mut DeviceBuffer<f32>,
 ) -> Result<()> {
     match linear {
@@ -53,9 +60,16 @@ fn qwen_attn_proj_batched(
         }
         CudaLinear::Bf16(m) => runtime.matmul_bf16_reference_batched_device(m, input, batch, output),
         CudaLinear::Fp8(f) => runtime.matmul_fp8_standalone_batched_device(f, input, batch, output),
-        CudaLinear::Nvfp4(_) => Err(AegisError::Unsupported(
-            "Qwen full-attn prefill: NVFP4 projection not supported on this path".into(),
-        )),
+        CudaLinear::Nvfp4(l) => {
+            let sp = if staging_ptr.is_null() {
+                None
+            } else {
+                Some(unsafe { &mut *staging_ptr })
+            };
+            crate::executor::linear_ops::matvec_nvfp4_batched_device_with_scratch(
+                runtime, l, input, batch, nvfp4_quant, nvfp4_mxfp4, output, sp,
+            )
+        }
     }
 }
 
@@ -92,7 +106,9 @@ fn forward_qwen_fullattn_prefill_chunk_device(
     //    query → prefill.gate, gate → prefill.attn_gate.
     if layer.attn_output_gate {
         qwen_attn_proj_batched(runtime, &layer.q_proj, &prefill.input_normed, params.batch,
-            &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.attn_q_full)?;
+            &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale,
+            &mut prefill.quant_hidden, &mut prefill.mxfp4_hidden, params.staging_ptr,
+            &mut prefill.attn_q_full)?;
         // The flat de-interleave kernel handles the [batch, n_q, 2*hd] layout
         // when called with num_heads = batch * n_q (per-"head" stride 2*hd).
         runtime.deinterleave_gated_q(
@@ -101,12 +117,18 @@ fn forward_qwen_fullattn_prefill_chunk_device(
         )?;
     } else {
         qwen_attn_proj_batched(runtime, &layer.q_proj, &prefill.input_normed, params.batch,
-            &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.gate)?;
+            &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale,
+            &mut prefill.quant_hidden, &mut prefill.mxfp4_hidden, params.staging_ptr,
+            &mut prefill.gate)?;
     }
     qwen_attn_proj_batched(runtime, &layer.k_proj, &prefill.input_normed, params.batch,
-        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.up)?;
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale,
+        &mut prefill.quant_hidden, &mut prefill.mxfp4_hidden, params.staging_ptr,
+        &mut prefill.up)?;
     qwen_attn_proj_batched(runtime, &layer.v_proj, &prefill.input_normed, params.batch,
-        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.v)?;
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale,
+        &mut prefill.quant_hidden, &mut prefill.mxfp4_hidden, params.staging_ptr,
+        &mut prefill.v)?;
     // 3. per-head q_norm / k_norm (batched over batch*heads rows of head_dim).
     if let Some(ref qnw) = layer.q_norm_weight {
         runtime.rms_norm_batched_device(
@@ -172,9 +194,11 @@ fn forward_qwen_fullattn_prefill_chunk_device(
     if layer.attn_output_gate {
         runtime.sigmoid_gate_mul(&mut prefill.qkv, &prefill.attn_gate, params.batch * q_width)?;
     }
-    // 7. o_proj (native FP8 / BF16) → input_normed, then residual add.
+    // 7. o_proj (native FP8 / BF16 / NVFP4) → input_normed, then residual add.
     qwen_attn_proj_batched(runtime, &layer.o_proj, &prefill.qkv, params.batch,
-        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.input_normed)?;
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale,
+        &mut prefill.quant_hidden, &mut prefill.mxfp4_hidden, params.staging_ptr,
+        &mut prefill.input_normed)?;
     runtime.add_inplace_device_len(
         &mut prefill.hidden, &prefill.input_normed, params.batch * hidden_size,
     )?;

@@ -806,13 +806,20 @@ impl CudaLlamaExecutor {
                 .layers
                 .iter()
                 .any(|layer| cuda_linear_on_native_mxfp4_path(&self.runtime, &layer.down_proj));
+        // Qwen3-Next gated full-attention: o_proj quantizes a q_width-wide input
+        // (heads·head_dim = 4096 on the 35B) through `quant_hidden`/`mxfp4_hidden`,
+        // and q_width can EXCEED hidden_size (2048). Size these scratch buffers to
+        // cover the wider of the two — mirrors the decode-path sizing
+        // (`self.hidden_size.max(max_q_width)`). Without this the batched o_proj
+        // NVFP4 quant overruns a `chunk*hidden`-sized buffer.
+        let quant_width = self.hidden_size.max(max_q_width);
         let quant_hidden_len = if needs_quant_hidden_scratch {
-            self.prefill_chunk_size * self.hidden_size
+            self.prefill_chunk_size * quant_width
         } else {
             1
         };
         let mxfp4_hidden_len = if needs_mxfp4_hidden_scratch {
-            self.prefill_chunk_size * CudaRuntime::mxfp4_vector_bytes(self.hidden_size)?
+            self.prefill_chunk_size * CudaRuntime::mxfp4_vector_bytes(quant_width)?
         } else {
             1
         };
@@ -1001,6 +1008,8 @@ impl CudaLlamaExecutor {
                         gather_shared_gate_up_fused: self
                             .runtime
                             .alloc_f32(cs * 2 * max_expert_intermediate)?,
+                        // Per-token Qwen3-Next shared-expert gate logits ([cs]).
+                        shared_gate_logit: self.runtime.alloc_f32(cs)?,
                         gather_out: self.runtime.alloc_f32(cs * self.hidden_size)?,
                         gather_quant: self.runtime.alloc_f32(cs * max_dim)?,
                         gather_mxfp4: self.runtime.alloc_u8(
