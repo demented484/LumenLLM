@@ -385,6 +385,26 @@ extern "C" __global__ void aegis_scale_by_sigmoid_scalar_f32(
     x[i] = x[i] * (1.0f / (1.0f + expf(-g)));
 }
 
+// Batched (chunked-prefill) counterpart of aegis_scale_by_sigmoid_scalar_f32:
+// each token row `t` of `x[batch, width]` is scaled by sigmoid(logit[t]), where
+// `logit` is the [batch] per-token shared-expert gate logit produced by the
+// shared_gate matvec. Folds the Qwen3-Next shared-expert gate (per-token
+// sigmoid + broadcast over the hidden dim) into one launch — the batched
+// analogue of the decode-side single-scalar broadcast. Thread i owns one
+// element; its row index is i / width.
+extern "C" __global__ void aegis_scale_by_sigmoid_rows_f32(
+    float* __restrict__ x,
+    const float* __restrict__ logit,
+    const unsigned int width,
+    const unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned int row = i / width;
+    const float g = logit[row];
+    x[i] = x[i] * (1.0f / (1.0f + expf(-g)));
+}
+
 // ============================================================================
 // Batched (chunked-prefill) GDN kernels. These process a whole T-token chunk in
 // one launch, mirroring the single-token decode kernels above. The matmuls

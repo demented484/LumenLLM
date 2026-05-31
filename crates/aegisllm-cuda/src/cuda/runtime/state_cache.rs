@@ -701,6 +701,58 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Batched per-row counterpart of `scale_by_sigmoid_scalar`. Scales each
+    /// of `batch` rows of `out[batch, width]` in place by `sigmoid(logit[row])`,
+    /// where `logit` is a `[batch]` device buffer of per-token shared-expert
+    /// gate logits. Used by the chunked-prefill MoE shared-expert gate
+    /// (Qwen3-Next): the gate logits land in a `[batch]` buffer from the
+    /// shared_gate batched matvec and this folds the per-token sigmoid +
+    /// broadcast over the hidden dim into one launch.
+    pub fn scale_by_sigmoid_rows(
+        &self,
+        out: &mut DeviceBuffer<f32>,
+        logit: &DeviceBuffer<f32>,
+        batch: usize,
+        width: usize,
+    ) -> Result<()> {
+        let n = batch.saturating_mul(width);
+        if n == 0 {
+            return Ok(());
+        }
+        if out.len() < n {
+            return Err(AegisError::InvalidPlan(format!(
+                "scale_by_sigmoid_rows: out has {} elems, need {}",
+                out.len(),
+                n
+            )));
+        }
+        if logit.len() < batch {
+            return Err(AegisError::InvalidPlan(format!(
+                "scale_by_sigmoid_rows: logit has {} elems, need batch={}",
+                logit.len(),
+                batch
+            )));
+        }
+        let threads = 256u32;
+        let blocks = ((n as u32) + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.scale_by_sigmoid_rows)
+                .arg(&mut out.slice)
+                .arg(&logit.slice)
+                .arg(&(width as u32))
+                .arg(&(n as u32))
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("scale_by_sigmoid_rows"))?;
+        Ok(())
+    }
+
     /// Apply the Gated DeltaNet chunked-prefill kernel over `chunk_len` tokens.
     ///
     /// **Phase 6 stub** — returns `Unsupported` until `gated_deltanet_prefill.cu`
