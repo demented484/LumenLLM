@@ -486,11 +486,16 @@ impl CudaWeightLoader<'_> {
         let len = std::fs::metadata(path)
             .map_err(|e| AegisError::InvalidPlan(format!("stat shard {}: {e}", path.display())))?
             .len() as usize;
-        // RAM guard: shard buffer + margin for the OS/IDE and the still-growing
-        // pinned arena. Decline (fall back to per-tensor) when RAM is tight.
+        // RAM guard. The shard buffer (`len`) is held SIMULTANEOUSLY with the
+        // experts being copied OUT of it into the persistent pinned arena (which
+        // accumulates ~this shard's expert bytes), so the true peak is ≈ 2×len,
+        // NOT len. The old `len + 4 GiB` guard under-counted by a whole shard and
+        // let a 20.9 GiB shard buffer + a 17.5 GiB arena fill OOM a 32 GiB host.
+        // Require room for both copies + an OS/IDE margin, else fall back to
+        // per-tensor reads (one tensor in flight — peak is just the arena).
         const MARGIN: u64 = 4 * 1024 * 1024 * 1024;
         if let Some(avail) = mem_available_bytes() {
-            if avail < len as u64 + MARGIN {
+            if avail < 2 * len as u64 + MARGIN {
                 return Ok(None);
             }
         }
