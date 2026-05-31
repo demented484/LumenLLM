@@ -221,11 +221,13 @@ pub struct HfConfig {
     /// vision-tower embeds at these positions in the prompt.
     #[serde(default)]
     pub image_token_id: Option<u32>,
-    /// Begin-of-image delimiter id (`<|image>` = 255999 in Gemma-4).
-    #[serde(default)]
+    /// Begin-of-image delimiter id (`<|image>` = 255999 in Gemma-4; Qwen3-VL
+    /// names it `vision_start_token_id` = 248053).
+    #[serde(default, alias = "vision_start_token_id")]
     pub boi_token_id: Option<u32>,
-    /// End-of-image delimiter id (`<image|>` = 258882 in Gemma-4).
-    #[serde(default)]
+    /// End-of-image delimiter id (`<image|>` = 258882 in Gemma-4; Qwen3-VL
+    /// names it `vision_end_token_id` = 248054).
+    #[serde(default, alias = "vision_end_token_id")]
     pub eoi_token_id: Option<u32>,
     /// Audio soft-token id (`<|audio|>` = 258881 in Gemma-4).
     #[serde(default)]

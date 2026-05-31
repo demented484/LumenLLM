@@ -634,6 +634,57 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Qwen3-VL interleaved M-RoPE (batched prefill). Each token carries 3
+    /// position components (T,H,W); per-frequency-slot axis = [T,H,W][slot%3].
+    /// Collapses to the 1-D partial-NeoX RoPE when T==H==W everywhere.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_mrope_neox_partial_batched_device(
+        &self,
+        values: &mut DeviceBuffer<f32>,
+        pos_t: &DeviceBuffer<u32>,
+        pos_h: &DeviceBuffer<u32>,
+        pos_w: &DeviceBuffer<u32>,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        theta: f32,
+        rotary_dim: usize,
+    ) -> Result<()> {
+        if num_heads == 0 || rotary_dim == 0 || seq_len == 0 {
+            return Ok(());
+        }
+        if values.len() < seq_len * num_heads * head_dim {
+            return Err(AegisError::InvalidPlan(
+                "mrope neox partial batched: buffer too small".into(),
+            ));
+        }
+        if pos_t.len() < seq_len || pos_h.len() < seq_len || pos_w.len() < seq_len {
+            return Err(AegisError::InvalidPlan(
+                "mrope neox partial batched: position buffer too small".into(),
+            ));
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (num_heads as u32, seq_len as u32, 1),
+            block_dim: ((rotary_dim / 2) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.apply_mrope_neox_partial_batched)
+                .arg(&mut values.slice)
+                .arg(&pos_t.slice)
+                .arg(&pos_h.slice)
+                .arg(&pos_w.slice)
+                .arg(&(num_heads as u32))
+                .arg(&(head_dim as u32))
+                .arg(&theta)
+                .arg(&(rotary_dim as u32))
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("apply_mrope_neox_partial_batched"))?;
+        Ok(())
+    }
+
     /// `x[i] *= sigmoid(g[i])` over `n` elements (Qwen3-Next attention output gate).
     pub fn sigmoid_gate_mul(
         &self,

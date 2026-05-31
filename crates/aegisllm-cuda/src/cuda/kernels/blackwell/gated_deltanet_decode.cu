@@ -354,6 +354,50 @@ extern "C" __global__ void aegis_apply_rope_neox_partial_batched(
     row[i + half] = x1 * cosv + x0 * sinv;
 }
 
+// Qwen3-VL interleaved M-RoPE (multimodal RoPE) — batched, full-attention
+// prefill. Same NeoX partial-rotary mechanics as
+// aegis_apply_rope_neox_partial_batched, but each token carries THREE position
+// components (T, H, W) and the per-frequency-slot axis is chosen by the
+// interleaved pattern: slot j (j in [0, rotary_dim/2)) uses axis [T,H,W][j%3].
+// (mrope_section=[11,11,10] summing to rotary_dim/2=32 with T,H,W,T,H,W,...
+// interleave gives exactly that assignment.) When T==H==W for every token
+// (text-only / post-image decode-aligned positions), every slot picks the same
+// position, so this is BIT-IDENTICAL to the 1-D partial-NeoX RoPE — the
+// no-regression guarantee.
+//
+// `pos_t/h/w` are each [T] u32. `values` layout: [T, num_heads, head_dim].
+// Grid: (num_heads, seq_len, 1)   Block: (rotary_dim/2, 1, 1)
+extern "C" __global__ void aegis_apply_mrope_neox_partial_batched(
+    float* __restrict__ values,
+    const unsigned int* __restrict__ pos_t,   // [T]
+    const unsigned int* __restrict__ pos_h,   // [T]
+    const unsigned int* __restrict__ pos_w,   // [T]
+    const unsigned int num_heads,
+    const unsigned int head_dim,
+    const float theta,
+    const unsigned int rotary_dim
+) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int t    = blockIdx.y;
+    const unsigned int i    = threadIdx.x;
+    const unsigned int half = rotary_dim / 2u;
+    if (head >= num_heads || i >= half) return;
+    float* row = values + (((unsigned long long)t * num_heads) + head) * head_dim;
+    // Interleaved axis pick: slot i -> [T,H,W][i % 3].
+    const unsigned int axis = i % 3u;
+    float position;
+    if (axis == 0u)      position = (float)(pos_t[t]);
+    else if (axis == 1u) position = (float)(pos_h[t]);
+    else                 position = (float)(pos_w[t]);
+    const float freq = 1.0f / powf(theta, (float)(2u * i) / (float)rotary_dim);
+    float sinv, cosv;
+    sincosf(position * freq, &sinv, &cosv);
+    const float x0 = row[i];
+    const float x1 = row[i + half];
+    row[i]        = x0 * cosv - x1 * sinv;
+    row[i + half] = x1 * cosv + x0 * sinv;
+}
+
 // Multiply x by sigmoid(g) elementwise (Qwen3-Next attention output gating,
 // applied to the attention context before o_proj).
 extern "C" __global__ void aegis_sigmoid_gate_mul_f32(

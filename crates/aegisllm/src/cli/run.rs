@@ -351,6 +351,19 @@ fn compute_image_injection(
     engine: &AegisEngine,
     image_path: &Path,
 ) -> Result<aegisllm_base::generation::ImageInjection> {
+    // Qwen3-VL native-ViT tower (spatial_merge_size > 0 in vision_config) takes
+    // a different loader + forward + M-RoPE fusion path than the Gemma SigLIP
+    // tower; dispatch on the config-declared merge size (Gemma leaves it 0).
+    if engine
+        .artifact
+        .config
+        .vision_config
+        .as_ref()
+        .map(|vc| vc.spatial_merge_size > 0)
+        .unwrap_or(false)
+    {
+        return compute_qwen_image_injection(engine, image_path);
+    }
     use aegisllm_base::modalities::image_preprocess::ImageProcessor;
     use aegisllm_base::tensor::storage::TensorStorageLoader;
     use aegisllm_cuda::executor::vision::{VisionEncoderShape, VisionTower};
@@ -428,6 +441,84 @@ fn compute_image_injection(
         n_tokens,
         hidden: text_hidden,
         image_token_id: image_token_id as usize,
+        grid_thw: None,
+        spatial_merge_size: 0,
+    })
+}
+
+/// Qwen3-VL image path: preprocess (Qwen2VL smart-resize + pack), run the
+/// `QwenVisionTower`, and return an `ImageInjection` carrying the merged image
+/// embeddings + the pre-merge grid (for M-RoPE). Mirrors `compute_image_injection`
+/// but for the native-ViT tower.
+fn compute_qwen_image_injection(
+    engine: &AegisEngine,
+    image_path: &Path,
+) -> Result<aegisllm_base::generation::ImageInjection> {
+    use aegisllm_base::modalities::image_preprocess::ImageProcessor;
+    use aegisllm_base::tensor::storage::TensorStorageLoader;
+    use aegisllm_cuda::executor::vision_qwen::{QwenVisionShape, QwenVisionTower};
+
+    let device = engine.inventory.gpus.first().map(|g| g.index)
+        .ok_or_else(|| AegisError::Unsupported("no CUDA device for --image".into()))?;
+    let cuda = aegisllm_cuda::cuda::CudaRuntime::new_with_config(device, engine.cuda)?;
+    let cuda_weights = cuda.weight_loader();
+    let mut loader = TensorStorageLoader::new();
+
+    let shape = QwenVisionShape::from_artifact(&engine.artifact)?;
+    eprintln!(
+        "qwen-vision: loading tower ({}L hidden={} heads={} merge={} out_hidden={})...",
+        shape.depth, shape.hidden_size, shape.num_heads, shape.spatial_merge_size,
+        shape.out_hidden_size,
+    );
+    let tower = QwenVisionTower::from_artifact(&engine.artifact, shape, &cuda_weights, device, &mut loader)?;
+
+    let vc = engine.artifact.config.vision_config.as_ref()
+        .ok_or_else(|| AegisError::InvalidPlan("qwen-vision: missing vision_config".into()))?;
+    // Qwen3-VL processor AREA bounds (processor_config size.{shortest,longest}_edge).
+    // Overridable via AEGIS_QWEN_MIN_PIXELS / AEGIS_QWEN_MAX_PIXELS for OCR/budget.
+    let min_px = std::env::var("AEGIS_QWEN_MIN_PIXELS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(65536usize);
+    let max_px = std::env::var("AEGIS_QWEN_MAX_PIXELS").ok()
+        .and_then(|s| s.parse().ok()).unwrap_or(16777216usize);
+    let processor = ImageProcessor::qwen2vl_from_artifact_vision(vc, min_px, max_px);
+    let pre = processor.preprocess_qwen2vl(image_path)?;
+    let (gt, gh, gw) = pre.grid_thw();
+    let merge = vc.spatial_merge_size.max(1);
+    let n_tokens = pre.num_merged_tokens(merge);
+    let out_hidden = tower.out_hidden();
+    eprintln!(
+        "qwen-vision: {}x{} → grid {gt}x{gh}x{gw} → {} patches → {} merged tokens",
+        pre.height, pre.width, pre.num_patches(), n_tokens,
+    );
+
+    let embeds = if let Ok(path) = std::env::var("AEGIS_INJECT_FROM_FILE") {
+        eprintln!("qwen-vision: loading embeds from {path} (bypass tower)");
+        let bytes = std::fs::read(&path)
+            .map_err(|e| AegisError::InvalidPlan(format!("read {path}: {e}")))?;
+        let expected = n_tokens * out_hidden * 4;
+        if bytes.len() != expected {
+            return Err(AegisError::InvalidPlan(format!(
+                "inject-from-file: {} bytes != {} ({}×{}×4)", bytes.len(), expected, n_tokens, out_hidden)));
+        }
+        bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    } else {
+        eprintln!("qwen-vision: running tower forward...");
+        let t0 = std::time::Instant::now();
+        let e = tower.forward_gpu(&cuda, &pre.pixel_values, gh, gw)?;
+        eprintln!("qwen-vision: forward done in {:.2}s", t0.elapsed().as_secs_f64());
+        e
+    };
+
+    let image_token_id = engine.artifact.config.image_token_id.ok_or_else(|| {
+        AegisError::InvalidPlan("qwen-vision: config.json missing image_token_id".into())
+    })?;
+    Ok(aegisllm_base::generation::ImageInjection {
+        data: embeds,
+        n_tokens,
+        hidden: out_hidden,
+        image_token_id: image_token_id as usize,
+        grid_thw: Some((gt, gh, gw)),
+        spatial_merge_size: merge,
     })
 }
 

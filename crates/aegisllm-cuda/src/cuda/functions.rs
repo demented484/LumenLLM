@@ -243,6 +243,7 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) scale_by_sigmoid_rows: CudaFunction,
     pub(crate) apply_rope_neox_partial: CudaFunction,
     pub(crate) apply_rope_neox_partial_batched: CudaFunction,
+    pub(crate) apply_mrope_neox_partial_batched: CudaFunction,
     pub(crate) gdn_deinterleave_qkv: CudaFunction,
     pub(crate) mamba_scan_decode: CudaFunction,
 }
@@ -793,6 +794,7 @@ impl CudaKernelFunctions {
             scale_by_sigmoid_rows: load(&module, "aegis_scale_by_sigmoid_rows_f32")?,
             apply_rope_neox_partial: load(&module, "aegis_apply_rope_ptr_neox_partial")?,
             apply_rope_neox_partial_batched: load(&module, "aegis_apply_rope_neox_partial_batched")?,
+            apply_mrope_neox_partial_batched: load(&module, "aegis_apply_mrope_neox_partial_batched")?,
             gdn_deinterleave_qkv: load(&module, "aegis_gdn_deinterleave_qkv")?,
             mamba_scan_decode: load(&module, "aegis_mamba_scan_decode")?,
             _module: module,

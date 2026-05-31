@@ -575,6 +575,21 @@ pub struct CudaLlamaState {
     pub image_embeds: Option<DeviceBuffer<f32>>,
     pub image_token_id: u32,
     pub image_n_tokens: usize,
+    /// Qwen3-VL M-RoPE: per-image pre-merge grid `(grid_t, grid_h, grid_w)` +
+    /// `spatial_merge_size`. `Some` enables 3-component M-RoPE position ids in
+    /// prefill (built from the prompt token sequence via `get_rope_index`).
+    /// `None` → ordinary 1-D RoPE (Gemma / text-only), no behaviour change.
+    pub mrope_grid: Option<(usize, usize, usize, usize)>,
+    /// M-RoPE decode position delta = `max(position)+1 - seq_len`, set after
+    /// the prompt is processed. Decode positions = `seq_len + delta + step` in
+    /// all 3 axes (they re-align post-image), so decode stays on the 1-D path
+    /// with this shifted scalar position.
+    pub mrope_decode_delta: i64,
+    /// Full prompt M-RoPE position ids `[3][seq]` (T,H,W), computed once at the
+    /// start of prefill from the prompt token sequence + `mrope_grid`. Per-chunk
+    /// the relevant slice is uploaded to the prefill scratch buffers. Empty when
+    /// no image / non-M-RoPE model.
+    pub mrope_positions: Option<[Vec<u32>; 3]>,
     /// Audio soft-token embeddings `[audio_n_tokens, hidden_size]` (VRAM).
     /// The prefill embed step overwrites every input position whose token id
     /// equals `audio_token_id` with consecutive rows from this buffer. Mirrors
@@ -939,6 +954,15 @@ pub(super) struct CudaPrefillScratch {
     pub(super) seq_ids: DeviceBuffer<u32>,
     pub(super) tokens: DeviceBuffer<u32>,
     pub(super) positions: DeviceBuffer<u32>,
+    /// Qwen3-VL M-RoPE 3-component position buffers (T,H,W), each sized like
+    /// `positions`. Populated only when the prompt carries an image and the
+    /// model uses M-RoPE; the prefill RoPE then reads these instead of the
+    /// 1-D `positions`. `mrope_active` gates the swap so text-only/non-Qwen
+    /// prefill is byte-for-byte unchanged.
+    pub(super) mrope_pos_t: DeviceBuffer<u32>,
+    pub(super) mrope_pos_h: DeviceBuffer<u32>,
+    pub(super) mrope_pos_w: DeviceBuffer<u32>,
+    pub(super) mrope_active: bool,
     pub(super) slot_mapping: DeviceBuffer<u32>,
     pub(super) cu_q: DeviceBuffer<u32>,
     pub(super) cu_k: DeviceBuffer<u32>,

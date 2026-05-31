@@ -56,6 +56,15 @@ pub struct ImageInjection {
     pub n_tokens: usize,
     pub hidden: usize,
     pub image_token_id: usize,
+    /// Qwen3-VL M-RoPE: the pre-merge patch grid `(grid_t, grid_h, grid_w)` for
+    /// this image. When `Some`, the executor builds the 3-component M-RoPE
+    /// position ids (`get_rope_index`) so image-token positions carry distinct
+    /// (T,H,W) rotations. `None` for models with ordinary 1-D RoPE (Gemma),
+    /// where the standard sequential positions apply unchanged.
+    pub grid_thw: Option<(usize, usize, usize)>,
+    /// Spatial merge size (Qwen: 2) — needed alongside `grid_thw` to build the
+    /// merged-token M-RoPE positions. Ignored when `grid_thw` is `None`.
+    pub spatial_merge_size: usize,
 }
 
 /// Audio soft-token embeddings spliced into the prefill embedding stream.

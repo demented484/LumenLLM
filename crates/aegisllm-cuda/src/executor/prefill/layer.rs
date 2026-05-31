@@ -143,15 +143,31 @@ fn forward_qwen_fullattn_prefill_chunk_device(
         runtime.copy_prefix_f32_device(&prefill.qkv, &mut prefill.up, params.batch * kv_width)?;
     }
     // 4. partial-NeoX RoPE on q and k (batched; standard 1/sqrt(d) scaling — no
-    //    sqrt(d) pre-scale, which is Gemma-only).
+    //    sqrt(d) pre-scale, which is Gemma-only). When M-RoPE is active (Qwen
+    //    vision prompt), use the interleaved 3-component (T,H,W) RoPE; it is
+    //    bit-identical to the 1-D kernel for text spans (T==H==W) and only
+    //    differs at image-token positions.
     let rd = layer.rope.partial_dim as usize;
-    runtime.apply_rope_neox_partial_batched_device(
-        &mut prefill.gate, &prefill.positions, params.batch, n_q, hd, layer.rope.theta, rd,
-    )?;
-    if kv_shared_override.is_none() {
-        runtime.apply_rope_neox_partial_batched_device(
-            &mut prefill.up, &prefill.positions, params.batch, n_kv, hd, layer.rope.theta, rd,
+    if prefill.mrope_active {
+        runtime.apply_mrope_neox_partial_batched_device(
+            &mut prefill.gate, &prefill.mrope_pos_t, &prefill.mrope_pos_h, &prefill.mrope_pos_w,
+            params.batch, n_q, hd, layer.rope.theta, rd,
         )?;
+        if kv_shared_override.is_none() {
+            runtime.apply_mrope_neox_partial_batched_device(
+                &mut prefill.up, &prefill.mrope_pos_t, &prefill.mrope_pos_h, &prefill.mrope_pos_w,
+                params.batch, n_kv, hd, layer.rope.theta, rd,
+            )?;
+        }
+    } else {
+        runtime.apply_rope_neox_partial_batched_device(
+            &mut prefill.gate, &prefill.positions, params.batch, n_q, hd, layer.rope.theta, rd,
+        )?;
+        if kv_shared_override.is_none() {
+            runtime.apply_rope_neox_partial_batched_device(
+                &mut prefill.up, &prefill.positions, params.batch, n_kv, hd, layer.rope.theta, rd,
+            )?;
+        }
     }
     record_prefill_stage(runtime, timings, qkv_start, |t, e| t.qkv_us += e)?;
 

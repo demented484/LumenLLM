@@ -67,9 +67,34 @@ impl CudaLlamaExecutor {
         sampling: &SamplingConfig,
     ) -> Result<usize> {
         state.prefill_timings.reset();
+        // ── Qwen3-VL M-RoPE: when the prompt carries an image, build the full
+        // 3-component (T,H,W) position ids once from the prompt token sequence
+        // + the per-image grid, and record the decode delta. Text-only / non-
+        // M-RoPE models leave this `None`, keeping the 1-D RoPE path unchanged.
+        if let Some((gt, gh, gw, merge)) = state.mrope_grid {
+            use aegisllm_base::modalities::mrope::{get_rope_index, GridThw};
+            let ids: Vec<u32> = prompt_tokens.iter().map(|&t| t as u32).collect();
+            let grid = GridThw::new(gt, gh, gw);
+            let pos = get_rope_index(&ids, state.image_token_id, &[grid], merge)?;
+            state.mrope_decode_delta = pos.position_delta();
+            let to_u32 = |v: &[i64]| v.iter().map(|&x| x.max(0) as u32).collect::<Vec<u32>>();
+            state.mrope_positions = Some([
+                to_u32(&pos.comp[0]), to_u32(&pos.comp[1]), to_u32(&pos.comp[2]),
+            ]);
+        } else {
+            state.mrope_positions = None;
+            state.mrope_decode_delta = 0;
+        }
         let chunk_size = state.prefill.as_ref().map(|s| s.chunk_size).unwrap_or(1);
         for chunk in prompt_tokens.chunks(chunk_size) {
             let start_position = state.position;
+            // Slice this chunk's M-RoPE (T,H,W) positions out of the full prompt
+            // ids BEFORE borrowing `state.prefill` (avoids an aliasing conflict).
+            let chunk_mrope: Option<[Vec<u32>; 3]> = state.mrope_positions.as_ref().map(|mp| {
+                let s = start_position;
+                let e = s + chunk.len();
+                [mp[0][s..e].to_vec(), mp[1][s..e].to_vec(), mp[2][s..e].to_vec()]
+            });
             let prefill = state
                 .prefill
                 .as_mut()
@@ -82,6 +107,20 @@ impl CudaLlamaExecutor {
                 self.kv_context_size,
                 self.embed_tokens.rows,
             )?;
+            // M-RoPE: upload this chunk's (T,H,W) position slice so the per-layer
+            // RoPE rotates image tokens by their (row,col) positions.
+            // `prepare_dense_batch` already filled `positions` with the plain
+            // arange used for the KV slots / mask; M-RoPE changes ONLY the
+            // rotation, not the cache layout. `mrope_active=false` → 1-D path
+            // (text-only / non-Qwen), byte-for-byte unchanged.
+            if let Some(cm) = chunk_mrope {
+                self.runtime.copy_u32_to_device(&cm[0], &mut prefill.mrope_pos_t)?;
+                self.runtime.copy_u32_to_device(&cm[1], &mut prefill.mrope_pos_h)?;
+                self.runtime.copy_u32_to_device(&cm[2], &mut prefill.mrope_pos_w)?;
+                prefill.mrope_active = true;
+            } else {
+                prefill.mrope_active = false;
+            }
             record_prefill_stage(
                 &self.runtime,
                 &mut state.prefill_timings,

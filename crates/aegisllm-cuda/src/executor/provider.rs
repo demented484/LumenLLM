@@ -425,6 +425,9 @@ impl GenerationBackendPrimitives for CudaExecutorProvider {
         s.image_embeds = Some(buf);
         s.image_token_id = injection.image_token_id as u32;
         s.image_n_tokens = injection.n_tokens;
+        s.mrope_grid = injection.grid_thw.map(|(t, h, w)| {
+            (t, h, w, injection.spatial_merge_size.max(1))
+        });
         Ok(())
     }
 

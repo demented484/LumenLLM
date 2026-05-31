@@ -245,8 +245,13 @@ impl CudaLlamaExecutor {
         }
 
         let seq_len = state.position + 1;
+        // M-RoPE decode: rotation position is shifted by the prompt's M-RoPE
+        // delta (post-image, all 3 axes re-aligned to a single running value).
+        // The KV/attention length (`decode_seq_len`) stays the sequential
+        // count; only the RoPE position carries the shift. delta=0 for 1-D.
+        let rope_pos = (state.position as i64 + state.mrope_decode_delta).max(0) as u32;
         self.runtime.copy_u32_to_device(
-            &[state.position as u32],
+            &[rope_pos],
             &mut state.decode_position,
         )?;
         self.runtime.copy_u32_to_device(
@@ -392,8 +397,11 @@ impl CudaLlamaExecutor {
 
         let seq_len = state.position + 1;
         // Update dynamic decode params BEFORE capture/replay (outside the captured graph).
+        // M-RoPE decode: shift the rotation position by the prompt's M-RoPE
+        // delta (delta=0 for ordinary 1-D RoPE → no change).
+        let rope_pos = (state.position as i64 + state.mrope_decode_delta).max(0) as u32;
         self.runtime.copy_u32_to_device(
-            &[state.position as u32],
+            &[rope_pos],
             &mut state.decode_position,
         )?;
         self.runtime.copy_u32_to_device(
