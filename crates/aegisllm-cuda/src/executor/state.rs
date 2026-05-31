@@ -287,6 +287,15 @@ pub(super) struct CudaMoEScratch {
     /// (graph-capturable). 1-element stubs when GPU-driven decode is not armed.
     pub(super) slot_in_scale: DeviceBuffer<f32>,
     pub(super) slot_out_scale: DeviceBuffer<f32>,
+    /// Experts-on-CPU decode (AEGIS_CPU_MOE): reusable host buffers + the
+    /// CPU kernel's per-layer scratch. `cpu_expert_input` holds the per-layer
+    /// routed-expert input hidden downloaded from `hidden_out`; `cpu_routed_acc`
+    /// holds the CPU kernel's `Σ_k w_k·expert_k` result before it is uploaded
+    /// back into `routed_acc`. `cpu_moe_scratch` is the gate/up/swiglu/down
+    /// slabs + flattened rayon job tables (zero per-token alloc once warmed).
+    pub(super) cpu_expert_input: Vec<f32>,
+    pub(super) cpu_routed_acc: Vec<f32>,
+    pub(super) cpu_moe_scratch: aegisllm_cpu::MoeLayerScratch,
 }
 
 /// Wraps `CudaGraph` so that `CudaLlamaState` satisfies `Send`.

@@ -1516,6 +1516,12 @@ impl CudaLlamaExecutor {
                         // per top-k slot). Tiny; allocate to the max top_k.
                         slot_in_scale: self.runtime.alloc_f32((max_top_k * 3).max(1))?,
                         slot_out_scale: self.runtime.alloc_f32((max_top_k * 3).max(1))?,
+                        // Experts-on-CPU decode (AEGIS_CPU_MOE). Empty until the
+                        // first layer warms them (resized to hidden / per-layer);
+                        // no allocation when the flag is off.
+                        cpu_expert_input: Vec::new(),
+                        cpu_routed_acc: Vec::new(),
+                        cpu_moe_scratch: aegisllm_cpu::MoeLayerScratch::default(),
                     }))
                 } else {
                     None

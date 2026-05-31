@@ -71,6 +71,7 @@ name = "aegisllm-cuda"
 version = "0.2.0"
 dependencies = [
  "aegisllm-base",
+ "aegisllm-cpu",
  "cudarc",
  "half",
  "libc",

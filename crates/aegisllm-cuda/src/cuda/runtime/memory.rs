@@ -235,6 +235,33 @@ impl CudaRuntime {
             .map_err(map_cuda_err("dtoh f32 buffer"))
     }
 
+    /// Download the first `len` elements of `buffer` into an existing host
+    /// `Vec<f32>` (resized as needed), avoiding a per-call allocation. Blocking
+    /// (the underlying `memcpy_dtoh` synchronizes the stream), so on return the
+    /// host slice is valid. Used by the experts-on-CPU decode path to pull the
+    /// per-layer routed-expert input hidden without churning the allocator.
+    pub fn download_f32_into(
+        &self,
+        buffer: &DeviceBuffer<f32>,
+        len: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<()> {
+        if len > buffer.len() {
+            return Err(AegisError::InvalidPlan(format!(
+                "download_f32_into: len={} > device buffer cap={}",
+                len,
+                buffer.len()
+            )));
+        }
+        if out.len() < len {
+            out.resize(len, 0.0);
+        }
+        let src = buffer.slice.slice(0..len);
+        self.stream
+            .memcpy_dtoh(&src, &mut out[..len])
+            .map_err(map_cuda_err("dtoh f32 into host buffer"))
+    }
+
     pub fn download_u32(&self, buffer: &DeviceBuffer<u32>) -> Result<Vec<u32>> {
         self.stream
             .clone_dtoh(&buffer.slice)

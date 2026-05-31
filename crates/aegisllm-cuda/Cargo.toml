@@ -6,6 +6,7 @@ build = "build.rs"
 
 [dependencies]
 aegisllm-base = { path = "../aegisllm-base" }
+aegisllm-cpu = { path = "../aegisllm-cpu" }
 cudarc.workspace = true
 half.workspace = true
 memmap2.workspace = true

@@ -561,7 +561,7 @@ unsafe impl Sync for SendPtr {}
 /// slabs + the flattened rayon job tables). The caller keeps one of these across
 /// all MoE layers / tokens so the per-token path does ZERO heap allocation once
 /// warmed.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct MoeLayerScratch {
     gate_buf: Vec<f32>,
     up_buf: Vec<f32>,

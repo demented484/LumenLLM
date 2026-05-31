@@ -19,6 +19,18 @@ fn batched_decode_moe_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("AEGIS_BATCHED_DECODE_MOE").is_ok())
 }
 
+/// Opt-in (default OFF): route the ROUTED NVFP4 experts' decode GEMV to the
+/// fused CPU kernel (read in place from the pinned host arena, computed off
+/// PCIe) instead of streaming 540 MiB/token over the link. Shared expert + GDN
+/// + attention + router stay on `cuda:0`. The lever for the 35B decode
+/// transfer/host-issue co-floor — see aegisllm_qwen35b_decode_transfer_bound.
+/// Read once (decode hot path).
+pub(super) fn cpu_moe_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("AEGIS_CPU_MOE").is_ok())
+}
+
 pub(super) fn forward_mlp_device(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
@@ -501,6 +513,23 @@ fn forward_moe_decode_device(
         runtime.copy_f32_device(post_normed, hidden_out)?;
     }
 
+    // ── Experts-on-CPU (AEGIS_CPU_MOE): pull the routed-expert input NOW ──────
+    //
+    // Gated on the flag, host-resident NVFP4 experts, and the host-streamed
+    // (non-gpu_driven) path. Download the expert-input hidden (`hidden_out`)
+    // BEFORE issuing the shared MLP, so this blocking dtoh waits only on the
+    // cheap expert-input norm — then the shared MLP (issued just below) runs on
+    // the GPU concurrently with the CPU routed-expert compute. The bytes are
+    // tiny (hidden_size f32 ≈ 8 KiB), unlike the 540 MiB/token of NVFP4 expert
+    // weights this path keeps OFF the PCIe link entirely (computed in place from
+    // the pinned host arena where they already live).
+    let cpu_moe = !gpu_driven
+        && cpu_moe_enabled()
+        && moe.experts.first().map(|e| e.gate_proj.is_host_resident()).unwrap_or(false);
+    if cpu_moe {
+        runtime.download_f32_into(hidden_out, hidden_size, &mut moe_scratch.cpu_expert_input)?;
+    }
+
     let staging_ptr: *mut LinearStagingPool =
         staging.map_or(std::ptr::null_mut(), |p| p as *mut _);
 
@@ -901,6 +930,15 @@ fn forward_moe_decode_device(
 
     if gpu_driven {
         // Routed experts already dispatched by the GPU-driven gather path above.
+    } else if cpu_moe {
+        // ── Experts-on-CPU dispatch ─────────────────────────────────────────
+        // The expert-input hidden was already downloaded to `cpu_expert_input`
+        // (before the shared MLP was issued, so the shared MLP runs on the GPU
+        // concurrently with this CPU compute). Build the active experts' borrowed
+        // packed/scale views from the pinned arena (read in place — NO H2D of the
+        // 540 MiB/token weights), run the fused CPU kernel in 2 big rayon regions,
+        // then upload the small routed_acc result back to the GPU.
+        forward_moe_decode_cpu(runtime, moe, moe_scratch, active_top_k)?;
     } else if batched_staged {
         forward_moe_decode_batched_staged(
             runtime, moe, moe_scratch, hidden_out, active_top_k,
@@ -1148,6 +1186,96 @@ fn forward_moe_decode_device(
         runtime.scale_f32_device(scalar, hidden_out)?;
     }
 
+    Ok(())
+}
+
+/// Borrow a host-resident NVFP4 linear's packed+scale arena bytes as a
+/// `PackedWeights` view for the CPU kernel (no copy). Explicit lifetime ties the
+/// returned view to the linear's borrow.
+fn cpu_moe_packed_view(
+    lin: &crate::cuda::DeviceNvfp4Linear,
+) -> Result<aegisllm_cpu::PackedWeights<'_>> {
+    let (packed, scales) = lin.host_packed_scales_bytes().ok_or_else(|| {
+        AegisError::InvalidPlan(format!(
+            "CPU MoE: expert proj `{}` is not host-resident",
+            lin.name
+        ))
+    })??;
+    Ok(aegisllm_cpu::PackedWeights::new(
+        lin.rows, lin.cols, packed, scales, lin.output_scale,
+    ))
+}
+
+/// Experts-on-CPU routed-expert decode (AEGIS_CPU_MOE).
+///
+/// The routed NVFP4 experts live in the pinned host arena. Rather than stream
+/// 540 MiB/token of their packed weights over PCIe to GPU GEMVs (the 35B decode
+/// transfer/host-issue co-floor), this computes them ON the CPU where they
+/// already live — reading the packed bytes IN PLACE (no copy) at ~65 GB/s DRAM
+/// bandwidth, dequant fused in-register.
+///
+/// The expert-input hidden was already downloaded into `moe_scratch.cpu_expert_input`
+/// by the caller (BEFORE the GPU shared MLP was issued, so the shared expert
+/// runs on the GPU concurrently with this CPU work). On return
+/// `moe_scratch.routed_acc = Σ_k w[k] · expert_k(input)`, uploaded back HtoD.
+///
+/// EFFICIENT DISPATCH: `moe_layer_experts_into` runs the whole layer's experts
+/// in TWO large rayon parallel regions (gate+up, then down) — NOT `top_k × 3`
+/// tiny GEMV launches, which fragment rayon to ~21 GB/s. See aegisllm-cpu.
+///
+/// Numerics: the weight dequant is bit-identical to the GPU; unlike the GPU GEMV
+/// the CPU dots the weights against the RAW f32 input (the GPU first quantizes
+/// the activation to NVFP4), so the CPU output is slightly MORE accurate, not
+/// bit-identical — coherent and closely tracking (like grouped-vs-per-token
+/// prefill drift). geglu_tanh + ascending weighted fold match the GPU path.
+fn forward_moe_decode_cpu(
+    runtime: &CudaRuntime,
+    moe: &CudaMoE,
+    moe_scratch: &mut CudaMoEScratch,
+    active_top_k: usize,
+) -> Result<()> {
+    if active_top_k == 0 {
+        runtime.zero_f32_device(&mut moe_scratch.routed_acc)?;
+        return Ok(());
+    }
+    let intermediate = moe.expert_intermediate_size;
+
+    // Build the active experts' borrowed packed/scale views from the arena.
+    let mut experts: Vec<aegisllm_cpu::CpuMoeExpert> = Vec::with_capacity(active_top_k);
+    for i in 0..active_top_k {
+        let expert = &moe.experts[moe_scratch.router_top_indices[i]];
+        let weight = moe_scratch.router_top_weights[i];
+        experts.push(aegisllm_cpu::CpuMoeExpert {
+            gate: cpu_moe_packed_view(&expert.gate_proj)?,
+            up: cpu_moe_packed_view(&expert.up_proj)?,
+            down: cpu_moe_packed_view(&expert.down_proj)?,
+            weight,
+        });
+    }
+
+    // Run the fused CPU kernel (2 big rayon regions/layer). Split the scratch
+    // borrows: input (read) + per-layer scratch (write) + result (write).
+    {
+        let CudaMoEScratch { cpu_expert_input, cpu_moe_scratch, cpu_routed_acc, .. } = moe_scratch;
+        aegisllm_cpu::moe_layer_experts_into(
+            &experts,
+            cpu_expert_input,
+            intermediate,
+            cpu_moe_scratch,
+            {
+                if cpu_routed_acc.len() < cpu_expert_input.len() {
+                    cpu_routed_acc.resize(cpu_expert_input.len(), 0.0);
+                }
+                cpu_routed_acc
+            },
+        );
+    }
+
+    // Upload the routed sum back into the GPU `routed_acc` for the combine.
+    // Split-borrow the two distinct fields (read cpu_routed_acc, write routed_acc).
+    let hidden = moe_scratch.cpu_expert_input.len();
+    let CudaMoEScratch { cpu_routed_acc, routed_acc, .. } = moe_scratch;
+    runtime.upload_f32_slice_to_device(&cpu_routed_acc[..hidden], routed_acc)?;
     Ok(())
 }
 
