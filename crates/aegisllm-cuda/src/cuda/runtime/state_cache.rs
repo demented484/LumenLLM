@@ -1193,4 +1193,251 @@ mod tests {
         eprintln!("fp8_block_gemm cos={cos:.6} maxerr={maxerr:.5}");
         assert!(cos > 0.999, "fp8_block_gemm cos {cos} too low (maxerr {maxerr})");
     }
+
+    // ── Batched (chunked-prefill) GDN kernels vs the validated decode kernels ──
+    // Each test drives a SMALL T-token sequence through the BATCHED kernel and
+    // compares to running the DECODE kernel T times sequentially with the SAME
+    // inputs (state threaded). They MUST match — any divergence localizes the
+    // numerical bug in the batched-prefill path (decode is the trusted oracle).
+
+    fn skip_or_rt() -> Option<crate::cuda::runtime::CudaRuntime> {
+        match crate::cuda::runtime::CudaRuntime::new(0) {
+            Ok(r) => Some(r),
+            Err(e) => { eprintln!("no CUDA device ({e:?}); skipping"); None }
+        }
+    }
+    fn frng(seed: usize, n: usize) -> Vec<f32> {
+        (0..n).map(|i| {
+            let h = seed.wrapping_mul(2_654_435_761).wrapping_add(i.wrapping_mul(40_503));
+            (h % 1000) as f32 / 500.0 - 1.0
+        }).collect()
+    }
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(&x, &y)| (x - y).abs()).fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn gdn_prefill_delta_rule_matches_decode_t_times() {
+        let Some(rt) = skip_or_rt() else { return };
+        let (t_len, n_v, d_k, d_v) = (5usize, 4usize, 8usize, 8usize);
+        // Per-token inputs (already normed/scaled/expanded in the real path).
+        let q: Vec<Vec<f32>> = (0..t_len).map(|t| frng(t * 7 + 1, n_v * d_k)).collect();
+        let k: Vec<Vec<f32>> = (0..t_len).map(|t| frng(t * 7 + 2, n_v * d_k)).collect();
+        let v: Vec<Vec<f32>> = (0..t_len).map(|t| frng(t * 7 + 3, n_v * d_v)).collect();
+        let beta: Vec<Vec<f32>> = (0..t_len)
+            .map(|t| (0..n_v).map(|h| 0.3 + 0.05 * (h + t) as f32).collect())
+            .collect();
+        let g: Vec<Vec<f32>> = (0..t_len)
+            .map(|t| (0..n_v).map(|h| -0.2 - 0.07 * (h + t) as f32).collect())
+            .collect();
+
+        // Reference: decode kernel T times (state threaded), capturing each y.
+        let mut dec_state = rt.upload_f32(&vec![0.0f32; n_v * d_v * d_k]).unwrap();
+        let mut dec_outs = vec![0.0f32; t_len * n_v * d_v];
+        for t in 0..t_len {
+            let dq = rt.upload_f32(&q[t]).unwrap();
+            let dk = rt.upload_f32(&k[t]).unwrap();
+            let dv = rt.upload_f32(&v[t]).unwrap();
+            let db = rt.upload_f32(&beta[t]).unwrap();
+            let dg = rt.upload_f32(&g[t]).unwrap();
+            let mut dout = rt.alloc_f32(n_v * d_v).unwrap();
+            rt.gated_deltanet_decode_step(&mut dec_state, &dq, &dk, &dv, &db, &dg, &mut dout,
+                n_v, d_k, d_v).unwrap();
+            rt.synchronize().unwrap();
+            let o = rt.download_f32(&dout).unwrap();
+            dec_outs[t * n_v * d_v..(t + 1) * n_v * d_v].copy_from_slice(&o);
+        }
+        let dec_final_state = rt.download_f32(&dec_state).unwrap();
+
+        // Batched: flatten [T, n_v, *] and run the prefill kernel once.
+        let flat = |v: &[Vec<f32>]| -> Vec<f32> { v.iter().flatten().copied().collect() };
+        let dq = rt.upload_f32(&flat(&q)).unwrap();
+        let dk = rt.upload_f32(&flat(&k)).unwrap();
+        let dv = rt.upload_f32(&flat(&v)).unwrap();
+        let db = rt.upload_f32(&flat(&beta)).unwrap();
+        let dg = rt.upload_f32(&flat(&g)).unwrap();
+        let mut pre_state = rt.upload_f32(&vec![0.0f32; n_v * d_v * d_k]).unwrap();
+        let mut pre_out = rt.alloc_f32(t_len * n_v * d_v).unwrap();
+        rt.gated_deltanet_prefill_step(&mut pre_state, &dq, &dk, &dv, &db, &dg, &mut pre_out,
+            t_len, n_v, d_k, d_v).unwrap();
+        rt.synchronize().unwrap();
+        let pre_outs = rt.download_f32(&pre_out).unwrap();
+        let pre_final_state = rt.download_f32(&pre_state).unwrap();
+
+        let oerr = max_abs_diff(&dec_outs, &pre_outs);
+        let serr = max_abs_diff(&dec_final_state, &pre_final_state);
+        assert!(oerr < 1e-4, "delta-rule batched-vs-decode out max_abs={oerr}");
+        assert!(serr < 1e-4, "delta-rule batched-vs-decode state max_abs={serr}");
+    }
+
+    #[test]
+    fn gdn_prefill_conv1d_matches_decode_t_times() {
+        let Some(rt) = skip_or_rt() else { return };
+        let (t_len, channels, kern) = (5usize, 5usize, 4usize);
+        let weight = frng(7, channels * kern);
+        let xs: Vec<Vec<f32>> = (0..t_len).map(|t| frng(100 + t, channels)).collect();
+        let dw = rt.upload_f32(&weight).unwrap();
+
+        // Decode T times (conv_state threaded).
+        let mut dec_state = rt.upload_f32(&vec![0.0f32; channels * (kern - 1)]).unwrap();
+        let mut dec_outs = vec![0.0f32; t_len * channels];
+        for t in 0..t_len {
+            let dx = rt.upload_f32(&xs[t]).unwrap();
+            let mut dout = rt.alloc_f32(channels).unwrap();
+            rt.gdn_conv1d_decode(&dx, &mut dec_state, &dw, &mut dout, channels, kern).unwrap();
+            rt.synchronize().unwrap();
+            let o = rt.download_f32(&dout).unwrap();
+            dec_outs[t * channels..(t + 1) * channels].copy_from_slice(&o);
+        }
+        let dec_final_state = rt.download_f32(&dec_state).unwrap();
+
+        // Batched: [T, C].
+        let x_flat: Vec<f32> = xs.iter().flatten().copied().collect();
+        let dx = rt.upload_f32(&x_flat).unwrap();
+        let mut pre_state = rt.upload_f32(&vec![0.0f32; channels * (kern - 1)]).unwrap();
+        let mut pre_out = rt.alloc_f32(t_len * channels).unwrap();
+        rt.gdn_conv1d_prefill(&dx, &mut pre_state, &dw, &mut pre_out, t_len, channels, kern).unwrap();
+        rt.synchronize().unwrap();
+        let pre_outs = rt.download_f32(&pre_out).unwrap();
+        let pre_final_state = rt.download_f32(&pre_state).unwrap();
+
+        let oerr = max_abs_diff(&dec_outs, &pre_outs);
+        let serr = max_abs_diff(&dec_final_state, &pre_final_state);
+        assert!(oerr < 1e-4, "conv1d batched-vs-decode out max_abs={oerr}");
+        assert!(serr < 1e-4, "conv1d batched-vs-decode state max_abs={serr}");
+    }
+
+    #[test]
+    fn gdn_prefill_qk_norm_matches_decode_t_times() {
+        let Some(rt) = skip_or_rt() else { return };
+        let (t_len, n_k, n_v, d_k) = (5usize, 2usize, 4usize, 8usize);
+        let expand = n_v / n_k;
+        let q: Vec<Vec<f32>> = (0..t_len).map(|t| frng(t * 11 + 1, n_k * d_k)).collect();
+        let k: Vec<Vec<f32>> = (0..t_len).map(|t| frng(t * 11 + 2, n_k * d_k)).collect();
+
+        // Decode per token.
+        let mut dec_q = vec![0.0f32; t_len * n_v * d_k];
+        let mut dec_k = vec![0.0f32; t_len * n_v * d_k];
+        for t in 0..t_len {
+            let dq = rt.upload_f32(&q[t]).unwrap();
+            let dk = rt.upload_f32(&k[t]).unwrap();
+            let mut dqo = rt.alloc_f32(n_v * d_k).unwrap();
+            let mut dko = rt.alloc_f32(n_v * d_k).unwrap();
+            rt.gdn_qk_norm_expand(&dq, &dk, &mut dqo, &mut dko, n_k, n_v, d_k).unwrap();
+            rt.synchronize().unwrap();
+            dec_q[t * n_v * d_k..(t + 1) * n_v * d_k].copy_from_slice(&rt.download_f32(&dqo).unwrap());
+            dec_k[t * n_v * d_k..(t + 1) * n_v * d_k].copy_from_slice(&rt.download_f32(&dko).unwrap());
+        }
+        // Batched [T, n_k, d_k].
+        let qf: Vec<f32> = q.iter().flatten().copied().collect();
+        let kf: Vec<f32> = k.iter().flatten().copied().collect();
+        let dq = rt.upload_f32(&qf).unwrap();
+        let dk = rt.upload_f32(&kf).unwrap();
+        let mut dqo = rt.alloc_f32(t_len * n_v * d_k).unwrap();
+        let mut dko = rt.alloc_f32(t_len * n_v * d_k).unwrap();
+        rt.gdn_qk_norm_expand_batched(&dq, &dk, &mut dqo, &mut dko, t_len, n_k, n_v, d_k, expand).unwrap();
+        rt.synchronize().unwrap();
+        let qerr = max_abs_diff(&dec_q, &rt.download_f32(&dqo).unwrap());
+        let kerr = max_abs_diff(&dec_k, &rt.download_f32(&dko).unwrap());
+        assert!(qerr < 1e-4, "qk_norm batched-vs-decode q max_abs={qerr}");
+        assert!(kerr < 1e-4, "qk_norm batched-vs-decode k max_abs={kerr}");
+    }
+
+    #[test]
+    fn gdn_prefill_gate_matches_decode_t_times() {
+        let Some(rt) = skip_or_rt() else { return };
+        let (t_len, n_v) = (5usize, 6usize);
+        let a_log = frng(91, n_v);
+        let dt = frng(92, n_v);
+        let dal = rt.upload_f32(&a_log).unwrap();
+        let ddt = rt.upload_f32(&dt).unwrap();
+        let b: Vec<Vec<f32>> = (0..t_len).map(|t| frng(t * 13 + 1, n_v)).collect();
+        let a: Vec<Vec<f32>> = (0..t_len).map(|t| frng(t * 13 + 2, n_v)).collect();
+
+        let mut dec_beta = vec![0.0f32; t_len * n_v];
+        let mut dec_g = vec![0.0f32; t_len * n_v];
+        for t in 0..t_len {
+            let db = rt.upload_f32(&b[t]).unwrap();
+            let da = rt.upload_f32(&a[t]).unwrap();
+            let mut dbeta = rt.alloc_f32(n_v).unwrap();
+            let mut dg = rt.alloc_f32(n_v).unwrap();
+            rt.gdn_gate(&db, &da, &dal, &ddt, &mut dbeta, &mut dg, n_v).unwrap();
+            rt.synchronize().unwrap();
+            dec_beta[t * n_v..(t + 1) * n_v].copy_from_slice(&rt.download_f32(&dbeta).unwrap());
+            dec_g[t * n_v..(t + 1) * n_v].copy_from_slice(&rt.download_f32(&dg).unwrap());
+        }
+        let bf: Vec<f32> = b.iter().flatten().copied().collect();
+        let af: Vec<f32> = a.iter().flatten().copied().collect();
+        let db = rt.upload_f32(&bf).unwrap();
+        let da = rt.upload_f32(&af).unwrap();
+        let mut dbeta = rt.alloc_f32(t_len * n_v).unwrap();
+        let mut dg = rt.alloc_f32(t_len * n_v).unwrap();
+        rt.gdn_gate_batched(&db, &da, &dal, &ddt, &mut dbeta, &mut dg, t_len, n_v).unwrap();
+        rt.synchronize().unwrap();
+        let berr = max_abs_diff(&dec_beta, &rt.download_f32(&dbeta).unwrap());
+        let gerr = max_abs_diff(&dec_g, &rt.download_f32(&dg).unwrap());
+        assert!(berr < 1e-5, "gate batched-vs-decode beta max_abs={berr}");
+        assert!(gerr < 1e-5, "gate batched-vs-decode g max_abs={gerr}");
+    }
+
+    #[test]
+    fn gdn_prefill_gated_rmsnorm_matches_decode_t_times() {
+        let Some(rt) = skip_or_rt() else { return };
+        let (t_len, n_v, d_v) = (5usize, 4usize, 8usize);
+        let w = frng(53, d_v);
+        let dw = rt.upload_f32(&w).unwrap();
+        let eps = 1e-6f32;
+        let o: Vec<Vec<f32>> = (0..t_len).map(|t| frng(t * 17 + 1, n_v * d_v)).collect();
+        let z: Vec<Vec<f32>> = (0..t_len).map(|t| frng(t * 17 + 2, n_v * d_v)).collect();
+
+        let mut dec_out = vec![0.0f32; t_len * n_v * d_v];
+        for t in 0..t_len {
+            let dop = rt.upload_f32(&o[t]).unwrap();
+            let dz = rt.upload_f32(&z[t]).unwrap();
+            let mut dout = rt.alloc_f32(n_v * d_v).unwrap();
+            rt.gdn_gated_rmsnorm(&dop, &dz, &dw, &mut dout, n_v, d_v, eps).unwrap();
+            rt.synchronize().unwrap();
+            dec_out[t * n_v * d_v..(t + 1) * n_v * d_v].copy_from_slice(&rt.download_f32(&dout).unwrap());
+        }
+        let of: Vec<f32> = o.iter().flatten().copied().collect();
+        let zf: Vec<f32> = z.iter().flatten().copied().collect();
+        let dop = rt.upload_f32(&of).unwrap();
+        let dz = rt.upload_f32(&zf).unwrap();
+        let mut dout = rt.alloc_f32(t_len * n_v * d_v).unwrap();
+        rt.gdn_gated_rmsnorm_batched(&dop, &dz, &dw, &mut dout, t_len, n_v, d_v, eps).unwrap();
+        rt.synchronize().unwrap();
+        let err = max_abs_diff(&dec_out, &rt.download_f32(&dout).unwrap());
+        assert!(err < 1e-4, "gated_rmsnorm batched-vs-decode max_abs={err}");
+    }
+
+    #[test]
+    fn gdn_prefill_strided_copy_splits_correctly() {
+        let Some(rt) = skip_or_rt() else { return };
+        // Mirror the conv-output split: src [rows, src_stride] → q/k/v slices.
+        let (rows, n_k, d_k, n_v, d_v) = (4usize, 2usize, 8usize, 4usize, 8usize);
+        let qk = n_k * d_k;
+        let vw = n_v * d_v;
+        let src_stride = 2 * qk + vw;
+        let src: Vec<f32> = frng(5, rows * src_stride);
+        let dsrc = rt.upload_f32(&src).unwrap();
+        let mut dq = rt.alloc_f32(rows * qk).unwrap();
+        let mut dk = rt.alloc_f32(rows * qk).unwrap();
+        let mut dv = rt.alloc_f32(rows * vw).unwrap();
+        rt.strided_copy_2d(&dsrc, &mut dq, rows, qk, src_stride, qk, 0).unwrap();
+        rt.strided_copy_2d(&dsrc, &mut dk, rows, qk, src_stride, qk, qk).unwrap();
+        rt.strided_copy_2d(&dsrc, &mut dv, rows, vw, src_stride, vw, 2 * qk).unwrap();
+        rt.synchronize().unwrap();
+        let gq = rt.download_f32(&dq).unwrap();
+        let gk = rt.download_f32(&dk).unwrap();
+        let gv = rt.download_f32(&dv).unwrap();
+        for r in 0..rows {
+            for c in 0..qk {
+                assert_eq!(gq[r * qk + c], src[r * src_stride + c], "q[{r},{c}]");
+                assert_eq!(gk[r * qk + c], src[r * src_stride + qk + c], "k[{r},{c}]");
+            }
+            for c in 0..vw {
+                assert_eq!(gv[r * vw + c], src[r * src_stride + 2 * qk + c], "v[{r},{c}]");
+            }
+        }
+    }
 }

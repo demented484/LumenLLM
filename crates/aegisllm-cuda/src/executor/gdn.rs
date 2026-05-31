@@ -253,6 +253,34 @@ pub(super) fn forward_gdn_mixer_prefill_chunk(
             runtime.matvec_fp8_standalone_device(f, &in0, &mut mvout)?;
             let mv = runtime.download_f32(&mvout)?;
             eprintln!("[GDN-DBG PRE] qkv_via_decode_matvec[0..6]={:?}", &mv[0..6]);
+            // Full-N cosine: GEMM row 0 vs decode-matvec.
+            let g0 = &q[0..f.rows];
+            let dot: f64 = g0.iter().zip(&mv).map(|(&x,&y)| x as f64 * y as f64).sum();
+            let na: f64 = g0.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = mv.iter().map(|&y| (y as f64).powi(2)).sum::<f64>().sqrt();
+            eprintln!("[GDN-DBG PRE] qkv GEMM-vs-matvec cos={:.5} |gemm|={:.3} |mv|={:.3}",
+                dot/(na*nb+1e-12), na, nb);
+            // Dump activation scale for token-0, group-0 and group-1.
+            let asc = runtime.download_f32(&prefill.fp8_a_scale)?;
+            let nkg = kdim / 128;
+            eprintln!("[GDN-DBG PRE] a_scale[tok0 g0..g3]={:?}", &asc[0..4.min(nkg)]);
+            // Reconstruct activation from a_q*a_scale and compare to raw normed (token 0).
+            let aq = runtime.download_u8(&prefill.fp8_a_q)?;
+            let e4 = |b: u8| -> f32 {
+                let s = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
+                let m = (b & 0x7f) as u32;
+                if m == 0 { return 0.0; }
+                let e = (m >> 3) & 0xf; let mant = (m & 7) as f32;
+                let v = if e == 0 { mant * 0.001953125 } else { (1.0 + mant*0.125) * 2f32.powi(e as i32 - 7) };
+                s * v
+            };
+            let mut rec_err = 0.0f64; let mut raw_n = 0.0f64;
+            for j in 0..kdim {
+                let rec = e4(aq[j]) * asc[j / 128];
+                rec_err += ((rec - n[j]) as f64).powi(2);
+                raw_n += (n[j] as f64).powi(2);
+            }
+            eprintln!("[GDN-DBG PRE] act-quant rel-err={:.5}", (rec_err/raw_n).sqrt());
         }
     }
     gdn_proj_batched(runtime, &gdn.in_proj_z, &prefill.input_normed, batch,
