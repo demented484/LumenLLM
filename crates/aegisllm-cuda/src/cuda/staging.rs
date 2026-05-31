@@ -29,6 +29,14 @@ fn count_h2d(bytes: usize) {
 pub(crate) struct StagingSlot {
     packed: CudaSlice<u8>,
     scales: CudaSlice<u8>,
+    /// Single contiguous `[packed_cap + scales_cap]` device buffer. When the
+    /// host packed+scales are adjacent in the pinned arena (the contiguous
+    /// loader layout), `prepare_async` issues ONE H2D into this buffer and the
+    /// consuming kernel reads packed at `[0..packed_bytes]` and scales at
+    /// `[packed_bytes..]`. Halves the per-projection H2D call count on the
+    /// CPU-issue-bound decode path. `packed`/`scales` above remain for the
+    /// non-contiguous fallback (two copies) and the native-MXFP4 path.
+    combined: CudaSlice<u8>,
     native_mxfp4: Option<CudaSlice<u8>>,
     bounce_packed: OwnedPinnedBuf,
     bounce_scales: OwnedPinnedBuf,
@@ -44,6 +52,11 @@ pub(crate) struct StagingSlot {
     /// Reusable transfer-stream event re-recorded after every H2D into this
     /// slot. Compute stream waits on this before launching its kernel.
     transfer_event: CudaEvent,
+    /// When the most recent `prepare_async` used the single-copy combined path,
+    /// this is `Some(packed_bytes)` — the offset at which scales begin inside
+    /// `combined`. `packed_view`/`scales_view` then carve views out of
+    /// `combined`. `None` means the last prepare used the two-buffer path.
+    combined_packed_bytes: Option<usize>,
 }
 
 /// Double-buffered VRAM staging pool used for streaming host-resident layers
@@ -137,6 +150,8 @@ impl LinearStagingPool {
                 .map_err(map_cuda_err("alloc staging packed buffer"))?;
             let scales = unsafe { stream.alloc::<u8>(cap_s) }
                 .map_err(map_cuda_err("alloc staging scales buffer"))?;
+            let combined = unsafe { stream.alloc::<u8>(cap_p + cap_s) }
+                .map_err(map_cuda_err("alloc staging combined buffer"))?;
             let bounce_packed = OwnedPinnedBuf::new(cap_p)?;
             let bounce_scales = OwnedPinnedBuf::new(cap_s)?;
             let (native_mxfp4, bounce_native_mxfp4) = if max_native_mxfp4_bytes > 0 {
@@ -158,6 +173,7 @@ impl LinearStagingPool {
             Ok(StagingSlot {
                 packed,
                 scales,
+                combined,
                 native_mxfp4,
                 bounce_packed,
                 bounce_scales,
@@ -165,6 +181,7 @@ impl LinearStagingPool {
                 compute_event,
                 primed: false,
                 transfer_event,
+                combined_packed_bytes: None,
             })
         };
         let slot_count = configured_slot_count();
@@ -236,6 +253,42 @@ impl LinearStagingPool {
             runtime.transfer_wait_event(&slot.compute_event)?;
         }
 
+        // ── Single-copy combined path (decode CPU-op-count fix) ──────────────
+        //
+        // When packed+scales are physically adjacent in the same pinned arena
+        // (the contiguous loader layout), issue ONE `cuMemcpyHtoDAsync` for the
+        // whole `[packed || scales]` block into this slot's `combined` device
+        // buffer. The consuming kernel then reads packed at `[0..packed_bytes]`
+        // and scales at `[packed_bytes..]` via `packed_view`/`scales_view`.
+        // Halves the per-projection H2D call count on the CPU-issue-bound
+        // decode path. Bit-identical: same bytes (the combined slice IS the two
+        // back-to-back regions), same kernel, same order — only the *number* of
+        // host-issued copies changes. Falls through to the two-copy path below
+        // when not arena-adjacent (mmap/pinned fallback, or pre-contiguous
+        // layouts). Native-MXFP4 is unaffected (separate buffer/path).
+        let transfer_stream = runtime.transfer_stream();
+        if let Some(combined) = hw.contiguous_packed_scales() {
+            let combined = combined?;
+            let total = packed_bytes + scale_bytes;
+            debug_assert_eq!(combined.len(), total, "combined slice spans packed+scales");
+            if total > slot.combined.len() {
+                return Err(AegisError::InvalidPlan(format!(
+                    "staging combined overflow: layer needs {} bytes, slot has {}",
+                    total,
+                    slot.combined.len()
+                )));
+            }
+            let mut dst = slot.combined.slice_mut(0..total);
+            transfer_stream
+                .memcpy_htod(&combined[..total], &mut dst)
+                .map_err(map_cuda_err("staging async h2d combined (pinned src)"))?;
+            slot.combined_packed_bytes = Some(packed_bytes);
+            runtime.record_into_transfer(&slot.transfer_event)?;
+            runtime.compute_wait_event(&slot.transfer_event)?;
+            self.last_prepared_slot = Some(slot_idx);
+            return Ok(slot_idx);
+        }
+        slot.combined_packed_bytes = None;
         // Source-type dispatch:
         //
         //   * Pinned source (Arena / Pinned variant) — feed straight into
@@ -248,7 +301,6 @@ impl LinearStagingPool {
         //     first, then DMA from bounce. Without the bounce, `memcpy_htod`
         //     internally bounces through the driver's small staging area,
         //     which serialises and is much slower for high-frequency calls.
-        let transfer_stream = runtime.transfer_stream();
         if hw.packed.is_pinned() {
             let src = hw.packed.as_bytes()?;
             let mut dst = slot.packed.slice_mut(0..packed_bytes);
@@ -370,11 +422,21 @@ impl LinearStagingPool {
     }
 
     pub(crate) fn packed_view(&self, slot_idx: usize, len: usize) -> CudaView<'_, u8> {
-        self.slots[slot_idx].packed.slice(0..len)
+        let slot = &self.slots[slot_idx];
+        // Combined single-copy path: packed lives at [0..len) inside `combined`.
+        if slot.combined_packed_bytes.is_some() {
+            return slot.combined.slice(0..len);
+        }
+        slot.packed.slice(0..len)
     }
 
     pub(crate) fn scales_view(&self, slot_idx: usize, len: usize) -> CudaView<'_, u8> {
-        self.slots[slot_idx].scales.slice(0..len)
+        let slot = &self.slots[slot_idx];
+        // Combined single-copy path: scales follow packed inside `combined`.
+        if let Some(packed_bytes) = slot.combined_packed_bytes {
+            return slot.combined.slice(packed_bytes..packed_bytes + len);
+        }
+        slot.scales.slice(0..len)
     }
 
     pub(crate) fn native_mxfp4_view(
@@ -404,6 +466,10 @@ impl LinearStagingPool {
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
     ) -> Result<()> {
         let slot = &mut self.slots[0];
+        // Legacy path writes the separate packed/scales buffers; clear any
+        // combined marker a prior prepare_async on slot 0 may have left so the
+        // view accessors read the right (separate) buffers.
+        slot.combined_packed_bytes = None;
         if packed_bytes > slot.packed.len() {
             return Err(AegisError::InvalidPlan(format!(
                 "staging packed overflow: layer needs {} bytes, pool has {}",

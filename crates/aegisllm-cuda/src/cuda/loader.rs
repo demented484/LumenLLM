@@ -168,45 +168,60 @@ fn dequant_fp8_block_into_bf16(
     });
 }
 
-/// Read a tensor's raw bytes from disk into the pinned host arena via
-/// 8-way parallel `pread`. Returns the byte offset inside the arena
-/// where bytes were placed; combined with the byte length this
-/// uniquely identifies the slice for downstream `HostWeightBytes::Arena`.
-fn read_tensor_into_arena(
+/// Reserve ONE contiguous arena slot holding a projection's packed weight
+/// immediately followed by its scales, and read both into it from disk via
+/// parallel `pread`. Returns `(packed, scales)` arena views with the invariant
+/// `scales.offset == packed.offset + packed.len` — i.e. the two are physically
+/// adjacent in the pinned arena.
+///
+/// This adjacency lets the decode staging pool issue ONE `cuMemcpyHtoDAsync`
+/// covering both packed+scales (into one contiguous device slot, viewed at
+/// sub-offsets) instead of two separate copies — halving the per-expert-
+/// projection H2D call count on the CPU-issue-bound decode path. Bit-identical:
+/// same bytes, same order, same kernel; only the *number* of host-issued copies
+/// changes. Other consumers (prefill bulk, GPU-driven gather) keep using the
+/// two views independently — adjacency is a superset guarantee, transparent to
+/// them.
+fn read_packed_scales_contiguous_into_arena(
     arena: &ArenaHandle,
-    tensor: &TensorInfo,
-) -> Result<HostWeightBytes> {
-    let len = tensor.data_len_bytes() as usize;
-    // Reserve the arena slot first (atomic bump). The actual read into
-    // the slot can then run in parallel with other tensors' reads
-    // because slots are disjoint by construction.
-    let offset = arena.reserve(len)?;
-    // SAFETY: `arena.reserve` exclusively claimed [offset, offset+len);
-    // we have unique write access until we release it.
-    let dst = unsafe { arena.slice_mut(offset, len) };
-    read_chunked_par(&tensor.shard_path, tensor.file_offsets.0, dst)?;
-    Ok(HostWeightBytes::Arena {
-        arena: arena.clone(),
-        offset,
-        len,
-    })
+    packed: &TensorInfo,
+    scales: &TensorInfo,
+) -> Result<(HostWeightBytes, HostWeightBytes)> {
+    let plen = packed.data_len_bytes() as usize;
+    let slen = scales.data_len_bytes() as usize;
+    let base = arena.reserve(plen + slen)?;
+    // SAFETY: `reserve` exclusively claimed [base, base+plen+slen); the two
+    // sub-ranges are disjoint and exclusively ours until released.
+    let pdst = unsafe { arena.slice_mut(base, plen) };
+    read_chunked_par(&packed.shard_path, packed.file_offsets.0, pdst)?;
+    let sdst = unsafe { arena.slice_mut(base + plen, slen) };
+    read_chunked_par(&scales.shard_path, scales.file_offsets.0, sdst)?;
+    Ok((
+        HostWeightBytes::Arena { arena: arena.clone(), offset: base, len: plen },
+        HostWeightBytes::Arena { arena: arena.clone(), offset: base + plen, len: slen },
+    ))
 }
 
-/// Copy already-in-memory bytes into a fresh pinned-arena slot (no disk I/O).
-/// Used by the shard-buffer prefetch, which reads a whole shard sequentially
-/// once then slices the (scattered) expert tensors out of the buffer.
-fn copy_into_arena(arena: &ArenaHandle, src: &[u8]) -> Result<HostWeightBytes> {
-    let len = src.len();
-    let offset = arena.reserve(len)?;
-    // SAFETY: `reserve` exclusively claimed [offset, offset+len); disjoint from
-    // every other slot, so parallel copies into distinct slots do not alias.
-    let dst = unsafe { arena.slice_mut(offset, len) };
-    dst.copy_from_slice(src);
-    Ok(HostWeightBytes::Arena {
-        arena: arena.clone(),
-        offset,
-        len,
-    })
+/// Like [`read_packed_scales_contiguous_into_arena`] but copies from an
+/// in-memory shard buffer (the whole-shard prefetch path) rather than reading
+/// from disk. Same adjacency guarantee.
+fn copy_packed_scales_contiguous_into_arena(
+    arena: &ArenaHandle,
+    packed_src: &[u8],
+    scales_src: &[u8],
+) -> Result<(HostWeightBytes, HostWeightBytes)> {
+    let plen = packed_src.len();
+    let slen = scales_src.len();
+    let base = arena.reserve(plen + slen)?;
+    // SAFETY: `reserve` exclusively claimed [base, base+plen+slen); disjoint.
+    let pdst = unsafe { arena.slice_mut(base, plen) };
+    pdst.copy_from_slice(packed_src);
+    let sdst = unsafe { arena.slice_mut(base + plen, slen) };
+    sdst.copy_from_slice(scales_src);
+    Ok((
+        HostWeightBytes::Arena { arena: arena.clone(), offset: base, len: plen },
+        HostWeightBytes::Arena { arena: arena.clone(), offset: base + plen, len: slen },
+    ))
 }
 
 /// Free host RAM (Linux `MemAvailable`), used as a guard before buffering a
@@ -442,12 +457,17 @@ impl CudaWeightLoader<'_> {
                     return pairs
                         .par_iter()
                         .map(|(w, s)| -> Result<(HostWeightBytes, HostWeightBytes)> {
-                            let slice = |t: &TensorInfo| -> Result<HostWeightBytes> {
-                                let start = t.file_offsets.0 as usize;
-                                let len = t.data_len_bytes() as usize;
-                                copy_into_arena(arena, &buf[start..start + len])
+                            let span = |t: &TensorInfo| -> (usize, usize) {
+                                (t.file_offsets.0 as usize, t.data_len_bytes() as usize)
                             };
-                            Ok((slice(w)?, slice(s)?))
+                            let (wstart, wlen) = span(w);
+                            let (sstart, slen) = span(s);
+                            // Contiguous packed||scales arena slot → one H2D at decode.
+                            copy_packed_scales_contiguous_into_arena(
+                                arena,
+                                &buf[wstart..wstart + wlen],
+                                &buf[sstart..sstart + slen],
+                            )
                         })
                         .collect::<Result<Vec<_>>>();
                 }
@@ -455,12 +475,12 @@ impl CudaWeightLoader<'_> {
         }
 
         // FALLBACK — per-tensor parallel reads (multi-shard layer or low RAM).
+        // Still places each projection's packed||scales contiguously in the
+        // arena (one combined reserve), preserving the decode single-H2D win.
         pairs
             .par_iter()
             .map(|(weight, scales)| -> Result<(HostWeightBytes, HostWeightBytes)> {
-                let packed = read_tensor_into_arena(arena, weight)?;
-                let s = read_tensor_into_arena(arena, scales)?;
-                Ok((packed, s))
+                read_packed_scales_contiguous_into_arena(arena, weight, scales)
             })
             .collect::<Result<Vec<_>>>()
     }
@@ -1308,8 +1328,10 @@ impl CudaWeightLoader<'_> {
                     spec.name
                 ))
             })?;
-            let mmap_packed = read_tensor_into_arena(arena, weight)?;
-            let mmap_scales = read_tensor_into_arena(arena, scales)?;
+            // Contiguous packed||scales arena slot (adjacency lets decode issue
+            // one combined H2D per projection; see the contiguous helper).
+            let (mmap_packed, mmap_scales) =
+                read_packed_scales_contiguous_into_arena(arena, weight, scales)?;
             let _ = store;
             let stub_packed = self
                 .runtime

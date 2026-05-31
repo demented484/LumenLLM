@@ -164,6 +164,43 @@ impl HostWeightBytes {
             _ => None,
         }
     }
+
+    /// `(arena_ptr_identity, offset, len)` for an `Arena`-backed slice, else
+    /// `None`. The identity is the arena `Arc`'s data pointer — two slices with
+    /// the same identity and adjacent `offset+len` are physically contiguous in
+    /// the same pinned arena, which the decode staging pool uses to coalesce a
+    /// projection's packed+scales into one `cuMemcpyHtoDAsync`.
+    pub fn arena_span(&self) -> Option<(usize, usize, usize)> {
+        match self {
+            Self::Arena { arena, offset, len } => {
+                Some((std::sync::Arc::as_ptr(arena) as usize, *offset, *len))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl HostResidentWeights {
+    /// If `packed` and `scales` are adjacent slices of the SAME pinned arena
+    /// (`scales` immediately follows `packed`), returns the single contiguous
+    /// `[packed || scales]` host byte slice. The decode staging pool issues ONE
+    /// H2D for it instead of two. Returns `None` when not arena-backed or not
+    /// adjacent (e.g. mmap/pinned fallback, or a layout that didn't use the
+    /// contiguous loader path) — callers then fall back to two copies.
+    pub fn contiguous_packed_scales(&self) -> Option<Result<&[u8]>> {
+        let (pa, po, pl) = self.packed.arena_span()?;
+        let (sa, so, _sl) = self.scales.arena_span()?;
+        if pa != sa || so != po + pl {
+            return None;
+        }
+        // Slice the combined region [po, po+pl+sl) from the packed view's arena.
+        let combined_len = pl + _sl;
+        Some(match &self.packed {
+            HostWeightBytes::Arena { arena, offset, .. } => Ok(arena.slice(*offset, combined_len)),
+            // arena_span already matched Arena above; unreachable otherwise.
+            _ => unreachable!("arena_span matched but variant is not Arena"),
+        })
+    }
 }
 
 #[derive(Debug)]
