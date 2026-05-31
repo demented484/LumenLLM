@@ -1145,8 +1145,18 @@ mod tests {
         };
         let (m, n, k) = (40usize, 128usize, 256usize); // M-tail, N=1 block, K=2 groups
         let nkg = k / 128;
+        // Generate VALID e4m3 weight bytes: magnitude 0x7F (and its signed
+        // 0xFF) is the e4m3 NaN encoding. Real FP8 checkpoints never contain it,
+        // but the SM120 tensor-core MMA decodes it as a hardware NaN that
+        // propagates through the whole accumulation tile — so a raw-random
+        // weight byte gave a spurious all-NaN GEMM output. Clamp the NaN
+        // magnitude to 0x7E (the e4m3 max, 448) to keep every byte finite.
         let urng = |seed: usize, len: usize| -> Vec<u8> {
-            (0..len).map(|i| ((seed.wrapping_mul(2_654_435_761).wrapping_add(i.wrapping_mul(40_503))) % 256) as u8).collect()
+            (0..len).map(|i| {
+                let b = ((seed.wrapping_mul(2_654_435_761).wrapping_add(i.wrapping_mul(40_503))) % 256) as u8;
+                let mag = b & 0x7F;
+                (b & 0x80) | if mag == 0x7F { 0x7E } else { mag }
+            }).collect()
         };
         let frng = |seed: usize, len: usize| -> Vec<f32> {
             (0..len).map(|i| ((seed.wrapping_mul(2_654_435_761).wrapping_add(i.wrapping_mul(40_503))) % 1000) as f32 / 500.0 - 1.0).collect()

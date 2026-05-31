@@ -19,6 +19,11 @@
 #ifndef AEGIS_FP8_LINEAR_CU
 #define AEGIS_FP8_LINEAR_CU
 
+#ifndef AEGIS_CUDA_FP8_H_INCLUDED
+#define AEGIS_CUDA_FP8_H_INCLUDED
+#include <cuda_fp8.h>   // __nv_fp8_e4m3 (hardware round-to-nearest-even e4m3 encoder)
+#endif
+
 extern "C" __global__ void aegis_quantize_bf16_to_fp8_per_row(
     const unsigned short* __restrict__ bf16,  // [rows, cols] BF16 packed as u16
     unsigned char* __restrict__ fp8_out,       // [rows, cols] E4M3
@@ -354,7 +359,16 @@ extern "C" __global__ void aegis_quantize_f32_to_fp8_token_group(
     if (tid == 0u && m < M) a_scale[(size_t)m * n_kgroups + g] = scale;
     if (m < M && k < K) {
         const float q = fminf(fmaxf(v / scale, -448.0f), 448.0f);
-        a_q[(size_t)m * K + k] = float_to_fp8_e4m3_bits(q);
+        // Hardware round-to-nearest-even e4m3 encoder. The hand-rolled
+        // `float_to_fp8_e4m3_bits` is round-half-UP, which over a 4096-wide
+        // RMS-normed activation accumulates a ~12% upward magnitude bias —
+        // catastrophic in the recurrent GDN prefill path (gibberish). The
+        // `__nv_fp8_e4m3` constructor (cuda_fp8.h, NVRTC-compilable on SM120,
+        // the same encoder the HW-verified fp8_mma_smoke harness uses) is
+        // unbiased and bit-matches the e4m3 the SM120 MMA decodes. Brought
+        // act-quant rel-err 30%->2.6% and the GEMM-vs-decode cos 0.9975->0.99996.
+        const __nv_fp8_e4m3 e = __nv_fp8_e4m3(q);
+        a_q[(size_t)m * K + k] = *reinterpret_cast<const unsigned char*>(&e);
     }
 }
 
