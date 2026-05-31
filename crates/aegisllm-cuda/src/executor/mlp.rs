@@ -1,6 +1,7 @@
 use super::linear_ops::{
     matvec_cuda_linear_with_scratch, matvec_nvfp4_device_with_scratch,
-    matvec_nvfp4_prepared_device_reuse, native_mxfp4_enabled, prepare_nvfp4_input,
+    matvec_nvfp4_prepared_device_reuse, native_mxfp4_enabled, nvfp4_a16_enabled,
+    prepare_nvfp4_input,
 };
 use super::state::{CudaLayer, CudaLinear, CudaMoE, CudaMoEScratch, CudaScratch};
 use crate::cuda::{CudaRuntime, DeviceBuffer};
@@ -1017,18 +1018,62 @@ fn forward_moe_decode_device(
             let expert_idx = moe_scratch.router_top_indices[i];
             let weight = moe_scratch.router_top_weights[i];
             let expert = &moe.experts[expert_idx];
-            matvec_nvfp4_device_with_scratch(
-                runtime, &expert.gate_proj, hidden_out,
-                &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
-                &mut moe_scratch.expert_gate,
-                if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-            )?;
-            matvec_nvfp4_device_with_scratch(
-                runtime, &expert.up_proj, hidden_out,
-                &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
-                &mut moe_scratch.expert_up,
-                if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
-            )?;
+            // ── Shared gate/up activation quantize (decode CPU-op-count fix) ──
+            //
+            // gate_proj and up_proj read the SAME input (`hidden_out`, this
+            // layer's expert-input hidden vector). For NVFP4 the input quant is
+            // a function of (input vector, input_scale); when the two
+            // projections also share `input_scale` the quantized buffer is
+            // BYTE-IDENTICAL, so quantizing once and reusing it for both GEMVs
+            // is bit-identical. The Qwen3.x NVFP4 checkpoint emits the SAME
+            // `input_global_scale` for gate_proj and up_proj of every expert
+            // (verified: gate==up across all experts/layers), so this fires on
+            // the hot path and halves the per-expert input-quant launches
+            // (3/expert → 2/expert, ~312 fewer quantize launches/token on the
+            // 35B). Strictly guarded: if the scales ever differ (other model),
+            // fall back to per-projection quant — still correct, just not
+            // deduped. `gate_up_share_quant` decides whether to reuse the
+            // gate-quantized buffer for up; `prepared_valid` tells the reuse
+            // helper to skip the (native-MXFP4 path's) MXFP4 quant too.
+            let gate_up_share_quant =
+                expert.gate_proj.is_host_resident()
+                    && !nvfp4_a16_enabled()
+                    && !expert.gate_proj.is_host_resident_with_native_mxfp4()
+                    && expert.gate_proj.input_scale == expert.up_proj.input_scale;
+            if gate_up_share_quant {
+                // Quantize hidden_out ONCE with the shared gate/up scale into
+                // quant_expert, then run both GEMVs reading that buffer.
+                runtime.quantize_nvfp4_input_device(
+                    hidden_out, expert.gate_proj.input_scale, &mut moe_scratch.quant_expert,
+                )?;
+                let staging_gate =
+                    if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) };
+                matvec_nvfp4_prepared_device_reuse(
+                    runtime, &expert.gate_proj, hidden_out, &moe_scratch.quant_expert,
+                    &mut moe_scratch.mxfp4_expert, false, &mut moe_scratch.expert_gate,
+                    staging_gate,
+                )?;
+                let staging_up =
+                    if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) };
+                matvec_nvfp4_prepared_device_reuse(
+                    runtime, &expert.up_proj, hidden_out, &moe_scratch.quant_expert,
+                    &mut moe_scratch.mxfp4_expert, false, &mut moe_scratch.expert_up,
+                    staging_up,
+                )?;
+            } else {
+                matvec_nvfp4_device_with_scratch(
+                    runtime, &expert.gate_proj, hidden_out,
+                    &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
+                    &mut moe_scratch.expert_gate,
+                    if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
+                )?;
+                matvec_nvfp4_device_with_scratch(
+                    runtime, &expert.up_proj, hidden_out,
+                    &mut moe_scratch.quant_expert, &mut moe_scratch.mxfp4_expert,
+                    &mut moe_scratch.expert_up,
+                    if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
+                )?;
+            }
             runtime.geglu_tanh_device(&moe_scratch.expert_gate, &moe_scratch.expert_up, &mut moe_scratch.expert_swiglu)?;
             matvec_nvfp4_device_with_scratch(
                 runtime, &expert.down_proj, &moe_scratch.expert_swiglu,

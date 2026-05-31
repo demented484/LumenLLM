@@ -50,7 +50,7 @@ pub(super) fn prepare_nvfp4_input_batched(
 /// is now valid so callers can chain projections without tracking the flag themselves.
 /// Debug A/B: run host-resident NVFP4 matvecs at W4A16 (f32 activation, no fp4
 /// input quant) to isolate W4A4 activation-accumulation. Set AEGIS_NVFP4_A16=1.
-fn nvfp4_a16_enabled() -> bool {
+pub(super) fn nvfp4_a16_enabled() -> bool {
     use std::sync::OnceLock;
     static F: OnceLock<bool> = OnceLock::new();
     *F.get_or_init(|| std::env::var("AEGIS_NVFP4_A16").is_ok_and(|v| v != "0"))
