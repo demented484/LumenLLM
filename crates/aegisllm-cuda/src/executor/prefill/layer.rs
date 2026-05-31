@@ -199,7 +199,15 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     params: CudaPrefillForwardParams,
     timings: &mut CudaPrefillStageTimings,
 ) -> Result<()> {
-    let hidden_size = layer.o_proj.rows();
+    // GDN layers have a 1-row dummy `o_proj` (their real output projection is
+    // `gdn.out_proj`, which maps v_width → hidden). Using `layer.o_proj.rows()`
+    // there yields hidden_size=1, so the GDN residual add only touched element 0
+    // of each token (everything past index 0 stayed at the embedding/garbage),
+    // producing gibberish. Take hidden from the GDN out_proj for GDN layers.
+    let hidden_size = match layer.gdn.as_ref() {
+        Some(gdn) => gdn.out_proj.rows(),
+        None => layer.o_proj.rows(),
+    };
     // For MoE layers, gate_proj is a dummy (rows=1). The real intermediate lives in
     // CudaMoE::expert_intermediate_size, but prefill MoE is guarded below.
     let intermediate = if layer.moe.is_some() { 1 } else { layer.gate_proj.rows() };

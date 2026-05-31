@@ -110,12 +110,6 @@ pub(super) fn forward_gdn_mixer_decode(
         runtime, &gdn.in_proj_qkv, &normed,
         &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut qkv, None,
     )?;
-    if std::env::var("AEGIS_GDN_DBG").is_ok() {
-        let n = runtime.download_f32(&normed)?;
-        let q = runtime.download_f32(&qkv)?;
-        eprintln!("[GDN-DBG DEC] normed[0..6]={:?}", &n[0..6]);
-        eprintln!("[GDN-DBG DEC] qkv[0..6]={:?}", &q[0..6]);
-    }
     let mut z = runtime.alloc_f32(d.v_width())?;
     matvec_cuda_linear_with_scratch(
         runtime, &gdn.in_proj_z, &normed,
@@ -174,21 +168,6 @@ pub(super) fn forward_gdn_mixer_decode(
         &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut mixer_out, None,
     )?;
 
-    if std::env::var("AEGIS_GDN_DBG").is_ok() {
-        let cv = runtime.download_f32(&qkv_conv)?;
-        let qn = runtime.download_f32(&q_n)?;
-        let bt = runtime.download_f32(&beta)?;
-        let gg = runtime.download_f32(&g)?;
-        let oo = runtime.download_f32(&o)?;
-        let on = runtime.download_f32(&o_norm)?;
-        let mo = runtime.download_f32(&mixer_out)?;
-        eprintln!("[GDN-DBG DEC] conv[0..6]={:?}", &cv[0..6]);
-        eprintln!("[GDN-DBG DEC] q_n[0..6]={:?}", &qn[0..6]);
-        eprintln!("[GDN-DBG DEC] beta[0..4]={:?} g[0..4]={:?}", &bt[0..4], &gg[0..4]);
-        eprintln!("[GDN-DBG DEC] o[0..6]={:?}", &oo[0..6]);
-        eprintln!("[GDN-DBG DEC] o_norm[0..6]={:?}", &on[0..6]);
-        eprintln!("[GDN-DBG DEC] mixer_out[0..6]={:?}", &mo[0..6]);
-    }
     // 8. residual add (Qwen is PreOnly — no post-sublayer norm).
     runtime.add_device(hidden, &mixer_out, &mut scratch.residual)?;
     Ok(())
@@ -238,51 +217,6 @@ pub(super) fn forward_gdn_mixer_prefill_chunk(
     //    decode path comment).
     gdn_proj_batched(runtime, &gdn.in_proj_qkv, &prefill.input_normed, batch,
         &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.gdn_qkv)?;
-    if std::env::var("AEGIS_GDN_DBG").is_ok() {
-        let n = runtime.download_f32(&prefill.input_normed)?;
-        let q = runtime.download_f32(&prefill.gdn_qkv)?;
-        eprintln!("[GDN-DBG PRE] normed[0..6]={:?}", &n[0..6]);
-        eprintln!("[GDN-DBG PRE] qkv[0..6]={:?}", &q[0..6]);
-        // Cross-check: run the DECODE block-matvec on token-0's normed input
-        // against the SAME FP8 weight, isolating native-GEMM vs decode-matvec.
-        if let CudaLinear::Fp8(f) = &gdn.in_proj_qkv {
-            let kdim = f.cols;
-            let n0: Vec<f32> = n[0..kdim].to_vec();
-            let in0 = runtime.upload_f32(&n0)?;
-            let mut mvout = runtime.alloc_f32(f.rows)?;
-            runtime.matvec_fp8_standalone_device(f, &in0, &mut mvout)?;
-            let mv = runtime.download_f32(&mvout)?;
-            eprintln!("[GDN-DBG PRE] qkv_via_decode_matvec[0..6]={:?}", &mv[0..6]);
-            // Full-N cosine: GEMM row 0 vs decode-matvec.
-            let g0 = &q[0..f.rows];
-            let dot: f64 = g0.iter().zip(&mv).map(|(&x,&y)| x as f64 * y as f64).sum();
-            let na: f64 = g0.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-            let nb: f64 = mv.iter().map(|&y| (y as f64).powi(2)).sum::<f64>().sqrt();
-            eprintln!("[GDN-DBG PRE] qkv GEMM-vs-matvec cos={:.5} |gemm|={:.3} |mv|={:.3}",
-                dot/(na*nb+1e-12), na, nb);
-            // Dump activation scale for token-0, group-0 and group-1.
-            let asc = runtime.download_f32(&prefill.fp8_a_scale)?;
-            let nkg = kdim / 128;
-            eprintln!("[GDN-DBG PRE] a_scale[tok0 g0..g3]={:?}", &asc[0..4.min(nkg)]);
-            // Reconstruct activation from a_q*a_scale and compare to raw normed (token 0).
-            let aq = runtime.download_u8(&prefill.fp8_a_q)?;
-            let e4 = |b: u8| -> f32 {
-                let s = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
-                let m = (b & 0x7f) as u32;
-                if m == 0 { return 0.0; }
-                let e = (m >> 3) & 0xf; let mant = (m & 7) as f32;
-                let v = if e == 0 { mant * 0.001953125 } else { (1.0 + mant*0.125) * 2f32.powi(e as i32 - 7) };
-                s * v
-            };
-            let mut rec_err = 0.0f64; let mut raw_n = 0.0f64;
-            for j in 0..kdim {
-                let rec = e4(aq[j]) * asc[j / 128];
-                rec_err += ((rec - n[j]) as f64).powi(2);
-                raw_n += (n[j] as f64).powi(2);
-            }
-            eprintln!("[GDN-DBG PRE] act-quant rel-err={:.5}", (rec_err/raw_n).sqrt());
-        }
-    }
     gdn_proj_batched(runtime, &gdn.in_proj_z, &prefill.input_normed, batch,
         &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.gdn_z)?;
     gdn_proj_batched(runtime, &gdn.in_proj_b, &prefill.input_normed, batch,
@@ -334,21 +268,6 @@ pub(super) fn forward_gdn_mixer_prefill_chunk(
     gdn_proj_batched(runtime, &gdn.out_proj, &prefill.gdn_o_norm, batch,
         &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.gdn_mixer_out)?;
 
-    if std::env::var("AEGIS_GDN_DBG").is_ok() {
-        let cv = runtime.download_f32(&prefill.gdn_conv_out)?;
-        let qn = runtime.download_f32(&prefill.gdn_q_n)?;
-        let bt = runtime.download_f32(&prefill.gdn_beta)?;
-        let gg = runtime.download_f32(&prefill.gdn_g)?;
-        let oo = runtime.download_f32(&prefill.gdn_o)?;
-        let on = runtime.download_f32(&prefill.gdn_o_norm)?;
-        let mo = runtime.download_f32(&prefill.gdn_mixer_out)?;
-        eprintln!("[GDN-DBG PRE] conv[0..6]={:?}", &cv[0..6]);
-        eprintln!("[GDN-DBG PRE] q_n[0..6]={:?}", &qn[0..6]);
-        eprintln!("[GDN-DBG PRE] beta[0..4]={:?} g[0..4]={:?}", &bt[0..4], &gg[0..4]);
-        eprintln!("[GDN-DBG PRE] o[0..6]={:?}", &oo[0..6]);
-        eprintln!("[GDN-DBG PRE] o_norm[0..6]={:?}", &on[0..6]);
-        eprintln!("[GDN-DBG PRE] mixer_out[0..6]={:?}", &mo[0..6]);
-    }
     // 8. residual add (Qwen is PreOnly — no post-sublayer norm).
     runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.gdn_mixer_out, batch * hidden_size)?;
     Ok(())
