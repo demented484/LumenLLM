@@ -968,6 +968,7 @@ impl CudaLlamaExecutor {
         let num_draft = self.num_draft_tokens.max(1);
         let spec_stats = std::env::var("AEGIS_SPEC_STATS").is_ok();
         let (mut stat_rounds, mut stat_proposed, mut stat_accepted) = (0usize, 0usize, 0usize);
+        let (mut stat_draft_us, mut stat_verify_us) = (0u64, 0u64);
         let stat_t0 = std::time::Instant::now();
 
         let mut next = self.prefill_prompt(state, prompt_tokens, &greedy)?;
@@ -992,14 +993,19 @@ impl CudaLlamaExecutor {
             // (computed inside mtp_propose). The MTP layer's own KV is advanced
             // over the draft positions; it is re-seeded each round so no rollback
             // of the MTP KV is needed.
+            if spec_stats { self.runtime.synchronize()?; }
+            let t_draft = std::time::Instant::now();
             let proposals = self.mtp_propose(state, next, base_pos, num_draft, is_eos)?;
+            if spec_stats { self.runtime.synchronize()?; stat_draft_us += t_draft.elapsed().as_micros() as u64; }
 
             // ── Snapshot GDN state, then batched verify over [next, prop0..]. ──
+            let t_verify = std::time::Instant::now();
             self.gdn_snapshot_save(state)?;
             let mut verify_tokens = Vec::with_capacity(proposals.len() + 1);
             verify_tokens.push(next);
             verify_tokens.extend_from_slice(&proposals);
             let preds = self.verify_batched(state, &verify_tokens, base_pos)?;
+            if spec_stats { self.runtime.synchronize()?; stat_verify_us += t_verify.elapsed().as_micros() as u64; }
             let kk = proposals.len();
 
             // Accept length m = longest prefix where target argmax == proposal.
@@ -1084,9 +1090,11 @@ impl CudaLlamaExecutor {
             };
             eprintln!(
                 "[mtp-spec-stats] generated={} rounds={} proposed={} accepted={} accept_rate={:.1}% \
-                 tokens/round={:.2} decode={:.2}s {:.1} tok/s (num_draft={})",
+                 tokens/round={:.2} decode={:.2}s {:.1} tok/s (num_draft={}) | draft={:.1}ms/rd verify={:.1}ms/rd",
                 generated.len(), stat_rounds, stat_proposed, stat_accepted,
                 acc_rate * 100.0, toks_per_round, dt, generated.len() as f64 / dt, num_draft,
+                stat_draft_us as f64 / 1000.0 / stat_rounds.max(1) as f64,
+                stat_verify_us as f64 / 1000.0 / stat_rounds.max(1) as f64,
             );
         }
         Ok(generated)
