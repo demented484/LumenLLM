@@ -1014,33 +1014,71 @@ fn forward_moe_decode_device(
         runtime.record_into_compute(&moe_scratch.bulk_expert_compute_event)?;
         moe_scratch.bulk_expert_primed = true;
     } else {
+        // ── Once-per-layer gate/up activation quantize (decode CPU-op-count fix) ──
+        //
+        // gate_proj and up_proj of EVERY routed expert read the SAME input
+        // (`hidden_out`, this layer's expert-input hidden) AND — in the Qwen3.x
+        // NVFP4 checkpoint — the SAME `input_scale`: verified constant across
+        // all 256 experts (e.g. 0.007634) and gate==up within each expert.
+        // Since the fp4 input quant is a pure function of (input vector,
+        // input_scale), the quantized buffer is BYTE-IDENTICAL for every
+        // expert's gate/up GEMV. So quantize `hidden_out` ONCE per layer into a
+        // persistent `quant_gate_up` buffer (the per-expert `quant_expert` can't
+        // hold it because each expert's down_proj quant clobbers it), then every
+        // expert's gate/up GEMV reads that one buffer. Removes `top_k-1`
+        // redundant identical quantize launches per MoE layer (~7×30 = 210
+        // fewer/token on the 35B). Bit-identical: same bytes feed the same
+        // GEMVs in the same order.
+        //
+        // Guarded: only fires when ALL active experts are host-resident NVFP4
+        // (not native-MXFP4, not A16) AND share the gate==up==first-expert
+        // input_scale. Any mismatch (other model / checkpoint) falls back to the
+        // per-expert shared-quant path — still bit-identical, just not hoisted.
+        let layer_gate_up_quant = active_top_k > 0
+            && !nvfp4_a16_enabled()
+            && (0..active_top_k).all(|i| {
+                let e = &moe.experts[moe_scratch.router_top_indices[i]];
+                e.gate_proj.is_host_resident()
+                    && !e.gate_proj.is_host_resident_with_native_mxfp4()
+                    && e.gate_proj.input_scale == e.up_proj.input_scale
+                    && e.gate_proj.input_scale
+                        == moe.experts[moe_scratch.router_top_indices[0]].gate_proj.input_scale
+            });
+        if layer_gate_up_quant {
+            let scale = moe.experts[moe_scratch.router_top_indices[0]].gate_proj.input_scale;
+            runtime.quantize_nvfp4_input_device(
+                hidden_out, scale, &mut moe_scratch.quant_gate_up,
+            )?;
+        }
         for i in 0..active_top_k {
             let expert_idx = moe_scratch.router_top_indices[i];
             let weight = moe_scratch.router_top_weights[i];
             let expert = &moe.experts[expert_idx];
-            // ── Shared gate/up activation quantize (decode CPU-op-count fix) ──
-            //
-            // gate_proj and up_proj read the SAME input (`hidden_out`, this
-            // layer's expert-input hidden vector). For NVFP4 the input quant is
-            // a function of (input vector, input_scale); when the two
-            // projections also share `input_scale` the quantized buffer is
-            // BYTE-IDENTICAL, so quantizing once and reusing it for both GEMVs
-            // is bit-identical. The Qwen3.x NVFP4 checkpoint emits the SAME
-            // `input_global_scale` for gate_proj and up_proj of every expert
-            // (verified: gate==up across all experts/layers), so this fires on
-            // the hot path and halves the per-expert input-quant launches
-            // (3/expert → 2/expert, ~312 fewer quantize launches/token on the
-            // 35B). Strictly guarded: if the scales ever differ (other model),
-            // fall back to per-projection quant — still correct, just not
-            // deduped. `gate_up_share_quant` decides whether to reuse the
-            // gate-quantized buffer for up; `prepared_valid` tells the reuse
-            // helper to skip the (native-MXFP4 path's) MXFP4 quant too.
-            let gate_up_share_quant =
-                expert.gate_proj.is_host_resident()
-                    && !nvfp4_a16_enabled()
-                    && !expert.gate_proj.is_host_resident_with_native_mxfp4()
-                    && expert.gate_proj.input_scale == expert.up_proj.input_scale;
-            if gate_up_share_quant {
+            // Per-expert fallback gate/up shared-quant (when the once-per-layer
+            // hoist above didn't fire): gate_proj and up_proj share input +
+            // input_scale, so quantize once per expert into `quant_expert`.
+            let gate_up_share_quant = !layer_gate_up_quant
+                && expert.gate_proj.is_host_resident()
+                && !nvfp4_a16_enabled()
+                && !expert.gate_proj.is_host_resident_with_native_mxfp4()
+                && expert.gate_proj.input_scale == expert.up_proj.input_scale;
+            if layer_gate_up_quant {
+                // Both gate/up GEMVs read the once-per-layer quantized input.
+                let staging_gate =
+                    if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) };
+                matvec_nvfp4_prepared_device_reuse(
+                    runtime, &expert.gate_proj, hidden_out, &moe_scratch.quant_gate_up,
+                    &mut moe_scratch.mxfp4_expert, false, &mut moe_scratch.expert_gate,
+                    staging_gate,
+                )?;
+                let staging_up =
+                    if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) };
+                matvec_nvfp4_prepared_device_reuse(
+                    runtime, &expert.up_proj, hidden_out, &moe_scratch.quant_gate_up,
+                    &mut moe_scratch.mxfp4_expert, false, &mut moe_scratch.expert_up,
+                    staging_up,
+                )?;
+            } else if gate_up_share_quant {
                 // Quantize hidden_out ONCE with the shared gate/up scale into
                 // quant_expert, then run both GEMVs reading that buffer.
                 runtime.quantize_nvfp4_input_device(

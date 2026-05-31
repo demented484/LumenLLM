@@ -1453,6 +1453,9 @@ impl CudaLlamaExecutor {
                         // so the decode path never allocs per MoE layer per token.
                         shared_gate_logit: self.runtime.alloc_f32(1)?,
                         quant_expert: self.runtime.alloc_f32(max_input)?,
+                        // Persistent gate/up quantized input (hoisted once-per-layer
+                        // quantize). Same size as quant_expert.
+                        quant_gate_up: self.runtime.alloc_f32(max_input)?,
                         // ── BATCHED decode MoE scratch (AEGIS_BATCHED_DECODE_MOE) ──
                         // Separate [max_top_k * width] buffers so the per-slot path
                         // (default) keeps its exact single-expert buffers + .len()

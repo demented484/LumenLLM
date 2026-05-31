@@ -221,6 +221,19 @@ pub(super) struct CudaMoEScratch {
     /// blocking `download_f32`, no per-call alloc).
     pub(super) shared_gate_logit: DeviceBuffer<f32>,
     pub(super) quant_expert: DeviceBuffer<f32>,
+    /// Decode-only: persistent NVFP4-quantized copy of the routed-expert input
+    /// hidden, quantized ONCE per MoE layer with the gate/up `input_scale`.
+    ///
+    /// Every routed expert's gate_proj and up_proj read the SAME `hidden_out`
+    /// and (in the Qwen3.x NVFP4 checkpoint) the SAME `input_scale` — verified
+    /// constant across all 256 experts (0.007634) AND gate==up within each
+    /// expert. So the fp4-quantized input is byte-identical for every expert's
+    /// gate/up GEMV. Quantizing it once per layer (into this buffer) instead of
+    /// once per expert (into `quant_expert`, which the down_proj quant clobbers
+    /// each iteration) removes `top_k-1` redundant identical quantize launches
+    /// per MoE layer — bit-identical output (same bytes feed the same GEMVs).
+    /// Sized like `quant_expert` (`max_input`).
+    pub(super) quant_gate_up: DeviceBuffer<f32>,
     pub(super) mxfp4_expert: DeviceBuffer<u8>,
     /// Decode async-overlap router scratch.
     ///
