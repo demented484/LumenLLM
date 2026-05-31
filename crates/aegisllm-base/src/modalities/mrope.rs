@@ -349,6 +349,21 @@ mod tests {
     }
 
     #[test]
+    fn get_rope_index_matches_hf_qwen35_1x4x6() {
+        // Cross-checked against HF Qwen3_5Model.get_rope_index (modeling_qwen3_5.py,
+        // transformers 5.9.0): tokens [10,11,12] + image(1×4×6 → 6 merged) + [20,21].
+        let mut ids = vec![10u32, 11, 12];
+        ids.extend([IMAGE_TOKEN; 6]); // (4/2)*(6/2) = 2*3 = 6 merged
+        ids.extend([20u32, 21]);
+        let grids = [GridThw::new(1, 4, 6)];
+        let pos = get_rope_index(&ids, IMAGE_TOKEN, &grids, MERGE).unwrap();
+        assert_eq!(pos.comp[0], vec![0, 1, 2, 3, 3, 3, 3, 3, 3, 6, 7], "T");
+        assert_eq!(pos.comp[1], vec![0, 1, 2, 3, 3, 3, 4, 4, 4, 6, 7], "H");
+        assert_eq!(pos.comp[2], vec![0, 1, 2, 3, 4, 5, 3, 4, 5, 6, 7], "W");
+        assert_eq!(pos.position_delta(), -3, "delta");
+    }
+
+    #[test]
     fn bilinear_weights_sum_to_one() {
         let (_idx, w) = qwen_bilinear_pos_indices_weights(8, 12, 48, 2);
         let n = 8 * 12;
