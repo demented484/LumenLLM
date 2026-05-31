@@ -384,6 +384,84 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Quantize an f32 activation `[m, k]` to e4m3 `[m, k]` + per-(token,128-K-group)
+    /// scale `[m, k/128]` (the native-FP8 prefill GEMM's A-side input). `k % 128 == 0`.
+    pub fn quantize_f32_to_fp8_token_group_device(
+        &self,
+        a: &DeviceBuffer<f32>,
+        m: usize,
+        k: usize,
+        a_q: &mut DeviceBuffer<u8>,
+        a_scale: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let n_kgroups = k.div_ceil(128);
+        let cfg = LaunchConfig {
+            grid_dim: (m as u32, n_kgroups as u32, 1),
+            block_dim: (128, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.quantize_f32_to_fp8_token_group)
+                .arg(&a.slice)
+                .arg(&mut a_q.slice)
+                .arg(&mut a_scale.slice)
+                .arg(&(m as u32))
+                .arg(&(k as u32))
+                .arg(&(n_kgroups as u32))
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("quantize_f32_to_fp8_token_group"))?;
+        Ok(())
+    }
+
+    /// Native FP8 block-scaled W8A8 GEMM: `out[m, N] = a_q[m, K] @ weight[N, K]^T`
+    /// using the SM120 e4m3 tensor-core MMA, rescaled per 128-K block by
+    /// `a_scale[m, g] * weight.block_scales[N/128, g]`. No dequant. `N%64==0`, `K%128==0`.
+    pub fn fp8_block_gemm_device(
+        &self,
+        a_q: &DeviceBuffer<u8>,
+        a_scale: &DeviceBuffer<f32>,
+        weight: &super::super::StandaloneFp8Linear,
+        m: usize,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let n = weight.rows;
+        let k = weight.cols;
+        let n_kgroups = weight.scale_cols as usize;
+        let w_scale = weight.block_scales_slice().ok_or_else(|| {
+            AegisError::InvalidPlan(format!("fp8_block_gemm: `{}` has no block scales", weight.name))
+        })?;
+        if output.len() < m * n {
+            return Err(AegisError::InvalidPlan(format!(
+                "fp8_block_gemm output too small: {} < {}",
+                output.len(),
+                m * n
+            )));
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.fp8_block_gemm)
+                .arg(&a_q.slice)
+                .arg(&a_scale.slice)
+                .arg(weight.data_slice())
+                .arg(w_scale)
+                .arg(&mut output.slice)
+                .arg(&(m as u32))
+                .arg(&(n as u32))
+                .arg(&(k as u32))
+                .arg(&(n_kgroups as u32))
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("fp8_block_gemm"))?;
+        Ok(())
+    }
+
     /// Batched matmul against a standalone FP8 weight (prefill path).
     pub fn matmul_fp8_standalone_batched_device(
         &self,

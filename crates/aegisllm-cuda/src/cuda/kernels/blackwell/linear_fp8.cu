@@ -322,4 +322,147 @@ extern "C" __global__ void aegis_dequant_fp8_block_to_bf16(
     bf16_out[(size_t)row * cols + col] = (unsigned short)(rounded >> 16u);
 }
 
+// ============================================================================
+// Native FP8 block-scaled W8A8 tiled GEMM (Qwen3.5-9B prefill, no dequant).
+//   out[M,N] = A[M,K] @ W[N,K]^T   (row.col MMA form)
+// A = activation e4m3 [M,K] with per-(token,128-K-group) scale a_scale[M,K/128];
+// W = weight e4m3 [N,K] with weight_scale_inv[N/128,K/128]. Both scales MULTIPLY.
+// Scales depend on k/128, so the f32 accumulator is rescaled+flushed every 128 K.
+// ============================================================================
+
+// Quantize f32 activation [M,K] -> e4m3 [M,K] + per-(token,128-K-group) scale.
+// scale = max(|group|,1e-10)/448 (stored, MULTIPLY on dequant); q = RNE_e4m3(a/scale).
+// Grid (M, K/128); block 128 (one thread per K-element in the group).
+extern "C" __global__ void aegis_quantize_f32_to_fp8_token_group(
+    const float* __restrict__ a,        // [M, K]
+    unsigned char* __restrict__ a_q,    // [M, K]
+    float* __restrict__ a_scale,        // [M, n_kgroups]
+    const unsigned int M,
+    const unsigned int K,
+    const unsigned int n_kgroups)
+{
+    const unsigned int m = blockIdx.x;
+    const unsigned int g = blockIdx.y;
+    const unsigned int tid = threadIdx.x;     // 0..127
+    const unsigned int k = g * 128u + tid;
+    const float v = (m < M && k < K) ? a[(size_t)m * K + k] : 0.0f;
+    __shared__ float sm[128];
+    sm[tid] = fabsf(v);
+    __syncthreads();
+    for (unsigned int s = 64u; s > 0u; s >>= 1) { if (tid < s) sm[tid] = fmaxf(sm[tid], sm[tid + s]); __syncthreads(); }
+    const float scale = fmaxf(sm[0], 1.0e-10f) / 448.0f;
+    if (tid == 0u && m < M) a_scale[(size_t)m * n_kgroups + g] = scale;
+    if (m < M && k < K) {
+        const float q = fminf(fmaxf(v / scale, -448.0f), 448.0f);
+        a_q[(size_t)m * K + k] = float_to_fp8_e4m3_bits(q);
+    }
+}
+
+// Tiled FP8 block-scaled GEMM. Block = 64x64 C tile, 256 threads (8 warps, 4 M x
+// 2 N); each warp owns [16,32] = 4 n8 MMA tiles. K processed in 128-blocks
+// (4 m16n8k32 e4m3 MMA steps), rescaled by a_scale[m,g]*w_scale[n/128,g] per block.
+// Assumes N%64==0, K%128==0 (true for Qwen3.5-9B). M-tail guarded.
+extern "C" __global__ void aegis_fp8_block_gemm(
+    const unsigned char* __restrict__ a_q,    // [M, K] e4m3
+    const float* __restrict__ a_scale,         // [M, K/128]
+    const unsigned char* __restrict__ w,       // [N, K] e4m3
+    const float* __restrict__ w_scale,         // [N/128, K/128]
+    float* __restrict__ out,                   // [M, N] f32
+    const unsigned int M,
+    const unsigned int N,
+    const unsigned int K,
+    const unsigned int n_kgroups)              // K/128
+{
+    __shared__ unsigned char As[64 * 128];     // 8 KiB
+    __shared__ unsigned char Bs[64 * 128];     // 8 KiB
+    const unsigned int tile_m = blockIdx.y * 64u;
+    const unsigned int tile_n = blockIdx.x * 64u;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp = tid >> 5;        // 0..7
+    const unsigned int lane = tid & 31u;
+    const unsigned int g_l  = lane >> 2;        // 0..7
+    const unsigned int q_l  = lane & 3u;        // 0..3
+    const unsigned int warp_m = warp & 3u;      // 0..3
+    const unsigned int warp_n = warp >> 2;      // 0..1
+    const unsigned int w_scale_n = tile_n / 128u;
+
+    float out_acc[4][4];
+    #pragma unroll
+    for (int nt = 0; nt < 4; ++nt) { out_acc[nt][0]=0.f; out_acc[nt][1]=0.f; out_acc[nt][2]=0.f; out_acc[nt][3]=0.f; }
+
+    for (unsigned int g = 0u; g < n_kgroups; ++g) {
+        const unsigned int k0 = g * 128u;
+        // Cooperative coalesced load of As[64,128] + Bs[64,128] (uint4 = 16 e4m3).
+        for (unsigned int i = tid; i < 512u; i += 256u) {     // 512 uint4 per tile
+            const unsigned int row = i >> 3;                   // 0..63
+            const unsigned int cu4 = (i & 7u) * 16u;           // col byte offset
+            const unsigned int am = tile_m + row;
+            *reinterpret_cast<uint4*>(&As[row * 128u + cu4]) =
+                (am < M) ? *reinterpret_cast<const uint4*>(&a_q[(size_t)am * K + k0 + cu4])
+                         : make_uint4(0u, 0u, 0u, 0u);
+            *reinterpret_cast<uint4*>(&Bs[row * 128u + cu4]) =
+                *reinterpret_cast<const uint4*>(&w[(size_t)(tile_n + row) * K + k0 + cu4]);
+        }
+        __syncthreads();
+
+        float blk[4][4];
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) { blk[nt][0]=0.f; blk[nt][1]=0.f; blk[nt][2]=0.f; blk[nt][3]=0.f; }
+
+        #pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {        // 4 k32 steps in the 128-block
+            const unsigned int kbase = kk * 32u;
+            // A fragment (16x32) from As[16*warp_m .. , kbase ..]: a[v1+2*v2].
+            aegis_u32 af[4];
+            #pragma unroll
+            for (int v2 = 0; v2 < 2; ++v2)
+                #pragma unroll
+                for (int v1 = 0; v1 < 2; ++v1) {
+                    const unsigned int rr = 16u * warp_m + g_l + 8u * v1;
+                    const unsigned int cc = kbase + q_l * 4u + 16u * v2;
+                    const unsigned char* p = &As[rr * 128u + cc];
+                    af[v1 + 2 * v2] = aegis_pack_e4m3x4_p(p[0], p[1], p[2], p[3]);
+                }
+            #pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                // B fragment (8x32) from Bs[32*warp_n + 8*nt .., kbase ..]: b[v1].
+                aegis_u32 bf[2];
+                #pragma unroll
+                for (int v1 = 0; v1 < 2; ++v1) {
+                    const unsigned int rr = 32u * warp_n + 8u * (unsigned)nt + g_l;
+                    const unsigned int cc = kbase + q_l * 4u + 16u * v1;
+                    const unsigned char* p = &Bs[rr * 128u + cc];
+                    bf[v1] = aegis_pack_e4m3x4_p(p[0], p[1], p[2], p[3]);
+                }
+                aegis_mma_m16n8k32_e4m3_p(blk[nt], af, bf, blk[nt]);
+            }
+        }
+        __syncthreads();    // As/Bs reusable next g
+
+        // Rescale this 128-K block and accumulate. 2 distinct activation rows.
+        const unsigned int m_base = tile_m + 16u * warp_m;
+        const float ws  = w_scale[(size_t)w_scale_n * n_kgroups + g];
+        const float as0 = ((m_base + g_l)     < M) ? a_scale[(size_t)(m_base + g_l)     * n_kgroups + g] : 0.f;
+        const float as1 = ((m_base + g_l + 8u) < M) ? a_scale[(size_t)(m_base + g_l + 8u) * n_kgroups + g] : 0.f;
+        #pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+            out_acc[nt][0] += blk[nt][0] * as0 * ws;
+            out_acc[nt][1] += blk[nt][1] * as0 * ws;
+            out_acc[nt][2] += blk[nt][2] * as1 * ws;
+            out_acc[nt][3] += blk[nt][3] * as1 * ws;
+        }
+    }
+
+    // Epilogue: write [16,32] per warp.
+    const unsigned int m_base = tile_m + 16u * warp_m;
+    #pragma unroll
+    for (int nt = 0; nt < 4; ++nt) {
+        const unsigned int n_base = tile_n + 32u * warp_n + 8u * (unsigned)nt;
+        const unsigned int r0 = m_base + g_l, r1 = m_base + g_l + 8u;
+        const unsigned int c0 = n_base + 2u * q_l, c1 = n_base + 2u * q_l + 1u;
+        if (r0 < M) { out[(size_t)r0 * N + c0] = out_acc[nt][0]; out[(size_t)r0 * N + c1] = out_acc[nt][1]; }
+        if (r1 < M) { out[(size_t)r1 * N + c0] = out_acc[nt][2]; out[(size_t)r1 * N + c1] = out_acc[nt][3]; }
+    }
+}
+
 #endif  // AEGIS_FP8_LINEAR_CU

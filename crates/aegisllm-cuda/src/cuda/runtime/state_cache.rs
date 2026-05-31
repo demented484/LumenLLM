@@ -1075,4 +1075,80 @@ mod tests {
             }
         }
     }
+
+    fn e4m3_dec(b: u8) -> f32 {
+        let s = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
+        let e = ((b >> 3) & 0x0F) as i32;
+        let mant = (b & 0x07) as f32;
+        let v = if e == 0 {
+            (mant / 8.0) * 0.015_625
+        } else if e == 15 && (b & 7) == 7 {
+            0.0 // NaN guard (won't occur in test data)
+        } else {
+            (1.0 + mant / 8.0) * 2f32.powi(e - 7)
+        };
+        s * v
+    }
+
+    // GPU correctness: aegis_fp8_block_gemm vs f32 reference using the
+    // GPU-quantized activation. Validates the e4m3 MMA tiling + the per-128-K
+    // block rescale (a_scale[m,g] * w_scale[n/128,g]). Includes an M-tail (40).
+    #[test]
+    fn fp8_block_gemm_matches_reference_on_gpu() {
+        use crate::cuda::runtime::CudaRuntime;
+        use crate::cuda::StandaloneFp8Linear;
+        let rt = match CudaRuntime::new(0) {
+            Ok(r) => r,
+            Err(e) => { eprintln!("no CUDA ({e:?}); skip fp8_block_gemm check"); return; }
+        };
+        let (m, n, k) = (40usize, 128usize, 256usize); // M-tail, N=1 block, K=2 groups
+        let nkg = k / 128;
+        let urng = |seed: usize, len: usize| -> Vec<u8> {
+            (0..len).map(|i| ((seed.wrapping_mul(2_654_435_761).wrapping_add(i.wrapping_mul(40_503))) % 256) as u8).collect()
+        };
+        let frng = |seed: usize, len: usize| -> Vec<f32> {
+            (0..len).map(|i| ((seed.wrapping_mul(2_654_435_761).wrapping_add(i.wrapping_mul(40_503))) % 1000) as f32 / 500.0 - 1.0).collect()
+        };
+        let w_bytes = urng(7, n * k);
+        let nb = (n / 128).max(1);
+        let w_scale: Vec<f32> = (0..nb * nkg).map(|i| 0.02 + (i as f32) * 0.001).collect();
+        let weight = StandaloneFp8Linear {
+            name: "test".into(), rows: n, cols: k, bytes: n * k,
+            data: rt.stream.clone_htod(&w_bytes).unwrap(),
+            row_scales: rt.stream.clone_htod(&[1.0f32]).unwrap(),
+            block_scales: Some(rt.stream.clone_htod(&w_scale).unwrap()),
+            block_size: 128, scale_cols: nkg as u32,
+        };
+        let a = frng(11, m * k);
+        let a_dev = rt.upload_f32(&a).unwrap();
+        let mut a_q = rt.alloc_u8(m * k).unwrap();
+        let mut a_scale = rt.alloc_f32(m * nkg).unwrap();
+        rt.quantize_f32_to_fp8_token_group_device(&a_dev, m, k, &mut a_q, &mut a_scale).unwrap();
+        let mut out = rt.alloc_f32(m * n).unwrap();
+        rt.fp8_block_gemm_device(&a_q, &a_scale, &weight, m, &mut out).unwrap();
+        let gout = rt.download_f32(&out).unwrap();
+        let a_q_h = rt.download_u8(&a_q).unwrap();
+        let a_sc_h = rt.download_f32(&a_scale).unwrap();
+        let mut refout = vec![0.0f32; m * n];
+        for mm in 0..m {
+            for nn in 0..n {
+                let mut acc = 0.0f32;
+                for g in 0..nkg {
+                    let mut blk = 0.0f32;
+                    for kk in (g * 128)..(g * 128 + 128) {
+                        blk += e4m3_dec(a_q_h[mm * k + kk]) * e4m3_dec(w_bytes[nn * k + kk]);
+                    }
+                    acc += blk * a_sc_h[mm * nkg + g] * w_scale[(nn / 128) * nkg + g];
+                }
+                refout[mm * n + nn] = acc;
+            }
+        }
+        let dot: f64 = gout.iter().zip(&refout).map(|(&x, &y)| x as f64 * y as f64).sum();
+        let na: f64 = gout.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb2: f64 = refout.iter().map(|&y| (y as f64).powi(2)).sum::<f64>().sqrt();
+        let cos = dot / (na * nb2 + 1e-12);
+        let maxerr = gout.iter().zip(&refout).map(|(&x, &y)| (x - y).abs()).fold(0.0f32, f32::max);
+        eprintln!("fp8_block_gemm cos={cos:.6} maxerr={maxerr:.5}");
+        assert!(cos > 0.999, "fp8_block_gemm cos {cos} too low (maxerr {maxerr})");
+    }
 }
