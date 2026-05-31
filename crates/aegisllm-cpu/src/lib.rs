@@ -13,3 +13,6 @@ pub use cpu::{CpuNvfp4Linear, CpuReferenceExecutor, CpuRuntime, G4CpuExecutor, G
 pub use materialization::{
     LinearMaterializationCache, LinearMaterializationKey, LinearMaterializationStats,
 };
+pub use nvfp4_gemv::{
+    CpuMoeExpert, MoeLayerScratch, PackedWeights, gemm_into, gemv_into, moe_layer_experts_into,
+};

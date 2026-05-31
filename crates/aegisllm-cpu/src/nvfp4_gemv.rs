@@ -367,6 +367,225 @@ pub fn gemm_into(w: &PackedWeights, x: &[f32], m: usize, y: &mut [f32]) {
     }
 }
 
+// ── Layer-level MoE expert dispatch (the experts-on-CPU decode primitive) ─────
+//
+// The naive way to run a token's routed experts on the CPU is to call
+// `gemv_into` once per (expert, projection) — `top_k × 3` calls per MoE layer,
+// ~960 calls/token on Qwen3.6-35B-A3B. Each `gemv_into` opens its OWN rayon
+// parallel region over a SMALL row count (gate/up = 512 rows, down = 2048), so
+// the per-region join/wake overhead dominates and the kernel only realizes
+// ~21 GB/s of its 65.7 GB/s ceiling (measured). The fix is to do the whole
+// layer in as few large rayon regions as possible.
+//
+// Data dependency: within an expert, `down` needs `geglu(gate, up)`, so gate/up
+// and down can't share a region. But ACROSS experts everything is independent,
+// so we collapse to TWO big parallel regions per layer:
+//
+//   Region A: every active expert's gate rows + up rows in ONE `into_par_iter`
+//             over a flattened (expert, {gate|up}, local_row) job space
+//             (top_k × (gate.rows + up.rows) ≈ 8×1024 = 8192 rows) → fills all
+//             cores from a single fork/join.
+//   geglu:    per-expert element-wise gelu_tanh(gate)·up (cheap, serial).
+//   Region B: every active expert's down rows in ONE `into_par_iter`
+//             (top_k × down.rows ≈ 8×2048 = 16384 rows) → one fork/join.
+//   combine:  weighted sum of the per-expert down outputs into `routed_acc`
+//             (top_k × hidden adds, trivial), in fixed ascending expert order.
+//
+// So 2 rayon regions/layer instead of ~24 — the dispatch fragmentation is gone,
+// and each region is wide enough to saturate DRAM bandwidth (the kernel's
+// proven 65.7 GB/s single-region ceiling).
+
+/// One routed expert's three NVFP4 projections for a single MoE layer, as
+/// borrowed packed/scale byte views into the host arena (read in place — no
+/// copy) plus the per-tensor global scales and the token's routing weight.
+#[derive(Clone, Copy)]
+pub struct CpuMoeExpert<'a> {
+    pub gate: PackedWeights<'a>,
+    pub up: PackedWeights<'a>,
+    pub down: PackedWeights<'a>,
+    /// Router weight for this expert (already renormalized + per-expert-scaled).
+    pub weight: f32,
+}
+
+/// gelu_pytorch_tanh GeGLU, BIT-MATCHING the GPU `aegis_geglu_tanh_batched`
+/// (sampling.cu): `out = up * 0.5*g*(1 + tanh(0.7978845608028654*(g+0.044715*g^3)))`.
+/// The routed-expert decode path uses geglu_tanh on the GPU (verified coherent),
+/// so the CPU path mirrors the exact same literals + op order.
+#[inline]
+fn geglu_tanh_into(gate: &[f32], up: &[f32], out: &mut [f32]) {
+    const K: f32 = 0.7978845608028654;
+    const K2: f32 = 0.044715;
+    for ((o, &g), &u) in out.iter_mut().zip(gate.iter()).zip(up.iter()) {
+        let inner = K * (g + K2 * g * g * g);
+        let gelu = 0.5 * g * (1.0 + inner.tanh());
+        *o = gelu * u;
+    }
+}
+
+/// Run all of a MoE layer's routed experts on the CPU and accumulate the
+/// routing-weighted sum into `routed_acc` (`hidden_size` long, OVERWRITTEN —
+/// not added to). `x` is the routed-expert input hidden (`hidden_size`).
+///
+/// EFFICIENT DISPATCH: the entire layer runs in TWO large rayon parallel
+/// regions (gate+up, then down) instead of `top_k × 3` tiny `gemv_into` launches
+/// — see the module-level comment. The intermediate gate/up/swiglu buffers are
+/// scratch the caller owns (reused across layers); `scratch` must hold at least
+/// `top_k` `ExpertScratch` entries sized to `intermediate`.
+///
+/// Numerics: each row uses the SAME fused dequant as `gemv_into` (bit-identical
+/// to the GPU weight dequant). Unlike the GPU GEMV this dots the weights against
+/// the RAW f32 input (the GPU first quantizes the activation to NVFP4) — so the
+/// CPU output is slightly MORE accurate, not bit-identical, but tracks closely.
+/// The weighted combine folds experts in fixed ascending order (matches the GPU
+/// `axpy` accumulation order).
+pub fn moe_layer_experts_into(
+    experts: &[CpuMoeExpert<'_>],
+    x: &[f32],
+    intermediate: usize,
+    scratch: &mut MoeLayerScratch,
+    routed_acc: &mut [f32],
+) {
+    let top_k = experts.len();
+    if top_k == 0 {
+        for v in routed_acc.iter_mut() {
+            *v = 0.0;
+        }
+        return;
+    }
+    let hidden = x.len();
+    debug_assert_eq!(routed_acc.len(), hidden);
+    scratch.ensure(top_k, intermediate, hidden);
+
+    // ── Region A: all experts' gate + up rows in one parallel region ─────────
+    //
+    // Job space: for each expert e, gate has `gate.rows` rows and up has
+    // `up.rows` rows. Flatten to a single index; each job computes one output
+    // element and writes it to the right (expert, proj, row) scratch slot.
+    // We split the per-expert gate/up scratch into raw pointers so independent
+    // rows can be written concurrently (each job writes a DISTINCT element).
+    {
+        // Build a flat job table: (expert_idx, is_up, local_row).
+        let jobs = &mut scratch.gate_up_jobs;
+        jobs.clear();
+        for (e, ex) in experts.iter().enumerate() {
+            for r in 0..ex.gate.rows {
+                jobs.push((e as u32, 0u8, r as u32));
+            }
+            for r in 0..ex.up.rows {
+                jobs.push((e as u32, 1u8, r as u32));
+            }
+        }
+        // Per-expert output base pointers (gate then up scratch slabs).
+        let gate_ptrs: Vec<SendPtr> =
+            scratch.gate_buf.chunks_mut(intermediate).map(|c| SendPtr(c.as_mut_ptr())).collect();
+        let up_ptrs: Vec<SendPtr> =
+            scratch.up_buf.chunks_mut(intermediate).map(|c| SendPtr(c.as_mut_ptr())).collect();
+        jobs.par_iter().for_each(|&(e, is_up, r)| {
+            let ex = &experts[e as usize];
+            let (w, base) = if is_up == 0 {
+                (&ex.gate, gate_ptrs[e as usize].0)
+            } else {
+                (&ex.up, up_ptrs[e as usize].0)
+            };
+            let pc = w.cols / 2;
+            let sc = w.cols / SUB;
+            let r = r as usize;
+            let prow = &w.packed[r * pc..(r + 1) * pc];
+            let srow = &w.scales[r * sc..(r + 1) * sc];
+            let val = fused_row_dot(prow, srow, x) * w.output_scale;
+            // SAFETY: every job writes a DISTINCT (expert, proj, row) element;
+            // `base` is the expert's slab start and `r < intermediate`.
+            unsafe { *base.add(r) = val };
+        });
+    }
+
+    // ── geglu per expert (serial; cheap) ─────────────────────────────────────
+    for e in 0..top_k {
+        let g = &scratch.gate_buf[e * intermediate..e * intermediate + intermediate];
+        let u = &scratch.up_buf[e * intermediate..e * intermediate + intermediate];
+        let s = &mut scratch.swiglu_buf[e * intermediate..e * intermediate + intermediate];
+        geglu_tanh_into(g, u, s);
+    }
+
+    // ── Region B: all experts' down rows in one parallel region ──────────────
+    {
+        let jobs = &mut scratch.down_jobs;
+        jobs.clear();
+        for (e, ex) in experts.iter().enumerate() {
+            for r in 0..ex.down.rows {
+                jobs.push((e as u32, r as u32));
+            }
+        }
+        let down_ptrs: Vec<SendPtr> =
+            scratch.down_buf.chunks_mut(hidden).map(|c| SendPtr(c.as_mut_ptr())).collect();
+        let swiglu = &scratch.swiglu_buf;
+        jobs.par_iter().for_each(|&(e, r)| {
+            let ex = &experts[e as usize];
+            let w = &ex.down;
+            let pc = w.cols / 2;
+            let sc = w.cols / SUB;
+            let r = r as usize;
+            let prow = &w.packed[r * pc..(r + 1) * pc];
+            let srow = &w.scales[r * sc..(r + 1) * sc];
+            let xin = &swiglu[e as usize * intermediate..e as usize * intermediate + w.cols];
+            let val = fused_row_dot(prow, srow, xin) * w.output_scale;
+            // SAFETY: distinct (expert, row) element per job; r < hidden.
+            unsafe { *down_ptrs[e as usize].0.add(r) = val };
+        });
+    }
+
+    // ── Weighted combine into routed_acc (fixed ascending expert order) ──────
+    for v in routed_acc.iter_mut() {
+        *v = 0.0;
+    }
+    for e in 0..top_k {
+        let w = experts[e].weight;
+        let d = &scratch.down_buf[e * hidden..e * hidden + hidden];
+        for (acc, &dv) in routed_acc.iter_mut().zip(d.iter()) {
+            *acc += w * dv;
+        }
+    }
+}
+
+/// `*mut f32` wrapper so per-expert output base pointers can cross the rayon
+/// closure boundary. SAFETY contract: each parallel job writes a DISTINCT
+/// element via a distinct (base, row) pair — no two jobs alias.
+#[derive(Clone, Copy)]
+struct SendPtr(*mut f32);
+// SAFETY: only used to hand out disjoint write targets to rayon jobs (see the
+// per-job SAFETY notes in `moe_layer_experts_into`).
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+
+/// Reusable per-layer scratch for [`moe_layer_experts_into`] (gate/up/swiglu/down
+/// slabs + the flattened rayon job tables). The caller keeps one of these across
+/// all MoE layers / tokens so the per-token path does ZERO heap allocation once
+/// warmed.
+#[derive(Default)]
+pub struct MoeLayerScratch {
+    gate_buf: Vec<f32>,
+    up_buf: Vec<f32>,
+    swiglu_buf: Vec<f32>,
+    down_buf: Vec<f32>,
+    gate_up_jobs: Vec<(u32, u8, u32)>,
+    down_jobs: Vec<(u32, u32)>,
+}
+
+impl MoeLayerScratch {
+    fn ensure(&mut self, top_k: usize, intermediate: usize, hidden: usize) {
+        let inter_cap = top_k * intermediate;
+        let hidden_cap = top_k * hidden;
+        if self.gate_buf.len() < inter_cap {
+            self.gate_buf.resize(inter_cap, 0.0);
+            self.up_buf.resize(inter_cap, 0.0);
+            self.swiglu_buf.resize(inter_cap, 0.0);
+        }
+        if self.down_buf.len() < hidden_cap {
+            self.down_buf.resize(hidden_cap, 0.0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +742,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The layer-level MoE dispatch (2 big rayon regions) must produce the SAME
+    /// result as the obvious per-expert `gemv_into` + geglu + weighted-sum
+    /// reference — proving the flattened-job dispatch is just a re-parallelized
+    /// form of the same math (same dequant, same geglu literals, same fold).
+    #[test]
+    fn moe_layer_dispatch_matches_per_expert_reference() {
+        let mut rng = SmallRng::seed_from_u64(SEED ^ 0x4D6F_4500);
+        const HIDDEN: usize = 2048;
+        const INTER: usize = 512;
+        const TOP_K: usize = 8;
+
+        // Build TOP_K distinct experts.
+        struct OwnedExpert {
+            gate: (Vec<u8>, Vec<u8>, f32),
+            up: (Vec<u8>, Vec<u8>, f32),
+            down: (Vec<u8>, Vec<u8>, f32),
+            weight: f32,
+        }
+        let experts: Vec<OwnedExpert> = (0..TOP_K)
+            .map(|_| OwnedExpert {
+                gate: random_packed(&mut rng, INTER, HIDDEN),
+                up: random_packed(&mut rng, INTER, HIDDEN),
+                down: random_packed(&mut rng, HIDDEN, INTER),
+                weight: rng.random::<f32>() * 0.9 + 0.05,
+            })
+            .collect();
+        let x: Vec<f32> = (0..HIDDEN).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+
+        // Reference: per-expert gemv_into + geglu + weighted sum.
+        let mut ref_acc = vec![0.0f32; HIDDEN];
+        for ex in &experts {
+            let gw = PackedWeights::new(INTER, HIDDEN, &ex.gate.0, &ex.gate.1, ex.gate.2);
+            let uw = PackedWeights::new(INTER, HIDDEN, &ex.up.0, &ex.up.1, ex.up.2);
+            let dw = PackedWeights::new(HIDDEN, INTER, &ex.down.0, &ex.down.1, ex.down.2);
+            let mut g = vec![0.0f32; INTER];
+            let mut u = vec![0.0f32; INTER];
+            let mut s = vec![0.0f32; INTER];
+            gemv_into(&gw, &x, &mut g);
+            gemv_into(&uw, &x, &mut u);
+            geglu_tanh_into(&g, &u, &mut s);
+            let mut d = vec![0.0f32; HIDDEN];
+            gemv_into(&dw, &s, &mut d);
+            for (a, &dv) in ref_acc.iter_mut().zip(d.iter()) {
+                *a += ex.weight * dv;
+            }
+        }
+
+        // Dispatch path.
+        let cpu_experts: Vec<CpuMoeExpert> = experts
+            .iter()
+            .map(|ex| CpuMoeExpert {
+                gate: PackedWeights::new(INTER, HIDDEN, &ex.gate.0, &ex.gate.1, ex.gate.2),
+                up: PackedWeights::new(INTER, HIDDEN, &ex.up.0, &ex.up.1, ex.up.2),
+                down: PackedWeights::new(HIDDEN, INTER, &ex.down.0, &ex.down.1, ex.down.2),
+                weight: ex.weight,
+            })
+            .collect();
+        let mut scratch = MoeLayerScratch::default();
+        let mut got_acc = vec![0.0f32; HIDDEN];
+        moe_layer_experts_into(&cpu_experts, &x, INTER, &mut scratch, &mut got_acc);
+
+        let cos = cosine(&ref_acc, &got_acc);
+        let rel = max_rel_err(&ref_acc, &got_acc);
+        assert!(cos > 0.99999, "moe dispatch cosine {cos} <= 0.99999");
+        assert!(rel < 1e-4, "moe dispatch max-rel-err {rel} >= 1e-4");
+        eprintln!("moe_layer_dispatch: cos={cos:.9} max_rel_err={rel:.3e}");
     }
 
     /// Sanity: all-zero nibbles → zero output regardless of scales.
