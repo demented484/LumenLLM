@@ -462,6 +462,26 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Batched native-FP8 prefill matmul: quantize the f32 activation `[m, K]` to
+    /// e4m3 (per-token-128-group), then run the block-scaled e4m3 tensor-core GEMM
+    /// against `weight` → `out[m, N]`. No dequant. Caller supplies the e4m3 +
+    /// scale scratch (sized `m*K` u8 and `m*(K/128)` f32).
+    #[allow(clippy::too_many_arguments)]
+    pub fn matmul_fp8_block_native_batched(
+        &self,
+        weight: &super::super::StandaloneFp8Linear,
+        input: &DeviceBuffer<f32>,
+        m: usize,
+        a_q: &mut DeviceBuffer<u8>,
+        a_scale: &mut DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let k = weight.cols;
+        self.quantize_f32_to_fp8_token_group_device(input, m, k, a_q, a_scale)?;
+        self.fp8_block_gemm_device(a_q, a_scale, weight, m, output)?;
+        Ok(())
+    }
+
     /// Batched matmul against a standalone FP8 weight (prefill path).
     pub fn matmul_fp8_standalone_batched_device(
         &self,
