@@ -99,6 +99,17 @@ pub struct HfConfig {
     /// Fraction of head_dim that gets RoPE; the rest passes through.
     pub partial_rotary_factor: Option<f32>,
 
+    // ── Multimodal RoPE / M-RoPE (Qwen3-VL: Qwen3.5/3.6) ──────────────────
+    /// Per-axis RoPE frequency split `[temporal, height, width]` summing to
+    /// `rotary_dim/2` (Qwen: `[11, 11, 10]`, sum 32 = (head_dim·0.25)/2).
+    /// Hoisted from `text_config.rope_parameters.mrope_section`.
+    #[serde(default)]
+    pub mrope_section: Option<Vec<usize>>,
+    /// When true the 3 M-RoPE axes are interleaved (`THWTHW…`) rather than
+    /// block-concatenated. Qwen3.5/3.6 set this true.
+    #[serde(default)]
+    pub mrope_interleaved: Option<bool>,
+
     // ── Pre+Post RMSNorm (Gemma 4) ────────────────────────────────────────
     /// When true, a second RMSNorm is applied after attention/MLP output.
     pub post_attention_layernorm: Option<bool>,
@@ -235,18 +246,45 @@ pub struct HfConfig {
     pub vision_soft_tokens_per_image: Option<usize>,
 }
 
-/// Vision-tower architecture sub-config (Gemma-4 26B & E4B both expose
-/// this under `config.json["vision_config"]`).
+/// Vision-tower architecture sub-config. Shared by two families that name
+/// the same concepts differently:
+///   * **Gemma-4** (26B & E4B): SigLIP-style tower with spatial pooling.
+///     Uses `num_hidden_layers`, `num_attention_heads`, `head_dim`,
+///     `pooling_kernel_size`, `rms_norm_eps`, `position_embedding_size`.
+///   * **Qwen3-VL** (Qwen3.5/3.6 native ViT): uses `depth`,
+///     `num_heads`, `spatial_merge_size`, `temporal_patch_size`,
+///     `num_position_embeddings`, `out_hidden_size`, `in_channels`,
+///     `hidden_act`. No spatial pooling, no per-tower head_dim/rms_eps key.
+///
+/// Serde aliases bridge the two naming conventions onto one struct.
+/// Gemma-only keys carry `#[serde(default)]` so a Qwen `vision_config`
+/// (which omits them) still deserializes; Qwen-only keys carry defaults so
+/// a Gemma `vision_config` (which omits them) still deserializes. Each
+/// consumer reads only the fields its family populates.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct HfVisionConfig {
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    /// Transformer depth. Gemma: `num_hidden_layers`; Qwen: `depth`.
+    #[serde(alias = "depth")]
     pub num_hidden_layers: usize,
+    /// Attention heads. Gemma: `num_attention_heads`; Qwen: `num_heads`.
+    #[serde(alias = "num_heads")]
     pub num_attention_heads: usize,
+    /// Per-head dim (Gemma only; Qwen derives it from hidden_size/num_heads).
+    #[serde(default)]
     pub head_dim: usize,
     pub patch_size: usize,
+    /// Gemma spatial-pool factor applied after patchify. Qwen has no pool
+    /// (it merges 2×2 patches in the projector instead) so this is absent →
+    /// defaults to 0; callers must `.max(1)` it.
+    #[serde(default)]
     pub pooling_kernel_size: usize,
+    #[serde(default)]
     pub rms_norm_eps: f64,
+    /// Learned position-embedding table size. Gemma:
+    /// `position_embedding_size`; Qwen: `num_position_embeddings`.
+    #[serde(default, alias = "num_position_embeddings")]
     pub position_embedding_size: usize,
     /// When false (E4B), skip the final `(x - std_bias) * std_scale` step
     /// and the corresponding `std_bias/std_scale` checkpoint tensors.
@@ -255,6 +293,26 @@ pub struct HfVisionConfig {
     /// Per-axis RoPE base; nested under `rope_parameters.rope_theta`.
     #[serde(default)]
     pub rope_parameters: Option<HfVisionRopeParameters>,
+
+    // ── Qwen3-VL native-ViT fields ───────────────────────────────────────
+    /// Temporal patch depth (Qwen: 2). One still image is duplicated across
+    /// these temporal slots; absent on Gemma → 0.
+    #[serde(default)]
+    pub temporal_patch_size: usize,
+    /// 2×2 spatial merge applied in the projector/merger (Qwen: 2). The
+    /// post-merge token grid is `(gh/merge, gw/merge)`; absent on Gemma → 0.
+    #[serde(default)]
+    pub spatial_merge_size: usize,
+    /// Projector output width fed into the LLM (Qwen 35B: 2048, 9B: 4096).
+    /// Gemma carries no per-tower output dim → 0.
+    #[serde(default)]
+    pub out_hidden_size: usize,
+    /// Input image channels (Qwen: 3). Absent on Gemma → 0.
+    #[serde(default)]
+    pub in_channels: usize,
+    /// MLP activation in the vision tower (Qwen: "gelu_pytorch_tanh").
+    #[serde(default)]
+    pub hidden_act: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -680,15 +738,17 @@ fn normalize_config_json(value: &mut serde_json::Value) {
             }
         }
     }
-    // Drop a `vision_config` that doesn't match the engine's `HfVisionConfig`
-    // shape (which requires `num_hidden_layers`). Qwen3-Next's SigLIP-2-style
-    // tower uses `depth`/`num_heads` instead and is handled separately (P4
-    // vision phase); leaving it in would fail text-model deserialization.
+    // Drop a `vision_config` that matches neither family's `HfVisionConfig`
+    // shape. The struct requires a transformer depth, named `num_hidden_layers`
+    // (Gemma-4) or `depth` (Qwen3-VL) — `depth` is wired as a serde alias, so
+    // either key parses. A `vision_config` carrying neither (e.g. Nemotron's
+    // RADIO tower, handled separately) is removed so text-model
+    // deserialization doesn't choke on the foreign shape.
     if let Some(obj) = value.as_object_mut() {
         let incompatible = obj
             .get("vision_config")
             .and_then(|v| v.as_object())
-            .map(|v| !v.contains_key("num_hidden_layers"))
+            .map(|v| !v.contains_key("num_hidden_layers") && !v.contains_key("depth"))
             .unwrap_or(false);
         if incompatible {
             obj.remove("vision_config");
@@ -712,6 +772,24 @@ fn normalize_config_json(value: &mut serde_json::Value) {
             if let Some(f) = factor {
                 obj.insert("partial_rotary_factor".into(), serde_json::json!(f));
             }
+        }
+        // M-RoPE params (Qwen3-VL): hoist `mrope_section` / `mrope_interleaved`
+        // out of `rope_parameters` so `HfConfig` sees them at the top level.
+        if !obj.contains_key("mrope_section")
+            && let Some(sec) = obj
+                .get("rope_parameters")
+                .and_then(|rp| rp.get("mrope_section"))
+                .cloned()
+        {
+            obj.insert("mrope_section".into(), sec);
+        }
+        if !obj.contains_key("mrope_interleaved")
+            && let Some(itl) = obj
+                .get("rope_parameters")
+                .and_then(|rp| rp.get("mrope_interleaved"))
+                .cloned()
+        {
+            obj.insert("mrope_interleaved".into(), itl);
         }
         // Per-layer-type rope_theta (Gemma 4: sliding=10k, global=1M).
         for (key, lt) in [
@@ -875,6 +953,154 @@ mod tests {
         // 10_000 default that the old hoist produced.
         assert_eq!(cfg.rope_theta, Some(10_000_000.0));
         assert_eq!(cfg.partial_rotary_factor, Some(0.25));
+    }
+
+    /// Qwen3-VL `vision_config` shape (identical in 35B-A3B and 9B except
+    /// `out_hidden_size`). Names differ from Gemma: `depth`/`num_heads`/
+    /// `num_position_embeddings`.
+    fn qwen_vision_raw() -> serde_json::Value {
+        serde_json::json!({
+            "deepstack_visual_indexes": [],
+            "depth": 27,
+            "hidden_act": "gelu_pytorch_tanh",
+            "hidden_size": 1152,
+            "in_channels": 3,
+            "initializer_range": 0.02,
+            "intermediate_size": 4304,
+            "model_type": "qwen3_5",
+            "num_heads": 16,
+            "num_position_embeddings": 2304,
+            "out_hidden_size": 2048,
+            "patch_size": 16,
+            "spatial_merge_size": 2,
+            "temporal_patch_size": 2
+        })
+    }
+
+    #[test]
+    fn qwen_vision_config_parses_with_aliases() {
+        let cfg: super::HfVisionConfig =
+            serde_json::from_value(qwen_vision_raw()).unwrap();
+        // Aliased fields.
+        assert_eq!(cfg.num_hidden_layers, 27, "depth -> num_hidden_layers");
+        assert_eq!(cfg.num_attention_heads, 16, "num_heads -> num_attention_heads");
+        assert_eq!(
+            cfg.position_embedding_size, 2304,
+            "num_position_embeddings -> position_embedding_size"
+        );
+        // Direct fields.
+        assert_eq!(cfg.hidden_size, 1152);
+        assert_eq!(cfg.intermediate_size, 4304);
+        assert_eq!(cfg.patch_size, 16);
+        // Qwen-only fields.
+        assert_eq!(cfg.temporal_patch_size, 2);
+        assert_eq!(cfg.spatial_merge_size, 2);
+        assert_eq!(cfg.out_hidden_size, 2048);
+        assert_eq!(cfg.in_channels, 3);
+        assert_eq!(cfg.hidden_act.as_deref(), Some("gelu_pytorch_tanh"));
+        // Gemma-only fields absent → defaults (callers must `.max(1)` pool).
+        assert_eq!(cfg.pooling_kernel_size, 0);
+        assert_eq!(cfg.head_dim, 0);
+    }
+
+    #[test]
+    fn gemma_vision_config_still_parses() {
+        // Regression guard: Gemma names (no aliases) must still deserialize.
+        let cfg: super::HfVisionConfig = serde_json::from_value(serde_json::json!({
+            "hidden_size": 768,
+            "intermediate_size": 3072,
+            "num_hidden_layers": 16,
+            "num_attention_heads": 12,
+            "head_dim": 64,
+            "patch_size": 16,
+            "pooling_kernel_size": 3,
+            "rms_norm_eps": 1e-6,
+            "position_embedding_size": 10240,
+            "standardize": false
+        }))
+        .unwrap();
+        assert_eq!(cfg.num_hidden_layers, 16);
+        assert_eq!(cfg.num_attention_heads, 12);
+        assert_eq!(cfg.head_dim, 64);
+        assert_eq!(cfg.pooling_kernel_size, 3);
+        assert_eq!(cfg.position_embedding_size, 10240);
+        assert!(!cfg.standardize);
+        // Qwen-only fields default to 0 on a Gemma config.
+        assert_eq!(cfg.temporal_patch_size, 0);
+        assert_eq!(cfg.spatial_merge_size, 0);
+    }
+
+    #[test]
+    fn qwen_normalize_keeps_vision_and_hoists_mrope() {
+        // Full top-level config: vision_config sibling + text M-RoPE nested.
+        let mut v = serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "image_token_id": 248056,
+            "vision_start_token_id": 248053,
+            "vision_end_token_id": 248054,
+            "vision_config": qwen_vision_raw(),
+            "text_config": {
+                "hidden_size": 2048,
+                "num_hidden_layers": 40,
+                "num_attention_heads": 16,
+                "head_dim": 256,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25,
+                    "mrope_interleaved": true,
+                    "mrope_section": [11, 11, 10]
+                }
+            }
+        });
+        super::normalize_config_json(&mut v);
+        let cfg: HfConfig = serde_json::from_value(v).unwrap();
+        // vision_config survived the drop filter (uses `depth`, not `num_hidden_layers`).
+        let vc = cfg.vision_config.expect("vision_config kept");
+        assert_eq!(vc.num_hidden_layers, 27);
+        assert_eq!(vc.spatial_merge_size, 2);
+        // Text M-RoPE hoisted out of rope_parameters.
+        assert_eq!(cfg.mrope_section, Some(vec![11, 11, 10]));
+        assert_eq!(cfg.mrope_interleaved, Some(true));
+        assert_eq!(cfg.partial_rotary_factor, Some(0.25));
+        assert_eq!(cfg.rope_theta, Some(10_000_000.0));
+        assert_eq!(cfg.image_token_id, Some(248056));
+    }
+
+    /// Cross-check against the REAL on-disk Qwen config.json files. Skips
+    /// (does not fail) when the checkpoints aren't present on this machine.
+    #[test]
+    fn qwen_real_configs_parse() {
+        for (path, want_out_hidden, want_image_tok) in [
+            ("/home/daniil/LM-experements/models/Qwen3.6-35B-A3B-NVFP4/config.json", 2048usize, 248056u32),
+            ("/home/daniil/LM-experements/models/Qwen3.5-9B-FP8/config.json", 4096usize, 248056u32),
+        ] {
+            let p = std::path::Path::new(path);
+            if !p.exists() {
+                eprintln!("skip (missing): {path}");
+                continue;
+            }
+            let cfg = super::read_hf_config(p).expect("read real config");
+            let vc = cfg.vision_config.as_ref().expect("vision_config present");
+            assert_eq!(vc.num_hidden_layers, 27, "{path}: depth");
+            assert_eq!(vc.num_attention_heads, 16, "{path}: num_heads");
+            assert_eq!(vc.hidden_size, 1152, "{path}: hidden_size");
+            assert_eq!(vc.intermediate_size, 4304, "{path}: intermediate_size");
+            assert_eq!(vc.patch_size, 16, "{path}: patch_size");
+            assert_eq!(vc.temporal_patch_size, 2, "{path}: temporal_patch_size");
+            assert_eq!(vc.spatial_merge_size, 2, "{path}: spatial_merge_size");
+            assert_eq!(vc.num_attention_heads, 16);
+            assert_eq!(vc.position_embedding_size, 2304, "{path}: num_position_embeddings");
+            assert_eq!(vc.in_channels, 3, "{path}: in_channels");
+            assert_eq!(vc.out_hidden_size, want_out_hidden, "{path}: out_hidden_size");
+            assert_eq!(vc.hidden_act.as_deref(), Some("gelu_pytorch_tanh"));
+            // Text M-RoPE.
+            assert_eq!(cfg.mrope_section, Some(vec![11, 11, 10]), "{path}: mrope_section");
+            assert_eq!(cfg.mrope_interleaved, Some(true), "{path}: mrope_interleaved");
+            assert_eq!(cfg.partial_rotary_factor, Some(0.25), "{path}: partial_rotary_factor");
+            assert_eq!(cfg.rope_theta, Some(10_000_000.0), "{path}: rope_theta");
+            assert_eq!(cfg.image_token_id, Some(want_image_tok), "{path}: image_token_id");
+        }
     }
 
     #[test]

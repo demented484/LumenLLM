@@ -10,6 +10,7 @@
 pub mod audio;
 pub mod fusion;
 pub mod image_preprocess;
+pub mod mrope;
 pub mod video;
 pub mod vision;
 
