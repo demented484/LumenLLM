@@ -438,7 +438,11 @@ fn forward_moe_decode_device(
             runtime.scale_f32_device(scalar_root_size, &mut moe_scratch.router_input_scratch)?;
             &moe_scratch.router_input_scratch
         }
-        None => residual,
+        // Standard MoE (Qwen3-Next, Mixtral, …): the router runs on the SAME
+        // post-attention-layernorm'd hidden as the experts/shared (HF
+        // `gate(hidden_states)`), NOT the raw residual. Gemma uses its own
+        // `router.scale` norm via the `Some` arm above.
+        None => &*post_normed,
     };
     runtime.matvec_bf16_reference_device(&moe.router, router_input, &mut moe_scratch.router_logits)?;
     let top_k = moe.top_k;
@@ -529,11 +533,15 @@ fn forward_moe_decode_device(
                 &mut moe_scratch.expert_up,
                 if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
             )?;
-            runtime.geglu_tanh_device(
-                &moe_scratch.expert_gate,
-                &moe_scratch.expert_up,
-                &mut moe_scratch.expert_swiglu,
-            )?;
+            // Qwen3-Next shared expert is SwiGLU (silu); Gemma is GeGLU-tanh.
+            match layer.dense_activation {
+                super::mlp::DenseActivation::Swiglu => runtime.swiglu_device(
+                    &moe_scratch.expert_gate, &moe_scratch.expert_up, &mut moe_scratch.expert_swiglu,
+                )?,
+                super::mlp::DenseActivation::GeluTanh => runtime.geglu_tanh_device(
+                    &moe_scratch.expert_gate, &moe_scratch.expert_up, &mut moe_scratch.expert_swiglu,
+                )?,
+            }
         }
         matvec_cuda_linear_with_scratch(
             runtime, &shared.down_proj, &moe_scratch.expert_swiglu,
@@ -541,6 +549,15 @@ fn forward_moe_decode_device(
             &mut moe_scratch.moe_acc,
             if staging_ptr.is_null() { None } else { Some(unsafe { &mut *staging_ptr }) },
         )?;
+        // Qwen3-Next: scale the shared-expert output by sigmoid(shared_gate · x),
+        // where x is the (pre-shared-MLP) normed hidden still in `post_normed`.
+        if let Some(ref sgate) = shared.shared_gate {
+            let mut logit = runtime.alloc_f32(1)?;
+            runtime.matvec_bf16_reference_device(sgate, post_normed, &mut logit)?;
+            let g = runtime.download_f32(&logit)?[0];
+            let gate = 1.0f32 / (1.0f32 + (-g).exp());
+            runtime.scale_f32_device(gate, &mut moe_scratch.moe_acc)?;
+        }
     } else {
         runtime.zero_f32_device(&mut moe_scratch.moe_acc)?;
     }

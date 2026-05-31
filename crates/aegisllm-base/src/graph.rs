@@ -145,6 +145,18 @@ pub enum TensorRole {
     SsmD,
     SsmDt,
     SsmConv1d,
+    /// Qwen3-Next sigmoid gate scalar for the shared expert (`shared_expert_gate`).
+    MoeSharedExpertGate,
+    /// Gated DeltaNet (Qwen3-Next linear-attention) parameters.
+    GdnInProjQkv,
+    GdnInProjZ,
+    GdnInProjB,
+    GdnInProjA,
+    GdnConv1d,
+    GdnALog,
+    GdnDtBias,
+    GdnNorm,
+    GdnOutProj,
     /// Generic catch-all.
     Other,
 }
@@ -248,28 +260,34 @@ impl ModelGraph {
             add_known_tensor(&mut tensors, artifact, TensorRole::PostMlpNorm,
                 &format!("{prefix}.post_feedforward_layernorm.weight"));
 
-            // ── MoE router (Gemma 4: router.proj, Qwen: mlp.router_logits) ─
+            // ── MoE router (Gemma 4: router.proj, Qwen3: mlp.router_logits,
+            //    Qwen3-Next: mlp.gate) ──────────────────────────────────────
             add_known_tensor(&mut tensors, artifact, TensorRole::MoeRouter,
                 &format!("{prefix}.router.proj.weight"));
             add_known_tensor(&mut tensors, artifact, TensorRole::MoeRouter,
                 &format!("{prefix}.mlp.router_logits.weight"));
             add_known_tensor(&mut tensors, artifact, TensorRole::MoeRouter,
+                &format!("{prefix}.mlp.gate.weight"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::MoeRouter,
                 &format!("{prefix}.block_sparse_moe.gate.weight"));
 
-            // ── Per-expert tensors (Gemma 4 MoE: experts.N.{gate|up|down}_proj) ─
-            // We record individual expert regions as Other tensors so the loader
-            // can access them; the executor stacks them at load time.
+            // ── Per-expert tensors. Gemma 4: `experts.N.*`; Qwen3-Next:
+            //    `mlp.experts.N.*`. Both recorded; only present ones stick. ──
             if num_experts > 1 {
                 for expert_idx in 0..num_experts {
-                    let ep = format!("{prefix}.experts.{expert_idx}");
-                    for (proj, role) in [
-                        ("gate_proj", TensorRole::Gate),
-                        ("up_proj", TensorRole::Up),
-                        ("down_proj", TensorRole::Down),
+                    for base in [
+                        format!("{prefix}.experts.{expert_idx}"),
+                        format!("{prefix}.mlp.experts.{expert_idx}"),
                     ] {
-                        add_known_tensor(&mut tensors, artifact, role,
-                            &format!("{ep}.{proj}.weight"));
-                        add_quant_aux_tensors(&mut tensors, artifact, &format!("{ep}.{proj}"));
+                        for (proj, role) in [
+                            ("gate_proj", TensorRole::Gate),
+                            ("up_proj", TensorRole::Up),
+                            ("down_proj", TensorRole::Down),
+                        ] {
+                            add_known_tensor(&mut tensors, artifact, role,
+                                &format!("{base}.{proj}.weight"));
+                            add_quant_aux_tensors(&mut tensors, artifact, &format!("{base}.{proj}"));
+                        }
                     }
                 }
             }
@@ -277,10 +295,41 @@ impl ModelGraph {
             // ── Shared expert (Nemotron 3 / Qwen 3.x) ────────────────────
             add_known_tensor(&mut tensors, artifact, TensorRole::MoeSharedGate,
                 &format!("{prefix}.mlp.shared_expert.gate_proj.weight"));
+            add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.mlp.shared_expert.gate_proj"));
             add_known_tensor(&mut tensors, artifact, TensorRole::MoeSharedUp,
                 &format!("{prefix}.mlp.shared_expert.up_proj.weight"));
+            add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.mlp.shared_expert.up_proj"));
             add_known_tensor(&mut tensors, artifact, TensorRole::MoeSharedDown,
                 &format!("{prefix}.mlp.shared_expert.down_proj.weight"));
+            add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.mlp.shared_expert.down_proj"));
+            // Qwen3-Next sigmoid gate for the shared expert.
+            add_known_tensor(&mut tensors, artifact, TensorRole::MoeSharedExpertGate,
+                &format!("{prefix}.mlp.shared_expert_gate.weight"));
+
+            // ── Gated DeltaNet linear-attention (Qwen3-Next) ─────────────
+            // Four separate input projections + depthwise conv + recurrence
+            // params. Only present on linear-attention layers (others skip).
+            add_known_tensor(&mut tensors, artifact, TensorRole::GdnInProjQkv,
+                &format!("{prefix}.linear_attn.in_proj_qkv.weight"));
+            add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.linear_attn.in_proj_qkv"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::GdnInProjZ,
+                &format!("{prefix}.linear_attn.in_proj_z.weight"));
+            add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.linear_attn.in_proj_z"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::GdnInProjB,
+                &format!("{prefix}.linear_attn.in_proj_b.weight"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::GdnInProjA,
+                &format!("{prefix}.linear_attn.in_proj_a.weight"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::GdnConv1d,
+                &format!("{prefix}.linear_attn.conv1d.weight"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::GdnALog,
+                &format!("{prefix}.linear_attn.A_log"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::GdnDtBias,
+                &format!("{prefix}.linear_attn.dt_bias"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::GdnNorm,
+                &format!("{prefix}.linear_attn.norm.weight"));
+            add_known_tensor(&mut tensors, artifact, TensorRole::GdnOutProj,
+                &format!("{prefix}.linear_attn.out_proj.weight"));
+            add_quant_aux_tensors(&mut tensors, artifact, &format!("{prefix}.linear_attn.out_proj"));
 
             // ── SSM / Mamba tensors (Nemotron 3) ─────────────────────────
             add_known_tensor(&mut tensors, artifact, TensorRole::SsmInProj,

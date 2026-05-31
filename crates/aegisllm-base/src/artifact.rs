@@ -354,6 +354,9 @@ pub struct HfQuantizationConfig {
     pub quant_algo: Option<String>,
     /// HuggingFace standard alternative key for quantization name (FP8 / GPTQ / AWQ).
     pub quant_method: Option<String>,
+    /// compressed-tensors top-level `format` (e.g. "nvfp4-pack-quantized").
+    /// Qwen3-Next NVFP4 checkpoints carry the scheme here, not in quant_algo.
+    pub format: Option<String>,
     pub kv_cache_scheme: Option<HfKvCacheScheme>,
 }
 
@@ -484,6 +487,11 @@ impl ModelArtifact {
             }
             if let Some(method) = qcfg.quant_method.as_deref() {
                 return WeightQuantization::parse_guess(method);
+            }
+            // compressed-tensors (Qwen3-Next): scheme is in `format`
+            // (e.g. "nvfp4-pack-quantized").
+            if let Some(format) = qcfg.format.as_deref() {
+                return WeightQuantization::parse_guess(format);
             }
         }
         WeightQuantization::parse_guess(self.config.torch_dtype.as_deref().unwrap_or("none"))
@@ -624,6 +632,15 @@ fn read_hf_config(path: &Path) -> Result<HfConfig> {
     }
     let bytes = fs::read(path)?;
     let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    normalize_config_json(&mut value);
+    Ok(serde_json::from_value(value)?)
+}
+
+/// Normalizes a raw HF `config.json` value in place before deserialization:
+/// flattens `text_config`/`llm_config` wrappers, mirrors `dtype`→`torch_dtype`,
+/// and hoists nested `rope_parameters` fields (Gemma 4 per-attention-type and
+/// Qwen3-Next flat layouts) up to the top level so `HfConfig` sees them.
+fn normalize_config_json(value: &mut serde_json::Value) {
     // Flatten text_config (Qwen3.5, Gemma4, Nemotron Omni outer wrapper)
     // or llm_config (Nemotron Omni inner LLM config) when hidden_size is
     // absent at the top level.
@@ -663,6 +680,20 @@ fn read_hf_config(path: &Path) -> Result<HfConfig> {
             }
         }
     }
+    // Drop a `vision_config` that doesn't match the engine's `HfVisionConfig`
+    // shape (which requires `num_hidden_layers`). Qwen3-Next's SigLIP-2-style
+    // tower uses `depth`/`num_heads` instead and is handled separately (P4
+    // vision phase); leaving it in would fail text-model deserialization.
+    if let Some(obj) = value.as_object_mut() {
+        let incompatible = obj
+            .get("vision_config")
+            .and_then(|v| v.as_object())
+            .map(|v| !v.contains_key("num_hidden_layers"))
+            .unwrap_or(false);
+        if incompatible {
+            obj.remove("vision_config");
+        }
+    }
     // Gemma 4 nests per-attention-type rope params under `rope_parameters`.
     // Hoist `partial_rotary_factor` from `rope_parameters.full_attention` so
     // that HfConfig.partial_rotary_factor gets populated correctly.
@@ -670,8 +701,13 @@ fn read_hf_config(path: &Path) -> Result<HfConfig> {
         if !obj.contains_key("partial_rotary_factor") {
             let factor = obj
                 .get("rope_parameters")
-                .and_then(|rp| rp.get("full_attention"))
-                .and_then(|fa| fa.get("partial_rotary_factor"))
+                .and_then(|rp| {
+                    // Gemma 4 nests under `full_attention`; Qwen3-Next puts a single
+                    // flat `partial_rotary_factor` directly under `rope_parameters`.
+                    rp.get("full_attention")
+                        .and_then(|fa| fa.get("partial_rotary_factor"))
+                        .or_else(|| rp.get("partial_rotary_factor"))
+                })
                 .and_then(|f| f.as_f64());
             if let Some(f) = factor {
                 obj.insert("partial_rotary_factor".into(), serde_json::json!(f));
@@ -698,12 +734,18 @@ fn read_hf_config(path: &Path) -> Result<HfConfig> {
         if !obj.contains_key("rope_theta") {
             let global = obj.get("rope_theta_global").and_then(|f| f.as_f64());
             let sliding = obj.get("rope_theta_sliding").and_then(|f| f.as_f64());
-            if let Some(theta) = sliding.or(global) {
+            // Qwen3-Next: a single flat `rope_parameters.rope_theta` (e.g. 1e7),
+            // with no per-attention-type nesting. Without this the RoPE base would
+            // silently default to 10_000 and break long-context positions.
+            let flat = obj
+                .get("rope_parameters")
+                .and_then(|rp| rp.get("rope_theta"))
+                .and_then(|f| f.as_f64());
+            if let Some(theta) = sliding.or(global).or(flat) {
                 obj.insert("rope_theta".into(), serde_json::json!(theta));
             }
         }
     }
-    Ok(serde_json::from_value(value)?)
 }
 
 fn read_json_optional<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
@@ -788,6 +830,72 @@ mod tests {
         let d = cfg.effective_dims();
         assert_eq!(d.hidden_size, 4096);
         assert!(!d.is_sliced);
+    }
+
+    // ---- Qwen3-Next (Qwen3.5/3.6) config normalization ----
+
+    /// Mirror of the real Qwen3.6-35B-A3B `text_config` shape: rope params are
+    /// nested under `rope_parameters` (flat, no per-attention-type keys).
+    fn qwen3_next_raw() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "hidden_size": 2048,
+                "num_hidden_layers": 40,
+                "num_attention_heads": 16,
+                "num_experts": 256,
+                "num_experts_per_tok": 8,
+                "shared_expert_intermediate_size": 512,
+                "layer_types": ["linear_attention", "linear_attention",
+                                "linear_attention", "full_attention"],
+                "linear_num_key_heads": 16,
+                "linear_num_value_heads": 32,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "attn_output_gate": true,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25,
+                    "mrope_interleaved": true,
+                    "mrope_section": [11, 11, 10]
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn qwen3_next_hoists_rope_theta_and_partial_factor() {
+        let mut v = qwen3_next_raw();
+        super::normalize_config_json(&mut v);
+        let cfg: HfConfig = serde_json::from_value(v).unwrap();
+        // rope_theta must come from rope_parameters.rope_theta (1e7), NOT the
+        // 10_000 default that the old hoist produced.
+        assert_eq!(cfg.rope_theta, Some(10_000_000.0));
+        assert_eq!(cfg.partial_rotary_factor, Some(0.25));
+    }
+
+    #[test]
+    fn gemma4_rope_hoist_still_works() {
+        // Regression guard: Gemma 4 nests per-attention-type rope params.
+        let mut v = serde_json::json!({
+            "model_type": "gemma4",
+            "hidden_size": 2048,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 8,
+            "rope_parameters": {
+                "sliding_attention": { "rope_theta": 10000.0 },
+                "full_attention": { "rope_theta": 1000000.0,
+                                    "partial_rotary_factor": 0.5 }
+            }
+        });
+        super::normalize_config_json(&mut v);
+        let cfg: HfConfig = serde_json::from_value(v).unwrap();
+        assert_eq!(cfg.rope_theta_global, Some(1_000_000.0));
+        assert_eq!(cfg.rope_theta_sliding, Some(10_000.0));
+        assert_eq!(cfg.partial_rotary_factor, Some(0.5));
     }
 }
 

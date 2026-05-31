@@ -2,6 +2,7 @@ mod attention;
 pub mod block;
 mod forward;
 mod g4;
+pub mod gdn;
 mod loader;
 mod math;
 mod provider;

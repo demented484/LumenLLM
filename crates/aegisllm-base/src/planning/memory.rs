@@ -442,13 +442,17 @@ fn dense_vram_split(graph: &ModelGraph, region: &RegionPlacement) -> Option<Dens
     let mut split = DenseVramSplit { streamed: 0, forced_vram: 0, device };
     for tensor in &g_region.tensors {
         let bytes = tensor.info.data_len_bytes();
-        // BF16 dense weights (attention, shared expert, norms) have no
-        // streaming matmul → force-VRAM. NVFP4 packed weights (U8) and their
-        // FP8 scales stream → honour `store`.
-        if tensor.info.dtype == TensorDType::BF16 {
-            split.forced_vram += bytes;
-        } else {
+        // Only the ROUTED MoE experts (`...experts.{N}...`, sparse — gathered
+        // top-k per token) stream; everything else in the block is dense
+        // (used EVERY token) and force-VRAM, regardless of dtype: attention,
+        // GDN projections, the router (`mlp.gate`), the shared expert, and
+        // norms. Keying on `.experts.` rather than dtype is what stops a
+        // Qwen3-Next hybrid (NVFP4 GDN/attn/shared) from needlessly streaming
+        // ~all of its dense weights every token (was H2D-bound at 23 GB/s).
+        if tensor.info.name.contains(".experts.") {
             split.streamed += bytes;
+        } else {
+            split.forced_vram += bytes;
         }
     }
     Some(split)

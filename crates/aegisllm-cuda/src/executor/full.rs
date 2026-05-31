@@ -146,11 +146,20 @@ impl CudaLlamaExecutor {
         progress.step("embed");
         let final_norm_name = format!("{}norm.weight", graph.text_prefix);
         let t0 = std::time::Instant::now();
-        let final_norm = cuda_weights.load_dense_vector_with_store(
-            first_existing_tensor(artifact, &[&final_norm_name, "model.norm.weight"])?,
-            final_norm_region.store,
-            &mut loader,
-        )?;
+        let final_norm = {
+            let b = cuda_weights.load_dense_vector_with_store(
+                first_existing_tensor(artifact, &[&final_norm_name, "model.norm.weight"])?,
+                final_norm_region.store,
+                &mut loader,
+            )?;
+            // Qwen3-Next zero-centered RMSNorm: fold +1 into the final norm too.
+            let mt = artifact.config.model_type.as_str();
+            if mt.contains("qwen3_5") || mt.contains("qwen3_next") {
+                cuda_weights.plus_one_norm(b)?
+            } else {
+                b
+            }
+        };
         stage_t("final_norm", t0);
         progress.step("final_norm");
         let lm_head_tensor = first_existing_tensor(
@@ -1143,16 +1152,30 @@ impl CudaLlamaExecutor {
                             )?
                         }
                     };
-                    Ok(CudaLayerState { kv })
+                    // Qwen3-Next GDN layers carry recurrent + conv state instead
+                    // of (using) the KV cache. Allocate zeroed; persists across
+                    // the whole sequence. (KV above is allocated but unused for
+                    // GDN layers — harmless; a memory follow-up can skip it.)
+                    let (recurrent, conv_state) = match layer.gdn.as_ref() {
+                        Some(g) => (
+                            Some(self.runtime.upload_f32(&vec![0.0f32; g.dims.state_elems()])?),
+                            Some(self.runtime.upload_f32(&vec![0.0f32; g.dims.conv_state_elems()])?),
+                        ),
+                        None => (None, None),
+                    };
+                    Ok(CudaLayerState { kv, recurrent, conv_state })
                 })
                 .collect::<Result<Vec<_>>>()?,
             scratch: CudaScratch {
-                input_normed: self.runtime.alloc_f32(self.hidden_size)?,
-                quant_hidden: self.runtime.alloc_f32(self.hidden_size)?,
+                // Qwen3-Next: q_width (heads·head_dim = 4096) can exceed hidden
+                // (2048), and o_proj quantizes its q_width-wide input through
+                // these scratch buffers — size them to cover both.
+                input_normed: self.runtime.alloc_f32(self.hidden_size.max(max_q_width))?,
+                quant_hidden: self.runtime.alloc_f32(self.hidden_size.max(max_q_width))?,
                 quant_intermediate: self.runtime.alloc_f32(intermediate)?,
                 mxfp4_hidden: self
                     .runtime
-                    .alloc_u8(CudaRuntime::mxfp4_vector_bytes(self.hidden_size)?)?,
+                    .alloc_u8(CudaRuntime::mxfp4_vector_bytes(self.hidden_size.max(max_q_width))?)?,
                 mxfp4_intermediate: self
                     .runtime
                     .alloc_u8(CudaRuntime::mxfp4_vector_bytes(intermediate)?)?,

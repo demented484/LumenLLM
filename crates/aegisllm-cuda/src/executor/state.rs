@@ -120,6 +120,10 @@ pub(super) struct CudaMoEShared {
     /// Built at load time by `fuse_bf16_gate_up` for the BF16 `Wq::Default`
     /// shared-MLP path; left `None` for FP8 quantized shared MLP.
     pub(super) gate_up_fused: Option<DeviceBf16Matrix>,
+    /// Qwen3-Next `shared_expert_gate` weight `[1, hidden]` BF16. When present,
+    /// the shared-expert output is scaled by `sigmoid(gate · x)` before being
+    /// added to the routed experts. `None` for Gemma (ungated shared MLP).
+    pub(super) shared_gate: Option<DeviceBf16Matrix>,
 }
 
 /// GPU-driven MoE decode tables (built at load when the expert arena is
@@ -399,6 +403,14 @@ pub(super) struct CudaLayer {
     /// `num_hidden_layers - num_kv_shared_layers`. E4B: layers 24..41 are
     /// shared; layers 22 (sliding) and 23 (full) are the parents.
     pub(super) kv_shared_from: Option<usize>,
+    /// Qwen3-Next Gated DeltaNet mixer weights. `Some` replaces the
+    /// self-attention sublayer with the GDN recurrence; the MLP sublayer
+    /// (dense or MoE) is unaffected. `None` for every standard attention layer.
+    pub(super) gdn: Option<Box<super::gdn::CudaGdn>>,
+    /// Qwen3-Next full-attention output gate: when true, `q_proj` outputs
+    /// `[num_heads, 2*head_dim]` (query interleaved with a gate); the attention
+    /// output is multiplied by `sigmoid(gate)` per head before `o_proj`.
+    pub(super) attn_output_gate: bool,
 }
 
 /// EAGLE/MTP speculative-decoding draft model (Gemma-4 E4B-it-assistant).
@@ -570,6 +582,11 @@ pub(super) struct DraftState {
 #[derive(Debug)]
 pub(super) struct CudaLayerState {
     pub(super) kv: CudaKvCache,
+    /// Gated DeltaNet recurrent state `[n_v, d_v, d_k]` f32 (Qwen3-Next GDN
+    /// layers). Persists across the whole sequence; `None` for attention layers.
+    pub(super) recurrent: Option<DeviceBuffer<f32>>,
+    /// GDN depthwise-conv rolling state `[conv_channels, kernel-1]` f32.
+    pub(super) conv_state: Option<DeviceBuffer<f32>>,
 }
 
 /// KV weights stored in CUDA-pinned host RAM for `kv-cache.store=ram` configs.

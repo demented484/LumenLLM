@@ -107,25 +107,32 @@ impl CudaLlamaExecutor {
             let kv_shared_override = layer.kv_shared_from
                 .and_then(|parent_idx| left.get(parent_idx).map(|s| &s.kv));
             let lt_attn = std::time::Instant::now();
-            super::attention::forward_attention_device(
-                &self.runtime,
-                layer,
-                layer_state,
-                kv_shared_override,
-                hidden,
-                scratch,
-                decode_position,
-                decode_seq_len,
-                params.rms_norm_eps,
-                params.num_attention_heads,
-                layer.layer_num_kv_heads,
-                layer.layer_head_dim,
-                params.kv_context_size,
-                layer.rope,
-                params.staging_slot_idx,
-                params.position,
-                params.seq_len,
-            )?;
+            if layer.gdn.is_some() {
+                // Qwen3-Next Gated DeltaNet mixer replaces self-attention.
+                super::gdn::forward_gdn_mixer_decode(
+                    &self.runtime, layer, layer_state, hidden, scratch, params.rms_norm_eps,
+                )?;
+            } else {
+                super::attention::forward_attention_device(
+                    &self.runtime,
+                    layer,
+                    layer_state,
+                    kv_shared_override,
+                    hidden,
+                    scratch,
+                    decode_position,
+                    decode_seq_len,
+                    params.rms_norm_eps,
+                    params.num_attention_heads,
+                    layer.layer_num_kv_heads,
+                    layer.layer_head_dim,
+                    params.kv_context_size,
+                    layer.rope,
+                    params.staging_slot_idx,
+                    params.position,
+                    params.seq_len,
+                )?;
+            }
             let lt_attn_done = lt_attn.elapsed().as_secs_f64() * 1000.0;
             if let Ok(layer_str) = std::env::var("AEGIS_DUMP_LAYER") {
                 if let Ok(target_layer) = layer_str.parse::<usize>() {
@@ -145,6 +152,24 @@ impl CudaLlamaExecutor {
                 &self.runtime, layer, layer_idx, self.ple.as_ref(), scratch, params.rms_norm_eps,
             )?;
             let lt_mlp_done = lt_mlp.elapsed().as_secs_f64() * 1000.0;
+            if let Ok(s) = std::env::var("AEGIS_DUMP_MLP") {
+                if s.parse::<usize>().ok() == Some(layer_idx) {
+                    let tag = std::env::var("AEGIS_DUMP_TAG").unwrap_or_else(|_| "?".into());
+                    let h = self.runtime.download_f32(&scratch.hidden_out)?;
+                    eprintln!("[DUMP {tag} MLP L{}] hidden_out first8={:?}", layer_idx, &h[0..8.min(h.len())]);
+                }
+            }
+            // Full per-layer hidden dump. With AEGIS_DUMP_HIDDEN_POS set, dump
+            // only that position; else dump EVERY token (last write = last
+            // prompt token, the one generation predicts from).
+            if let Ok(dir) = std::env::var("AEGIS_DUMP_HIDDEN_DIR") {
+                let want = std::env::var("AEGIS_DUMP_HIDDEN_POS").ok().and_then(|s| s.parse::<usize>().ok());
+                if want.is_none() || want == Some(position) {
+                    let h = self.runtime.download_f32(&scratch.hidden_out)?;
+                    let bytes: Vec<u8> = h.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    let _ = std::fs::write(format!("{dir}/L{layer_idx}_p{position}.bin"), &bytes);
+                }
+            }
             std::mem::swap(hidden, &mut scratch.hidden_out);
             if prof {
                 eprintln!(
@@ -400,7 +425,8 @@ impl CudaLlamaExecutor {
             let can_capture = seq_len <= CUDA_GRAPH_ATTN_MAX_SEQ_LEN
                 && !staged_layers_block_capture
                 && !self.has_staged_kv
-                && state.decode_graph.is_none();
+                && state.decode_graph.is_none()
+                && std::env::var("AEGIS_NO_CUDA_GRAPH").is_err();
             if can_capture {
                 self.runtime.begin_decode_graph_capture()?;
             }

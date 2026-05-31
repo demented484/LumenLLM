@@ -349,6 +349,9 @@ impl CudaLayerBlockExecutor {
                                 layer_kv_capacity,
                                 cuda_layer.window_size > 0,
                             )?,
+                            // Hybrid executor does not yet drive GDN layers.
+                            recurrent: None,
+                            conv_state: None,
                         },
                     ))
                 })

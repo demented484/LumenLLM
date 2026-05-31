@@ -102,6 +102,72 @@ fn read_chunked_par(path: &std::path::Path, file_offset: u64, dst: &mut [u8]) ->
     Ok(())
 }
 
+/// Decode a signed OCP FP8 E4M3 byte to f32 (1 sign, 4 exp bias-7, 3 mantissa).
+/// E4M3 has no infinities; the lone NaN is S.1111.111. Built as a 256-entry LUT
+/// so the per-element dequant loop is a single table lookup.
+fn build_e4m3_signed_lut() -> [f32; 256] {
+    let mut lut = [0f32; 256];
+    for (b, slot) in lut.iter_mut().enumerate() {
+        let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
+        let exp = ((b >> 3) & 0x0F) as i32;
+        let mant = (b & 0x07) as f32;
+        let v = if exp == 0 {
+            // Subnormal: 2^(1-bias) * (mant/8), bias = 7 → 2^-6 = 0.015625.
+            (mant / 8.0) * 0.015_625
+        } else if exp == 15 && (b & 0x07) == 7 {
+            f32::NAN
+        } else {
+            (1.0 + mant / 8.0) * 2f32.powi(exp - 7)
+        };
+        *slot = sign * v;
+    }
+    lut
+}
+
+/// Round-to-nearest-even f32 → bf16 (matches PyTorch's `.bfloat16()`), so the
+/// dequanted weights bit-match a torch/vLLM reference rather than truncate-biased.
+#[inline]
+fn f32_to_bf16_round(x: f32) -> u16 {
+    let bits = x.to_bits();
+    if bits & 0x7FFF_FFFF > 0x7F80_0000 {
+        return 0x7FC0; // canonical bf16 NaN
+    }
+    let rounding_bias = 0x0000_7FFF + ((bits >> 16) & 1);
+    ((bits.wrapping_add(rounding_bias)) >> 16) as u16
+}
+
+/// Dequant a DeepSeek-style FP8 block-scaled weight straight into a BF16
+/// destination byte buffer (LE u16 per element), parallel over output rows.
+/// `w_bf16[i,j] = e4m3(fp8[i,j]) * scale[i/blk_r, j/blk_c]`.
+#[allow(clippy::too_many_arguments)]
+fn dequant_fp8_block_into_bf16(
+    dst: &mut [u8],
+    fp8: &[u8],
+    scales: &[f32],
+    rows: usize,
+    cols: usize,
+    s_cols: usize,
+    blk_r: usize,
+    blk_c: usize,
+    lut: &[f32; 256],
+) {
+    use rayon::prelude::*;
+    dst.par_chunks_mut(cols * 2).enumerate().for_each(|(i, row)| {
+        if i >= rows {
+            return;
+        }
+        let sr = (i / blk_r) * s_cols;
+        let base = i * cols;
+        for j in 0..cols {
+            let w = lut[fp8[base + j] as usize];
+            let sc = scales[sr + j / blk_c];
+            let bytes = f32_to_bf16_round(w * sc).to_le_bytes();
+            row[2 * j] = bytes[0];
+            row[2 * j + 1] = bytes[1];
+        }
+    });
+}
+
 /// Read a tensor's raw bytes from disk into the pinned host arena via
 /// 8-way parallel `pread`. Returns the byte offset inside the arena
 /// where bytes were placed; combined with the byte length this
@@ -476,18 +542,12 @@ impl CudaWeightLoader<'_> {
             .tensors
             .get(&format!("{prefix}.weight_scale"))
             .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`")))?;
-        let output_scale = artifact
-            .tensors
-            .get(&format!("{prefix}.weight_scale_2"))
-            .map(|t| read_scalar_f32_with_loader(loader, t, store))
-            .transpose()?
-            .unwrap_or(1.0);
-        let input_scale = artifact
-            .tensors
-            .get(&format!("{prefix}.input_scale"))
-            .map(|t| read_scalar_f32_with_loader(loader, t, store))
-            .transpose()?
-            .unwrap_or(1.0);
+        let output_scale = read_nvfp4_pertensor_scale(
+            artifact, prefix, "weight_scale_2", "weight_global_scale", loader, store,
+        )?.unwrap_or(1.0);
+        let input_scale = read_nvfp4_pertensor_scale(
+            artifact, prefix, "input_scale", "input_global_scale", loader, store,
+        )?.unwrap_or(1.0);
         let spec = Nvfp4LinearSpec::from_tensors(prefix, weight, scales, input_scale, output_scale)?;
         let stub_packed = self
             .runtime
@@ -528,9 +588,12 @@ impl CudaWeightLoader<'_> {
         store: StoragePlacement,
         loader: &mut TensorStorageLoader,
     ) -> Result<DeviceBuffer<f32>> {
-        if tensor.shape.len() != 1 {
+        // Vectors (norms, biases) are 1-D; GDN's depthwise conv1d weight is
+        // `[channels, 1, kernel]` (3-D), loaded flattened row-major. Accept any
+        // shape and flatten to `num_elements` f32 values below.
+        if tensor.num_elements == 0 {
             return Err(AegisError::InvalidPlan(format!(
-                "`{}` must be a dense vector",
+                "`{}` is empty (cannot load as a dense vector)",
                 tensor.name
             )));
         }
@@ -555,6 +618,19 @@ impl CudaWeightLoader<'_> {
             }
         };
         self.runtime.upload_f32(&values)
+    }
+
+    /// Adds 1.0 to every element of a loaded norm-weight buffer (one-time, at
+    /// load). Qwen3-Next's `Qwen3NextRMSNorm` computes `norm(x) * (1 + weight)`
+    /// (zero-centered weights), while the engine's RMSNorm kernels apply a plain
+    /// `weight` — folding the +1 here makes the plain kernel exact without
+    /// touching the hot path or other architectures.
+    pub fn plus_one_norm(&self, buf: DeviceBuffer<f32>) -> Result<DeviceBuffer<f32>> {
+        let mut v = self.runtime.download_f32(&buf)?;
+        for x in &mut v {
+            *x += 1.0;
+        }
+        self.runtime.upload_f32(&v)
     }
 
     pub fn load_bf16_matrix_with_store(
@@ -653,6 +729,114 @@ impl CudaWeightLoader<'_> {
             name: tensor.name.clone(),
             rows: effective_rows,
             cols: effective_cols,
+            residency,
+            values: buffer.slice,
+            host_values: None,
+        })
+    }
+
+    /// Load a DeepSeek-style FP8 **block-scaled** linear and dequantize it to
+    /// BF16 on the host so it runs through the already-validated BF16 matvec
+    /// path. The checkpoint stores `weight` as F8_E4M3 `[rows, cols]` plus a
+    /// `weight_scale_inv` BF16 block table `[ceil(rows/128), ceil(cols/128)]`;
+    /// dequant is `w_bf16[i,j] = e4m3(w[i,j]) * scale_inv[i/blk, j/blk]`.
+    /// Placement (VRAM vs pinned host arena) mirrors `load_bf16_matrix_with_store`.
+    pub fn load_fp8_block_as_bf16_matrix(
+        &self,
+        weight: &TensorInfo,
+        scale: &TensorInfo,
+        _store: StoragePlacement,
+        residency: TensorResidencyPlan,
+        _loader: &mut TensorStorageLoader,
+    ) -> Result<DeviceBf16Matrix> {
+        if weight.dtype != TensorDType::F8E4M3 || weight.shape.len() != 2 {
+            return Err(AegisError::InvalidPlan(format!(
+                "`{}` must be a 2-D F8_E4M3 matrix (got dtype={:?} shape={:?})",
+                weight.name, weight.dtype, weight.shape
+            )));
+        }
+        if scale.shape.len() != 2 {
+            return Err(AegisError::InvalidPlan(format!(
+                "`{}` FP8 block-scale must be 2-D (got {:?})",
+                scale.name, scale.shape
+            )));
+        }
+        let rows = weight.shape[0];
+        let cols = weight.shape[1];
+        let s_rows = scale.shape[0];
+        let s_cols = scale.shape[1];
+        let blk_r = rows.div_ceil(s_rows.max(1));
+        let blk_c = cols.div_ceil(s_cols.max(1));
+
+        // Read raw bytes: FP8 weight (1 B/elem) + BF16 block scales (2 B/elem).
+        let mut fp8 = vec![0u8; rows * cols];
+        read_chunked_par(&weight.shard_path, weight.file_offsets.0, &mut fp8)?;
+        let mut s_bytes = vec![0u8; s_rows * s_cols * 2];
+        read_chunked_par(&scale.shard_path, scale.file_offsets.0, &mut s_bytes)?;
+        let scales: Vec<f32> = (0..s_rows * s_cols)
+            .map(|k| {
+                let bits = u16::from_le_bytes([s_bytes[2 * k], s_bytes[2 * k + 1]]);
+                f32::from_bits((bits as u32) << 16)
+            })
+            .collect();
+        let lut = build_e4m3_signed_lut();
+
+        let is_host_resident = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
+        if is_host_resident {
+            let arena = self.arena.as_ref().ok_or_else(|| {
+                AegisError::InvalidPlan(format!(
+                    "host-resident FP8 `{}` requires loader built with weight_loader_with_arena(...)",
+                    weight.name
+                ))
+            })?;
+            let len = rows * cols * 2;
+            let offset = arena.reserve(len)?;
+            // SAFETY: `reserve` exclusively claimed [offset, offset+len);
+            // `dequant_fp8_block_into_bf16` writes disjoint per-row sub-slices.
+            let dst = unsafe { arena.slice_mut(offset, len) };
+            dequant_fp8_block_into_bf16(dst, &fp8, &scales, rows, cols, s_cols, blk_r, blk_c, &lut);
+            let stub = self
+                .runtime
+                .stream
+                .clone_htod(&[0u16])
+                .map_err(map_cuda_err("htod fp8-block bf16 host-resident stub"))?;
+            let host_weights = HostBf16Weights::from_arena(arena.clone(), offset, len)?;
+            return Ok(DeviceBf16Matrix {
+                name: weight.name.clone(),
+                rows,
+                cols,
+                residency,
+                values: stub,
+                host_values: Some(Box::new(host_weights)),
+            });
+        }
+
+        // VRAM-resident: dequant to a host Vec<u16>, then DMA → VRAM.
+        let mut out = vec![0u16; rows * cols];
+        {
+            use rayon::prelude::*;
+            out.par_chunks_mut(cols).enumerate().for_each(|(i, row)| {
+                let sr = (i / blk_r) * s_cols;
+                let base = i * cols;
+                for (j, slot) in row.iter_mut().enumerate() {
+                    let w = lut[fp8[base + j] as usize];
+                    let sc = scales[sr + j / blk_c];
+                    *slot = f32_to_bf16_round(w * sc);
+                }
+            });
+        }
+        let mut buffer = self.runtime.alloc_u16(rows * cols)?;
+        self.runtime
+            .stream
+            .memcpy_htod(&out, &mut buffer.slice)
+            .map_err(map_cuda_err("htod fp8-block bf16 matrix"))?;
+        self.runtime
+            .synchronize()
+            .map_err(|e| AegisError::Unsupported(format!("sync after fp8-block htod: {e}")))?;
+        Ok(DeviceBf16Matrix {
+            name: weight.name.clone(),
+            rows,
+            cols,
             residency,
             values: buffer.slice,
             host_values: None,
@@ -845,6 +1029,96 @@ impl CudaWeightLoader<'_> {
             bytes: total,
             data: fp8_dev.slice,
             row_scales: row_scales_dev.slice,
+            block_scales: None,
+            block_size: 0,
+            scale_cols: 0,
+        })
+    }
+
+    /// Load a pre-quantized DeepSeek-style FP8 **block-scaled** linear into VRAM:
+    /// F8_E4M3 `weight [rows, cols]` + BF16 `weight_scale_inv [rows/blk, cols/blk]`.
+    /// The 9 GB of FP8 weights fit the 16 GB GPU directly (vs 18 GB dequanted to
+    /// BF16), and the fused `aegis_fp8_block_matvec` dequant-on-the-fly avoids ever
+    /// materializing BF16. Always VRAM-resident (caller's store/residency ignored).
+    pub fn load_fp8_block_linear(
+        &self,
+        weight: &TensorInfo,
+        scale: &TensorInfo,
+        loader: &mut TensorStorageLoader,
+    ) -> Result<crate::cuda::StandaloneFp8Linear> {
+        if weight.dtype != TensorDType::F8E4M3 || weight.shape.len() != 2 {
+            return Err(AegisError::InvalidPlan(format!(
+                "`{}` must be a 2-D F8_E4M3 matrix (got dtype={:?} shape={:?})",
+                weight.name, weight.dtype, weight.shape
+            )));
+        }
+        if scale.shape.len() != 2 {
+            return Err(AegisError::InvalidPlan(format!(
+                "`{}` FP8 block-scale must be 2-D (got {:?})",
+                scale.name, scale.shape
+            )));
+        }
+        let rows = weight.shape[0];
+        let cols = weight.shape[1];
+        let total = rows.checked_mul(cols).ok_or_else(|| {
+            AegisError::InvalidPlan(format!("`{}` FP8 element-count overflow", weight.name))
+        })?;
+        let s_rows = scale.shape[0];
+        let s_cols = scale.shape[1];
+        let blk_r = rows.div_ceil(s_rows.max(1));
+        let blk_c = cols.div_ceil(s_cols.max(1));
+        if blk_r != blk_c {
+            return Err(AegisError::InvalidPlan(format!(
+                "`{}` FP8 block scale expects square blocks, got {blk_r}x{blk_c}",
+                weight.name
+            )));
+        }
+
+        // FP8 weight bytes → VRAM (1 byte/elem).
+        let w_loaded = loader.load_for_store(weight, StoragePlacement::Ram)?;
+        let fp8_bytes = w_loaded.as_bytes();
+        if fp8_bytes.len() < total {
+            return Err(AegisError::InvalidPlan(format!(
+                "`{}` FP8 weight short read: {} < {total}",
+                weight.name,
+                fp8_bytes.len()
+            )));
+        }
+        let data = self
+            .runtime
+            .stream
+            .clone_htod(&fp8_bytes[..total])
+            .map_err(map_cuda_err("htod fp8 block weight"))?;
+
+        // BF16 block scales → f32 → VRAM.
+        let s_loaded = loader.load_for_store(scale, StoragePlacement::Ram)?;
+        let scales_f32: Vec<f32> = s_loaded
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect();
+        let block_scales = self
+            .runtime
+            .stream
+            .clone_htod(&scales_f32)
+            .map_err(map_cuda_err("htod fp8 block scales"))?;
+        // Unused in the block path, but the struct requires a non-empty slice.
+        let row_scales = self
+            .runtime
+            .stream
+            .clone_htod(&[1.0f32])
+            .map_err(map_cuda_err("htod fp8 block row-scale stub"))?;
+
+        Ok(crate::cuda::StandaloneFp8Linear {
+            name: weight.name.clone(),
+            rows,
+            cols,
+            bytes: total,
+            data,
+            row_scales,
+            block_scales: Some(block_scales),
+            block_size: blk_r as u32,
+            scale_cols: s_cols as u32,
         })
     }
 
@@ -903,18 +1177,12 @@ impl CudaWeightLoader<'_> {
             .tensors
             .get(&format!("{prefix}.weight_scale"))
             .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`")))?;
-        let output_scale = artifact
-            .tensors
-            .get(&format!("{prefix}.weight_scale_2"))
-            .map(|tensor| read_scalar_f32_with_loader(loader, tensor, store))
-            .transpose()?
-            .unwrap_or(1.0);
-        let input_scale = artifact
-            .tensors
-            .get(&format!("{prefix}.input_scale"))
-            .map(|tensor| read_scalar_f32_with_loader(loader, tensor, store))
-            .transpose()?
-            .unwrap_or(1.0);
+        let output_scale = read_nvfp4_pertensor_scale(
+            artifact, prefix, "weight_scale_2", "weight_global_scale", loader, store,
+        )?.unwrap_or(1.0);
+        let input_scale = read_nvfp4_pertensor_scale(
+            artifact, prefix, "input_scale", "input_global_scale", loader, store,
+        )?.unwrap_or(1.0);
         let spec =
             Nvfp4LinearSpec::from_tensors(prefix, weight, scales, input_scale, output_scale)?;
         let is_host_resident = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. });
@@ -1125,18 +1393,12 @@ impl CudaWeightLoader<'_> {
             .tensors
             .get(&format!("{prefix}.weight_scale"))
             .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`")))?;
-        let output_scale = artifact
-            .tensors
-            .get(&format!("{prefix}.weight_scale_2"))
-            .map(|t| read_scalar_f32_with_loader(loader, t, store))
-            .transpose()?
-            .unwrap_or(1.0);
-        let input_scale = artifact
-            .tensors
-            .get(&format!("{prefix}.input_scale"))
-            .map(|t| read_scalar_f32_with_loader(loader, t, store))
-            .transpose()?
-            .unwrap_or(1.0);
+        let output_scale = read_nvfp4_pertensor_scale(
+            artifact, prefix, "weight_scale_2", "weight_global_scale", loader, store,
+        )?.unwrap_or(1.0);
+        let input_scale = read_nvfp4_pertensor_scale(
+            artifact, prefix, "input_scale", "input_global_scale", loader, store,
+        )?.unwrap_or(1.0);
 
         if eff_logical_cols == 0 || eff_logical_cols % QK_NVFP4 != 0 {
             return Err(AegisError::InvalidPlan(format!(
@@ -1688,18 +1950,12 @@ fn load_nvfp4_linear_host_parts(
         .tensors
         .get(&format!("{prefix}.weight_scale"))
         .ok_or_else(|| AegisError::InvalidPlan(format!("missing `{prefix}.weight_scale`")))?;
-    let output_scale = artifact
-        .tensors
-        .get(&format!("{prefix}.weight_scale_2"))
-        .map(|tensor| read_scalar_f32_with_loader(loader, tensor, store))
-        .transpose()?
-        .unwrap_or(1.0);
-    let input_scale = artifact
-        .tensors
-        .get(&format!("{prefix}.input_scale"))
-        .map(|tensor| read_scalar_f32_with_loader(loader, tensor, store))
-        .transpose()?
-        .unwrap_or(1.0);
+    let output_scale = read_nvfp4_pertensor_scale(
+        artifact, prefix, "weight_scale_2", "weight_global_scale", loader, store,
+    )?.unwrap_or(1.0);
+    let input_scale = read_nvfp4_pertensor_scale(
+        artifact, prefix, "input_scale", "input_global_scale", loader, store,
+    )?.unwrap_or(1.0);
     let spec = Nvfp4LinearSpec::from_tensors(prefix, weight, scales, input_scale, output_scale)?;
     let packed = loader.load_for_store(weight, store)?;
     let scales = loader.load_for_store(scales, store)?;
@@ -1708,6 +1964,30 @@ fn load_nvfp4_linear_host_parts(
         packed,
         scales,
     })
+}
+
+/// Reads an NVFP4 per-tensor scale, normalizing the two checkpoint conventions
+/// to a MULTIPLIER (what the dequant kernel expects). Gemma stores
+/// `weight_scale_2`/`input_scale` as a multiplier directly. compressed-tensors
+/// (Qwen3-Next) stores `weight_global_scale`/`input_global_scale` as a DIVISOR
+/// (`≈ FP4_MAX*FP8_MAX/amax`, e.g. 45312) — invert it so `nibble·block·scale`
+/// matches. Returns `None` if neither name is present.
+pub(crate) fn read_nvfp4_pertensor_scale(
+    artifact: &ModelArtifact,
+    prefix: &str,
+    gemma_suffix: &str,
+    ct_suffix: &str,
+    loader: &mut TensorStorageLoader,
+    store: StoragePlacement,
+) -> Result<Option<f32>> {
+    if let Some(t) = artifact.tensors.get(&format!("{prefix}.{gemma_suffix}")) {
+        Ok(Some(read_scalar_f32_with_loader(loader, t, store)?))
+    } else if let Some(t) = artifact.tensors.get(&format!("{prefix}.{ct_suffix}")) {
+        let v = read_scalar_f32_with_loader(loader, t, store)?;
+        Ok(Some(if v.abs() > f32::MIN_POSITIVE { 1.0 / v } else { 1.0 }))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) fn read_scalar_f32_with_loader(

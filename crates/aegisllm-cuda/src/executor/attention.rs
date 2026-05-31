@@ -54,6 +54,12 @@ pub(super) fn forward_attention_device(
         kv_context_size
     };
 
+    // Qwen3-Next attention output gate: q_proj is double-width; we de-interleave
+    // the query into `scratch.q` and stash the gate here, applying
+    // `attn_context *= sigmoid(gate)` after attention, before o_proj.
+    let q_width = num_attention_heads * head_dim;
+    let mut gate_buf: Option<DeviceBuffer<f32>> = None;
+
     if let (Some(q), Some(k), Some(v)) = (layer.q_proj.as_nvfp4(), layer.k_proj.as_nvfp4(), layer.v_proj.as_nvfp4()) {
         // NVFP4 path (Llama, Qwen, etc.)
         runtime.rms_norm_quant_nvfp4_device(
@@ -66,16 +72,35 @@ pub(super) fn forward_attention_device(
         )?;
         let mut quant_scale = Some(q.input_scale);
         // Q projection: quantize input_normed to mxfp4_hidden (native path) or quant_hidden (legacy).
-        let mxfp4_valid = matvec_nvfp4_prepared_device_reuse(
-            runtime,
-            q,
-            &scratch.input_normed,
-            &scratch.quant_hidden,
-            &mut scratch.mxfp4_hidden,
-            false,
-            &mut scratch.q,
-            scratch.staging_pool.as_deref_mut(),
-        )?;
+        // Gated layers project to 2×q_width then de-interleave query→scratch.q, gate→gate_buf.
+        let mxfp4_valid = if layer.attn_output_gate {
+            let mut q_full = runtime.alloc_f32(2 * q_width)?;
+            let valid = matvec_nvfp4_prepared_device_reuse(
+                runtime,
+                q,
+                &scratch.input_normed,
+                &scratch.quant_hidden,
+                &mut scratch.mxfp4_hidden,
+                false,
+                &mut q_full,
+                scratch.staging_pool.as_deref_mut(),
+            )?;
+            let mut gate = runtime.alloc_f32(q_width)?;
+            runtime.deinterleave_gated_q(&q_full, &mut scratch.q, &mut gate, num_attention_heads, head_dim)?;
+            gate_buf = Some(gate);
+            valid
+        } else {
+            matvec_nvfp4_prepared_device_reuse(
+                runtime,
+                q,
+                &scratch.input_normed,
+                &scratch.quant_hidden,
+                &mut scratch.mxfp4_hidden,
+                false,
+                &mut scratch.q,
+                scratch.staging_pool.as_deref_mut(),
+            )?
+        };
         // K/V projections share the same input_normed — skip MXFP4 re-quantize in native path.
         prepare_nvfp4_input(
             runtime,
@@ -114,9 +139,19 @@ pub(super) fn forward_attention_device(
     } else {
         // BF16 path (Gemma4 attention)
         runtime.rms_norm_device(hidden, &layer.input_norm_weight, rms_norm_eps, &mut scratch.input_normed)?;
-        matvec_cuda_linear_with_scratch(runtime, &layer.q_proj, &scratch.input_normed,
-            &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut scratch.q,
-            scratch.staging_pool.as_deref_mut())?;
+        if layer.attn_output_gate {
+            let mut q_full = runtime.alloc_f32(2 * q_width)?;
+            matvec_cuda_linear_with_scratch(runtime, &layer.q_proj, &scratch.input_normed,
+                &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut q_full,
+                scratch.staging_pool.as_deref_mut())?;
+            let mut gate = runtime.alloc_f32(q_width)?;
+            runtime.deinterleave_gated_q(&q_full, &mut scratch.q, &mut gate, num_attention_heads, head_dim)?;
+            gate_buf = Some(gate);
+        } else {
+            matvec_cuda_linear_with_scratch(runtime, &layer.q_proj, &scratch.input_normed,
+                &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut scratch.q,
+                scratch.staging_pool.as_deref_mut())?;
+        }
         // Shared layers (Gemma-4 E4B last 18 of 42) skip K/V projection +
         // norm + RoPE + cache write — their attention reads K/V from the
         // parent layer's cache slot via `kv_shared_override`. Q is still
@@ -167,7 +202,8 @@ pub(super) fn forward_attention_device(
     }
     // Gemma 4: V is RMS-normed per-head with NO learned weight (with_scale=False).
     // This applies whenever `q_norm` is present (Gemma 4 always pairs q/k/v norms).
-    if kv_shared_override.is_none() && layer.q_norm_weight.is_some() {
+    // Qwen3-Next (attn_output_gate) has QK-norm but NO V-norm — exclude it.
+    if kv_shared_override.is_none() && layer.q_norm_weight.is_some() && !layer.attn_output_gate {
         runtime.rms_norm_batched_no_weight_device(
             &scratch.v,
             num_kv_heads,
@@ -189,15 +225,29 @@ pub(super) fn forward_attention_device(
         eprintln!("[DUMP {tag} K post-norm] first8={:?}", &k[0..8]);
         eprintln!("[DUMP {tag} V post-norm] first8={:?}", &v[0..8]);
     }
-    runtime.apply_rope_ptr_device(
-        &mut scratch.q,
-        p_position,
-        num_attention_heads,
-        head_dim,
-        rope,
-    )?;
-    if kv_shared_override.is_none() {
-        runtime.apply_rope_ptr_device(&mut scratch.k, p_position, num_kv_heads, head_dim, rope)?;
+    if layer.attn_output_gate {
+        // Qwen3-Next: HF/GPT-NeoX partial RoPE (rotate first rotary_dim with
+        // half-split within rotary_dim, divisor rotary_dim).
+        let rd = rope.partial_dim as usize;
+        runtime.apply_rope_neox_partial_device(
+            &mut scratch.q, p_position, num_attention_heads, head_dim, rope.theta, rd,
+        )?;
+        if kv_shared_override.is_none() {
+            runtime.apply_rope_neox_partial_device(
+                &mut scratch.k, p_position, num_kv_heads, head_dim, rope.theta, rd,
+            )?;
+        }
+    } else {
+        runtime.apply_rope_ptr_device(
+            &mut scratch.q,
+            p_position,
+            num_attention_heads,
+            head_dim,
+            rope,
+        )?;
+        if kv_shared_override.is_none() {
+            runtime.apply_rope_ptr_device(&mut scratch.k, p_position, num_kv_heads, head_dim, rope)?;
+        }
     }
     if let Ok(tag) = std::env::var("AEGIS_DUMP_QROPE") {
         thread_local! { static C: std::cell::RefCell<usize> = std::cell::RefCell::new(0); }
@@ -212,7 +262,8 @@ pub(super) fn forward_attention_device(
     // Gemma 4 attention uses scaling=1.0 (NOT 1/sqrt(d)). Our attention kernels hardcode
     // softmax scale = rsqrt(head_dim). Pre-multiply Q by sqrt(head_dim) so the kernel's
     // built-in scaling cancels out and the effective Q·K^T is unscaled.
-    if layer.q_norm_weight.is_some() {
+    // Qwen3-Next (attn_output_gate) uses STANDARD 1/sqrt(d) scaling — skip this.
+    if layer.q_norm_weight.is_some() && !layer.attn_output_gate {
         let sqrt_d = (head_dim as f32).sqrt();
         runtime.scale_f32_device_len(sqrt_d, &mut scratch.q, num_attention_heads * head_dim)?;
     }
@@ -331,6 +382,11 @@ pub(super) fn forward_attention_device(
             let pos = runtime.download_u32(p_position).unwrap();
             eprintln!("[DUMP {tag} call#{} pos={:?} attn_output] {:?}", idx, pos, &q[0..8]);
         }
+    }
+    // Qwen3-Next attention output gate: multiply the attention context by
+    // sigmoid(gate) per head before the output projection.
+    if let Some(ref gate) = gate_buf {
+        runtime.sigmoid_gate_mul(&mut scratch.attn_context, gate, q_width)?;
     }
     match &layer.o_proj {
         CudaLinear::Nvfp4(o) => {

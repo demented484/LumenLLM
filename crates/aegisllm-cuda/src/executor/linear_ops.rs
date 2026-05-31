@@ -48,6 +48,14 @@ pub(super) fn prepare_nvfp4_input_batched(
 /// `mxfp4_already_valid` is true (i.e. `mxfp4_input` was already filled from the same
 /// `native_input` by a previous projection in the same layer). Returns whether `mxfp4_input`
 /// is now valid so callers can chain projections without tracking the flag themselves.
+/// Debug A/B: run host-resident NVFP4 matvecs at W4A16 (f32 activation, no fp4
+/// input quant) to isolate W4A4 activation-accumulation. Set AEGIS_NVFP4_A16=1.
+fn nvfp4_a16_enabled() -> bool {
+    use std::sync::OnceLock;
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var("AEGIS_NVFP4_A16").is_ok_and(|v| v != "0"))
+}
+
 pub(super) fn matvec_nvfp4_prepared_device_reuse(
     runtime: &CudaRuntime,
     linear: &DeviceNvfp4Linear,
@@ -66,6 +74,10 @@ pub(super) fn matvec_nvfp4_prepared_device_reuse(
                 linear.name
             ))
         })?;
+        if nvfp4_a16_enabled() {
+            runtime.matvec_nvfp4_staged_reference_device(linear, staging, native_input, output)?;
+            return Ok(false);
+        }
         if linear.is_host_resident_with_native_mxfp4() {
             // Tensor-core path: quantize input to MXFP4 (reuse if already valid), stage weight.
             if !mxfp4_already_valid {
@@ -106,6 +118,9 @@ pub(super) fn matvec_nvfp4_device_with_scratch(
                 linear.name
             ))
         })?;
+        if nvfp4_a16_enabled() {
+            return runtime.matvec_nvfp4_staged_reference_device(linear, staging, input, output);
+        }
         if linear.is_host_resident_with_native_mxfp4() {
             runtime.quantize_mxfp4_input_device(input, mxfp4_input)?;
             return runtime.matvec_native_mxfp4_staged_device(linear, staging, mxfp4_input, output);

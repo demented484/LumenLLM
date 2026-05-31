@@ -144,6 +144,39 @@ impl TensorRegistry {
             }
         }
 
+        // compressed-tensors (Qwen3-Next NVFP4) uses different tensor names than
+        // the engine's Gemma-derived NVFP4 layout, but the byte layout is
+        // identical (`nvfp4-pack-quantized`: 2 nibbles/byte, per-16 fp8-e4m3
+        // group scales). Register name aliases that point at the SAME bytes so
+        // the planner, graph builder, and CUDA loader (all keyed on Gemma's
+        // names) work unchanged — no repack needed.
+        //   weight_packed → weight   (packed 4-bit, u8 — identical bytes)
+        // (`weight_scale`, the per-group fp8 scale, has the same name in both.)
+        // The PER-TENSOR global scales (compressed-tensors `weight_global_scale`
+        // / `input_global_scale`) are NOT byte-aliased: they use the RECIPROCAL
+        // convention vs Gemma's `weight_scale_2` / `input_scale` (a DIVISOR, not
+        // a multiplier), so the loader reads + inverts them by name instead.
+        const ALIASES: [(&str, &str); 1] = [
+            (".weight_packed", ".weight"),
+        ];
+        let mut to_add: Vec<(String, TensorInfo)> = Vec::new();
+        for (name, info) in tensors.iter() {
+            for (ct_suffix, gemma_suffix) in ALIASES {
+                if let Some(stem) = name.strip_suffix(ct_suffix) {
+                    let alias = format!("{stem}{gemma_suffix}");
+                    // Don't clobber a real tensor that already carries this name.
+                    if !tensors.contains_key(&alias) {
+                        let mut cloned = info.clone();
+                        cloned.name = alias.clone();
+                        to_add.push((alias, cloned));
+                    }
+                }
+            }
+        }
+        for (alias, info) in to_add {
+            tensors.entry(alias).or_insert(info);
+        }
+
         Ok(Self { tensors })
     }
 

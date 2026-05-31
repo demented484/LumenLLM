@@ -416,9 +416,12 @@ impl CudaRuntime {
         normed_output: &mut DeviceBuffer<f32>,
         quantized_output: &mut DeviceBuffer<f32>,
     ) -> Result<()> {
+        // Output buffers may be LARGER than the input (the engine sizes shared
+        // scratch to the widest consumer, e.g. Qwen3-Next's q_width=4096 >
+        // hidden=2048); the kernel writes exactly `input.len()` elements.
         if input.len() != weight.len()
-            || input.len() != normed_output.len()
-            || input.len() != quantized_output.len()
+            || normed_output.len() < input.len()
+            || quantized_output.len() < input.len()
         {
             return Err(AegisError::InvalidPlan(format!(
                 "rms norm nvfp4 quant shape mismatch: input={} weight={} normed={} quantized={}",

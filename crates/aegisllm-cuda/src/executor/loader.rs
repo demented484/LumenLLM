@@ -154,12 +154,98 @@ pub(super) fn load_cuda_layer(
         None
     };
 
+    // Qwen3-Next Gated DeltaNet layers replace self-attention with the GDN
+    // mixer (detected by the presence of `linear_attn.in_proj_qkv.weight`). The
+    // q/k/v/o slots become dummies; the MLP/MoE sublayer is loaded as usual.
+    let is_gdn = artifact
+        .tensors
+        .has(&format!("{prefix}.linear_attn.in_proj_qkv.weight"));
+    // Qwen3-Next uses zero-centered RMSNorm weights (norm·(1+weight)); fold the
+    // +1 into the regular norms at load (NOT the GDN gated norm, which is plain).
+    let qwen_unit_norm = {
+        let mt = artifact.config.model_type.as_str();
+        mt.contains("qwen3_5") || mt.contains("qwen3_next")
+    };
+    let gdn = if is_gdn {
+        Some(Box::new(load_gdn(
+            cuda, artifact, &prefix, attn_store, attn_residency, resident_layout,
+            attention_quantization, loader,
+        )?))
+    } else {
+        None
+    };
+    let (q_proj, k_proj, v_proj, qkv_proj, o_proj) = if is_gdn {
+        (
+            CudaLinear::Nvfp4(cuda.alloc_dummy_nvfp4_linear(&format!("{prefix}.self_attn.q_proj"))?),
+            CudaLinear::Nvfp4(cuda.alloc_dummy_nvfp4_linear(&format!("{prefix}.self_attn.k_proj"))?),
+            CudaLinear::Nvfp4(cuda.alloc_dummy_nvfp4_linear(&format!("{prefix}.self_attn.v_proj"))?),
+            None,
+            CudaLinear::Nvfp4(cuda.alloc_dummy_nvfp4_linear(&format!("{prefix}.self_attn.o_proj"))?),
+        )
+    } else {
+        // Qwen3-Next full-attention output gate: q_proj outputs 2×q_width
+        // ([query | gate] interleaved per head). Load the full gated width.
+        let gated = artifact.config.attn_output_gate == Some(true);
+        let q_proj_rows = if gated { 2 * q_width } else { q_width };
+        let q_proj = load_cuda_linear(
+            cuda, artifact, &format!("{prefix}.self_attn.q_proj"),
+            attn_store, attn_residency, resident_layout,
+            q_proj_rows, hidden, is_sliced, attention_quantization, loader,
+        )?;
+        let k_proj = load_cuda_linear(
+            cuda, artifact, &format!("{prefix}.self_attn.k_proj"),
+            attn_store, attn_residency, resident_layout,
+            kv_width, hidden, is_sliced, attention_quantization, loader,
+        )?;
+        let v_proj = {
+            // Gemma 4 global layers have attention_k_eq_v=true: no separate v_proj.
+            let v_has_weight = artifact.tensors.has(&format!("{prefix}.self_attn.v_proj.weight"))
+                || artifact.tensors.has(&format!("{prefix}.self_attn.v_proj.weight_scale"));
+            let v_prefix = if v_has_weight {
+                format!("{prefix}.self_attn.v_proj")
+            } else {
+                format!("{prefix}.self_attn.k_proj")
+            };
+            load_cuda_linear(
+                cuda, artifact, &v_prefix,
+                attn_store, attn_residency, resident_layout,
+                kv_width, hidden, is_sliced, attention_quantization, loader,
+            )?
+        };
+        let qkv_proj = if is_sliced || gated {
+            // Gated attention can't use a fused QKV group (q is double-width).
+            None
+        } else if artifact.tensors.has(&format!("{prefix}.self_attn.q_proj.weight_scale")) {
+            cuda.load_cutlass_qkv_group_with_layout(
+                artifact,
+                &format!("{prefix}.self_attn.q_proj"),
+                &format!("{prefix}.self_attn.k_proj"),
+                &format!("{prefix}.self_attn.v_proj"),
+                placement.store,
+                residency,
+                resident_layout,
+                loader,
+            )?.map(CudaLinear::Nvfp4)
+        } else {
+            None
+        };
+        let o_proj = load_cuda_linear(
+            cuda, artifact, &format!("{prefix}.self_attn.o_proj"),
+            attn_store, attn_residency, resident_layout,
+            hidden, q_width, is_sliced, attention_quantization, loader,
+        )?;
+        (q_proj, k_proj, v_proj, qkv_proj, o_proj)
+    };
+
     let layer_out = CudaLayer {
-        input_norm_weight: cuda.load_dense_vector_with_store(
-            require_tensor(artifact, &format!("{prefix}.input_layernorm.weight"))?,
-            placement.store,
-            loader,
-        )?,
+        input_norm_weight: {
+            let b = cuda.load_dense_vector_with_store(
+                require_tensor(artifact, &format!("{prefix}.input_layernorm.weight"))?,
+                placement.store,
+                loader,
+            )?;
+            if qwen_unit_norm { cuda.plus_one_norm(b)? } else { b }
+        },
         // Gemma 4 (PrePost): post_attention_layernorm = post-attn sublayer norm,
         //                     pre_feedforward_layernorm = pre-MLP norm.
         // Llama / Qwen (PreOnly): post_attention_layernorm = pre-MLP norm only.
@@ -175,11 +261,12 @@ pub(super) fn load_cuda_layer(
                 // Llama / Qwen: the single norm after attention is the pre-MLP norm.
                 format!("{prefix}.post_attention_layernorm.weight")
             };
-            cuda.load_dense_vector_with_store(
+            let b = cuda.load_dense_vector_with_store(
                 require_tensor(artifact, &pre_mlp_name)?,
                 placement.store,
                 loader,
-            )?
+            )?;
+            if qwen_unit_norm { cuda.plus_one_norm(b)? } else { b }
         },
         post_attn_sublayer_norm: load_optional_norm_weight(
             cuda, artifact, placement.store, loader,
@@ -229,65 +316,27 @@ pub(super) fn load_cuda_layer(
                 .map(|t| read_scalar_f32_with_loader(loader, t, placement.store))
                 .transpose()?
         },
-        q_proj: load_cuda_linear(
-            cuda, artifact, &format!("{prefix}.self_attn.q_proj"),
-            attn_store, attn_residency, resident_layout,
-            q_width, hidden, is_sliced, attention_quantization, loader,
-        )?,
-        k_proj: load_cuda_linear(
-            cuda, artifact, &format!("{prefix}.self_attn.k_proj"),
-            attn_store, attn_residency, resident_layout,
-            kv_width, hidden, is_sliced, attention_quantization, loader,
-        )?,
-        v_proj: {
-            // Gemma 4 global layers have attention_k_eq_v=true: no separate v_proj,
-            // K and V use the same projection. Fall back to k_proj weights when absent.
-            let v_has_weight = artifact.tensors.has(&format!("{prefix}.self_attn.v_proj.weight"))
-                || artifact.tensors.has(&format!("{prefix}.self_attn.v_proj.weight_scale"));
-            let v_prefix = if v_has_weight {
-                format!("{prefix}.self_attn.v_proj")
-            } else {
-                format!("{prefix}.self_attn.k_proj")
-            };
-            load_cuda_linear(
-                cuda, artifact, &v_prefix,
-                attn_store, attn_residency, resident_layout,
-                kv_width, hidden, is_sliced, attention_quantization, loader,
-            )?
+        q_proj,
+        k_proj,
+        v_proj,
+        qkv_proj,
+        o_proj,
+        // Gemma 4 / Qwen3-Next: per-head RMS norm on Q (between q_proj and RoPE).
+        q_norm_weight: {
+            let o = load_optional_norm_weight(
+                cuda, artifact, placement.store, loader,
+                &[&format!("{prefix}.self_attn.q_norm.weight")],
+            )?;
+            if qwen_unit_norm { o.map(|b| cuda.plus_one_norm(b)).transpose()? } else { o }
         },
-        // CUTLASS fused QKV group is not supported for sliced models.
-        // Only attempt fused QKV for NVFP4 layers (BF16 attn layers skip this).
-        qkv_proj: if is_sliced {
-            None
-        } else if artifact.tensors.has(&format!("{prefix}.self_attn.q_proj.weight_scale")) {
-            cuda.load_cutlass_qkv_group_with_layout(
-                artifact,
-                &format!("{prefix}.self_attn.q_proj"),
-                &format!("{prefix}.self_attn.k_proj"),
-                &format!("{prefix}.self_attn.v_proj"),
-                placement.store,
-                residency,
-                resident_layout,
-                loader,
-            )?.map(CudaLinear::Nvfp4)
-        } else {
-            None
+        // Gemma 4 / Qwen3-Next: per-head RMS norm on K (between k_proj and RoPE).
+        k_norm_weight: {
+            let o = load_optional_norm_weight(
+                cuda, artifact, placement.store, loader,
+                &[&format!("{prefix}.self_attn.k_norm.weight")],
+            )?;
+            if qwen_unit_norm { o.map(|b| cuda.plus_one_norm(b)).transpose()? } else { o }
         },
-        o_proj: load_cuda_linear(
-            cuda, artifact, &format!("{prefix}.self_attn.o_proj"),
-            attn_store, attn_residency, resident_layout,
-            hidden, q_width, is_sliced, attention_quantization, loader,
-        )?,
-        // Gemma 4: per-head RMS norm on Q (applied between q_proj and RoPE).
-        q_norm_weight: load_optional_norm_weight(
-            cuda, artifact, placement.store, loader,
-            &[&format!("{prefix}.self_attn.q_norm.weight")],
-        )?,
-        // Gemma 4: per-head RMS norm on K (applied between k_proj and RoPE).
-        k_norm_weight: load_optional_norm_weight(
-            cuda, artifact, placement.store, loader,
-            &[&format!("{prefix}.self_attn.k_norm.weight")],
-        )?,
         gate_proj,
         up_proj,
         down_proj,
@@ -311,6 +360,8 @@ pub(super) fn load_cuda_layer(
         // the full layer list (and thus per-layer `layer_type`s for parent
         // resolution).
         kv_shared_from: None,
+        gdn,
+        attn_output_gate: !is_gdn && artifact.config.attn_output_gate == Some(true),
         dense_activation: {
             // Pick activation from the architecture descriptor: `silu` (Llama
             // / Qwen) → SwiGLU; `gelu_pytorch_tanh` (Gemma-4 E4B / 26B-A4B
@@ -327,10 +378,80 @@ pub(super) fn load_cuda_layer(
             }
         },
     };
-    if !is_moe {
+    if !is_moe && !is_gdn {
         validate_cuda_layer_shape(&layer_out, shape)?;
     }
     Ok(layer_out)
+}
+
+/// Load the Qwen3-Next Gated DeltaNet mixer weights for one layer.
+#[allow(clippy::too_many_arguments)]
+fn load_gdn(
+    cuda: &CudaWeightLoader<'_>,
+    artifact: &ModelArtifact,
+    prefix: &str,
+    store: StoragePlacement,
+    residency: TensorResidencyPlan,
+    resident_layout: LinearResidentLayout,
+    quant_override: aegisllm_base::planning::placement::WeightQuantOverride,
+    loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
+) -> Result<super::gdn::CudaGdn> {
+    let cfg = &artifact.config;
+    let n_k = cfg.linear_num_key_heads.ok_or_else(|| {
+        AegisError::InvalidPlan("GDN: missing linear_num_key_heads".into())
+    })?;
+    let d_k = cfg.linear_key_head_dim.ok_or_else(|| {
+        AegisError::InvalidPlan("GDN: missing linear_key_head_dim".into())
+    })?;
+    let n_v = cfg.linear_num_value_heads.unwrap_or(n_k);
+    let d_v = cfg.linear_value_head_dim.unwrap_or(d_k);
+    let kc = cfg.linear_conv_kernel_dim.unwrap_or(4);
+    let dims = super::gdn::GdnDims {
+        num_k_heads: n_k,
+        num_v_heads: n_v,
+        k_head_dim: d_k,
+        v_head_dim: d_v,
+        conv_kernel: kc,
+    };
+    let qkv_out = 2 * n_k * d_k + n_v * d_v;
+    let zp = format!("{prefix}.linear_attn");
+    let hidden = artifact.config.hidden_size;
+    let in_proj_qkv = load_cuda_linear(
+        cuda, artifact, &format!("{zp}.in_proj_qkv"),
+        store, residency, resident_layout, qkv_out, hidden, false, quant_override, loader,
+    )?;
+    let in_proj_z = load_cuda_linear(
+        cuda, artifact, &format!("{zp}.in_proj_z"),
+        store, residency, resident_layout, n_v * d_v, hidden, false, quant_override, loader,
+    )?;
+    let in_proj_b = load_cuda_linear(
+        cuda, artifact, &format!("{zp}.in_proj_b"),
+        store, residency, resident_layout, n_v, hidden, false, quant_override, loader,
+    )?;
+    let in_proj_a = load_cuda_linear(
+        cuda, artifact, &format!("{zp}.in_proj_a"),
+        store, residency, resident_layout, n_v, hidden, false, quant_override, loader,
+    )?;
+    let out_proj = load_cuda_linear(
+        cuda, artifact, &format!("{zp}.out_proj"),
+        store, residency, resident_layout, hidden, n_v * d_v, false, quant_override, loader,
+    )?;
+    let conv1d_weight = cuda.load_dense_vector_with_store(
+        require_tensor(artifact, &format!("{zp}.conv1d.weight"))?, store, loader,
+    )?;
+    let a_log = cuda.load_dense_vector_with_store(
+        require_tensor(artifact, &format!("{zp}.A_log"))?, store, loader,
+    )?;
+    let dt_bias = cuda.load_dense_vector_with_store(
+        require_tensor(artifact, &format!("{zp}.dt_bias"))?, store, loader,
+    )?;
+    let norm_weight = cuda.load_dense_vector_with_store(
+        require_tensor(artifact, &format!("{zp}.norm.weight"))?, store, loader,
+    )?;
+    Ok(super::gdn::CudaGdn {
+        in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, out_proj,
+        conv1d_weight, a_log, dt_bias, norm_weight, dims,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -361,12 +482,14 @@ fn load_cuda_moe(
     // Router weight matrix [num_experts, hidden_size] — BF16
     // Gemma 4: {prefix}.router.proj.weight
     // Qwen 3.x: {prefix}.mlp.router_logits.weight
+    // Qwen3-Next: {prefix}.mlp.gate.weight
     // Mixtral-style: {prefix}.block_sparse_moe.gate.weight
     let router_tensor = first_existing_tensor(
         artifact,
         &[
             &format!("{prefix}.router.proj.weight"),
             &format!("{prefix}.mlp.router_logits.weight"),
+            &format!("{prefix}.mlp.gate.weight"),
             &format!("{prefix}.block_sparse_moe.gate.weight"),
         ],
     )?;
@@ -532,17 +655,27 @@ fn load_cuda_moe(
     // Optional shared (always-active) expert
     let shared_expert = if has_shared_expert {
         // Qwen/Nemotron style NVFP4 shared expert at mlp.shared_expert.*
+        // The shared expert runs on EVERY token (unlike the sparse routed
+        // experts), so it must be VRAM-resident — route it to the dense store
+        // (`attention.store`, VRAM) not the streamed routed-expert `store`.
+        // Streaming it per token was a large chunk of the decode H2D volume.
         let sp = format!("{prefix}.mlp.shared_expert");
         let gate_proj = CudaLinear::Nvfp4(cuda.load_nvfp4_linear_with_layout(
-            artifact, &format!("{sp}.gate_proj"), store, residency, resident_layout, loader,
+            artifact, &format!("{sp}.gate_proj"), bf16_dense_store, bf16_dense_residency.clone(), resident_layout, loader,
         )?);
         let up_proj = CudaLinear::Nvfp4(cuda.load_nvfp4_linear_with_layout(
-            artifact, &format!("{sp}.up_proj"), store, residency, resident_layout, loader,
+            artifact, &format!("{sp}.up_proj"), bf16_dense_store, bf16_dense_residency.clone(), resident_layout, loader,
         )?);
         let down_proj = CudaLinear::Nvfp4(cuda.load_nvfp4_linear_with_layout(
-            artifact, &format!("{sp}.down_proj"), store, residency, resident_layout, loader,
+            artifact, &format!("{sp}.down_proj"), bf16_dense_store, bf16_dense_residency.clone(), resident_layout, loader,
         )?);
-        Some(CudaMoEShared { gate_proj, up_proj, down_proj, gate_up_fused: None })
+        // Qwen3-Next: sigmoid gate on the shared expert (`shared_expert_gate`).
+        let shared_gate = artifact
+            .tensors
+            .get(&format!("{prefix}.mlp.shared_expert_gate.weight"))
+            .map(|t| cuda.load_bf16_matrix_with_store(t, bf16_dense_store, bf16_dense_residency.clone(), loader))
+            .transpose()?;
+        Some(CudaMoEShared { gate_proj, up_proj, down_proj, gate_up_fused: None, shared_gate })
     } else if artifact.tensors.has(&format!("{prefix}.mlp.gate_proj.weight")) {
         // Gemma 4 style: mlp.* is always-active shared expert. Stored as
         // BF16 in the checkpoint; the user can opt into a smaller format
@@ -577,6 +710,7 @@ fn load_cuda_moe(
                     up_proj:   CudaLinear::Bf16(up_stub),
                     down_proj: CudaLinear::Bf16(down_mat),
                     gate_up_fused: Some(fused),
+                    shared_gate: None,
                 })
             }
             Wq::Fp8 => Some(CudaMoEShared {
@@ -584,6 +718,7 @@ fn load_cuda_moe(
                 up_proj:   CudaLinear::Fp8(cuda.load_bf16_as_fp8_linear(up_tensor,   loader)?),
                 down_proj: CudaLinear::Fp8(cuda.load_bf16_as_fp8_linear(down_tensor, loader)?),
                 gate_up_fused: None,
+                shared_gate: None,
             }),
             other => return Err(AegisError::Unsupported(format!(
                 "shared-MLP-quantization={other:?} not yet wired into the loader"
@@ -690,6 +825,15 @@ fn load_cuda_linear(
         return Ok(CudaLinear::Nvfp4(l));
     }
     let tensor = require_tensor(artifact, &format!("{prefix}.weight"))?;
+    // DeepSeek-style FP8 block-scaled (F8_E4M3 weight + `weight_scale_inv`
+    // [rows/128, cols/128]): keep the FP8 weights in VRAM (9 GB fits the 16 GB
+    // GPU vs 18 GB dequanted) and dequant-on-the-fly in the matvec. Covers
+    // Qwen3.5-9B-FP8 (dense) — every linear routes here.
+    if tensor.dtype == aegisllm_base::tensor::TensorDType::F8E4M3 {
+        let scale = require_tensor(artifact, &format!("{prefix}.weight_scale_inv"))?;
+        let l = cuda.load_fp8_block_linear(tensor, scale, loader)?;
+        return Ok(CudaLinear::Fp8(l));
+    }
     use aegisllm_base::planning::placement::WeightQuantOverride as Wq;
     match quant_override {
         Wq::Default => {
@@ -768,7 +912,9 @@ fn validate_cuda_layer_shape(layer: &CudaLayer, shape: CudaLayerShape) -> Result
         layer.q_proj.name(),
         layer.q_proj.rows(),
         layer.q_proj.cols(),
-        q_width,
+        // Qwen3-Next full-attention output gate: q_proj emits 2×q_width
+        // ([query | gate] per head), so the loaded matrix is the gated width.
+        if layer.attn_output_gate { 2 * q_width } else { q_width },
         hidden,
     )?;
     require_linear_shape(

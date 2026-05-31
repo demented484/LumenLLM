@@ -259,6 +259,35 @@ impl CudaRuntime {
             block_dim: (block_dim, 1, 1),
             shared_mem_bytes: block_dim * std::mem::size_of::<f32>() as u32,
         };
+        // DeepSeek-style block-scaled FP8: scale varies along both axes, so the
+        // dedicated kernel folds it inside the K-loop. Use 128 threads/block (not
+        // 256): the vectorized kernel then processes ≥2 uint4 chunks per thread,
+        // doubling in-flight loads on 4096-col matvecs (78%→ higher HBM util;
+        // the kernel is memory-bound). The warp-shuffle reduction needs no smem.
+        if let Some(block_scales) = linear.block_scales_slice() {
+            let blk = linear.block_size;
+            let scale_cols = linear.scale_cols;
+            let block_cfg = LaunchConfig {
+                grid_dim: (rows, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.fp8_block_matvec)
+                    .arg(linear.data_slice())
+                    .arg(block_scales)
+                    .arg(&input.slice)
+                    .arg(&rows)
+                    .arg(&cols)
+                    .arg(&blk)
+                    .arg(&scale_cols)
+                    .arg(&mut output.slice)
+                    .launch(block_cfg)
+            }
+            .map_err(map_cuda_err("launch fp8 block matvec"))?;
+            return Ok(());
+        }
         unsafe {
             self.stream
                 .launch_builder(&self.kernels.fp8_matvec)
@@ -308,6 +337,50 @@ impl CudaRuntime {
                 .launch(cfg)
         }
         .map_err(map_cuda_err("launch fp8 dequant to bf16"))?;
+        Ok(())
+    }
+
+    /// Dequantize a DeepSeek-style block-scaled FP8 weight into a BF16 scratch
+    /// (block scales `[ceil(rows/blk), scale_cols]`). Unlocks the cuBLASLt BF16
+    /// GEMM (weight read once) for block-scaled FP8 — the prefill weight-traffic fix.
+    pub fn dequant_fp8_block_to_bf16_device(
+        &self,
+        linear: &super::super::StandaloneFp8Linear,
+        bf16_out: &mut DeviceBuffer<u16>,
+    ) -> Result<()> {
+        let total = linear.rows * linear.cols;
+        if bf16_out.len() < total {
+            return Err(AegisError::InvalidPlan(format!(
+                "fp8-block→bf16 dequant: scratch too small for `{}`: have {} need {}",
+                linear.name, bf16_out.len(), total
+            )));
+        }
+        let block_scales = linear.block_scales_slice().ok_or_else(|| {
+            AegisError::InvalidPlan(format!("`{}` has no block scales", linear.name))
+        })?;
+        let rows = u32_arg("rows", linear.rows)?;
+        let cols = u32_arg("cols", linear.cols)?;
+        let blk = linear.block_size;
+        let scale_cols = linear.scale_cols;
+        let block_dim = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (rows, ceil_div(cols, block_dim), 1),
+            block_dim: (block_dim, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.dequant_fp8_block_to_bf16)
+                .arg(linear.data_slice())
+                .arg(block_scales)
+                .arg(&mut bf16_out.slice)
+                .arg(&rows)
+                .arg(&cols)
+                .arg(&blk)
+                .arg(&scale_cols)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch fp8 block dequant to bf16"))?;
         Ok(())
     }
 
@@ -2039,6 +2112,42 @@ impl CudaRuntime {
                 linear.cols,
                 linear.output_scale,
                 &quantized_input.slice,
+                &mut output.slice,
+            )
+        };
+        staging.mark_kernel_launched(self, slot)?;
+        result
+    }
+
+    /// Staged W4A16 matvec: stream the fp4 weight, but run the REFERENCE kernel
+    /// with the raw f32 activation (no fp4-input quant). Strictly higher
+    /// precision than the prequantized path (used to A/B the W4A4 activation
+    /// accumulation). Takes the raw f32 `input`.
+    pub(crate) fn matvec_nvfp4_staged_reference_device(
+        &self,
+        linear: &DeviceNvfp4Linear,
+        staging: &mut LinearStagingPool,
+        input: &DeviceBuffer<f32>,
+        output: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        let hw = linear.host_weights.as_deref().ok_or_else(|| {
+            AegisError::InvalidPlan(format!(
+                "staged reference matvec called on non-host-resident linear `{}`",
+                linear.name
+            ))
+        })?;
+        let slot = staging.prepare_async(self, hw, linear.packed_bytes, linear.scale_bytes)?;
+        let result = {
+            let packed_view = staging.packed_view(slot, linear.packed_bytes);
+            let scales_view = staging.scales_view(slot, linear.scale_bytes);
+            self.launch_nvfp4_reference_views(
+                &packed_view,
+                &scales_view,
+                linear.rows,
+                linear.cols,
+                linear.input_scale,
+                linear.output_scale,
+                &input.slice,
                 &mut output.slice,
             )
         };

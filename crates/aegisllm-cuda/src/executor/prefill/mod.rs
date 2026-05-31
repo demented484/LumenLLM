@@ -46,7 +46,12 @@ impl CudaLlamaExecutor {
                 self.kv_context_size
             )));
         }
-        if prompt_tokens.len() > 1 && state.prefill.is_some() {
+        // Gated DeltaNet (Qwen3-Next) layers carry recurrent state that must be
+        // threaded token-by-token; the chunked-prefill path has no GDN kernel
+        // yet. Route GDN models through the sequential per-token path (the
+        // decode forward, which DOES handle GDN + the NVFP4 shared expert).
+        let has_gdn = self.layers.iter().any(|l| l.gdn.is_some());
+        if prompt_tokens.len() > 1 && state.prefill.is_some() && !has_gdn {
             return self.prefill_prompt_chunked(state, prompt_tokens, sampling);
         }
         for &token in prefix {

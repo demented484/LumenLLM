@@ -285,6 +285,12 @@ fn estimate_extra_bytes(
 ) -> u64 {
     match (source_format, resident_layout) {
         (_, LinearResidentLayout::PackedSource) | (_, LinearResidentLayout::DenseTensorCore) => 0,
+        // FP8 block-scaled (DeepSeek-style) weights stay packed in VRAM and are
+        // dequant-on-the-fly in `aegis_fp8_block_matvec` — they never materialize
+        // a tensor-core copy, so 0 extra bytes regardless of the nominal layout.
+        // (Without this the planner over-counts ~source_bytes/weight as phantom
+        // NativeTensorCore materialization and falsely trips the VRAM budget gate.)
+        (QuantFormat::Fp8E4M3Block, _) => 0,
         (QuantFormat::Nvfp4, LinearResidentLayout::NativeTensorCore) => source_bytes,
         (QuantFormat::Nvfp4, LinearResidentLayout::CudaR4fE2m1Ue4m3) => source_bytes,
         (_, LinearResidentLayout::NativeTensorCore) => source_bytes,

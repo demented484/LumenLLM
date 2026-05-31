@@ -416,6 +416,8 @@ fn load_draft_layer(
         // is resolved at forward time against the TARGET's layer states (see
         // `DraftModel::target_kv_layer`). We always pass kv_shared_override.
         kv_shared_from: None,
+        gdn: None,
+        attn_output_gate: false,
     })
 }
 
@@ -676,7 +678,7 @@ pub(super) fn build_draft_state(exec: &CudaLlamaExecutor) -> Result<super::state
     Ok(super::state::DraftState {
         scratch,
         decoder_scratch,
-        dummy_layer_state: CudaLayerState { kv: dummy_kv },
+        dummy_layer_state: CudaLayerState { kv: dummy_kv, recurrent: None, conv_state: None },
     })
 }
 

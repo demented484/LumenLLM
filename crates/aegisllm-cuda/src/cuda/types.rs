@@ -391,11 +391,18 @@ pub struct StandaloneFp8Linear {
     pub bytes: usize,
     pub(super) data: CudaSlice<u8>,
     pub(super) row_scales: CudaSlice<f32>,
+    /// DeepSeek-style block scales `[ceil(rows/block_size), scale_cols]` as f32.
+    /// `Some` → use the block-scaled matvec (scale varies along both axes);
+    /// `None` → use `row_scales` (one scale per output row).
+    pub(super) block_scales: Option<CudaSlice<f32>>,
+    pub(super) block_size: u32,
+    pub(super) scale_cols: u32,
 }
 
 impl StandaloneFp8Linear {
     pub(super) fn data_slice(&self) -> &CudaSlice<u8> { &self.data }
     pub(super) fn row_scales_slice(&self) -> &CudaSlice<f32> { &self.row_scales }
+    pub(super) fn block_scales_slice(&self) -> Option<&CudaSlice<f32>> { self.block_scales.as_ref() }
 }
 
 #[derive(Debug, Clone, Copy)]

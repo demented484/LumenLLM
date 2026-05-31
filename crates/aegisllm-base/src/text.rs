@@ -73,6 +73,9 @@ impl TextProcessor {
         {
             ids.insert(0, bos);
         }
+        if std::env::var("AEGIS_DUMP_TOKENS").is_ok() {
+            eprintln!("[DUMP TOKENS] {ids:?}");
+        }
         Ok(ids)
     }
 

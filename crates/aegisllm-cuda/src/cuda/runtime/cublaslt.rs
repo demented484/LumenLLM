@@ -311,8 +311,13 @@ impl CudaRuntime {
             )));
         }
 
-        // Step 1: FP8 weight → BF16 scratch (dequant).
-        self.dequant_fp8_to_bf16_device(weight, weight_dequant_scratch)?;
+        // Step 1: FP8 weight → BF16 scratch (dequant). Block-scaled weights
+        // (Qwen3.5-9B) use the [blk×blk] block dequant; per-row otherwise.
+        if weight.block_scales_slice().is_some() {
+            self.dequant_fp8_block_to_bf16_device(weight, weight_dequant_scratch)?;
+        } else {
+            self.dequant_fp8_to_bf16_device(weight, weight_dequant_scratch)?;
+        }
 
         // Step 2: F32 input → BF16 scratch.
         self.f32_to_bf16_device(input, in_len, input_bf16)?;

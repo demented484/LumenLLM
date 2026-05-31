@@ -111,6 +111,120 @@ extern "C" __global__ void aegis_fp8_matvec(
     }
 }
 
+// FP8 BLOCK-scaled matvec (DeepSeek-style W8 with [blk×blk] weight_scale_inv):
+//   output[r] = sum_c { e4m3_to_f32(fp8[r,c]) * scale[r/blk, c/blk] * input[c] }
+// The scale varies along BOTH axes (unlike per-row), so it is folded inside the
+// K-loop. Block per output row; threads cooperatively reduce along K.
+extern "C" __global__ void aegis_fp8_block_matvec(
+    const unsigned char* __restrict__ fp8,      // [rows, cols]
+    const float* __restrict__ block_scales,      // [ceil(rows/blk), scale_cols]
+    const float* __restrict__ input,             // [cols]
+    const unsigned int rows,
+    const unsigned int cols,
+    const unsigned int blk,
+    const unsigned int scale_cols,
+    float* __restrict__ output)                  // [rows]
+{
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_dim = blockDim.x;
+    const unsigned char* row_fp8 = fp8 + (size_t)row * cols;
+    const unsigned int srow = (row / blk) * scale_cols;
+
+    // Decode LUT in shared memory: the e4m3→float decode (branches + exp2f) is
+    // otherwise evaluated 16×/thread and makes the GEMV ALU-bound. Each block
+    // computes the 256-entry table once (1 KiB smem) → one smem load per weight.
+    __shared__ float e4m3_lut[256];
+    for (unsigned int i = tid; i < 256u; i += block_dim) {
+        e4m3_lut[i] = fp8_e4m3_bits_to_float((unsigned char)i);
+    }
+    __syncthreads();
+
+    // Vectorized: each thread reads 16 fp8 weights (one 128-bit uint4 load) and
+    // 16 inputs (four float4 loads) per chunk. cols and the weight row base are
+    // 16-aligned (hidden/intermediate are multiples of 16), so the loads are
+    // aligned and coalesced — vs 1-byte scalar loads that ran at ~25% of HBM.
+    // A 16-element chunk never crosses a 128-element scale block (base%128 ≤
+    // 112 for any 16-aligned base), so one scale lookup covers all 16.
+    float partial = 0.0f;
+    const unsigned int nvec = cols / 16u;
+    const uint4* row_fp8_v = reinterpret_cast<const uint4*>(row_fp8);
+    const float4* input_v = reinterpret_cast<const float4*>(input);
+    for (unsigned int ch = tid; ch < nvec; ch += block_dim) {
+        uint4 wpack = row_fp8_v[ch];
+        const unsigned char* wb = reinterpret_cast<const unsigned char*>(&wpack);
+        float s = block_scales[srow + (ch * 16u) / blk];
+        float inbuf[16];
+        *reinterpret_cast<float4*>(&inbuf[0])  = input_v[ch * 4u + 0u];
+        *reinterpret_cast<float4*>(&inbuf[4])  = input_v[ch * 4u + 1u];
+        *reinterpret_cast<float4*>(&inbuf[8])  = input_v[ch * 4u + 2u];
+        *reinterpret_cast<float4*>(&inbuf[12]) = input_v[ch * 4u + 3u];
+        #pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            partial += e4m3_lut[wb[k]] * s * inbuf[k];
+        }
+    }
+    // Scalar tail for any cols not divisible by 16 (none of the current shapes,
+    // but keeps the kernel correct if that changes).
+    for (unsigned int c = nvec * 16u + tid; c < cols; c += block_dim) {
+        partial += e4m3_lut[row_fp8[c]] * block_scales[srow + c / blk] * input[c];
+    }
+    // Warp-shuffle reduction: each warp reduces in registers, then warp 0
+    // combines the per-warp sums (1 barrier vs the 8-barrier smem tree).
+    for (int off = 16; off > 0; off >>= 1)
+        partial += __shfl_down_sync(0xffffffffu, partial, off);
+    __shared__ float warp_sums[32];
+    const unsigned int lane = tid & 31u, warp = tid >> 5;
+    if (lane == 0) warp_sums[warp] = partial;
+    __syncthreads();
+    if (warp == 0) {
+        float v = (lane < (block_dim >> 5)) ? warp_sums[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1)
+            v += __shfl_down_sync(0xffffffffu, v, off);
+        if (lane == 0) output[row] = v;
+    }
+}
+
+// Batched (prefill) variant of the FP8 block-scaled matmul.
+// out[b, r] = sum_c { e4m3(fp8[r,c]) * scale[r/blk, c/blk] * input[b, c] }
+// Grid: (rows, batch). Block: threads reduce along K.
+extern "C" __global__ void aegis_fp8_block_matmul_batched(
+    const unsigned char* __restrict__ fp8,      // [rows, cols]
+    const float* __restrict__ block_scales,      // [ceil(rows/blk), scale_cols]
+    const float* __restrict__ input,             // [batch, cols]
+    const unsigned int rows,
+    const unsigned int cols,
+    const unsigned int blk,
+    const unsigned int scale_cols,
+    const unsigned int batch,
+    float* __restrict__ output)                  // [batch, rows]
+{
+    const unsigned int row = blockIdx.x;
+    const unsigned int b   = blockIdx.y;
+    if (row >= rows || b >= batch) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int block_dim = blockDim.x;
+    const unsigned char* row_fp8 = fp8 + (size_t)row * cols;
+    const float* row_in = input + (size_t)b * cols;
+    const unsigned int srow = (row / blk) * scale_cols;
+
+    float partial = 0.0f;
+    for (unsigned int c = tid; c < cols; c += block_dim) {
+        float w = fp8_e4m3_bits_to_float(row_fp8[c]);
+        float s = block_scales[srow + c / blk];
+        partial += w * s * row_in[c];
+    }
+    extern __shared__ float sdata[];
+    sdata[tid] = partial;
+    __syncthreads();
+    for (unsigned int s = block_dim / 2u; s > 0u; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) output[(size_t)b * rows + row] = sdata[0];
+}
+
 // Batched matmul (prefill path): out[b, r] = sum_c { dequant(fp8[r,c]) * input[b, c] }
 //
 // Grid: (rows, batch). Block: 128 threads. One block per (row, token) pair;
@@ -181,6 +295,31 @@ extern "C" __global__ void aegis_dequant_fp8_to_bf16(
     unsigned int bits = __float_as_uint(v);
     unsigned int rounded = bits + 0x7FFFu + ((bits >> 16u) & 1u);
     bf16_out[row * cols + col] = (unsigned short)(rounded >> 16u);
+}
+
+// Block-scaled FP8 → BF16 dequant (DeepSeek-style): bf16_out[r,c] =
+//   bf16( e4m3(fp8[r,c]) * block_scales[r/blk, c/blk] ).
+// Unlocks the cuBLASLt BF16 GEMM (weight read once, amortized over M tokens) for
+// the block-scaled FP8 weights used by Qwen3.5-9B prefill.
+// Grid: (rows, ceil(cols/blockDim.x)). Block: 256.
+extern "C" __global__ void aegis_dequant_fp8_block_to_bf16(
+    const unsigned char* __restrict__ fp8,      // [rows, cols]
+    const float* __restrict__ block_scales,      // [ceil(rows/blk), scale_cols]
+    unsigned short* __restrict__ bf16_out,       // [rows, cols] BF16 packed as u16
+    const unsigned int rows,
+    const unsigned int cols,
+    const unsigned int blk,
+    const unsigned int scale_cols)
+{
+    const unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned int col = blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= cols) return;
+    const float s = block_scales[(row / blk) * scale_cols + (col / blk)];
+    const float v = fp8_e4m3_bits_to_float(fp8[(size_t)row * cols + col]) * s;
+    unsigned int bits = __float_as_uint(v);
+    unsigned int rounded = bits + 0x7FFFu + ((bits >> 16u) & 1u);
+    bf16_out[(size_t)row * cols + col] = (unsigned short)(rounded >> 16u);
 }
 
 #endif  // AEGIS_FP8_LINEAR_CU
