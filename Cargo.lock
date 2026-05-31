@@ -57,6 +57,7 @@ name = "aegisllm-cpu"
 version = "0.2.0"
 dependencies = [
  "aegisllm-base",
+ "libc",
  "memmap2",
  "pulp",
  "rand",

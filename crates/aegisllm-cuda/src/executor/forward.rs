@@ -547,6 +547,25 @@ fn report_decode_split(t0: std::time::Instant, t_cpu_done: std::time::Instant, h
         mib,
         gbps,
     );
+    // Experts-on-CPU per-layer phase breakdown (summed across this token's MoE
+    // layers), when AEGIS_CPU_MOE_TIMING=1. Drained each token so the numbers
+    // are per-token. dtoh = blocking input download; build = arena view build;
+    // cpu = the fused CPU expert kernel (the DRAM-bound dispatch); upload =
+    // result HtoD.
+    use crate::executor::mlp::{
+        CPU_MOE_BUILD_MS, CPU_MOE_CALLS, CPU_MOE_DTOH_MS, CPU_MOE_COMPUTE_MS, CPU_MOE_UPLOAD_MS,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    let calls = CPU_MOE_CALLS.swap(0, Relaxed);
+    if calls > 0 {
+        let dtoh = CPU_MOE_DTOH_MS.swap(0, Relaxed) as f64 / 1000.0;
+        let build = CPU_MOE_BUILD_MS.swap(0, Relaxed) as f64 / 1000.0;
+        let cpu = CPU_MOE_COMPUTE_MS.swap(0, Relaxed) as f64 / 1000.0;
+        let upload = CPU_MOE_UPLOAD_MS.swap(0, Relaxed) as f64 / 1000.0;
+        eprintln!(
+            "[CPU-MOE] layers={calls} dtoh={dtoh:>5.2}ms build={build:>5.2}ms cpu={cpu:>6.2}ms upload={upload:>5.2}ms (per-token)"
+        );
+    }
 }
 
 impl CudaLayerBlockExecutor {

@@ -272,13 +272,23 @@ fn fused_row_dot_avx512(packed_row: &[u8], scale_row: &[u8], x: &[f32]) -> f32 {
 
         let mut acc = _mm512_setzero_ps();
         let nblocks = scale_row.len();
+        let packed_ptr = packed_row.as_ptr();
         // `b` indexes packed (×8), scales (×1) and x (×16) at different strides.
         #[allow(clippy::needless_range_loop)]
         for b in 0..nblocks {
             // --- read exactly 8 packed bytes (one block) from DRAM -------------
             let pbase = b * PACKED_PER_BLOCK;
+            // Software-prefetch a cache line ahead of the packed read. The rows
+            // are processed near-contiguously per lane, but at expert/matrix
+            // boundaries the HW prefetcher resets; a T0 prefetch ~64B ahead keeps
+            // the DRAM stream from stalling on the scattered per-expert layout
+            // (measured: 25 → 46 GB/s on the integrated per-layer MoE shape).
+            // `wrapping_add` so the address computed past the row end is always a
+            // defined (if possibly-invalid) pointer — `_mm_prefetch` never faults
+            // on an invalid address, it is a pure hint.
+            _mm_prefetch::<_MM_HINT_T0>(packed_ptr.wrapping_add(pbase + 64) as *const i8);
             // Load the 8 packed bytes into the low 64 bits of an xmm register.
-            let packed_xmm = _mm_loadl_epi64(packed_row.as_ptr().add(pbase) as *const _);
+            let packed_xmm = _mm_loadl_epi64(packed_ptr.add(pbase) as *const _);
             // Duplicate byte j into lanes 2j,2j+1 (pshufb) → 16 bytes in-reg.
             let dup_xmm = _mm_shuffle_epi8(packed_xmm, dup_ctrl);
             // Zero-extend 16 u8 → 16 u32 lanes.
@@ -456,6 +466,16 @@ pub fn moe_layer_experts_into(
     debug_assert_eq!(routed_acc.len(), hidden);
     scratch.ensure(top_k, intermediate, hidden);
 
+    // Dispatch backend: persistent pinned pool (default) or rayon (A/B via
+    // AEGIS_CPU_MOE_RAYON=1). On the 6-core test host the pinned pool keeps its
+    // lanes hot through the inter-layer CUDA FFI gaps and lifts the integrated
+    // Qwen3.6-35B decode from ~30.8 tps (rayon) to ~36 tps (pool) — the workers
+    // never sleep mid-token and lane 0 is pinned off the worker cores. The rayon
+    // fallback is kept for measurement + as the safe path on hosts where the
+    // pool's spin nets a regression.
+    let use_rayon = crate::persistent_pool::use_rayon_fallback();
+    let pool = crate::persistent_pool::global_pool();
+
     // ── Region A: all experts' gate + up rows in one parallel region ─────────
     //
     // Job space: for each expert e, gate has `gate.rows` rows and up has
@@ -480,7 +500,13 @@ pub fn moe_layer_experts_into(
             scratch.gate_buf.chunks_mut(intermediate).map(|c| SendPtr(c.as_mut_ptr())).collect();
         let up_ptrs: Vec<SendPtr> =
             scratch.up_buf.chunks_mut(intermediate).map(|c| SendPtr(c.as_mut_ptr())).collect();
-        jobs.par_iter().for_each(|&(e, is_up, r)| {
+        // Dispatch on the PERSISTENT hot pool (default; rayon under
+        // AEGIS_CPU_MOE_RAYON=1). The pool statically shards `[0, jobs.len())`
+        // across its pinned lanes. Every job writes a DISTINCT (expert, proj,
+        // row) element.
+        let jobs: &[(u32, u8, u32)] = jobs;
+        let body = |j: usize| {
+            let (e, is_up, r) = jobs[j];
             let ex = &experts[e as usize];
             let (w, base) = if is_up == 0 {
                 (&ex.gate, gate_ptrs[e as usize].0)
@@ -496,7 +522,12 @@ pub fn moe_layer_experts_into(
             // SAFETY: every job writes a DISTINCT (expert, proj, row) element;
             // `base` is the expert's slab start and `r < intermediate`.
             unsafe { *base.add(r) = val };
-        });
+        };
+        if use_rayon {
+            (0..jobs.len()).into_par_iter().for_each(body);
+        } else {
+            pool.dispatch(jobs.len(), body);
+        }
     }
 
     // ── geglu per expert (serial; cheap) ─────────────────────────────────────
@@ -518,8 +549,10 @@ pub fn moe_layer_experts_into(
         }
         let down_ptrs: Vec<SendPtr> =
             scratch.down_buf.chunks_mut(hidden).map(|c| SendPtr(c.as_mut_ptr())).collect();
-        let swiglu = &scratch.swiglu_buf;
-        jobs.par_iter().for_each(|&(e, r)| {
+        let swiglu: &[f32] = &scratch.swiglu_buf;
+        let jobs: &[(u32, u32)] = jobs;
+        let body = |j: usize| {
+            let (e, r) = jobs[j];
             let ex = &experts[e as usize];
             let w = &ex.down;
             let pc = w.cols / 2;
@@ -531,7 +564,12 @@ pub fn moe_layer_experts_into(
             let val = fused_row_dot(prow, srow, xin) * w.output_scale;
             // SAFETY: distinct (expert, row) element per job; r < hidden.
             unsafe { *down_ptrs[e as usize].0.add(r) = val };
-        });
+        };
+        if use_rayon {
+            (0..jobs.len()).into_par_iter().for_each(body);
+        } else {
+            pool.dispatch(jobs.len(), body);
+        }
     }
 
     // ── Weighted combine into routed_acc (fixed ascending expert order) ──────
@@ -1126,6 +1164,113 @@ mod tests {
         }
         eprintln!("── NVFP4 fused kernel: PARALLEL ceiling (single rayon region) ──");
         eprintln!("best parallel: {best_gbps:.1} GB/s  sink={sink:.1}");
+        assert!(sink.is_finite());
+    }
+
+    /// HONEST integrated-shape microbench: builds 40 distinct MoE layers' worth
+    /// of 8 active experts (>LLC), then per token loops the 40 layers calling
+    /// `moe_layer_experts_into` once per layer (the EXACT shape the integrated
+    /// decode path drives — 2 big parallel regions/layer, ~18 MiB/region,
+    /// weights streamed cold from DRAM). This is the real per-token CPU expert
+    /// floor (no GPU). With `AEGIS_BENCH_FFI_GAP_US` set, a busy-wait of that
+    /// many microseconds runs on the dispatch (lane-0) thread BETWEEN layers, to
+    /// reproduce the inter-layer CUDA FFI gap that puts rayon's workers to sleep
+    /// — this is where the persistent pool wins over rayon. Reports GB/s +
+    /// implied experts-only tps.
+    #[test]
+    #[ignore]
+    fn nvfp4_moe_layer_dispatch_per_token() {
+        const HIDDEN: usize = 2048;
+        const INTER: usize = 512;
+        const TOP_K: usize = 8;
+        const MOE_LAYERS: usize = 40;
+        const GSCALE: f32 = 0.5;
+
+        let mut rng = SmallRng::seed_from_u64(SEED ^ 0x10AD);
+        // Distinct experts across all 40 layers so the working set (>700 MiB)
+        // far exceeds LLC — reads come from DRAM, exactly like decode.
+        struct LayerExperts {
+            gate: Vec<(Vec<u8>, Vec<u8>)>,
+            up: Vec<(Vec<u8>, Vec<u8>)>,
+            down: Vec<(Vec<u8>, Vec<u8>)>,
+        }
+        let layers: Vec<LayerExperts> = (0..MOE_LAYERS)
+            .map(|_| LayerExperts {
+                gate: (0..TOP_K).map(|_| build_expert(&mut rng, INTER, HIDDEN)).collect(),
+                up: (0..TOP_K).map(|_| build_expert(&mut rng, INTER, HIDDEN)).collect(),
+                down: (0..TOP_K).map(|_| build_expert(&mut rng, HIDDEN, INTER)).collect(),
+            })
+            .collect();
+        let x: Vec<f32> = (0..HIDDEN).map(|_| rng.random::<f32>() * 2.0 - 1.0).collect();
+
+        let bytes_per_expert = layers[0].gate[0].0.len()
+            + layers[0].gate[0].1.len()
+            + layers[0].up[0].0.len()
+            + layers[0].up[0].1.len()
+            + layers[0].down[0].0.len()
+            + layers[0].down[0].1.len();
+        let bytes_per_token = bytes_per_expert * TOP_K * MOE_LAYERS;
+
+        let ffi_gap_us: u64 = std::env::var("AEGIS_BENCH_FFI_GAP_US")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let busy_wait_us = |us: u64| {
+            if us == 0 {
+                return;
+            }
+            let t = Instant::now();
+            while (t.elapsed().as_micros() as u64) < us {
+                std::hint::spin_loop();
+            }
+        };
+
+        let mut scratch = MoeLayerScratch::default();
+        let mut routed_acc = vec![0.0f32; HIDDEN];
+
+        let run_token = |scratch: &mut MoeLayerScratch, routed_acc: &mut [f32]| -> f32 {
+            let mut sink = 0.0f32;
+            for layer in &layers {
+                let experts: Vec<CpuMoeExpert> = (0..TOP_K)
+                    .map(|e| CpuMoeExpert {
+                        gate: PackedWeights::new(
+                            INTER, HIDDEN, &layer.gate[e].0, &layer.gate[e].1, GSCALE,
+                        ),
+                        up: PackedWeights::new(
+                            INTER, HIDDEN, &layer.up[e].0, &layer.up[e].1, GSCALE,
+                        ),
+                        down: PackedWeights::new(
+                            HIDDEN, INTER, &layer.down[e].0, &layer.down[e].1, GSCALE,
+                        ),
+                        weight: 0.125,
+                    })
+                    .collect();
+                moe_layer_experts_into(&experts, &x, INTER, scratch, routed_acc);
+                sink += routed_acc[0];
+                // Reproduce the inter-layer CUDA FFI gap on the dispatch thread.
+                busy_wait_us(ffi_gap_us);
+            }
+            sink
+        };
+
+        // Warm.
+        let mut sink = run_token(&mut scratch, &mut routed_acc);
+        const TOKENS: usize = 20;
+        let t0 = Instant::now();
+        for _ in 0..TOKENS {
+            sink += run_token(&mut scratch, &mut routed_acc);
+        }
+        let secs = t0.elapsed().as_secs_f64();
+        let per_token_ms = secs / TOKENS as f64 * 1e3;
+        let gbps = (bytes_per_token * TOKENS) as f64 / secs / 1e9;
+        let implied_tps = 1.0 / (secs / TOKENS as f64);
+        eprintln!("── NVFP4 moe_layer_experts_into: INTEGRATED per-token shape ──");
+        eprintln!(
+            "per-token active set: {:.1} MiB ({MOE_LAYERS} layers × {TOP_K} experts)  ffi_gap={ffi_gap_us}us/layer",
+            bytes_per_token as f64 / 1024.0 / 1024.0
+        );
+        eprintln!("achieved: {gbps:.1} GB/s   per-token: {per_token_ms:.2} ms");
+        eprintln!("implied decode (experts only, no overlap): {implied_tps:.1} tps  sink={sink:.1}");
         assert!(sink.is_finite());
     }
 }

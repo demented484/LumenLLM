@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 aegisllm-base = { path = "../aegisllm-base" }
+libc.workspace = true
 memmap2.workspace = true
 pulp.workspace = true
 rayon.workspace = true

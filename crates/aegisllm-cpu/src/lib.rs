@@ -4,6 +4,7 @@ pub mod attention;
 pub mod cpu;
 pub mod materialization;
 pub mod nvfp4_gemv;
+pub mod persistent_pool;
 
 pub use attention::{
     ReferenceAttentionDecodeRequest, ReferenceAttentionPrefillRequest,

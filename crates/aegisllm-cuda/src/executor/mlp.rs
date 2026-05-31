@@ -19,6 +19,27 @@ fn batched_decode_moe_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("AEGIS_BATCHED_DECODE_MOE").is_ok())
 }
 
+/// Diagnostic: accumulate the experts-on-CPU per-layer phase breakdown (in
+/// microseconds, summed across all MoE-layer calls) so a session can report the
+/// dtoh / view-build / cpu-compute / result-upload split. Toggle with
+/// `AEGIS_CPU_MOE_TIMING=1`; printed once per token by the decode timer.
+pub(crate) static CPU_MOE_BUILD_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CPU_MOE_COMPUTE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CPU_MOE_UPLOAD_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CPU_MOE_DTOH_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static CPU_MOE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn cpu_moe_timing_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("AEGIS_CPU_MOE_TIMING").is_ok())
+}
+
 pub(super) fn forward_mlp_device(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
@@ -516,7 +537,14 @@ fn forward_moe_decode_device(
         && moe.cpu_experts
         && moe.experts.first().map(|e| e.gate_proj.is_host_resident()).unwrap_or(false);
     if cpu_moe {
+        let dt0 = if cpu_moe_timing_enabled() { Some(std::time::Instant::now()) } else { None };
         runtime.download_f32_into(hidden_out, hidden_size, &mut moe_scratch.cpu_expert_input)?;
+        if let Some(t) = dt0 {
+            CPU_MOE_DTOH_MS.fetch_add(
+                (t.elapsed().as_secs_f64() * 1e6) as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
     }
 
     let staging_ptr: *mut LinearStagingPool =
@@ -1228,6 +1256,8 @@ fn forward_moe_decode_cpu(
         return Ok(());
     }
     let intermediate = moe.expert_intermediate_size;
+    let timing = cpu_moe_timing_enabled();
+    let t0 = if timing { Some(std::time::Instant::now()) } else { None };
 
     // Build the active experts' borrowed packed/scale views from the arena.
     let mut experts: Vec<aegisllm_cpu::CpuMoeExpert> = Vec::with_capacity(active_top_k);
@@ -1241,8 +1271,9 @@ fn forward_moe_decode_cpu(
             weight,
         });
     }
+    let t_build = t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
-    // Run the fused CPU kernel (2 big rayon regions/layer). Split the scratch
+    // Run the fused CPU kernel (2 big pool regions/layer). Split the scratch
     // borrows: input (read) + per-layer scratch (write) + result (write).
     {
         let CudaMoEScratch { cpu_expert_input, cpu_moe_scratch, cpu_routed_acc, .. } = moe_scratch;
@@ -1259,12 +1290,21 @@ fn forward_moe_decode_cpu(
             },
         );
     }
+    let t_compute = t0.map(|t| t.elapsed().as_secs_f64() * 1000.0);
 
     // Upload the routed sum back into the GPU `routed_acc` for the combine.
     // Split-borrow the two distinct fields (read cpu_routed_acc, write routed_acc).
     let hidden = moe_scratch.cpu_expert_input.len();
     let CudaMoEScratch { cpu_routed_acc, routed_acc, .. } = moe_scratch;
     runtime.upload_f32_slice_to_device(&cpu_routed_acc[..hidden], routed_acc)?;
+    if let (Some(t), Some(tb), Some(tr)) = (t0, t_build, t_compute) {
+        let total = t.elapsed().as_secs_f64() * 1000.0;
+        use std::sync::atomic::Ordering::Relaxed;
+        CPU_MOE_BUILD_MS.fetch_add((tb * 1000.0) as u64, Relaxed);
+        CPU_MOE_COMPUTE_MS.fetch_add(((tr - tb) * 1000.0) as u64, Relaxed);
+        CPU_MOE_UPLOAD_MS.fetch_add(((total - tr) * 1000.0) as u64, Relaxed);
+        CPU_MOE_CALLS.fetch_add(1, Relaxed);
+    }
     Ok(())
 }
 
