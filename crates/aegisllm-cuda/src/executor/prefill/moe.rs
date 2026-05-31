@@ -183,10 +183,106 @@ pub(super) fn forward_moe_prefill_chunk_device(
                 &mut moe_scratch.gather_out,
             )?;
         }
+        (CL::Nvfp4(g), CL::Nvfp4(u), CL::Nvfp4(d)) => {
+            // Qwen3-Next NVFP4 shared expert (the 35B-A3B case). Mirrors the
+            // per-token decode shared-MLP path exactly, batched over the chunk:
+            // gate/up via the batched NVFP4 GEMM, the layer's configured dense
+            // activation (SwiGLU for Qwen `silu`; GeGLU-tanh for Gemma), then
+            // down. The shared_gate sigmoid (below, after this match) scales
+            // the result per token. Routed experts use their own GeGLU-tanh
+            // path (matching decode) — do NOT conflate the two activations.
+            let sp = if staging_ptr.is_null() {
+                None
+            } else {
+                Some(unsafe { &mut *staging_ptr })
+            };
+            matvec_nvfp4_batched_device_with_scratch(
+                runtime, g, &pf.input_normed, batch,
+                &mut moe_scratch.gather_quant, &mut moe_scratch.gather_mxfp4,
+                &mut moe_scratch.gather_intermediate, sp,
+            )?;
+            let sp = if staging_ptr.is_null() {
+                None
+            } else {
+                Some(unsafe { &mut *staging_ptr })
+            };
+            matvec_nvfp4_batched_device_with_scratch(
+                runtime, u, &pf.input_normed, batch,
+                &mut moe_scratch.gather_quant, &mut moe_scratch.gather_mxfp4,
+                &mut moe_scratch.gather_swiglu, sp,
+            )?;
+            // Activation. SwiGLU writes into `gather_intermediate` (silu(gate)*up),
+            // GeGLU-tanh writes into `gather_swiglu` (gelu_tanh(gate)*up). Track
+            // which buffer holds the activated value so `down` reads the right
+            // one — matching the decode `match layer.dense_activation` arms.
+            use crate::executor::mlp::DenseActivation;
+            let act_in_intermediate = match layer.dense_activation {
+                DenseActivation::Swiglu => {
+                    runtime.swiglu_inplace_gate_device_len(
+                        &mut moe_scratch.gather_intermediate,
+                        &moe_scratch.gather_swiglu,
+                        batch * intermediate,
+                    )?;
+                    true
+                }
+                DenseActivation::GeluTanh => {
+                    runtime.geglu_tanh_in_place_device(
+                        &moe_scratch.gather_intermediate,
+                        &mut moe_scratch.gather_swiglu,
+                        batch * intermediate,
+                    )?;
+                    false
+                }
+            };
+            let sp = if staging_ptr.is_null() {
+                None
+            } else {
+                Some(unsafe { &mut *staging_ptr })
+            };
+            // SAFETY: the activation buffer (read) and gather_out (write) are
+            // distinct fields of moe_scratch; the raw split sidesteps the
+            // borrow checker over the shared &mut moe_scratch.
+            if act_in_intermediate {
+                let act = &moe_scratch.gather_intermediate as *const DeviceBuffer<f32>;
+                matvec_nvfp4_batched_device_with_scratch(
+                    runtime, d, unsafe { &*act }, batch,
+                    &mut moe_scratch.gather_quant, &mut moe_scratch.gather_mxfp4,
+                    &mut moe_scratch.gather_out, sp,
+                )?;
+            } else {
+                let act = &moe_scratch.gather_swiglu as *const DeviceBuffer<f32>;
+                matvec_nvfp4_batched_device_with_scratch(
+                    runtime, d, unsafe { &*act }, batch,
+                    &mut moe_scratch.gather_quant, &mut moe_scratch.gather_mxfp4,
+                    &mut moe_scratch.gather_out, sp,
+                )?;
+            }
+        }
         _ => return Err(AegisError::InvalidPlan(
             "MoE prefill expects shared expert with all three projections in the same \
-             format (BF16 or FP8)".into(),
+             format (BF16, FP8, or NVFP4)".into(),
         )),
+    }
+
+    // ── Qwen3-Next shared-expert gate ───────────────────────────────────────
+    // Scale each token's shared-MLP output by `sigmoid(shared_gate · x)`, where
+    // x is the (pre-shared-MLP) normed hidden in `pf.input_normed`. Mirrors the
+    // decode path (`scale_by_sigmoid_scalar` per token); here the [1, hidden]
+    // gate produces a `[batch]` logit vector via the batched matvec and a
+    // per-row sigmoid scale broadcasts over the hidden dim. `None` for Gemma.
+    if let Some(ref sgate) = shared.shared_gate {
+        runtime.matmul_bf16_reference_batched_device(
+            sgate,
+            &pf.input_normed,
+            batch,
+            &mut moe_scratch.shared_gate_logit,
+        )?;
+        runtime.scale_by_sigmoid_rows(
+            &mut moe_scratch.gather_out,
+            &moe_scratch.shared_gate_logit,
+            batch,
+            hidden_size,
+        )?;
     }
 
     report(cp_shared, "shared_mlp_done");

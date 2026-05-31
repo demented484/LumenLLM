@@ -1047,6 +1047,13 @@ pub(super) struct CudaMoEPrefillScratch {
     /// Sized to `cs * 2 * max_expert_intermediate` (an upper bound across
     /// MoE layers; shared intermediate is usually the larger of the two).
     pub(super) gather_shared_gate_up_fused: DeviceBuffer<f32>,
+    /// Qwen3-Next shared-expert gate logits, `[chunk_size]`. Per-token logit
+    /// produced by the `shared_gate` `[1, hidden]` batched matvec; the shared
+    /// MLP output rows are scaled by `sigmoid(logit[token])` before being added
+    /// to the routed experts (mirrors `CudaMoEScratch.shared_gate_logit` for
+    /// decode but holds one logit per chunk token, not a single scalar).
+    /// `None`/unused for models without a shared-expert gate (Gemma).
+    pub(super) shared_gate_logit: DeviceBuffer<f32>,
     /// Gather buffer for down_proj output: `[max_active_tokens, hidden_size]`.
     pub(super) gather_out: DeviceBuffer<f32>,
     /// Quantized input scratch for NVFP4 expert matmuls: `[max_active_tokens, max_dim]`.
