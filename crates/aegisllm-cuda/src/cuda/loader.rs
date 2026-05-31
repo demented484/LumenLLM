@@ -760,6 +760,41 @@ impl CudaWeightLoader<'_> {
         })
     }
 
+    /// Load a BF16 tensor into a VRAM-resident `DeviceBf16Matrix` with the
+    /// caller's explicit `(rows, cols)` shape, regardless of the checkpoint's
+    /// stored N-D shape. Used for tensors whose logical 2-D linear shape isn't
+    /// "all-leading-dims × last-dim" — e.g. Qwen's Conv3d patch-embed
+    /// `[1152, 3, 2, 16, 16]` which is the linear `[1152, 1536]` (rows = first
+    /// dim, cols = product of the rest). `rows * cols` must equal the tensor's
+    /// element count.
+    pub fn load_bf16_matrix_explicit_dims(
+        &self,
+        tensor: &TensorInfo,
+        rows: usize,
+        cols: usize,
+        loader: &mut TensorStorageLoader,
+    ) -> Result<DeviceBf16Matrix> {
+        if tensor.dtype != TensorDType::BF16 {
+            return Err(AegisError::InvalidPlan(format!(
+                "`{}` must be BF16 for explicit-dims load (got {:?})",
+                tensor.name, tensor.dtype
+            )));
+        }
+        if rows * cols != tensor.num_elements {
+            return Err(AegisError::InvalidPlan(format!(
+                "`{}`: explicit rows*cols={} != num_elements={}",
+                tensor.name, rows * cols, tensor.num_elements
+            )));
+        }
+        let loaded = loader.load_for_store(tensor, StoragePlacement::Ram)?;
+        let bytes = loaded.as_bytes();
+        let values: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        self.bf16_matrix_from_host_u16(&tensor.name, rows, cols, &values)
+    }
+
     /// Build a VRAM-resident `DeviceBf16Matrix` directly from a host `&[u16]`
     /// (BF16 bit-pattern) slice of length `rows * cols`. Used to materialize
     /// per-expert weight matrices sliced out of a stacked/fused expert tensor

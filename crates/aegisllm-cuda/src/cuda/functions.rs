@@ -98,6 +98,13 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) vision_rope_2d: CudaFunction,
     pub(crate) vision_standardize: CudaFunction,
     pub(crate) vision_pool3x3_scale: CudaFunction,
+    /// Qwen3-VL native-ViT kernels (LayerNorm+bias, gelu_tanh, (row,col) RoPE,
+    /// add-bias-rows).
+    pub(crate) vision_layernorm_bias: CudaFunction,
+    pub(crate) vision_gelu_tanh: CudaFunction,
+    pub(crate) vision_gelu_erf: CudaFunction,
+    pub(crate) vision_add_bias_rows: CudaFunction,
+    pub(crate) vision_rope_qwen: CudaFunction,
     /// Gemma-4 audio tower (USM/Conformer) per-token kernels.
     pub(crate) audio_glu_halfsplit: CudaFunction,
     pub(crate) audio_depthwise_causal_conv1d: CudaFunction,
@@ -388,6 +395,11 @@ impl CudaKernelFunctions {
             vision_rope_2d: load(&module, "aegis_vision_rope_2d")?,
             vision_standardize: load(&module, "aegis_vision_standardize")?,
             vision_pool3x3_scale: load(&module, "aegis_vision_pool3x3_scale")?,
+            vision_layernorm_bias: load(&module, "aegis_vision_layernorm_bias")?,
+            vision_gelu_tanh: load(&module, "aegis_vision_gelu_tanh")?,
+            vision_gelu_erf: load(&module, "aegis_vision_gelu_erf")?,
+            vision_add_bias_rows: load(&module, "aegis_vision_add_bias_rows")?,
+            vision_rope_qwen: load(&module, "aegis_vision_rope_qwen")?,
             audio_glu_halfsplit: load(&module, "aegis_audio_glu_halfsplit")?,
             audio_depthwise_causal_conv1d: load(
                 &module,

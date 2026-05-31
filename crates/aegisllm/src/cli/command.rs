@@ -32,6 +32,11 @@ pub enum Command {
     /// `model.vision_tower.*` + `model.embed_vision.*` into VRAM via the
     /// existing safetensors path, reports the loaded tensor stats. No forward.
     VisionLoadSmoke(EngineConfig),
+    /// Qwen3-VL vision-tower smoke: loads `model.visual.*` via QwenVisionTower,
+    /// reads pixel_values from the HF dump (bench/qwen_vis_pixel_values.bin +
+    /// qwen_vis_grid.json), runs forward_gpu, dumps per-stage activations for
+    /// HF cross-validation. Gated by AEGIS_VISION_DUMP for the dumps.
+    QwenVisionSmoke(EngineConfig),
     CudaCutlassNvfp4Smoke,
     CudaAttnFp8Smoke,
     /// Standalone correctness check (Stage A.3 / B.1): validates the GPU f32

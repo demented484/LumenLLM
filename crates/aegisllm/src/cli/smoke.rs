@@ -857,6 +857,78 @@ pub(super) fn vision_load_smoke(config: EngineConfig) -> Result<()> {
     Ok(())
 }
 
+/// Qwen3-VL vision-tower smoke. Loads `model.visual.*` via QwenVisionTower,
+/// reads pixel_values + grid from the HF dump (bench/qwen_vis_pixel_values.bin,
+/// bench/qwen_vis_grid.json) so the tower is isolated from preprocessing, runs
+/// `forward_gpu`, and (when AEGIS_VISION_DUMP=<prefix> is set) dumps per-stage
+/// activations for HF cross-validation. Reports output stats.
+pub(super) fn qwen_vision_smoke(config: EngineConfig) -> Result<()> {
+    use aegisllm_cuda::executor::vision_qwen::{QwenVisionShape, QwenVisionTower};
+    use aegisllm_base::tensor::storage::TensorStorageLoader;
+    use aegisllm_base::error::AegisError;
+
+    let cuda_config = config.cuda;
+    let engine = AegisEngine::build(EngineConfig { enable_executor: false, ..config })?;
+    let device = first_cuda_device(&engine, "qwen-vision-smoke")?;
+    let cuda = aegisllm_cuda::cuda::CudaRuntime::new_with_config(device, cuda_config)?;
+    let cuda_weights = cuda.weight_loader();
+    let mut loader = TensorStorageLoader::new();
+
+    let shape = QwenVisionShape::from_artifact(&engine.artifact)?;
+    eprintln!(
+        "qwen-vision-smoke: depth={} hidden={} heads={} head_dim={} patch={} merge={} out_hidden={} npos={} (side={}) theta={}",
+        shape.depth, shape.hidden_size, shape.num_heads, shape.head_dim,
+        shape.patch_size, shape.spatial_merge_size, shape.out_hidden_size,
+        shape.num_pos_embeddings, shape.num_grid_per_side, shape.rope_theta,
+    );
+    let t0 = std::time::Instant::now();
+    let tower = QwenVisionTower::from_artifact(&engine.artifact, shape, &cuda_weights, device, &mut loader)?;
+    eprintln!("qwen-vision-smoke: loaded {} blocks in {:.2}s (out_hidden={})",
+        tower.blocks.len(), t0.elapsed().as_secs_f64(), tower.out_hidden());
+
+    // Read pixel_values + grid from the HF dump (isolate tower from preprocess).
+    let bench = std::env::var("AEGIS_QWEN_VIS_BENCH")
+        .unwrap_or_else(|_| "bench".into());
+    let grid_path = format!("{bench}/qwen_vis_grid.json");
+    let px_path = format!("{bench}/qwen_vis_pixel_values.bin");
+    let grid_txt = std::fs::read_to_string(&grid_path)
+        .map_err(|e| AegisError::InvalidPlan(format!("read {grid_path}: {e}")))?;
+    let parse_usize = |key: &str| -> Result<usize> {
+        let pat = format!("\"{key}\":");
+        let i = grid_txt.find(&pat).ok_or_else(|| AegisError::InvalidPlan(format!("grid json missing {key}")))?;
+        let rest = &grid_txt[i + pat.len()..];
+        let num: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+        num.parse::<usize>().map_err(|_| AegisError::InvalidPlan(format!("grid json bad {key}")))
+    };
+    let grid_h = parse_usize("grid_h")?;
+    let grid_w = parse_usize("grid_w")?;
+    let n_patches = parse_usize("n_patches")?;
+    let embed_dim = parse_usize("embed_dim")?;
+    eprintln!("qwen-vision-smoke: grid {grid_h}x{grid_w} n_patches={n_patches} embed_dim={embed_dim}");
+
+    let bytes = std::fs::read(&px_path)
+        .map_err(|e| AegisError::InvalidPlan(format!("read {px_path}: {e}")))?;
+    if bytes.len() != n_patches * embed_dim * 4 {
+        return Err(AegisError::InvalidPlan(format!(
+            "pixel_values {} bytes != {}*{}*4 = {}",
+            bytes.len(), n_patches, embed_dim, n_patches * embed_dim * 4)));
+    }
+    let pixel_values: Vec<f32> = bytes.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+    let t1 = std::time::Instant::now();
+    let embeds = tower.forward_gpu(&cuda, &pixel_values, grid_h, grid_w)?;
+    let out_hidden = tower.out_hidden();
+    let n_merged = n_patches / (tower.shape.spatial_merge_size * tower.shape.spatial_merge_size);
+    eprintln!("qwen-vision-smoke: forward {:.2}s → [{}, {}]", t1.elapsed().as_secs_f64(), n_merged, out_hidden);
+    let (mut mn, mut mx, mut sum) = (f32::MAX, f32::MIN, 0.0f64);
+    for &x in &embeds { mn = mn.min(x); mx = mx.max(x); sum += x as f64; }
+    eprintln!("  out mean={:.5} min={:.5} max={:.5}", sum / embeds.len() as f64, mn, mx);
+    eprintln!("  embeds[0][0..8]: {:?}", &embeds[..8.min(embeds.len())]);
+    println!("qwen-vision-smoke: PASS");
+    Ok(())
+}
+
 pub(super) fn cuda_dense_smoke(config: EngineConfig) -> Result<()> {
     let cuda_config = config.cuda;
     let engine = AegisEngine::build(EngineConfig {

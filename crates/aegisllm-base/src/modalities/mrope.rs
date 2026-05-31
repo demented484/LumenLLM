@@ -208,12 +208,155 @@ pub fn get_rope_index(
     Ok(MRopePositionIds { comp: [t, h, w] })
 }
 
+/// HF `get_vision_position_ids` for a single image grid — the per-token
+/// `(row, col)` ids consumed by the vision-tower RoPE. Returns a flat
+/// `[n_patches * 2]` i32 array in `(row, col)` pairs, in 2×2-merge-block order
+/// (the same order the packer rows follow).
+///
+/// Port of `transformers.vision_utils.get_vision_position_ids` for `t=1`:
+///   hpos = arange(h).unsqueeze(1).expand(h, w)
+///   hpos = hpos.reshape(h/m, m, w/m, m).transpose(1,2).flatten()
+///   (and wpos analogously) → stack → [n, 2].
+pub fn qwen_vision_position_ids(grid_h: usize, grid_w: usize, merge: usize) -> Vec<i32> {
+    let m = merge.max(1);
+    let n = grid_h * grid_w;
+    let mut out = vec![0i32; n * 2];
+    // Replicate reshape [h/m, m, w/m, m].transpose(1,2).flatten() iteration:
+    // outer bh in [0,h/m), bw in [0,w/m), then mr in [0,m), mc in [0,m).
+    let mut idx = 0usize;
+    for bh in 0..(grid_h / m) {
+        for bw in 0..(grid_w / m) {
+            for mr in 0..m {
+                for mc in 0..m {
+                    let row = (bh * m + mr) as i32;
+                    let col = (bw * m + mc) as i32;
+                    out[idx * 2] = row;
+                    out[idx * 2 + 1] = col;
+                    idx += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// HF `get_vision_bilinear_indices_and_weights` for a single image grid.
+///
+/// Returns `(indices, weights)` where each is `[4 * n_patches]` flat (corner
+/// index 0..4 major), reordered into 2×2-merge-block order. The interpolated
+/// position embedding for token `i` is
+///   `sum_{c in 0..4} weights[c*n + i] * pos_embed[indices[c*n + i]]`.
+///
+/// `side = num_grid_per_side = sqrt(num_position_embeddings)` (48).
+pub fn qwen_bilinear_pos_indices_weights(
+    grid_h: usize,
+    grid_w: usize,
+    side: usize,
+    merge: usize,
+) -> (Vec<i32>, Vec<f32>) {
+    let m = merge.max(1);
+    let n = grid_h * grid_w;
+
+    // linspace(0, side-1, h) and (0, side-1, w).
+    let linspace = |len: usize| -> Vec<f64> {
+        if len == 1 {
+            return vec![0.0];
+        }
+        let step = (side as f64 - 1.0) / (len as f64 - 1.0);
+        (0..len).map(|i| i as f64 * step).collect()
+    };
+    let h_grid = linspace(grid_h);
+    let w_grid = linspace(grid_w);
+
+    // floor/ceil + fractional parts (torch `.int()` truncates toward zero;
+    // grid values are non-negative so this equals floor).
+    let h_floor: Vec<i64> = h_grid.iter().map(|&v| v as i64).collect();
+    let w_floor: Vec<i64> = w_grid.iter().map(|&v| v as i64).collect();
+    let clamp = |v: i64| -> i64 { v.min(side as i64 - 1) };
+    let h_ceil: Vec<i64> = h_floor.iter().map(|&v| clamp(v + 1)).collect();
+    let w_ceil: Vec<i64> = w_floor.iter().map(|&v| clamp(v + 1)).collect();
+    let h_frac: Vec<f64> = h_grid.iter().zip(&h_floor).map(|(&g, &f)| g - f as f64).collect();
+    let w_frac: Vec<f64> = w_grid.iter().zip(&w_floor).map(|(&g, &f)| g - f as f64).collect();
+
+    // Row-major (h, w) layout BEFORE the merge-block reorder.
+    // corner c: index = h_off[ph]*... per HF (h_floor*side + w_floor, etc).
+    let mut idx_rm = vec![vec![0i32; n]; 4];
+    let mut w_rm = vec![vec![0f32; n]; 4];
+    for ph in 0..grid_h {
+        let hf = h_floor[ph] * side as i64;
+        let hc = h_ceil[ph] * side as i64;
+        let hfrac = h_frac[ph];
+        for pw in 0..grid_w {
+            let flat = ph * grid_w + pw;
+            let wf = w_floor[pw];
+            let wc = w_ceil[pw];
+            let wfrac = w_frac[pw];
+            idx_rm[0][flat] = (hf + wf) as i32;
+            idx_rm[1][flat] = (hf + wc) as i32;
+            idx_rm[2][flat] = (hc + wf) as i32;
+            idx_rm[3][flat] = (hc + wc) as i32;
+            w_rm[0][flat] = ((1.0 - hfrac) * (1.0 - wfrac)) as f32;
+            w_rm[1][flat] = ((1.0 - hfrac) * wfrac) as f32;
+            w_rm[2][flat] = (hfrac * (1.0 - wfrac)) as f32;
+            w_rm[3][flat] = (hfrac * wfrac) as f32;
+        }
+    }
+
+    // reorder = (h_idx[:,:,None,None]*w + w_idx[None,None,:,:]).transpose(1,2).flatten()
+    // i.e. the same merge-block order as position ids: for each (bh, bw, mr, mc),
+    // the source row-major flat index is (bh*m+mr)*w + (bw*m+mc).
+    let mut reorder = Vec::with_capacity(n);
+    for bh in 0..(grid_h / m) {
+        for bw in 0..(grid_w / m) {
+            for mr in 0..m {
+                for mc in 0..m {
+                    let ph = bh * m + mr;
+                    let pw = bw * m + mc;
+                    reorder.push(ph * grid_w + pw);
+                }
+            }
+        }
+    }
+
+    let mut indices = vec![0i32; 4 * n];
+    let mut weights = vec![0f32; 4 * n];
+    for c in 0..4 {
+        for (i, &src) in reorder.iter().enumerate() {
+            indices[c * n + i] = idx_rm[c][src];
+            weights[c * n + i] = w_rm[c][src];
+        }
+    }
+    (indices, weights)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const IMAGE_TOKEN: u32 = 248056;
     const MERGE: usize = 2;
+
+    #[test]
+    fn vision_pos_ids_match_hf_4x4() {
+        // grid 4×4, merge 2 → (row,col) in merge-block order. HF reference:
+        // rows = [0,0,1,1, 0,0,1,1, 2,2,3,3, 2,2,3,3]
+        // cols = [0,1,0,1, 2,3,2,3, 0,1,0,1, 2,3,2,3]
+        let p = qwen_vision_position_ids(4, 4, MERGE);
+        let rows: Vec<i32> = (0..16).map(|i| p[i * 2]).collect();
+        let cols: Vec<i32> = (0..16).map(|i| p[i * 2 + 1]).collect();
+        assert_eq!(rows, vec![0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3]);
+        assert_eq!(cols, vec![0, 1, 0, 1, 2, 3, 2, 3, 0, 1, 0, 1, 2, 3, 2, 3]);
+    }
+
+    #[test]
+    fn bilinear_weights_sum_to_one() {
+        let (_idx, w) = qwen_bilinear_pos_indices_weights(8, 12, 48, 2);
+        let n = 8 * 12;
+        for i in 0..n {
+            let s = w[i] + w[n + i] + w[2 * n + i] + w[3 * n + i];
+            assert!((s - 1.0).abs() < 1e-4, "token {i} weight sum {s}");
+        }
+    }
 
     #[test]
     fn text_only_collapses_to_arange() {

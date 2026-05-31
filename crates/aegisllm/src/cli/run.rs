@@ -7,7 +7,7 @@ use super::smoke::{
     cpu_materialize_smoke, cpu_smoke, cuda_attn_compare, cuda_attn_fp8_smoke, cuda_attn_ref_check,
     cuda_chain_smoke, cuda_compare, cuda_cutlass_nvfp4_smoke, cuda_dense_smoke,
     cuda_prefill_compare, cuda_prefill_sweep, cuda_smoke, inspect_hardware, mvp_check,
-    quality_smoke, storage_smoke, vision_load_smoke,
+    quality_smoke, qwen_vision_smoke, storage_smoke, vision_load_smoke,
 };
 use super::{Command, parse_args};
 use crate::engine::bench::run_generation_bench;
@@ -104,6 +104,7 @@ pub fn run_env() -> Result<()> {
         Command::CpuMaterializeSmoke(config) => cpu_materialize_smoke(config)?,
         Command::CudaSmoke(config) => cuda_smoke(config)?,
         Command::VisionLoadSmoke(config) => vision_load_smoke(config)?,
+        Command::QwenVisionSmoke(config) => qwen_vision_smoke(config)?,
         Command::CudaCutlassNvfp4Smoke => cuda_cutlass_nvfp4_smoke()?,
         Command::CudaAttnFp8Smoke => cuda_attn_fp8_smoke()?,
         Command::CudaAttnRefCheck => cuda_attn_ref_check()?,

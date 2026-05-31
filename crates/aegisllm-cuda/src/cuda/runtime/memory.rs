@@ -141,6 +141,17 @@ impl CudaRuntime {
         })
     }
 
+    /// Upload an i32 slice to a fresh device buffer (e.g. Qwen vision RoPE
+    /// (row,col) position ids).
+    pub fn upload_i32(&self, values: &[i32]) -> Result<DeviceBuffer<i32>> {
+        Ok(DeviceBuffer {
+            slice: self
+                .stream
+                .clone_htod(values)
+                .map_err(map_cuda_err("htod i32 buffer"))?,
+        })
+    }
+
     /// Upload a u16 slice (used for f16-bits KV caches) to a fresh device
     /// buffer. Used by the attention-reference correctness smoke.
     /// Copy a host u16 slice into an existing device buffer (used for PLE

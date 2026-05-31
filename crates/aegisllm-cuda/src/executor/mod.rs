@@ -19,6 +19,7 @@ mod rope;
 mod speculative;
 pub(crate) mod state;
 pub mod vision;
+pub mod vision_qwen;
 pub mod audio;
 
 pub use planning::cuda_kernel_limitations;

@@ -1888,6 +1888,158 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Qwen3-VL LayerNorm with weight + bias over `[n_rows, dim]` row-major.
+    /// `y = (x - mean)/sqrt(var + eps) * weight + bias`. Out-of-place.
+    pub fn vision_layernorm_bias_device(
+        &self,
+        x: &DeviceBuffer<f32>,
+        weight: &DeviceBuffer<f32>,
+        bias: &DeviceBuffer<f32>,
+        n_rows: usize,
+        dim: usize,
+        eps: f32,
+        out: &mut DeviceBuffer<f32>,
+    ) -> Result<()> {
+        if x.len() < n_rows * dim || out.len() < n_rows * dim {
+            return Err(AegisError::InvalidPlan(format!(
+                "vision_layernorm_bias: x={} out={} need n_rows*dim={}",
+                x.len(), out.len(), n_rows * dim
+            )));
+        }
+        let dim_u = u32_arg("dim", dim)?;
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_rows", n_rows)?, 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_layernorm_bias)
+                .arg(&x.slice)
+                .arg(&weight.slice)
+                .arg(&bias.slice)
+                .arg(&dim_u)
+                .arg(&eps)
+                .arg(&mut out.slice)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_layernorm_bias"))?;
+        Ok(())
+    }
+
+    /// Qwen3-VL gelu_pytorch_tanh, in-place over a flat buffer of `len`.
+    pub fn vision_gelu_tanh_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        len: usize,
+    ) -> Result<()> {
+        let len_u = u32_arg("len", len)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len_u, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_gelu_tanh)
+                .arg(&mut x.slice)
+                .arg(&len_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_gelu_tanh"))?;
+        Ok(())
+    }
+
+    /// Exact erf-based GELU (HF `nn.GELU()` default), in place over `len`.
+    /// Used by the Qwen vision merger fc1 activation.
+    pub fn gelu_erf_inplace_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        len: usize,
+    ) -> Result<()> {
+        let len_u = u32_arg("len", len)?;
+        let cfg = LaunchConfig {
+            grid_dim: (ceil_div(len_u, 256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_gelu_erf)
+                .arg(&mut x.slice)
+                .arg(&len_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_gelu_erf"))?;
+        Ok(())
+    }
+
+    /// Qwen3-VL per-column bias add: `x[row, c] += bias[c]`, in place over
+    /// `[n_rows, dim]` row-major.
+    pub fn vision_add_bias_rows_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        bias: &DeviceBuffer<f32>,
+        n_rows: usize,
+        dim: usize,
+    ) -> Result<()> {
+        let dim_u = u32_arg("dim", dim)?;
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_rows", n_rows)?, ceil_div(dim_u, 256), 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_add_bias_rows)
+                .arg(&mut x.slice)
+                .arg(&bias.slice)
+                .arg(&dim_u)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_add_bias_rows"))?;
+        Ok(())
+    }
+
+    /// Qwen3-VL 2D vision RoPE (standard rotate-half form) over Q or K,
+    /// in place over `[n_tok, n_heads, head_dim]`. `pos_ids` is the per-token
+    /// (row, col) device array `[n_tok, 2]` i32 in merge-block order.
+    pub fn vision_rope_qwen_device(
+        &self,
+        x: &mut DeviceBuffer<f32>,
+        pos_ids: &DeviceBuffer<i32>,
+        n_tok: usize,
+        n_heads: usize,
+        head_dim: usize,
+        rope_theta: f32,
+    ) -> Result<()> {
+        if pos_ids.len() < n_tok * 2 {
+            return Err(AegisError::InvalidPlan(format!(
+                "vision_rope_qwen: pos_ids len={} < n_tok*2={}",
+                pos_ids.len(), n_tok * 2
+            )));
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (u32_arg("n_tok", n_tok)?, u32_arg("n_heads", n_heads)?, 1),
+            block_dim: (head_dim as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let n_heads_u = n_heads as u32;
+        let head_dim_u = head_dim as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.vision_rope_qwen)
+                .arg(&mut x.slice)
+                .arg(&pos_ids.slice)
+                .arg(&n_heads_u)
+                .arg(&head_dim_u)
+                .arg(&rope_theta)
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("launch vision_rope_qwen"))?;
+        Ok(())
+    }
+
     /// Stage I.4 per-channel affine standardization: x = (x - bias) * scale.
     /// In-place over `[n_rows, hidden_size]` row-major.
     pub fn vision_standardize_device(

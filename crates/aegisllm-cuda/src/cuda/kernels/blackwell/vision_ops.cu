@@ -206,4 +206,177 @@ void aegis_vision_pool3x3_scale(
     dst[((size_t)tok) * hidden_size + c] = sum * out_scale;
 }
 
+// =============================================================================
+// Qwen3-VL native-ViT kernels (LayerNorm+bias, gelu_tanh batched, 2D vision
+// RoPE in (row,col) rotate-half form, add-bias-rows).
+// =============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────
+// LayerNorm with weight + bias (per-row over `dim`), f32 in/out.
+//   y = (x - mean) / sqrt(var + eps) * weight + bias    (var = E[x²]-E[x]²)
+// Launch: grid = (n_rows, 1, 1), block = (256, 1, 1). One block per row;
+// 256 threads cooperate over `dim` via a 2-pass shared reduction.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__
+void aegis_vision_layernorm_bias(
+    const float* __restrict__ x,        // [n_rows, dim]
+    const float* __restrict__ weight,   // [dim]
+    const float* __restrict__ bias,     // [dim]
+    const unsigned int dim,
+    const float eps,
+    float* __restrict__ out             // [n_rows, dim]
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int nthreads = blockDim.x;
+    const size_t base = (size_t)row * dim;
+
+    __shared__ float s_sum[256];
+    __shared__ float s_sumsq[256];
+
+    float local_sum = 0.0f;
+    float local_sumsq = 0.0f;
+    for (unsigned int i = tid; i < dim; i += nthreads) {
+        const float v = x[base + i];
+        local_sum += v;
+        local_sumsq += v * v;
+    }
+    s_sum[tid] = local_sum;
+    s_sumsq[tid] = local_sumsq;
+    __syncthreads();
+    for (unsigned int stride = nthreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_sum[tid]   += s_sum[tid + stride];
+            s_sumsq[tid] += s_sumsq[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float mean = s_sum[0] / (float)dim;
+    const float var  = s_sumsq[0] / (float)dim - mean * mean;
+    const float inv  = rsqrtf(var + eps);
+    for (unsigned int i = tid; i < dim; i += nthreads) {
+        const float v = x[base + i];
+        out[base + i] = (v - mean) * inv * weight[i] + bias[i];
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// GELU tanh approximation (per element, in place over a flat buffer of n):
+//   0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715 x³) ))
+// Same formula as aegis_gelu_tanh_inplace_f32; kept here so the vision PTX
+// module is self-contained (avoids relying on which TU defines it first).
+// Launch: grid = ceil(n/256), block = 256.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__
+void aegis_vision_gelu_tanh(
+    float* __restrict__ x,
+    const unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = x[i];
+    const float c = 0.7978845608028654f; // sqrt(2/pi)
+    const float inner = c * (v + 0.044715f * v * v * v);
+    x[i] = 0.5f * v * (1.0f + tanhf(inner));
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Exact (erf-based) GELU, in place over n elements:  0.5 x (1 + erf(x/√2)).
+// HF nn.GELU() default — used by the Qwen vision merger fc1 activation
+// (the per-block MLP uses gelu_pytorch_tanh instead).
+// Launch: grid = ceil(n/256), block = 256.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__
+void aegis_vision_gelu_erf(
+    float* __restrict__ x,
+    const unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = x[i];
+    x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f)); // 1/√2
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Add a per-column bias to every row.  x[row, c] += bias[c].  In place.
+// Launch: grid = (n_rows, ceil(dim/256)), block = 256.
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__
+void aegis_vision_add_bias_rows(
+    float*       __restrict__ x,
+    const float* __restrict__ bias,
+    const unsigned int dim
+) {
+    const unsigned int row = blockIdx.x;
+    const unsigned int c   = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c >= dim) return;
+    x[(size_t)row * dim + c] += bias[c];
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Qwen3-VL vision RoPE (in place over Q or K).  Standard rotate-half form,
+// NOT Gemma's multidim-split.  Per HF apply_rotary_pos_emb_vision:
+//
+//   rotary_pos_emb[tok] = [ row_id[tok] * inv_freq(0..n_freqs),
+//                            col_id[tok] * inv_freq(0..n_freqs) ]   (len head_dim/2)
+//   emb = cat([rotary, rotary])                                     (len head_dim)
+//   cos/sin = emb.cos()/emb.sin()
+//   y = x * cos + rotate_half(x) * sin
+//   rotate_half(x) = [-x[d/2:], x[:d/2]]
+//
+// where inv_freq(i) = 1 / theta^(2i / (head_dim/2)),  i in [0, head_dim/4).
+// row_id/col_id are the per-token (h,w) ids in merge-block order, supplied
+// as a device array `pos_ids` of shape [n_tok, 2] (row, col) int32.
+//
+// Launch: grid = (n_tok, n_heads), block = (head_dim, 1, 1). Each thread
+// owns one head_dim element of one (tok, head); reads its rotate-half pair
+// then writes only its own slot (race-free).
+// ─────────────────────────────────────────────────────────────────────────
+extern "C" __global__
+void aegis_vision_rope_qwen(
+    float*             __restrict__ x,        // [n_tok, n_heads, head_dim]
+    const int*         __restrict__ pos_ids,  // [n_tok, 2] (row, col)
+    const unsigned int n_heads,
+    const unsigned int head_dim,
+    const float        rope_theta
+) {
+    const unsigned int tok  = blockIdx.x;
+    const unsigned int head = blockIdx.y;
+    const unsigned int k    = threadIdx.x;
+    if (k >= head_dim) return;
+    const unsigned int half    = head_dim / 2;     // 36 for hd=72
+    const unsigned int n_freqs = half / 2;         // 18 (inv_freq count per axis)
+
+    // Which entry of `emb` (len head_dim) is this? emb = cat([rotary, rotary]),
+    // rotary = [row*invf(0..nf), col*invf(0..nf)] (len half).
+    // So index k in [0, head_dim): the "rotary index" is (k % half).
+    const unsigned int r = (k < half) ? k : (k - half);  // index into rotary[0..half)
+    // r in [0, n_freqs)      -> row axis, freq r
+    // r in [n_freqs, half)   -> col axis, freq (r - n_freqs)
+    int   pos_id;
+    unsigned int freq_i;
+    if (r < n_freqs) {
+        pos_id = pos_ids[tok * 2 + 0];   // row
+        freq_i = r;
+    } else {
+        pos_id = pos_ids[tok * 2 + 1];   // col
+        freq_i = r - n_freqs;
+    }
+    const float exponent = (float)(2u * freq_i) / (float)half;
+    const float inv_freq = 1.0f / powf(rope_theta, exponent);
+    const float angle    = (float)pos_id * inv_freq;
+    const float cos_v    = cosf(angle);
+    const float sin_v    = sinf(angle);
+
+    // rotate_half over the FULL head_dim: pair(k) = k+half if k<half else k-half,
+    // with sign -1 for the lower half, +1 for the upper half.
+    const unsigned int pair_k = (k < half) ? (k + half) : (k - half);
+    const float sign = (k < half) ? -1.0f : 1.0f;
+
+    const size_t base = ((size_t)tok * n_heads + head) * head_dim;
+    const float my_val   = x[base + k];
+    const float pair_val = x[base + pair_k];
+    x[base + k] = my_val * cos_v + sign * pair_val * sin_v;
+}
+
 #endif  // __CUDA_ARCH__ >= 800
