@@ -597,6 +597,8 @@ mod tests {
             attention_quantization: crate::planning::placement::WeightQuantOverride::Default,
             shared_mlp_quantization: crate::planning::placement::WeightQuantOverride::Default,
             attention_store_override: None,
+            experts_compute_override: None,
+            experts_store_override: None,
         };
         let runtime = RuntimePlan {
             kernels: vec![KernelPlan {

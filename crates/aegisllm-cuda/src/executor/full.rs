@@ -48,6 +48,12 @@ impl CudaLlamaExecutor {
     ) -> Result<Self> {
         validate_cuda_placement(placement, device)?;
         let attention_store_override = placement.attention_store_override;
+        // Routed-expert placement (`hidden-layers.experts`). When
+        // `experts.compute=cpu`, the routed experts' decode GEMV runs on the CPU
+        // (read in place from the host arena) — see `forward_moe_decode_cpu`.
+        // `None` for every config without an `experts` section → unchanged path.
+        let experts_compute_override = placement.experts_compute_override;
+        let experts_store_override = placement.experts_store_override;
         // Reject load-time quantization overrides that don't yet have a
         // runtime implementation. The schema parses all of mxfp4 / fp8 /
         // mxint4 / int4 / int8, but only the formats below have a wired
@@ -261,6 +267,8 @@ impl CudaLlamaExecutor {
                 shared_mlp_q,
                 attention_q,
                 attention_store_override,
+                experts_compute_override,
+                experts_store_override,
                 &mut loader,
             )?);
             stage_t(&format!("layer {layer}"), t0);
@@ -1516,9 +1524,10 @@ impl CudaLlamaExecutor {
                         // per top-k slot). Tiny; allocate to the max top_k.
                         slot_in_scale: self.runtime.alloc_f32((max_top_k * 3).max(1))?,
                         slot_out_scale: self.runtime.alloc_f32((max_top_k * 3).max(1))?,
-                        // Experts-on-CPU decode (AEGIS_CPU_MOE). Empty until the
-                        // first layer warms them (resized to hidden / per-layer);
-                        // no allocation when the flag is off.
+                        // Experts-on-CPU decode (config `hidden-layers.experts.compute = cpu`).
+                        // Empty until the first layer warms them (resized to
+                        // hidden / per-layer); no allocation when the routed
+                        // experts stay on the GPU (the default path).
                         cpu_expert_input: Vec::new(),
                         cpu_routed_acc: Vec::new(),
                         cpu_moe_scratch: aegisllm_cpu::MoeLayerScratch::default(),

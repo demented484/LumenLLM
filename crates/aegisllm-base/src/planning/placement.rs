@@ -62,6 +62,20 @@ pub struct PlacementPolicy {
     /// MoE/MLP weights.
     pub attention_store_override: Option<StoragePlacement>,
     pub attention_compute_override: Option<ComputePlacement>,
+    /// Per-layer ROUTED-expert (sparse top-k) compute override. When
+    /// `Some(ComputePlacement::Cpu)`, the routed experts' decode GEMV runs on
+    /// the CPU (read in place from the host arena) instead of streaming over
+    /// PCIe to `cuda:0`. The shared expert / GDN / attention / router are NOT
+    /// affected — they follow the layer-region `weights_compute`. `None` →
+    /// routed experts use the layer-region compute (the unchanged GPU path).
+    /// Set by the `hidden-layers.experts` section of the parameters file.
+    pub experts_compute_override: Option<ComputePlacement>,
+    /// Per-layer ROUTED-expert storage override. When `Some`, the routed-expert
+    /// NVFP4 weights load with this store instead of the enclosing layer
+    /// region's store (lets `experts.store=ram` keep routed experts host-
+    /// resident while the shared MLP / attention stay VRAM). `None` → routed
+    /// experts use the layer-region store.
+    pub experts_store_override: Option<StoragePlacement>,
     /// Per-load-time quantization for attention Q/K/V/O. `Default` keeps
     /// the checkpoint's storage format (BF16 for our Gemma-4-26B-NVFP4).
     /// Other values run a load-time per-block-absmax quantizer so the
@@ -148,6 +162,16 @@ pub struct ResolvedPlacement {
     /// streaming) while keeping `attention.store=vram` (BF16 QKV/O on
     /// device, since there's no streaming-aware BF16 matmul).
     pub attention_store_override: Option<StoragePlacement>,
+    /// Routed-expert compute override, carried from
+    /// `PlacementPolicy.experts_compute_override`. When
+    /// `Some(ComputePlacement::Cpu)` the CUDA executor runs the routed
+    /// experts' decode GEMV on the CPU. `None` → GPU path.
+    pub experts_compute_override: Option<ComputePlacement>,
+    /// Routed-expert storage override, carried from
+    /// `PlacementPolicy.experts_store_override`. When `Some` the loader uses
+    /// this store for the routed-expert NVFP4 weights instead of the layer
+    /// region's store.
+    pub experts_store_override: Option<StoragePlacement>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -223,6 +247,8 @@ impl PlacementPolicy {
                 kv_first_store: None,
                 attention_store_override: None,
                 attention_compute_override: None,
+                experts_compute_override: None,
+                experts_store_override: None,
                 attention_quantization: WeightQuantOverride::Default,
                 shared_mlp_quantization: WeightQuantOverride::Default,
             },
@@ -243,6 +269,8 @@ impl PlacementPolicy {
                 kv_first_store: None,
                 attention_store_override: None,
                 attention_compute_override: None,
+                experts_compute_override: None,
+                experts_store_override: None,
                 attention_quantization: WeightQuantOverride::Default,
                 shared_mlp_quantization: WeightQuantOverride::Default,
             },
@@ -334,6 +362,8 @@ impl ResolvedPlacement {
             attention_quantization: policy.attention_quantization,
             shared_mlp_quantization: policy.shared_mlp_quantization,
             attention_store_override: policy.attention_store_override,
+            experts_compute_override: policy.experts_compute_override,
+            experts_store_override: policy.experts_store_override,
         })
     }
 

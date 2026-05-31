@@ -19,18 +19,6 @@ fn batched_decode_moe_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("AEGIS_BATCHED_DECODE_MOE").is_ok())
 }
 
-/// Opt-in (default OFF): route the ROUTED NVFP4 experts' decode GEMV to the
-/// fused CPU kernel (read in place from the pinned host arena, computed off
-/// PCIe) instead of streaming 540 MiB/token over the link. Shared expert + GDN
-/// + attention + router stay on `cuda:0`. The lever for the 35B decode
-/// transfer/host-issue co-floor — see aegisllm_qwen35b_decode_transfer_bound.
-/// Read once (decode hot path).
-pub(super) fn cpu_moe_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("AEGIS_CPU_MOE").is_ok())
-}
-
 pub(super) fn forward_mlp_device(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
@@ -513,9 +501,10 @@ fn forward_moe_decode_device(
         runtime.copy_f32_device(post_normed, hidden_out)?;
     }
 
-    // ── Experts-on-CPU (AEGIS_CPU_MOE): pull the routed-expert input NOW ──────
+    // ── Experts-on-CPU (config `hidden-layers.experts.compute = cpu`) ─────────
     //
-    // Gated on the flag, host-resident NVFP4 experts, and the host-streamed
+    // Gated on the per-layer `moe.cpu_experts` flag (set at load from the config
+    // — NOT an env var), host-resident NVFP4 experts, and the host-streamed
     // (non-gpu_driven) path. Download the expert-input hidden (`hidden_out`)
     // BEFORE issuing the shared MLP, so this blocking dtoh waits only on the
     // cheap expert-input norm — then the shared MLP (issued just below) runs on
@@ -524,7 +513,7 @@ fn forward_moe_decode_device(
     // weights this path keeps OFF the PCIe link entirely (computed in place from
     // the pinned host arena where they already live).
     let cpu_moe = !gpu_driven
-        && cpu_moe_enabled()
+        && moe.cpu_experts
         && moe.experts.first().map(|e| e.gate_proj.is_host_resident()).unwrap_or(false);
     if cpu_moe {
         runtime.download_f32_into(hidden_out, hidden_size, &mut moe_scratch.cpu_expert_input)?;
@@ -1206,7 +1195,7 @@ fn cpu_moe_packed_view(
     ))
 }
 
-/// Experts-on-CPU routed-expert decode (AEGIS_CPU_MOE).
+/// Experts-on-CPU routed-expert decode (config `hidden-layers.experts.compute = cpu`).
 ///
 /// The routed NVFP4 experts live in the pinned host arena. Rather than stream
 /// 540 MiB/token of their packed weights over PCIe to GPU GEMVs (the 35B decode

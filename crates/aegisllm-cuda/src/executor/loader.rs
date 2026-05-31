@@ -67,6 +67,13 @@ pub(super) fn load_cuda_layer(
     shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
     attention_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
     attention_store_override: Option<aegisllm_base::planning::placement::StoragePlacement>,
+    // Routed-expert placement overrides (`hidden-layers.experts.{compute,store}`).
+    // Apply ONLY to the sparse routed experts of a MoE layer; the shared expert /
+    // GDN / attention / router are unaffected. `experts_compute_override =
+    // Some(Cpu)` marks the layer's `CudaMoE.cpu_experts`; `experts_store_override`
+    // overrides the routed-expert NVFP4 residency. Both `None` → unchanged path.
+    experts_compute_override: Option<aegisllm_base::planning::placement::ComputePlacement>,
+    experts_store_override: Option<aegisllm_base::planning::placement::StoragePlacement>,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<CudaLayer> {
     if region_kind != GraphRegionKind::TransformerBlock {
@@ -134,6 +141,22 @@ pub(super) fn load_cuda_layer(
     };
 
     let moe = if let LayerKind::MoEDecoder { num_experts, top_k, has_shared_expert } = layer_kind {
+        // Routed-expert residency: `hidden-layers.experts.store` if set, else the
+        // layer-region store. CPU compute REQUIRES host residency (the kernel
+        // reads the packed bytes in place from the host arena), so when
+        // `experts.compute=cpu` is configured without an explicit `experts.store`,
+        // default the routed experts to RAM rather than the region's VRAM — the
+        // CPU path cannot read VRAM-resident weights in place.
+        let cpu_experts = matches!(
+            experts_compute_override,
+            Some(aegisllm_base::planning::placement::ComputePlacement::Cpu)
+        );
+        let expert_store = match experts_store_override {
+            Some(s) => s,
+            None if cpu_experts => StoragePlacement::Ram,
+            None => placement.store,
+        };
+        let expert_residency = cuda_residency_for_store(expert_store, cuda.device_index())?;
         Some(Box::new(load_cuda_moe(
             cuda,
             artifact,
@@ -148,6 +171,9 @@ pub(super) fn load_cuda_layer(
             shared_mlp_quantization,
             attn_store,
             attn_residency,
+            expert_store,
+            expert_residency,
+            cpu_experts,
             loader,
         )?))
     } else {
@@ -464,7 +490,10 @@ fn load_cuda_moe(
     has_shared_expert: bool,
     text_prefix: &str,
     store: StoragePlacement,
-    residency: TensorResidencyPlan,
+    // Layer-region residency (kept for call-site symmetry / documentation). The
+    // routed experts now follow `expert_residency` (the `experts.store`
+    // override, defaulting to the region store), so this is unused directly.
+    _residency: TensorResidencyPlan,
     resident_layout: LinearResidentLayout,
     shared_mlp_quantization: aegisllm_base::planning::placement::WeightQuantOverride,
     // Store for the BF16 dense parts of the MoE block (router + shared MLP).
@@ -475,6 +504,17 @@ fn load_cuda_moe(
     // main `store` because they have a per-call H2D streaming path.
     bf16_dense_store: StoragePlacement,
     bf16_dense_residency: TensorResidencyPlan,
+    // Routed-expert residency override (`hidden-layers.experts.store`). When the
+    // user pins the routed experts to a different tier than the layer region
+    // (e.g. experts on `ram` while the shared MLP / attention stay `vram`), the
+    // routed-expert NVFP4 weights load with this store/residency instead of
+    // `store`/`residency`. Defaults to `store`/`residency` when no override.
+    expert_store: StoragePlacement,
+    expert_residency: TensorResidencyPlan,
+    // Routed-expert CPU compute (`hidden-layers.experts.compute = cpu`). Marks
+    // the returned `CudaMoE` so the decode path runs the routed experts on the
+    // CPU (read in place from the host arena) — see `forward_moe_decode_cpu`.
+    cpu_experts: bool,
     loader: &mut aegisllm_base::tensor::storage::TensorStorageLoader,
 ) -> Result<CudaMoE> {
     let prefix = format!("{text_prefix}layers.{layer}");
@@ -574,7 +614,7 @@ fn load_cuda_moe(
     // are the same PackedSource layout. Treat both as prefetch-eligible so the
     // 26B experts (planned NativeTensorCore) use the PARALLEL shard-buffered
     // prefetch instead of the serial single-threaded per-expert path (~33s).
-    let prefetch_eligible = matches!(residency, TensorResidencyPlan::StagedHostToDevice { .. })
+    let prefetch_eligible = matches!(expert_residency, TensorResidencyPlan::StagedHostToDevice { .. })
         && matches!(
             resident_layout,
             LinearResidentLayout::PackedSource | LinearResidentLayout::NativeTensorCore
@@ -601,17 +641,17 @@ fn load_cuda_moe(
             let gate_p = prefix_iter.next().expect("prefix available");
             let (gate_packed, gate_scales) = iter.next().expect("prefetched gate");
             let gate_proj = cuda.finalize_host_nvfp4_with_prefetched(
-                artifact, gate_p, residency, store, gate_packed, gate_scales, loader,
+                artifact, gate_p, expert_residency, expert_store, gate_packed, gate_scales, loader,
             )?;
             let up_p = prefix_iter.next().expect("prefix available");
             let (up_packed, up_scales) = iter.next().expect("prefetched up");
             let up_proj = cuda.finalize_host_nvfp4_with_prefetched(
-                artifact, up_p, residency, store, up_packed, up_scales, loader,
+                artifact, up_p, expert_residency, expert_store, up_packed, up_scales, loader,
             )?;
             let down_p = prefix_iter.next().expect("prefix available");
             let (down_packed, down_scales) = iter.next().expect("prefetched down");
             let down_proj = cuda.finalize_host_nvfp4_with_prefetched(
-                artifact, down_p, residency, store, down_packed, down_scales, loader,
+                artifact, down_p, expert_residency, expert_store, down_packed, down_scales, loader,
             )?;
             experts.push(CudaMoEExpert { gate_proj, up_proj, down_proj });
         }
@@ -624,13 +664,13 @@ fn load_cuda_moe(
             }
             let ep = format!("{expert_base_prefix}.{expert_idx}");
             let gate_proj = cuda.load_nvfp4_linear_with_layout(
-                artifact, &format!("{ep}.gate_proj"), store, residency, resident_layout, loader,
+                artifact, &format!("{ep}.gate_proj"), expert_store, expert_residency, resident_layout, loader,
             )?;
             let up_proj = cuda.load_nvfp4_linear_with_layout(
-                artifact, &format!("{ep}.up_proj"), store, residency, resident_layout, loader,
+                artifact, &format!("{ep}.up_proj"), expert_store, expert_residency, resident_layout, loader,
             )?;
             let down_proj = cuda.load_nvfp4_linear_with_layout(
-                artifact, &format!("{ep}.down_proj"), store, residency, resident_layout, loader,
+                artifact, &format!("{ep}.down_proj"), expert_store, expert_residency, resident_layout, loader,
             )?;
             experts.push(CudaMoEExpert { gate_proj, up_proj, down_proj });
         }
@@ -753,6 +793,7 @@ fn load_cuda_moe(
         // Populated post-load in `full.rs` when the expert arena is
         // device-mapped (AEGIS_GPU_DRIVEN_MOE). Defaults to host-streamed decode.
         device_tables: None,
+        cpu_experts,
     })
 }
 

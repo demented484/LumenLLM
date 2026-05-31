@@ -199,6 +199,14 @@ pub struct HiddenLayersSection {
     /// wins (longer form is more specific).
     pub store: Option<String>,
     pub weights: Option<HiddenLayerWeightsSection>,
+    /// Placement for the ROUTED (sparse, top-k) experts only — distinct from the
+    /// shared expert / GDN / attention, which follow `hidden-layers.compute`.
+    /// Sits beside `weights` / `kv-cache`. When `compute: cpu`, the routed-expert
+    /// decode GEMV runs on the CPU (read in place from the host arena — no
+    /// 540 MiB/token H2D stream) instead of `cuda:0`. `store` controls routed-
+    /// expert residency (ram/mmap = host arena). ABSENT → routed experts fall
+    /// back to `hidden-layers.compute` (the unchanged GPU path).
+    pub experts: Option<HiddenLayerExpertsSection>,
     #[serde(rename = "kv-cache")]
     pub kv_cache: Option<HiddenLayerKvCacheSection>,
     /// Arbitrary per-layer-range placement, e.g. a 4-way CPU/GPU split:
@@ -245,6 +253,30 @@ pub struct HiddenLayerWeightsSection {
     pub fallback_store: Option<String>,
     #[serde(rename = "fallback-compute")]
     pub fallback_compute: Option<String>,
+}
+
+/// Routed-expert placement. Mirrors the `weights` / `kv-cache` sub-sections but
+/// applies ONLY to the sparse top-k routed experts of a MoE layer (NVFP4 in our
+/// Qwen3.x / Gemma-4 checkpoints). The shared expert, GDN/attention, and router
+/// stay on `hidden-layers.compute` regardless — they are not the routed experts.
+///
+/// Semantics:
+///   * `compute: cpu`    → the routed-expert decode GEMV runs on the CPU
+///                         (`aegisllm-cpu::moe_layer_experts_into`), reading the
+///                         packed NVFP4 bytes IN PLACE from the host arena. This
+///                         keeps the 540 MiB/token expert stream OFF the PCIe link.
+///                         Requires the experts to be host-resident (`store: ram`
+///                         or `mmap`) — enforced at materialization, not parse.
+///   * `compute: cuda:N` → the unchanged GPU streaming path.
+///   * `compute` omitted → falls back to `hidden-layers.compute` → `model.compute`
+///                         (so every existing config behaves EXACTLY as before).
+///   * `store`           → routed-expert residency (`ram`/`mmap` host arena, or
+///                         `vram`). Falls back to the layer-region store.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HiddenLayerExpertsSection {
+    pub compute: Option<String>,
+    pub store: Option<String>,
 }
 
 /// KV cache section. Note: no `compute` / `fallback-compute` fields by design — KV cache

@@ -183,6 +183,14 @@ pub(super) struct CudaMoE {
     /// device-mapped at load and this layer's experts are host-resident NVFP4.
     /// `None` → decode uses the host-streamed staging-pool path.
     pub(super) device_tables: Option<MoeDeviceTables>,
+    /// Config-driven (`hidden-layers.experts.compute = cpu`): when `true` the
+    /// routed-expert decode GEMV runs on the CPU (read in place from the host
+    /// arena via `aegisllm-cpu::moe_layer_experts_into`) instead of streaming
+    /// the NVFP4 weights over PCIe. Set at load from `experts_compute_override`;
+    /// `false` (the default for every config without an `experts` section) keeps
+    /// the unchanged GPU path. The shared expert / GDN / attention / router are
+    /// NOT affected — they always run on the layer's `cuda:0` compute.
+    pub(super) cpu_experts: bool,
 }
 
 /// Extra scratch buffers allocated only when the model contains MoE layers.
@@ -287,7 +295,8 @@ pub(super) struct CudaMoEScratch {
     /// (graph-capturable). 1-element stubs when GPU-driven decode is not armed.
     pub(super) slot_in_scale: DeviceBuffer<f32>,
     pub(super) slot_out_scale: DeviceBuffer<f32>,
-    /// Experts-on-CPU decode (AEGIS_CPU_MOE): reusable host buffers + the
+    /// Experts-on-CPU decode (config `hidden-layers.experts.compute = cpu`):
+    /// reusable host buffers + the
     /// CPU kernel's per-layer scratch. `cpu_expert_input` holds the per-layer
     /// routed-expert input hidden downloaded from `hidden_out`; `cpu_routed_acc`
     /// holds the CPU kernel's `Σ_k w_k·expert_k` result before it is uploaded

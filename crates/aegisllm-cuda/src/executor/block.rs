@@ -72,6 +72,11 @@ impl CudaLayerBlockExecutor {
         selected_layers: &BTreeSet<usize>,
     ) -> Result<Self> {
         let cuda = CudaRuntime::new_with_config(device, cuda_config)?;
+        // Routed-expert placement overrides (`hidden-layers.experts`) carried from
+        // the resolved placement; captured before the per-layer `placement`
+        // shadow below. `None` for every config without an `experts` section.
+        let experts_compute_override = placement.experts_compute_override;
+        let experts_store_override = placement.experts_store_override;
         let region_placements = placement.region_map();
         // Host arena for any host-resident weights THIS CUDA executor loads: the
         // always-host-resident Gemma-4 PLE table + any selected GPU layer with
@@ -181,6 +186,8 @@ impl CudaLayerBlockExecutor {
                     aegisllm_base::planning::placement::WeightQuantOverride::Default,
                     aegisllm_base::planning::placement::WeightQuantOverride::Default,
                     None,
+                    experts_compute_override,
+                    experts_store_override,
                     &mut loader,
                 )?,
             );

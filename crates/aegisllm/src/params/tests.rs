@@ -440,3 +440,100 @@
             assert_eq!(store, StoragePlacement::Ram, "layer {layer}");
         }
     }
+
+    #[test]
+    fn experts_compute_cpu_sets_routed_expert_override() {
+        // `hidden-layers.experts.compute = cpu` routes ONLY the routed experts to
+        // the CPU; the layer-region weights_compute stays cuda:0 (shared expert /
+        // GDN / attention follow it). `experts.store` overrides routed residency.
+        let params: ParametersFile = serde_json::from_value(serde_json::json!({
+            "model": {
+                "path": "/tmp/model",
+                "compute": "cuda:0",
+                "store": "vram",
+                "hidden-layers": {
+                    "compute": "cuda:0",
+                    "store": "mmap",
+                    "experts": { "compute": "cpu", "store": "ram" },
+                    "kv-cache": { "context-size": 8192, "type-k": "f16", "type-v": "f16" }
+                }
+            }
+        }))
+        .expect("parameters with experts section should parse");
+
+        let fragment = params
+            .into_engine_fragment(PlacementPolicy::auto_for(&HardwareInventory::detect()))
+            .expect("fragment");
+
+        assert_eq!(
+            fragment.policy.experts_compute_override,
+            Some(ComputePlacement::Cpu)
+        );
+        assert_eq!(
+            fragment.policy.experts_store_override,
+            Some(StoragePlacement::Ram)
+        );
+        // The layer-region compute is NOT moved to the CPU.
+        assert_eq!(
+            fragment.policy.weights_compute,
+            ComputePlacement::Cuda { device: 0 }
+        );
+    }
+
+    #[test]
+    fn no_experts_section_leaves_routed_experts_on_gpu() {
+        // No-regression guard: a config WITHOUT an `experts` key must leave the
+        // override as None so the routed experts keep the unchanged GPU path.
+        let params: ParametersFile = serde_json::from_value(serde_json::json!({
+            "model": {
+                "path": "/tmp/model",
+                "compute": "cuda:0",
+                "store": "vram",
+                "hidden-layers": {
+                    "compute": "cuda:0",
+                    "store": "mmap",
+                    "kv-cache": { "context-size": 8192 }
+                }
+            }
+        }))
+        .expect("parameters without experts section should parse");
+
+        let fragment = params
+            .into_engine_fragment(PlacementPolicy::auto_for(&HardwareInventory::detect()))
+            .expect("fragment");
+
+        assert_eq!(fragment.policy.experts_compute_override, None);
+        assert_eq!(fragment.policy.experts_store_override, None);
+    }
+
+    #[test]
+    fn experts_compute_omitted_falls_back_to_hidden_layers_compute() {
+        // `experts` present with only `store` → compute falls back to
+        // `hidden-layers.compute`. So an `experts` block that only repins storage
+        // does NOT silently move compute to the CPU.
+        let params: ParametersFile = serde_json::from_value(serde_json::json!({
+            "model": {
+                "path": "/tmp/model",
+                "compute": "cuda:0",
+                "store": "vram",
+                "hidden-layers": {
+                    "compute": "cuda:0",
+                    "experts": { "store": "ram" }
+                }
+            }
+        }))
+        .expect("experts with only store should parse");
+
+        let fragment = params
+            .into_engine_fragment(PlacementPolicy::auto_for(&HardwareInventory::detect()))
+            .expect("fragment");
+
+        assert_eq!(
+            fragment.policy.experts_compute_override,
+            Some(ComputePlacement::Cuda { device: 0 })
+        );
+        assert_eq!(
+            fragment.policy.experts_store_override,
+            Some(StoragePlacement::Ram)
+        );
+    }

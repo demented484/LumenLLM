@@ -298,6 +298,30 @@ impl ParametersFile {
                 }
             }
 
+            // ── experts sub-section ────────────────────────────────────────────
+            // Routed (sparse top-k) experts ONLY — distinct from the shared
+            // expert / GDN / attention (which follow `parent_compute`). Records
+            // a compute + store override on the policy; the loader marks the
+            // routed-expert NVFP4 weights with this store and the decode path
+            // branches on the compute. `compute` falls back to
+            // `hidden-layers.compute` → `model.compute`; `store` has no fallback
+            // here (the loader uses the layer-region store when `None`). This is
+            // purely additive — when the `experts` key is absent the overrides
+            // stay `None` and the GPU path is unchanged.
+            if let Some(experts) = hidden_layers.experts {
+                let experts_compute = experts.compute
+                    .as_deref()
+                    .map(|c| parse_compute(c, cuda_device))
+                    .transpose()?
+                    .or(parent_compute);
+                let experts_store = experts.store
+                    .as_deref()
+                    .map(|s| parse_storage(s, cuda_device))
+                    .transpose()?;
+                policy.experts_compute_override = experts_compute;
+                policy.experts_store_override = experts_store;
+            }
+
             // ── kv-cache sub-section ───────────────────────────────────────────
             if let Some(kv) = hidden_layers.kv_cache {
                 if let Some(context_size) = kv.context_size {
@@ -436,6 +460,12 @@ pub(crate) fn retarget_cuda_policy(policy: &mut PlacementPolicy, device: usize) 
     policy.weights_compute = retarget_compute(policy.weights_compute, device);
     policy.spill_compute = retarget_compute(policy.spill_compute, device);
     policy.kv_compute = retarget_compute(policy.kv_compute, device);
+    policy.experts_compute_override = policy
+        .experts_compute_override
+        .map(|compute| retarget_compute(compute, device));
+    policy.experts_store_override = policy
+        .experts_store_override
+        .map(|store| retarget_store(store, device));
     for rule in &mut policy.rules {
         rule.store = rule.store.map(|store| retarget_store(store, device));
         rule.compute = rule
