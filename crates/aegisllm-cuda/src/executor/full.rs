@@ -722,6 +722,52 @@ impl CudaLlamaExecutor {
             .map(|l| l.gate_proj.rows())
             .max()
             .unwrap_or(self.hidden_size);
+        // ── Batched-GDN chunked-prefill scratch sizing (Qwen3-Next) ──────────
+        // Per-layer max GDN dims (all GDN layers share one shape, but use max
+        // to be safe). Stub 0 when the model has no GDN layers.
+        let gdn_dims: Vec<super::gdn::GdnDims> = self
+            .layers
+            .iter()
+            .filter_map(|l| l.gdn.as_ref().map(|g| g.dims))
+            .collect();
+        let gdn_conv_channels = gdn_dims.iter().map(|d| d.conv_channels()).max().unwrap_or(0);
+        let gdn_v_width = gdn_dims.iter().map(|d| d.v_width()).max().unwrap_or(0);
+        let gdn_qk_width = gdn_dims.iter().map(|d| d.qk_width()).max().unwrap_or(0);
+        let gdn_n_v = gdn_dims.iter().map(|d| d.num_v_heads).max().unwrap_or(0);
+        let gdn_nv_dk = gdn_dims
+            .iter()
+            .map(|d| d.num_v_heads * d.k_head_dim)
+            .max()
+            .unwrap_or(0);
+        // Native FP8 block GEMM activation scratch: the A-side is quantized to
+        // e4m3 [chunk, K] + per-128-group scale [chunk, ceil(K/128)]. Size to
+        // the widest FP8-block weight's `cols` (K) across the model. Stub when
+        // there are no FP8-block weights (other configs don't use this path).
+        let max_fp8_block_k = {
+            use crate::executor::state::CudaLinear as CL;
+            self.layers
+                .iter()
+                .flat_map(|l| {
+                    let mut v: Vec<&CL> = vec![
+                        &l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj,
+                        &l.gate_proj, &l.up_proj, &l.down_proj,
+                    ];
+                    if let Some(g) = l.gdn.as_ref() {
+                        v.push(&g.in_proj_qkv);
+                        v.push(&g.in_proj_z);
+                        v.push(&g.in_proj_b);
+                        v.push(&g.in_proj_a);
+                        v.push(&g.out_proj);
+                    }
+                    v.into_iter()
+                })
+                .filter_map(|p| match p {
+                    CL::Fp8(f) if f.is_block_scaled() => Some(f.cols),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+        };
         // MoE expert intermediate size: max across MoE layers (0 if no MoE layers).
         let moe_intermediate = self
             .layers
@@ -1095,6 +1141,48 @@ impl CudaLlamaExecutor {
                     .map(|p| self.prefill_chunk_size *
                         (self.layers.len() * p.ple_dim).max(self.hidden_size))
                     .unwrap_or(1))?,
+                // Native FP8 block GEMM activation scratch (shared across all
+                // FP8-block matmuls in chunked prefill). Stub when no FP8-block
+                // weights exist.
+                fp8_a_q: self.runtime.alloc_u8(
+                    (self.prefill_chunk_size * max_fp8_block_k).max(1),
+                )?,
+                fp8_a_scale: self.runtime.alloc_f32(
+                    (self.prefill_chunk_size * max_fp8_block_k.div_ceil(128)).max(1),
+                )?,
+                // Batched-GDN chunked-prefill scratch. Stub size 1 when the
+                // model has no GDN layers (Gemma / Llama / dense Qwen).
+                gdn_qkv: self.runtime.alloc_f32(
+                    (self.prefill_chunk_size * gdn_conv_channels).max(1),
+                )?,
+                gdn_conv_out: self.runtime.alloc_f32(
+                    (self.prefill_chunk_size * gdn_conv_channels).max(1),
+                )?,
+                gdn_z: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_v_width).max(1))?,
+                gdn_b: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_n_v).max(1))?,
+                gdn_a: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_n_v).max(1))?,
+                gdn_q_raw: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_qk_width).max(1))?,
+                gdn_k_raw: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_qk_width).max(1))?,
+                gdn_v: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_v_width).max(1))?,
+                gdn_q_n: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_nv_dk).max(1))?,
+                gdn_k_n: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_nv_dk).max(1))?,
+                gdn_beta: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_n_v).max(1))?,
+                gdn_g: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_n_v).max(1))?,
+                gdn_o: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_v_width).max(1))?,
+                gdn_o_norm: self.runtime.alloc_f32((self.prefill_chunk_size * gdn_v_width).max(1))?,
+                gdn_mixer_out: self.runtime.alloc_f32(self.prefill_chunk_size * self.hidden_size)?,
+                // Qwen full-attn gated-q scratch. Sized to the widest q_proj
+                // (2 * q_width for gated layers). Stub 1 when no gated attn.
+                attn_q_full: self.runtime.alloc_f32(
+                    if self.layers.iter().any(|l| l.attn_output_gate) {
+                        self.prefill_chunk_size * 2 * max_q_width
+                    } else { 1 },
+                )?,
+                attn_gate: self.runtime.alloc_f32(
+                    if self.layers.iter().any(|l| l.attn_output_gate) {
+                        self.prefill_chunk_size * max_q_width
+                    } else { 1 },
+                )?,
             })
         } else {
             None

@@ -592,6 +592,48 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Batched HF/GPT-NeoX partial RoPE (Qwen3-Next full-attention prefill).
+    /// `values` is `[seq_len, num_heads, head_dim]` in place; each token uses
+    /// its own position from `p_positions[t]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_rope_neox_partial_batched_device(
+        &self,
+        values: &mut DeviceBuffer<f32>,
+        p_positions: &DeviceBuffer<u32>,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        theta: f32,
+        rotary_dim: usize,
+    ) -> Result<()> {
+        if num_heads == 0 || rotary_dim == 0 || seq_len == 0 {
+            return Ok(());
+        }
+        if values.len() < seq_len * num_heads * head_dim {
+            return Err(AegisError::InvalidPlan(
+                "rope neox partial batched: buffer too small".into(),
+            ));
+        }
+        let cfg = LaunchConfig {
+            grid_dim: (num_heads as u32, seq_len as u32, 1),
+            block_dim: ((rotary_dim / 2) as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.apply_rope_neox_partial_batched)
+                .arg(&mut values.slice)
+                .arg(&p_positions.slice)
+                .arg(&(num_heads as u32))
+                .arg(&(head_dim as u32))
+                .arg(&theta)
+                .arg(&(rotary_dim as u32))
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("apply_rope_neox_partial_batched"))?;
+        Ok(())
+    }
+
     /// `x[i] *= sigmoid(g[i])` over `n` elements (Qwen3-Next attention output gate).
     pub fn sigmoid_gate_mul(
         &self,

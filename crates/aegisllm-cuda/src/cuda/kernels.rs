@@ -11,6 +11,12 @@ pub(crate) const BLACKWELL_FP4_KERNEL_SRC: &str = concat!(
     "\n",
     include_str!("kernels/blackwell/kv_fp8.cu"),
     "\n",
+    // fp8_mma.cuh (e4m3 m16n8k32 MMA + aegis_pack_e4m3x4_p + aegis_u32) MUST
+    // precede linear_fp8.cu — `aegis_fp8_block_gemm` uses those primitives.
+    // Include-guarded, so the later re-include before the FA2-FP8-MMA kernel
+    // is a no-op.
+    include_str!("kernels/blackwell/fp8_mma.cuh"),
+    "\n",
     include_str!("kernels/blackwell/linear_fp8.cu"),
     "\n",
     include_str!("kernels/blackwell/attention_utils.cuh"),

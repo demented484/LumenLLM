@@ -233,6 +233,7 @@ pub(crate) struct CudaKernelFunctions {
     pub(crate) deinterleave_gated_q: CudaFunction,
     pub(crate) sigmoid_gate_mul: CudaFunction,
     pub(crate) apply_rope_neox_partial: CudaFunction,
+    pub(crate) apply_rope_neox_partial_batched: CudaFunction,
     pub(crate) gdn_deinterleave_qkv: CudaFunction,
     pub(crate) mamba_scan_decode: CudaFunction,
 }
@@ -775,6 +776,7 @@ impl CudaKernelFunctions {
             deinterleave_gated_q: load(&module, "aegis_deinterleave_gated_q")?,
             sigmoid_gate_mul: load(&module, "aegis_sigmoid_gate_mul_f32")?,
             apply_rope_neox_partial: load(&module, "aegis_apply_rope_ptr_neox_partial")?,
+            apply_rope_neox_partial_batched: load(&module, "aegis_apply_rope_neox_partial_batched")?,
             gdn_deinterleave_qkv: load(&module, "aegis_gdn_deinterleave_qkv")?,
             mamba_scan_decode: load(&module, "aegis_mamba_scan_decode")?,
             _module: module,

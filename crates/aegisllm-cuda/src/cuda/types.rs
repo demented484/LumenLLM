@@ -403,6 +403,9 @@ impl StandaloneFp8Linear {
     pub(super) fn data_slice(&self) -> &CudaSlice<u8> { &self.data }
     pub(super) fn row_scales_slice(&self) -> &CudaSlice<f32> { &self.row_scales }
     pub(super) fn block_scales_slice(&self) -> Option<&CudaSlice<f32>> { self.block_scales.as_ref() }
+    /// True when this weight carries DeepSeek-style block scales — i.e. it is
+    /// eligible for the native FP8 block-scaled tensor-core GEMM (no dequant).
+    pub fn is_block_scaled(&self) -> bool { self.block_scales.is_some() }
 }
 
 #[derive(Debug, Clone, Copy)]

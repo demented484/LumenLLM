@@ -35,6 +35,153 @@ pub(super) struct CudaPrefillForwardParams {
     pub(super) kv_staging_ptr: *mut KvStagingPool,
 }
 
+/// Native-FP8 / BF16 batched projection for the Qwen full-attention prefill
+/// path. FP8-block → native tensor-core GEMM (no dequant); BF16 → batched
+/// reference matmul. Mirrors `gdn_proj_batched`.
+fn qwen_attn_proj_batched(
+    runtime: &CudaRuntime,
+    linear: &CudaLinear,
+    input: &DeviceBuffer<f32>,
+    batch: usize,
+    a_q: &mut DeviceBuffer<u8>,
+    a_scale: &mut DeviceBuffer<f32>,
+    output: &mut DeviceBuffer<f32>,
+) -> Result<()> {
+    match linear {
+        CudaLinear::Fp8(f) if f.is_block_scaled() => {
+            runtime.matmul_fp8_block_native_batched(f, input, batch, a_q, a_scale, output)
+        }
+        CudaLinear::Bf16(m) => runtime.matmul_bf16_reference_batched_device(m, input, batch, output),
+        CudaLinear::Fp8(f) => runtime.matmul_fp8_standalone_batched_device(f, input, batch, output),
+        CudaLinear::Nvfp4(_) => Err(AegisError::Unsupported(
+            "Qwen full-attn prefill: NVFP4 projection not supported on this path".into(),
+        )),
+    }
+}
+
+/// Qwen3-Next full-attention prefill over a `batch`-token chunk. Mirrors the
+/// decode `forward_attention_device` (gated q_proj → de-interleave → q/k-norm →
+/// partial-NeoX RoPE → store K/V → attention → sigmoid-gate-mul → o_proj) but
+/// batched. FP8 q/k/v/o projections use the native block-scaled GEMM (no
+/// dequant). Reads/writes `prefill.hidden` in place (residual add at the end).
+#[allow(clippy::too_many_arguments)]
+fn forward_qwen_fullattn_prefill_chunk_device(
+    runtime: &CudaRuntime,
+    layer: &CudaLayer,
+    kv_shared_override: Option<&crate::executor::state::CudaKvCache>,
+    layer_state: &mut CudaLayerState,
+    prefill: &mut CudaPrefillScratch,
+    params: CudaPrefillForwardParams,
+    timings: &mut CudaPrefillStageTimings,
+) -> Result<()> {
+    use crate::executor::state::KvBuffer;
+    let hidden_size = layer.o_proj.rows();
+    let n_q = params.num_attention_heads;
+    let n_kv = layer.layer_num_kv_heads;
+    let hd = layer.layer_head_dim;
+    let q_width = n_q * hd;
+    let kv_width = n_kv * hd;
+
+    let qkv_start = Instant::now();
+    // 1. input RMSNorm (batched).
+    runtime.rms_norm_batched_device(
+        &prefill.hidden, &layer.input_norm_weight, params.batch, params.rms_norm_eps,
+        &mut prefill.input_normed,
+    )?;
+    // 2. q/k/v projections. Gated q_proj emits [batch, 2*q_width]; de-interleave
+    //    query → prefill.gate, gate → prefill.attn_gate.
+    if layer.attn_output_gate {
+        qwen_attn_proj_batched(runtime, &layer.q_proj, &prefill.input_normed, params.batch,
+            &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.attn_q_full)?;
+        // The flat de-interleave kernel handles the [batch, n_q, 2*hd] layout
+        // when called with num_heads = batch * n_q (per-"head" stride 2*hd).
+        runtime.deinterleave_gated_q(
+            &prefill.attn_q_full, &mut prefill.gate, &mut prefill.attn_gate,
+            params.batch * n_q, hd,
+        )?;
+    } else {
+        qwen_attn_proj_batched(runtime, &layer.q_proj, &prefill.input_normed, params.batch,
+            &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.gate)?;
+    }
+    qwen_attn_proj_batched(runtime, &layer.k_proj, &prefill.input_normed, params.batch,
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.up)?;
+    qwen_attn_proj_batched(runtime, &layer.v_proj, &prefill.input_normed, params.batch,
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.v)?;
+    // 3. per-head q_norm / k_norm (batched over batch*heads rows of head_dim).
+    if let Some(ref qnw) = layer.q_norm_weight {
+        runtime.rms_norm_batched_device(
+            &prefill.gate, qnw, params.batch * n_q, params.rms_norm_eps, &mut prefill.qkv,
+        )?;
+        runtime.copy_prefix_f32_device(&prefill.qkv, &mut prefill.gate, params.batch * q_width)?;
+    }
+    if let Some(ref knw) = layer.k_norm_weight {
+        runtime.rms_norm_batched_device(
+            &prefill.up, knw, params.batch * n_kv, params.rms_norm_eps, &mut prefill.qkv,
+        )?;
+        runtime.copy_prefix_f32_device(&prefill.qkv, &mut prefill.up, params.batch * kv_width)?;
+    }
+    // 4. partial-NeoX RoPE on q and k (batched; standard 1/sqrt(d) scaling — no
+    //    sqrt(d) pre-scale, which is Gemma-only).
+    let rd = layer.rope.partial_dim as usize;
+    runtime.apply_rope_neox_partial_batched_device(
+        &mut prefill.gate, &prefill.positions, params.batch, n_q, hd, layer.rope.theta, rd,
+    )?;
+    if kv_shared_override.is_none() {
+        runtime.apply_rope_neox_partial_batched_device(
+            &mut prefill.up, &prefill.positions, params.batch, n_kv, hd, layer.rope.theta, rd,
+        )?;
+    }
+    record_prefill_stage(runtime, timings, qkv_start, |t, e| t.qkv_us += e)?;
+
+    // 5. store K/V into the (RoPE-free) f16 cache, then attention. Qwen full-attn
+    //    is global (window_size == 0) and uses the F16 KV cache for this config.
+    let kv_store_start = Instant::now();
+    let (keys_f16, values_f16): (&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>) =
+        match (&mut layer_state.kv.keys, &mut layer_state.kv.values) {
+            (KvBuffer::F16(k), KvBuffer::F16(v)) => (k, v),
+            _ => return Err(AegisError::Unsupported(
+                "Qwen full-attn prefill currently supports F16 KV cache only".into(),
+            )),
+        };
+    // K is already RoPE'd in prefill.up; store both K and V without re-applying RoPE.
+    runtime.store_kv_slots_batched_device(
+        keys_f16, values_f16, &prefill.up, &prefill.v, &prefill.slot_mapping,
+        params.batch, kv_width, params.kv_context_size, params.dense_metadata,
+    )?;
+    record_prefill_stage(runtime, timings, kv_store_start, |t, e| t.kv_store_us += e)?;
+
+    let attention_start = Instant::now();
+    let attn_kv = kv_shared_override.unwrap_or(&layer_state.kv);
+    let (keys_ref, values_ref) = match (&attn_kv.keys, &attn_kv.values) {
+        (KvBuffer::F16(k), KvBuffer::F16(v)) => (k, v),
+        _ => return Err(AegisError::Unsupported(
+            "Qwen full-attn prefill: parent KV cache must be F16".into(),
+        )),
+    };
+    runtime.attention_prefill_dense_compat_device(
+        keys_ref, values_ref, &prefill.up, &prefill.v, &prefill.gate, &mut prefill.q_half,
+        false, &mut prefill.attn_split_acc, &mut prefill.attn_split_m, &mut prefill.attn_split_l,
+        &prefill.slot_mapping, &prefill.cu_q, &prefill.cu_k, &prefill.context_lens,
+        &prefill.block_tables, params.num_sequences, params.start_position, params.batch,
+        n_q, n_kv, hd, layer.window_size as u32, &mut prefill.qkv, params.dense_metadata,
+    )?;
+    record_prefill_stage(runtime, timings, attention_start, |t, e| t.attention_us += e)?;
+
+    // 6. attention output gate: attn_context *= sigmoid(gate) per element.
+    let o_proj_start = Instant::now();
+    if layer.attn_output_gate {
+        runtime.sigmoid_gate_mul(&mut prefill.qkv, &prefill.attn_gate, params.batch * q_width)?;
+    }
+    // 7. o_proj (native FP8 / BF16) → input_normed, then residual add.
+    qwen_attn_proj_batched(runtime, &layer.o_proj, &prefill.qkv, params.batch,
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.input_normed)?;
+    runtime.add_inplace_device_len(
+        &mut prefill.hidden, &prefill.input_normed, params.batch * hidden_size,
+    )?;
+    record_prefill_stage(runtime, timings, o_proj_start, |t, e| t.o_proj_us += e)?;
+    Ok(())
+}
+
 pub(super) fn forward_cuda_layer_prefill_chunk_device(
     runtime: &CudaRuntime,
     layer: &CudaLayer,
@@ -59,6 +206,22 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     // Prefill scratch is lifetime-pooled manually here: Q lives in `gate`
     // until attention finishes, K lives in `up`, and attention context lives
     // in `qkv` after QKV split has consumed it. MLP overwrites gate/up later.
+    //
+    // Qwen3-Next mixer dispatch: GDN (linear_attention) layers and gated
+    // full-attention layers each have their own batched-prefill forward that
+    // writes the post-mixer residual into `prefill.hidden` directly (mirroring
+    // the decode path). They both fall through to the SAME dense-MLP code below.
+    if layer.gdn.is_some() {
+        let mixer_start = Instant::now();
+        crate::executor::gdn::forward_gdn_mixer_prefill_chunk(
+            runtime, layer, layer_state, prefill, params.batch, hidden_size, params.rms_norm_eps,
+        )?;
+        record_prefill_stage(runtime, timings, mixer_start, |t, e| t.attention_us += e)?;
+    } else if layer.attn_output_gate {
+        forward_qwen_fullattn_prefill_chunk_device(
+            runtime, layer, kv_shared_override, layer_state, prefill, params, timings,
+        )?;
+    } else {
     let qkv_start = Instant::now();
     // Dispatch: BF16 path if q_proj is BF16 (e.g. Gemma4), NVFP4 path otherwise.
     if let (Some(q_nvfp4), Some(k_nvfp4), Some(v_nvfp4)) = (
@@ -858,6 +1021,9 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     } else {
         runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.input_normed, batch_hidden)?;
     }
+    } // end else (standard attention sublayer; GDN / gated-attn handled above)
+
+    let batch_hidden = params.batch * hidden_size;
 
     // Per-layer post-attention hidden capture for the `cuda-attn-compare`
     // correctness gate (Stage A.3). `prefill.hidden` now holds this layer's

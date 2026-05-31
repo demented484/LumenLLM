@@ -965,6 +965,50 @@ pub(super) struct CudaPrefillScratch {
     /// (lookup row gather) and {chunk × hidden} (cuBLASLt input/output).
     pub(super) ple_bf16_in: DeviceBuffer<u16>,
     pub(super) ple_bf16_out: DeviceBuffer<u16>,
+    // ── Native FP8 block-scaled prefill GEMM scratch (Qwen3.5 FP8) ──────────
+    /// Per-(token,128-K-group) e4m3 quantized activation, `[chunk * max_fp8_K]`
+    /// u8. Shared by every `matmul_fp8_block_native_batched` call in the
+    /// chunked prefill (GDN in/out_proj, full-attn q/k/v/o, dense gate/up/down).
+    /// Zero-length stub for non-FP8-block configs.
+    pub(super) fp8_a_q: DeviceBuffer<u8>,
+    /// Per-(token,128-K-group) activation scale, `[chunk * ceil(max_fp8_K/128)]` f32.
+    pub(super) fp8_a_scale: DeviceBuffer<f32>,
+    // ── Batched GDN chunked-prefill scratch (Qwen3-Next linear_attention) ───
+    /// `[chunk * conv_channels]` — in_proj_qkv output / conv1d output (split into q/k/v).
+    pub(super) gdn_qkv: DeviceBuffer<f32>,
+    /// `[chunk * conv_channels]` — conv1d output (SiLU'd), before the q/k/v split.
+    pub(super) gdn_conv_out: DeviceBuffer<f32>,
+    /// `[chunk * v_width]` — in_proj_z output (gate stream for the gated RMSNorm).
+    pub(super) gdn_z: DeviceBuffer<f32>,
+    /// `[chunk * n_v]` — in_proj_b output.
+    pub(super) gdn_b: DeviceBuffer<f32>,
+    /// `[chunk * n_v]` — in_proj_a output.
+    pub(super) gdn_a: DeviceBuffer<f32>,
+    /// `[chunk * qk_width]` — q split out of conv output (pre-norm).
+    pub(super) gdn_q_raw: DeviceBuffer<f32>,
+    /// `[chunk * qk_width]` — k split out of conv output (pre-norm).
+    pub(super) gdn_k_raw: DeviceBuffer<f32>,
+    /// `[chunk * v_width]` — v split out of conv output.
+    pub(super) gdn_v: DeviceBuffer<f32>,
+    /// `[chunk * n_v * d_k]` — normed + GQA-expanded q.
+    pub(super) gdn_q_n: DeviceBuffer<f32>,
+    /// `[chunk * n_v * d_k]` — normed + GQA-expanded k.
+    pub(super) gdn_k_n: DeviceBuffer<f32>,
+    /// `[chunk * n_v]` — beta = sigmoid(b).
+    pub(super) gdn_beta: DeviceBuffer<f32>,
+    /// `[chunk * n_v]` — g = -exp(a_log)*softplus(a+dt_bias).
+    pub(super) gdn_g: DeviceBuffer<f32>,
+    /// `[chunk * v_width]` — delta-rule output o.
+    pub(super) gdn_o: DeviceBuffer<f32>,
+    /// `[chunk * v_width]` — gated-RMSNorm(o, z) → out_proj input.
+    pub(super) gdn_o_norm: DeviceBuffer<f32>,
+    /// `[chunk * hidden]` — out_proj output (mixer_out), added to the residual.
+    pub(super) gdn_mixer_out: DeviceBuffer<f32>,
+    // ── Qwen3-Next full-attention prefill scratch (gated q output) ──────────
+    /// `[chunk * 2 * q_width]` — gated q_proj output (query interleaved with gate).
+    pub(super) attn_q_full: DeviceBuffer<f32>,
+    /// `[chunk * q_width]` — de-interleaved attention output gate (sigmoid-mul'd in).
+    pub(super) attn_gate: DeviceBuffer<f32>,
 }
 
 /// Per-chunk scratch for chunked MoE prefill. Sized for `chunk_size` tokens.

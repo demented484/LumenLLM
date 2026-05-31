@@ -325,6 +325,35 @@ extern "C" __global__ void aegis_apply_rope_ptr_neox_partial(
     row[i + half] = x1 * cosv + x0 * sinv;
 }
 
+// Batched HF/GPT-NeoX partial RoPE (Qwen3-Next full-attention prefill): same
+// math as aegis_apply_rope_ptr_neox_partial but over a whole T-token chunk,
+// where each token carries its own position from p_positions[t].
+// Grid: (num_heads, seq_len, 1)   Block: (rotary_dim/2, 1, 1)
+// `values` layout: [T, num_heads, head_dim] (row-major).
+extern "C" __global__ void aegis_apply_rope_neox_partial_batched(
+    float* __restrict__ values,
+    const unsigned int* __restrict__ p_positions,   // [T]
+    const unsigned int num_heads,
+    const unsigned int head_dim,
+    const float theta,
+    const unsigned int rotary_dim
+) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int t    = blockIdx.y;
+    const unsigned int i    = threadIdx.x;
+    const unsigned int half = rotary_dim / 2u;
+    if (head >= num_heads || i >= half) return;
+    float* row = values + (((unsigned long long)t * num_heads) + head) * head_dim;
+    const float position = (float)(p_positions[t]);
+    const float freq = 1.0f / powf(theta, (float)(2u * i) / (float)rotary_dim);
+    float sinv, cosv;
+    sincosf(position * freq, &sinv, &cosv);
+    const float x0 = row[i];
+    const float x1 = row[i + half];
+    row[i]        = x0 * cosv - x1 * sinv;
+    row[i + half] = x1 * cosv + x0 * sinv;
+}
+
 // Multiply x by sigmoid(g) elementwise (Qwen3-Next attention output gating,
 // applied to the attention context before o_proj).
 extern "C" __global__ void aegis_sigmoid_gate_mul_f32(
