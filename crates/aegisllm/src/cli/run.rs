@@ -149,16 +149,25 @@ pub fn run_env() -> Result<()> {
                 if request.prompt.contains(&image_marker) {
                     let boi_s = boi.as_deref().unwrap_or("");
                     let eoi_s = eoi.as_deref().unwrap_or("");
+                    // Only wrap with BOI/EOI if the prompt doesn't already carry
+                    // them around the marker (Qwen's chat snippet
+                    // `<|vision_start|><|image_pad|><|vision_end|>` already does).
+                    let wrapped = format!("{boi_s}{image_marker}{eoi_s}");
+                    let already_delimited = !boi_s.is_empty()
+                        && !eoi_s.is_empty()
+                        && request.prompt.contains(&wrapped);
+                    let (pre, post) = if already_delimited { ("", "") } else { (boi_s, eoi_s) };
                     let mut block = String::with_capacity(
-                        boi_s.len() + image_marker.len() * injection.n_tokens + eoi_s.len()
+                        pre.len() + image_marker.len() * injection.n_tokens + post.len()
                     );
-                    block.push_str(boi_s);
+                    block.push_str(pre);
                     for _ in 0..injection.n_tokens { block.push_str(&image_marker); }
-                    block.push_str(eoi_s);
+                    block.push_str(post);
                     request.prompt = request.prompt.replacen(&image_marker, &block, 1);
                     eprintln!(
-                        "vision: expanded `{}` to {}{}×{}{} block",
-                        image_marker, boi_s, injection.n_tokens, image_marker, eoi_s,
+                        "vision: expanded `{}` to {}×{} block (delimiters {})",
+                        image_marker, injection.n_tokens, image_marker,
+                        if already_delimited { "from prompt" } else { "added" },
                     );
                 }
                 request.image_injection = Some(injection);
