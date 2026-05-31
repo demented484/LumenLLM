@@ -682,6 +682,7 @@ impl CudaLlamaExecutor {
             registered_shards,
             draft: None,
             num_draft_tokens: super::speculative::default_num_draft_tokens(),
+            mtp: None,
         })
     }
 
@@ -698,6 +699,33 @@ impl CudaLlamaExecutor {
         self.draft = Some(Box::new(draft));
         self.num_draft_tokens = num_draft_tokens.max(1);
         Ok(())
+    }
+
+    /// Load and attach the in-checkpoint Qwen3.6 EAGLE/MTP speculative-decoding
+    /// head from the SAME artifact (`mtp.*` tensors, indexed by the main
+    /// `model.safetensors.index.json`). Gated by the caller (`AEGIS_MTP=1`);
+    /// when never called, `self.mtp` stays `None` and generation is unchanged.
+    /// Requires the checkpoint to actually contain `mtp.fc.weight` (returns an
+    /// error otherwise — never fabricates a head).
+    pub fn attach_mtp_head(
+        &mut self,
+        artifact: &aegisllm_base::artifact::ModelArtifact,
+        num_draft_tokens: usize,
+    ) -> Result<()> {
+        if !artifact.tensors.has("mtp.fc.weight") {
+            return Err(AegisError::InvalidPlan(
+                "AEGIS_MTP set but checkpoint has no `mtp.fc.weight` (no MTP head)".into(),
+            ));
+        }
+        let head = super::mtp::load_mtp_head(self, artifact)?;
+        self.mtp = Some(Box::new(head));
+        self.num_draft_tokens = num_draft_tokens.max(1);
+        Ok(())
+    }
+
+    /// True when an MTP head is attached.
+    pub fn has_mtp_head(&self) -> bool {
+        self.mtp.is_some()
     }
 
     pub(super) fn new_state(&self) -> Result<CudaLlamaState> {
@@ -1520,6 +1548,7 @@ impl CudaLlamaExecutor {
             // Spec-decode draft scratch is attached separately by
             // `new_spec_state()` when a draft model is present.
             draft: None,
+            mtp: None,
         })
     }
 

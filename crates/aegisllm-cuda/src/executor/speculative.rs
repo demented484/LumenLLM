@@ -735,6 +735,9 @@ impl CudaLlamaExecutor {
         if self.draft.is_some() {
             state.draft = Some(Box::new(build_draft_state(self)?));
         }
+        if self.mtp.is_some() {
+            state.mtp = Some(Box::new(super::mtp::build_mtp_state(self)?));
+        }
         Ok(state)
     }
 

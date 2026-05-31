@@ -356,6 +356,11 @@ pub(super) struct CudaLlamaExecutor {
     pub(super) draft: Option<Box<DraftModel>>,
     /// Number of tokens the draft proposes per spec-decode round (default 4).
     pub(super) num_draft_tokens: usize,
+    /// Qwen3.6 EAGLE/MTP speculative-decoding head (in-checkpoint, full-attn +
+    /// MoE). `Some` only when the MTP head was attached (`AEGIS_MTP=1` and the
+    /// checkpoint has `mtp.fc.weight`). Distinct from `draft` (the Gemma-4
+    /// external draft model); only one of the two is ever set.
+    pub(super) mtp: Option<Box<super::mtp::MtpHead>>,
 }
 
 #[derive(Debug)]
@@ -575,6 +580,9 @@ pub struct CudaLlamaState {
     /// through the STATE (mirrors how the target's scratch lives on the state),
     /// so the executor's `&self` weight references stay immutable.
     pub(super) draft: Option<Box<DraftState>>,
+    /// Per-sequence MTP head state (KV + scratch). `Some` only when an MTP head
+    /// is attached and this state was allocated for spec-decode.
+    pub(super) mtp: Option<Box<super::mtp::MtpState>>,
 }
 
 /// Per-sequence speculative-decoding scratch (lives on `CudaLlamaState`).

@@ -9,6 +9,7 @@ mod linear_ops;
 mod load_progress;
 mod loader;
 mod mlp;
+mod mtp;
 mod planning;
 mod ple;
 mod prefill;

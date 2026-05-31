@@ -760,6 +760,38 @@ impl CudaWeightLoader<'_> {
         })
     }
 
+    /// Build a VRAM-resident `DeviceBf16Matrix` directly from a host `&[u16]`
+    /// (BF16 bit-pattern) slice of length `rows * cols`. Used to materialize
+    /// per-expert weight matrices sliced out of a stacked/fused expert tensor
+    /// (e.g. the Qwen3.6 MTP head's `experts.gate_up_proj [E, 2*I, H]` and
+    /// `experts.down_proj [E, H, I]`), which the per-tensor checkpoint loader
+    /// can't address as individual experts.
+    pub fn bf16_matrix_from_host_u16(
+        &self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        values: &[u16],
+    ) -> Result<DeviceBf16Matrix> {
+        if values.len() != rows * cols {
+            return Err(AegisError::InvalidPlan(format!(
+                "bf16_matrix_from_host_u16(`{name}`): values.len()={} != rows*cols={}",
+                values.len(),
+                rows * cols
+            )));
+        }
+        let device = self.device_index();
+        let buffer = self.runtime.upload_u16(values)?;
+        Ok(DeviceBf16Matrix {
+            name: name.to_string(),
+            rows,
+            cols,
+            residency: TensorResidencyPlan::VramResident { device },
+            values: buffer.slice,
+            host_values: None,
+        })
+    }
+
     /// Load a DeepSeek-style FP8 **block-scaled** linear and dequantize it to
     /// BF16 on the host so it runs through the already-validated BF16 matvec
     /// path. The checkpoint stores `weight` as F8_E4M3 `[rows, cols]` plus a

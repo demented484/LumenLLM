@@ -157,6 +157,24 @@ impl CudaExecutorProvider {
                 num_draft_tokens,
             );
         }
+        // Attach the in-checkpoint Qwen3.6 EAGLE/MTP head when AEGIS_MTP is set
+        // (the head lives in the SAME checkpoint as `mtp.*`). Mutually exclusive
+        // with the external `--draft-model` above; if both are requested the MTP
+        // head wins (the generate dispatch checks `has_mtp_head()` first).
+        if std::env::var("AEGIS_MTP").is_ok() {
+            let num_draft_tokens = std::env::var("AEGIS_NUM_DRAFT_TOKENS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(4);
+            let tm = std::time::Instant::now();
+            cuda_executor.attach_mtp_head(artifact, num_draft_tokens)?;
+            eprintln!(
+                "load-timing: MTP head attach         {:>6.2}s  (num_draft_tokens={})",
+                tm.elapsed().as_secs_f64(),
+                num_draft_tokens,
+            );
+        }
         // Pre-allocate the per-sequence state (KV cache, scratch, sampled-token
         // buffer, etc.) so the first prompt doesn't pay for a ~10 GiB cudaMalloc
         // on its critical path. Cached in `prepared_state` and consumed by the
@@ -228,6 +246,38 @@ impl CudaExecutorProvider {
         }
         let cuda_state = cuda_state_mut(state.as_mut())?;
         let generated = cuda.generate_speculative_greedy(
+            cuda_state,
+            &prompt_tokens,
+            request,
+            &|t| self.is_eos(t),
+        )?;
+        Ok(aegisllm_base::generation::GenerateOutput {
+            text: self.decode_tokens(&generated)?,
+            prompt_tokens: prompt_tokens.len(),
+            completion_tokens: generated.len(),
+            finish_reason: "length".into(),
+        })
+    }
+
+    /// Qwen3.6 in-checkpoint MTP speculative-decoding generate (greedy).
+    /// Lossless: token-identical to baseline greedy by construction.
+    fn generate_speculative_mtp(
+        &self,
+        request: &aegisllm_base::generation::GenerateRequest,
+    ) -> Result<aegisllm_base::generation::GenerateOutput> {
+        let cuda = self.cuda.as_ref().ok_or_else(|| {
+            AegisError::Unsupported("CUDA executor not initialized for MTP spec-decode".into())
+        })?;
+        let prompt_tokens = self.encode_prompt(&request.prompt)?;
+        if prompt_tokens.is_empty() {
+            return Err(AegisError::InvalidConfig("prompt produced no tokens".into()));
+        }
+        let mut state = self.new_sequence_state()?;
+        if let Some(ref injection) = request.image_injection {
+            self.set_image_injection(state.as_mut(), injection)?;
+        }
+        let cuda_state = cuda_state_mut(state.as_mut())?;
+        let generated = cuda.generate_speculative_mtp_greedy(
             cuda_state,
             &prompt_tokens,
             request,
@@ -407,6 +457,9 @@ impl ModelExecutorBackend for CudaExecutorProvider {
         &self,
         request: &aegisllm_base::generation::GenerateRequest,
     ) -> Result<aegisllm_base::generation::GenerateOutput> {
+        if self.cuda.as_ref().is_some_and(|c| c.has_mtp_head()) {
+            return self.generate_speculative_mtp(request);
+        }
         if self.cuda.as_ref().is_some_and(|c| c.has_draft()) {
             return self.generate_speculative(request);
         }
@@ -417,6 +470,21 @@ impl ModelExecutorBackend for CudaExecutorProvider {
         &self,
         request: &aegisllm_base::generation::GenerateRequest,
     ) -> Result<aegisllm_base::generation::TimedGenerateOutput> {
+        if self.cuda.as_ref().is_some_and(|c| c.has_mtp_head()) {
+            // Whole spec-decode run reported as decode (prefill is a small fixed
+            // cost). This makes bench-generate's decode_tok_per_s the honest
+            // end-to-end spec-decode throughput. TODO: split prefill bucket.
+            let start = std::time::Instant::now();
+            let output = self.generate_speculative_mtp(request)?;
+            return Ok(aegisllm_base::generation::TimedGenerateOutput {
+                output,
+                tokenize_elapsed: std::time::Duration::ZERO,
+                prefill_elapsed: std::time::Duration::ZERO,
+                decode_elapsed: start.elapsed(),
+                total_elapsed: start.elapsed(),
+                prefill_stage_timings: None,
+            });
+        }
         if self.cuda.as_ref().is_some_and(|c| c.has_draft()) {
             // Spec-decode timing is not yet split into prefill/decode buckets;
             // report the whole run as decode. TODO(gpu-verify): proper timing.
