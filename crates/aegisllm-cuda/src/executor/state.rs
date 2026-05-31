@@ -216,6 +216,10 @@ pub(super) struct CudaMoEScratch {
     /// of `[gate_logits, up_logits]` produced by the fused matvec when the
     /// shared MLP has a `gate_up_fused` matrix.
     pub(super) shared_gate_up_fused: DeviceBuffer<f32>,
+    /// Qwen3-Next shared-expert gate logit ([1] device scalar). Persistent so
+    /// the decode path computes the sigmoid gate fully on-device (no per-layer
+    /// blocking `download_f32`, no per-call alloc).
+    pub(super) shared_gate_logit: DeviceBuffer<f32>,
     pub(super) quant_expert: DeviceBuffer<f32>,
     pub(super) mxfp4_expert: DeviceBuffer<u8>,
     /// Decode async-overlap router scratch.
@@ -841,6 +845,11 @@ pub(super) struct CudaScratch {
     pub(super) argmax_block_indices: DeviceBuffer<u32>,
     /// Allocated only when model has MoE layers.
     pub(super) moe: Option<Box<CudaMoEScratch>>,
+    /// Allocated only when the model has Gated DeltaNet (linear-attention)
+    /// layers. Persistent per-decode-step scratch so the GDN mixer reuses one
+    /// buffer set across all GDN layers + tokens instead of ~16 fresh
+    /// `alloc_f32`s per layer per token.
+    pub(super) gdn_decode: Option<Box<super::gdn::GdnDecodeScratch>>,
     /// Allocated only when the model has any host-resident (StagedHostToDevice) linears.
     /// Sized to hold the largest staged layer's packed + scales in one slot.
     pub(super) staging_pool: Option<Box<LinearStagingPool>>,

@@ -551,12 +551,27 @@ fn forward_moe_decode_device(
         )?;
         // Qwen3-Next: scale the shared-expert output by sigmoid(shared_gate · x),
         // where x is the (pre-shared-MLP) normed hidden still in `post_normed`.
+        // Kept fully on-device: the gate logit lands in a persistent [1] scratch
+        // and `scale_by_sigmoid_scalar` reads it directly — no host download / no
+        // per-call alloc. Previously this did a blocking `download_f32` + host
+        // sigmoid + relaunch PER MoE LAYER PER TOKEN (36 syncs/token on the 35B),
+        // each stalling the CPU launch pipeline (cpu_issuing-bound decode).
         if let Some(ref sgate) = shared.shared_gate {
-            let mut logit = runtime.alloc_f32(1)?;
-            runtime.matvec_bf16_reference_device(sgate, post_normed, &mut logit)?;
-            let g = runtime.download_f32(&logit)?[0];
-            let gate = 1.0f32 / (1.0f32 + (-g).exp());
-            runtime.scale_f32_device(gate, &mut moe_scratch.moe_acc)?;
+            runtime.matvec_bf16_reference_device(
+                sgate,
+                post_normed,
+                &mut moe_scratch.shared_gate_logit,
+            )?;
+            let n = moe_scratch.moe_acc.len();
+            let logit = &moe_scratch.shared_gate_logit as *const DeviceBuffer<f32>;
+            // SAFETY: shared_gate_logit (read) and moe_acc (write) are distinct
+            // fields of moe_scratch; the raw ptr only sidesteps the borrow
+            // checker over the shared &mut moe_scratch.
+            runtime.scale_by_sigmoid_scalar(
+                &mut moe_scratch.moe_acc,
+                unsafe { &*logit },
+                n,
+            )?;
         }
     } else {
         runtime.zero_f32_device(&mut moe_scratch.moe_acc)?;
@@ -849,8 +864,46 @@ fn forward_moe_decode_device(
         && moe_scratch.bulk_expert_scales.is_some()
         && std::env::var("AEGIS_DECODE_BULK_MOE_ENABLE").is_ok();
 
+    // ── Batched-staged routed-expert decode (default ON for host-resident NVFP4
+    //    experts; toggle off with AEGIS_DECODE_BATCHED_STAGED_MOE=0) ──────────
+    //
+    // The per-slot path (the `else` fallback below) issues, per MoE layer,
+    // `top_k × (3 quant + 3 GEMV + 1 geglu + 1 axpy)` = 64 compute launches plus
+    // 24 staged H2Ds — ~88 host ops/layer × 36 layers ≈ 3000 host ops/token. The
+    // 35B decode is CPU-launch/issue-bound (~93% cpu_issuing, gpu_wait ~1.5ms),
+    // so that issuance rate gates the whole token.
+    //
+    // This path keeps the proven-fast PINNED per-expert H2D (24 small DMAs into a
+    // slot-major bulk VRAM buffer — NOT one giant transfer, which regressed) but
+    // COLLAPSES the compute into 8 batched launches/layer (3 batched quant + 3
+    // batched GEMV with the expert/slot on grid.y + 1 batched geglu + 1 weighted
+    // accumulate). Net ~32 host ops/layer vs ~88 → ~1150 ops/token. Output is
+    // bit-identical to the per-slot path: same weights, same NVFP4 dequant, same
+    // per-slot input quant, same fixed ascending weighted fold (the batched
+    // kernels are the exact loop-on-grid.y analogue, already validated on the
+    // gpu_driven path). Differs from AEGIS_DECODE_BULK_MOE_ENABLE: that one
+    // coalesced only the TRANSFER and kept the 64-launch per-expert compute loop
+    // + a full-burst transfer→compute fence (no overlap) → regression. Here the
+    // launch count itself drops, which is the actual lever.
+    // OPT-IN (default OFF): measured a small REGRESSION on the 35B (36.5→34.4
+    // tps, 26.7→25.1 GB/s). Collapsing compute to 8 batched launches/layer did
+    // cut launch count, but it forfeits the per-slot staging pool's
+    // transfer/compute OVERLAP (it must stage all 8 experts before the batched
+    // GEMV can read any slot) — and the decode wall turned out to be the
+    // ~27 GB/s pinned-H2D transfer with overlap, not the launch count. Kept
+    // behind a flag for A/B; the per-slot path stays default.
+    let batched_staged = !gpu_driven
+        && experts_host_resident
+        && moe_scratch.bulk_expert_packed.is_some()
+        && moe_scratch.bulk_expert_scales.is_some()
+        && std::env::var("AEGIS_DECODE_BATCHED_STAGED_MOE").map(|v| v == "1").unwrap_or(false);
+
     if gpu_driven {
         // Routed experts already dispatched by the GPU-driven gather path above.
+    } else if batched_staged {
+        forward_moe_decode_batched_staged(
+            runtime, moe, moe_scratch, hidden_out, active_top_k,
+        )?;
     } else if bulk_ready {
         // Build the per-expert/per-projection byte-offset layout host-side and
         // issue all H2Ds in one burst. Layout (contiguous): for each active
@@ -1012,6 +1065,171 @@ fn forward_moe_decode_device(
         runtime.scale_f32_device(scalar, hidden_out)?;
     }
 
+    Ok(())
+}
+
+/// Batched-staged routed-expert decode for host-resident NVFP4 experts.
+///
+/// Streams the `active_top_k` active experts' gate/up/down NVFP4 weights from
+/// the pinned host arena into a SLOT-MAJOR bulk VRAM buffer via per-expert async
+/// H2Ds (the proven-fast pinned DMA path — small back-to-back transfers, NOT one
+/// giant transfer), then runs the routed-expert FFN as 8 BATCHED launches (slot
+/// on grid.y) instead of the 64-launch per-slot loop. Math is bit-identical to
+/// the per-slot path: same weights, same NVFP4 input-quant + dequant, same fixed
+/// ascending weighted accumulation (the batched kernels are the validated
+/// loop-on-grid.y analogue used by the gpu_driven path).
+///
+/// `hidden_out` holds the (post pre_ffn_norm_2) routed-expert input. On return
+/// `moe_scratch.routed_acc = Σ_k w[k] · expert_k(hidden_out)`.
+fn forward_moe_decode_batched_staged(
+    runtime: &CudaRuntime,
+    moe: &CudaMoE,
+    moe_scratch: &mut CudaMoEScratch,
+    hidden_out: &DeviceBuffer<f32>,
+    active_top_k: usize,
+) -> Result<()> {
+    if active_top_k == 0 {
+        return Ok(());
+    }
+    // Uniform per-expert projection shapes (all experts share gate/up/down dims).
+    let e0 = &moe.experts[0];
+    let gate = &e0.gate_proj;
+    let up = &e0.up_proj;
+    let down = &e0.down_proj;
+    let gate_pb = gate.packed_bytes;
+    let up_pb = up.packed_bytes;
+    let down_pb = down.packed_bytes;
+    let gate_sb = gate.scale_bytes;
+    let up_sb = up.scale_bytes;
+    let down_sb = down.scale_bytes;
+    let per_slot_packed = gate_pb + up_pb + down_pb;
+    let per_slot_scale = gate_sb + up_sb + down_sb;
+
+    // ── 1) Stage each active expert's gate/up/down into the slot-major bulk
+    //       buffer + collect its NVFP4 input/output scales (slot-major:
+    //       slot k → [gate, up, down]). WAR fence: the bulk buffer + slot-scale
+    //       arrays are reused across MoE layers in this token, so block the
+    //       transfer stream until the PREVIOUS layer's batched GEMVs finished
+    //       reading them (no-op on the first layer). ──────────────────────────
+    if moe_scratch.bulk_expert_primed {
+        runtime.transfer_wait_event(&moe_scratch.bulk_expert_compute_event)?;
+    }
+    let mut in_scales: Vec<f32> = Vec::with_capacity(active_top_k * 3);
+    let mut out_scales: Vec<f32> = Vec::with_capacity(active_top_k * 3);
+    let mut h2d_bytes = 0usize;
+    {
+        let bulk_packed = moe_scratch.bulk_expert_packed.as_mut().unwrap();
+        let bulk_scales = moe_scratch.bulk_expert_scales.as_mut().unwrap();
+        for i in 0..active_top_k {
+            let expert = &moe.experts[moe_scratch.router_top_indices[i]];
+            let packed_base = i * per_slot_packed;
+            let scale_base = i * per_slot_scale;
+            let projs = [&expert.gate_proj, &expert.up_proj, &expert.down_proj];
+            let mut p_off = packed_base;
+            let mut s_off = scale_base;
+            for proj in projs.iter() {
+                let (pb, sb) = proj
+                    .host_packed_scales_bytes()
+                    .ok_or_else(|| AegisError::InvalidPlan(format!(
+                        "batched-staged MoE: expert proj `{}` is not host-resident",
+                        proj.name
+                    )))??;
+                runtime.copy_host_u8_to_device_at_offset_async(pb, bulk_packed, p_off)?;
+                runtime.copy_host_u8_to_device_at_offset_async(sb, bulk_scales, s_off)?;
+                p_off += pb.len();
+                s_off += sb.len();
+                h2d_bytes += pb.len() + sb.len();
+                in_scales.push(proj.input_scale);
+                out_scales.push(proj.output_scale);
+            }
+        }
+    }
+    // Account the streamed bytes in the shared H2D counter (these bypass the
+    // staging pool which normally increments it) so AEGIS_DECODE_TIMING's
+    // MiB/token + GB/s stay accurate. Same bytes/token as the per-slot path.
+    crate::cuda::staging::STAGING_H2D_BYTES
+        .fetch_add(h2d_bytes as u64, std::sync::atomic::Ordering::Relaxed);
+
+    // Upload the per-slot NVFP4 scales (tiny: top_k*3 f32 each) on the transfer
+    // stream so they land before the compute fence.
+    runtime.upload_f32_slice_to_device_async(&in_scales, &mut moe_scratch.slot_in_scale)?;
+    runtime.upload_f32_slice_to_device_async(&out_scales, &mut moe_scratch.slot_out_scale)?;
+
+    // One transfer→compute fence for the whole layer's staging.
+    runtime.record_into_transfer(&moe_scratch.bulk_expert_event)?;
+    runtime.compute_wait_event(&moe_scratch.bulk_expert_event)?;
+
+    // ── 2) Batched compute (mirrors the gpu_driven batched branch) ───────────
+    let tk = active_top_k;
+    let max_top_k = moe_scratch.packed_topk_device.len() / 2;
+    let inter_stride = moe_scratch.expert_gate_b.len() / max_top_k; // max_expert_intermediate
+    let quant_stride = moe_scratch.quant_b.len() / max_top_k; // max_input
+    let hidden_stride = down.rows; // = hidden_size
+    let bp = moe_scratch.bulk_expert_packed.as_ref().unwrap() as *const DeviceBuffer<u8>;
+    let bs = moe_scratch.bulk_expert_scales.as_ref().unwrap() as *const DeviceBuffer<u8>;
+    // GATE
+    runtime.quantize_nvfp4_input_batched_dptr_device(
+        hidden_out, 0, gate.cols, quant_stride,
+        &moe_scratch.slot_in_scale, 0, tk, &mut moe_scratch.quant_b,
+    )?;
+    runtime.matvec_nvfp4_prequantized_batched_dptr_device(
+        unsafe { &*bp }, unsafe { &*bs }, per_slot_packed, per_slot_scale,
+        0, 0,
+        &moe_scratch.quant_b, quant_stride, gate.rows, gate.cols,
+        &moe_scratch.slot_out_scale, 0, inter_stride, tk, &mut moe_scratch.expert_gate_b,
+    )?;
+    // UP
+    runtime.quantize_nvfp4_input_batched_dptr_device(
+        hidden_out, 0, up.cols, quant_stride,
+        &moe_scratch.slot_in_scale, 1, tk, &mut moe_scratch.quant_b,
+    )?;
+    runtime.matvec_nvfp4_prequantized_batched_dptr_device(
+        unsafe { &*bp }, unsafe { &*bs }, per_slot_packed, per_slot_scale,
+        gate_pb, gate_sb,
+        &moe_scratch.quant_b, quant_stride, up.rows, up.cols,
+        &moe_scratch.slot_out_scale, 1, inter_stride, tk, &mut moe_scratch.expert_up_b,
+    )?;
+    // GEGLU (batched, strided over slots) — matches the per-slot path's
+    // geglu_tanh_device exactly (loop-on-grid.y analogue).
+    {
+        let eg = &moe_scratch.expert_gate_b as *const DeviceBuffer<f32>;
+        let eu = &moe_scratch.expert_up_b as *const DeviceBuffer<f32>;
+        // SAFETY: eg/eu (read) are distinct from expert_swiglu_b (write).
+        runtime.geglu_tanh_batched_slots_device(
+            unsafe { &*eg }, unsafe { &*eu }, gate.rows, inter_stride, tk,
+            &mut moe_scratch.expert_swiglu_b,
+        )?;
+    }
+    // DOWN
+    {
+        let es = &moe_scratch.expert_swiglu_b as *const DeviceBuffer<f32>;
+        // SAFETY: es (read) is distinct from quant_b (write).
+        runtime.quantize_nvfp4_input_batched_dptr_device(
+            unsafe { &*es }, inter_stride, down.cols, quant_stride,
+            &moe_scratch.slot_in_scale, 2, tk, &mut moe_scratch.quant_b,
+        )?;
+    }
+    runtime.matvec_nvfp4_prequantized_batched_dptr_device(
+        unsafe { &*bp }, unsafe { &*bs }, per_slot_packed, per_slot_scale,
+        gate_pb + up_pb, gate_sb + up_sb,
+        &moe_scratch.quant_b, quant_stride, down.rows, down.cols,
+        &moe_scratch.slot_out_scale, 2, hidden_stride, tk, &mut moe_scratch.expert_out_b,
+    )?;
+    // WEIGHTED ACCUMULATE: routed_acc = Σ_k w[k]·expert_out[k] (fixed ascending
+    // fold; routed_acc was zeroed by the caller — this overwrites it).
+    {
+        let eo = &moe_scratch.expert_out_b as *const DeviceBuffer<f32>;
+        let ptk = &moe_scratch.packed_topk_device as *const DeviceBuffer<u32>;
+        // SAFETY: eo/ptk (read) are distinct from routed_acc (write).
+        runtime.moe_weighted_accumulate_device(
+            &mut moe_scratch.routed_acc, unsafe { &*eo }, hidden_stride,
+            unsafe { &*ptk }, tk, down.rows,
+        )?;
+    }
+    // Signal the compute stream is done reading the bulk buffer + slot scales so
+    // the next layer's staging burst can safely overwrite them.
+    runtime.record_into_compute(&moe_scratch.bulk_expert_compute_event)?;
+    moe_scratch.bulk_expert_primed = true;
     Ok(())
 }
 

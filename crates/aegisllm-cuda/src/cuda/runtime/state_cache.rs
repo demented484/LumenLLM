@@ -662,6 +662,45 @@ impl CudaRuntime {
         Ok(())
     }
 
+    /// Scale `out[0..n)` in place by `sigmoid(logit[0])`, where `logit` is a
+    /// single-element device buffer. Folds the Qwen3-Next shared-expert gate
+    /// (sigmoid + broadcast scale) into one on-device launch, avoiding a
+    /// blocking `download_f32` of the gate logit per MoE layer per token.
+    pub fn scale_by_sigmoid_scalar(
+        &self,
+        out: &mut DeviceBuffer<f32>,
+        logit: &DeviceBuffer<f32>,
+        n: usize,
+    ) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        if out.len() < n {
+            return Err(AegisError::InvalidPlan(format!(
+                "scale_by_sigmoid_scalar: out has {} elems, need {}",
+                out.len(),
+                n
+            )));
+        }
+        let threads = 256u32;
+        let blocks = ((n as u32) + threads - 1) / threads;
+        let cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (threads, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream
+                .launch_builder(&self.kernels.scale_by_sigmoid_scalar)
+                .arg(&mut out.slice)
+                .arg(&logit.slice)
+                .arg(&(n as u32))
+                .launch(cfg)
+        }
+        .map_err(map_cuda_err("scale_by_sigmoid_scalar"))?;
+        Ok(())
+    }
+
     /// Apply the Gated DeltaNet chunked-prefill kernel over `chunk_len` tokens.
     ///
     /// **Phase 6 stub** — returns `Unsupported` until `gated_deltanet_prefill.cu`

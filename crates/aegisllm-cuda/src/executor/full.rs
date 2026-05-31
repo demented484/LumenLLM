@@ -1440,6 +1440,9 @@ impl CudaLlamaExecutor {
                         shared_gate_up_fused: self
                             .runtime
                             .alloc_f32(2 * max_expert_intermediate)?,
+                        // Qwen3-Next shared-expert gate logit ([1]). Persistent
+                        // so the decode path never allocs per MoE layer per token.
+                        shared_gate_logit: self.runtime.alloc_f32(1)?,
                         quant_expert: self.runtime.alloc_f32(max_input)?,
                         // ── BATCHED decode MoE scratch (AEGIS_BATCHED_DECODE_MOE) ──
                         // Separate [max_top_k * width] buffers so the per-slot path
@@ -1476,6 +1479,17 @@ impl CudaLlamaExecutor {
                     }))
                 } else {
                     None
+                },
+                // GDN decode scratch: one persistent buffer set (shared dims
+                // across all GDN layers) so the mixer reuses it every token
+                // instead of ~16 fresh allocs per GDN layer per token.
+                gdn_decode: match gdn_dims.first() {
+                    Some(dims) => Some(Box::new(super::gdn::GdnDecodeScratch::new(
+                        &self.runtime,
+                        *dims,
+                        self.hidden_size,
+                    )?)),
+                    None => None,
                 },
             },
             prefill,

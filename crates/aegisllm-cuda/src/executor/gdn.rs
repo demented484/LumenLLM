@@ -56,6 +56,61 @@ impl GdnDims {
     }
 }
 
+/// Persistent per-decode-step scratch for the GDN mixer. All GDN layers share
+/// the same dims, so one set of buffers (sized to the GDN dims) is reused across
+/// every GDN layer and every token — replacing the ~16 per-call `alloc_f32`s
+/// that previously churned the stream allocator 16 × (#GDN layers) times per
+/// token (480/token on the 35B's 30 GDN layers). Buffers are fully written
+/// before read each step, so reuse is safe and bit-identical to fresh allocs.
+#[derive(Debug)]
+pub(super) struct GdnDecodeScratch {
+    pub(super) normed: DeviceBuffer<f32>,
+    pub(super) qkv: DeviceBuffer<f32>,
+    pub(super) z: DeviceBuffer<f32>,
+    pub(super) b: DeviceBuffer<f32>,
+    pub(super) a: DeviceBuffer<f32>,
+    pub(super) qkv_conv: DeviceBuffer<f32>,
+    pub(super) q_raw: DeviceBuffer<f32>,
+    pub(super) k_raw: DeviceBuffer<f32>,
+    pub(super) v: DeviceBuffer<f32>,
+    pub(super) q_n: DeviceBuffer<f32>,
+    pub(super) k_n: DeviceBuffer<f32>,
+    pub(super) beta: DeviceBuffer<f32>,
+    pub(super) g: DeviceBuffer<f32>,
+    pub(super) o: DeviceBuffer<f32>,
+    pub(super) o_norm: DeviceBuffer<f32>,
+    pub(super) mixer_out: DeviceBuffer<f32>,
+}
+
+impl GdnDecodeScratch {
+    /// Allocate once, sized to the (shared) GDN dims + the model hidden size.
+    pub(super) fn new(runtime: &CudaRuntime, dims: GdnDims, hidden_size: usize) -> Result<Self> {
+        let conv_ch = dims.conv_channels();
+        let qk = dims.qk_width();
+        let v_width = dims.v_width();
+        let n_v = dims.num_v_heads;
+        let d_k = dims.k_head_dim;
+        Ok(Self {
+            normed: runtime.alloc_f32(hidden_size)?,
+            qkv: runtime.alloc_f32(conv_ch)?,
+            z: runtime.alloc_f32(v_width)?,
+            b: runtime.alloc_f32(n_v)?,
+            a: runtime.alloc_f32(n_v)?,
+            qkv_conv: runtime.alloc_f32(conv_ch)?,
+            q_raw: runtime.alloc_f32(qk)?,
+            k_raw: runtime.alloc_f32(qk)?,
+            v: runtime.alloc_f32(v_width)?,
+            q_n: runtime.alloc_f32(n_v * d_k)?,
+            k_n: runtime.alloc_f32(n_v * d_k)?,
+            beta: runtime.alloc_f32(n_v)?,
+            g: runtime.alloc_f32(n_v)?,
+            o: runtime.alloc_f32(v_width)?,
+            o_norm: runtime.alloc_f32(v_width)?,
+            mixer_out: runtime.alloc_f32(hidden_size)?,
+        })
+    }
+}
+
 /// Loaded Gated DeltaNet weights for one layer.
 #[derive(Debug)]
 pub(super) struct CudaGdn {
@@ -92,12 +147,29 @@ pub(super) fn forward_gdn_mixer_decode(
     let d = gdn.dims;
     let (n_k, n_v, d_k, d_v, kc) =
         (d.num_k_heads, d.num_v_heads, d.k_head_dim, d.v_head_dim, d.conv_kernel);
-    let hsz = hidden.len();
     let conv_ch = d.conv_channels();
+    let qk = d.qk_width();
+    let v_width = d.v_width();
+
+    // Persistent per-step scratch (one alloc set, reused across all GDN layers
+    // and all tokens). Replaces the per-call `alloc_f32` churn. Borrow the GDN
+    // scratch + the shared quant/mxfp4/residual buffers disjointly via raw
+    // pointers (distinct fields of `scratch`).
+    // SAFETY: `gdn_decode`, `quant_hidden`, `mxfp4_hidden`, `residual` are
+    // distinct fields of `scratch`; the raw pointers only sidestep the borrow
+    // checker over the single `&mut scratch`.
+    let gs: *mut GdnDecodeScratch = scratch
+        .gdn_decode
+        .as_deref_mut()
+        .ok_or_else(|| AegisError::InvalidPlan(
+            "forward_gdn_mixer: GDN decode scratch not allocated".into(),
+        ))? as *mut _;
+    let quant_hidden = &mut scratch.quant_hidden as *mut DeviceBuffer<f32>;
+    let mxfp4_hidden = &mut scratch.mxfp4_hidden as *mut DeviceBuffer<u8>;
+    let gs = unsafe { &mut *gs };
 
     // 1. input RMSNorm.
-    let mut normed = runtime.alloc_f32(hsz)?;
-    runtime.rms_norm_device(hidden, &layer.input_norm_weight, rms_norm_eps, &mut normed)?;
+    runtime.rms_norm_device(hidden, &layer.input_norm_weight, rms_norm_eps, &mut gs.normed)?;
 
     // 2. input projections.
     // in_proj_qkv already emits the contiguous [all_q | all_k | all_v] layout
@@ -105,71 +177,84 @@ pub(super) fn forward_gdn_mixer_decode(
     // exactly the channel order the depthwise conv1d weight expects — no
     // per-head de-interleave (an earlier wrong assumption corrupted the conv
     // channel↔filter mapping and the q/k/v split, giving cos≈0.5 at layer 0).
-    let mut qkv = runtime.alloc_f32(conv_ch)?;
     matvec_cuda_linear_with_scratch(
-        runtime, &gdn.in_proj_qkv, &normed,
-        &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut qkv, None,
+        runtime, &gdn.in_proj_qkv, &gs.normed,
+        unsafe { &mut *quant_hidden }, unsafe { &mut *mxfp4_hidden }, &mut gs.qkv, None,
     )?;
-    let mut z = runtime.alloc_f32(d.v_width())?;
     matvec_cuda_linear_with_scratch(
-        runtime, &gdn.in_proj_z, &normed,
-        &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut z, None,
+        runtime, &gdn.in_proj_z, &gs.normed,
+        unsafe { &mut *quant_hidden }, unsafe { &mut *mxfp4_hidden }, &mut gs.z, None,
     )?;
-    let mut b = runtime.alloc_f32(n_v)?;
     matvec_cuda_linear_with_scratch(
-        runtime, &gdn.in_proj_b, &normed,
-        &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut b, None,
+        runtime, &gdn.in_proj_b, &gs.normed,
+        unsafe { &mut *quant_hidden }, unsafe { &mut *mxfp4_hidden }, &mut gs.b, None,
     )?;
-    let mut a = runtime.alloc_f32(n_v)?;
     matvec_cuda_linear_with_scratch(
-        runtime, &gdn.in_proj_a, &normed,
-        &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut a, None,
+        runtime, &gdn.in_proj_a, &gs.normed,
+        unsafe { &mut *quant_hidden }, unsafe { &mut *mxfp4_hidden }, &mut gs.a, None,
     )?;
 
     // 3. streaming depthwise causal conv1d + SiLU over cat[q,k,v].
-    let mut qkv_conv = runtime.alloc_f32(conv_ch)?;
-    let conv_state = layer_state.conv_state.as_mut().ok_or_else(|| {
-        AegisError::InvalidPlan("forward_gdn_mixer: missing conv state".into())
-    })?;
-    runtime.gdn_conv1d_decode(&qkv, conv_state, &gdn.conv1d_weight, &mut qkv_conv, conv_ch, kc)?;
+    {
+        let conv_state = layer_state.conv_state.as_mut().ok_or_else(|| {
+            AegisError::InvalidPlan("forward_gdn_mixer: missing conv state".into())
+        })?;
+        runtime.gdn_conv1d_decode(&gs.qkv, conv_state, &gdn.conv1d_weight, &mut gs.qkv_conv, conv_ch, kc)?;
+    }
 
     // 4. split q/k/v out of the fused conv output.
-    let qk = d.qk_width();
-    let mut q_raw = runtime.alloc_f32(qk)?;
-    let mut k_raw = runtime.alloc_f32(qk)?;
-    let mut v = runtime.alloc_f32(d.v_width())?;
-    runtime.copy_f32_d2d_range(&qkv_conv, 0, &mut q_raw, 0, qk)?;
-    runtime.copy_f32_d2d_range(&qkv_conv, qk, &mut k_raw, 0, qk)?;
-    runtime.copy_f32_d2d_range(&qkv_conv, 2 * qk, &mut v, 0, d.v_width())?;
+    {
+        let qkv_conv = &gs.qkv_conv as *const DeviceBuffer<f32>;
+        // SAFETY: qkv_conv (read) is distinct from q_raw/k_raw/v (write).
+        runtime.copy_f32_d2d_range(unsafe { &*qkv_conv }, 0, &mut gs.q_raw, 0, qk)?;
+        runtime.copy_f32_d2d_range(unsafe { &*qkv_conv }, qk, &mut gs.k_raw, 0, qk)?;
+        runtime.copy_f32_d2d_range(unsafe { &*qkv_conv }, 2 * qk, &mut gs.v, 0, v_width)?;
+    }
 
     // 5. L2-norm + GQA-expand q,k → [n_v, d_k]; compute beta,g.
-    let mut q_n = runtime.alloc_f32(n_v * d_k)?;
-    let mut k_n = runtime.alloc_f32(n_v * d_k)?;
-    runtime.gdn_qk_norm_expand(&q_raw, &k_raw, &mut q_n, &mut k_n, n_k, n_v, d_k)?;
-    let mut beta = runtime.alloc_f32(n_v)?;
-    let mut g = runtime.alloc_f32(n_v)?;
-    runtime.gdn_gate(&b, &a, &gdn.a_log, &gdn.dt_bias, &mut beta, &mut g, n_v)?;
+    {
+        let q_raw = &gs.q_raw as *const DeviceBuffer<f32>;
+        let k_raw = &gs.k_raw as *const DeviceBuffer<f32>;
+        // SAFETY: q_raw/k_raw (read) are distinct from q_n/k_n (write).
+        runtime.gdn_qk_norm_expand(
+            unsafe { &*q_raw }, unsafe { &*k_raw }, &mut gs.q_n, &mut gs.k_n, n_k, n_v, d_k,
+        )?;
+    }
+    {
+        let b = &gs.b as *const DeviceBuffer<f32>;
+        let a = &gs.a as *const DeviceBuffer<f32>;
+        // SAFETY: b/a (read) are distinct from beta/g (write).
+        runtime.gdn_gate(
+            unsafe { &*b }, unsafe { &*a }, &gdn.a_log, &gdn.dt_bias, &mut gs.beta, &mut gs.g, n_v,
+        )?;
+    }
 
     // 6. recurrent delta-rule step.
-    let mut o = runtime.alloc_f32(d.v_width())?;
-    let state = layer_state.recurrent.as_mut().ok_or_else(|| {
-        AegisError::InvalidPlan("forward_gdn_mixer: missing recurrent state".into())
-    })?;
-    runtime.gated_deltanet_decode_step(
-        state, &q_n, &k_n, &v, &beta, &g, &mut o, n_v, d_k, d_v,
-    )?;
+    {
+        let state = layer_state.recurrent.as_mut().ok_or_else(|| {
+            AegisError::InvalidPlan("forward_gdn_mixer: missing recurrent state".into())
+        })?;
+        runtime.gated_deltanet_decode_step(
+            state, &gs.q_n, &gs.k_n, &gs.v, &gs.beta, &gs.g, &mut gs.o, n_v, d_k, d_v,
+        )?;
+    }
 
     // 7. gated RMSNorm (gate-first by silu(z)), then out_proj.
-    let mut o_norm = runtime.alloc_f32(d.v_width())?;
-    runtime.gdn_gated_rmsnorm(&o, &z, &gdn.norm_weight, &mut o_norm, n_v, d_v, rms_norm_eps)?;
-    let mut mixer_out = runtime.alloc_f32(hsz)?;
+    {
+        let o = &gs.o as *const DeviceBuffer<f32>;
+        let z = &gs.z as *const DeviceBuffer<f32>;
+        // SAFETY: o/z (read) are distinct from o_norm (write).
+        runtime.gdn_gated_rmsnorm(
+            unsafe { &*o }, unsafe { &*z }, &gdn.norm_weight, &mut gs.o_norm, n_v, d_v, rms_norm_eps,
+        )?;
+    }
     matvec_cuda_linear_with_scratch(
-        runtime, &gdn.out_proj, &o_norm,
-        &mut scratch.quant_hidden, &mut scratch.mxfp4_hidden, &mut mixer_out, None,
+        runtime, &gdn.out_proj, &gs.o_norm,
+        unsafe { &mut *quant_hidden }, unsafe { &mut *mxfp4_hidden }, &mut gs.mixer_out, None,
     )?;
 
     // 8. residual add (Qwen is PreOnly — no post-sublayer norm).
-    runtime.add_device(hidden, &mixer_out, &mut scratch.residual)?;
+    runtime.add_device(hidden, &gs.mixer_out, &mut scratch.residual)?;
     Ok(())
 }
 

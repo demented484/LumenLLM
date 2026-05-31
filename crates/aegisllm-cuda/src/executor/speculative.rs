@@ -520,6 +520,12 @@ fn build_draft_scratch(exec: &CudaLlamaExecutor, draft: &DraftModel) -> Result<C
         argmax_block_values: rt.alloc_f32(1)?,
         argmax_block_indices: rt.alloc_u32(1)?,
         moe: None,
+        // GDN decode scratch — built from the draft's GDN dims if it has any
+        // (current EAGLE/MTP drafts are plain attention, so this is None).
+        gdn_decode: match draft.layers.iter().find_map(|l| l.gdn.as_ref().map(|g| g.dims)) {
+            Some(dims) => Some(Box::new(super::gdn::GdnDecodeScratch::new(rt, dims, hidden)?)),
+            None => None,
+        },
         staging_pool: None,
         kv_staging: None,
         per_layer_inputs: rt.alloc_f32(1)?,

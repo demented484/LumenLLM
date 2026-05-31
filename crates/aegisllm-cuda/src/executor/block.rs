@@ -395,6 +395,8 @@ impl CudaLayerBlockExecutor {
                 argmax_block_values: self.runtime.alloc_f32(1)?,
                 argmax_block_indices: self.runtime.alloc_u32(1)?,
                 moe: None,
+                // Hybrid executor does not yet drive GDN layers (see above).
+                gdn_decode: None,
                 staging_pool: None,
                 kv_staging: None,
                 // PLE decode scratch — sized for the hybrid Gemma-4 dense path

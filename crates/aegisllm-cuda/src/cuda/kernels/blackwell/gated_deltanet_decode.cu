@@ -367,6 +367,24 @@ extern "C" __global__ void aegis_sigmoid_gate_mul_f32(
     x[i] = x[i] * (1.0f / (1.0f + expf(-gv)));
 }
 
+// Scale x[0..n) in place by sigmoid of a SINGLE device-resident scalar logit
+// (broadcast). Used by the Qwen3-Next shared-expert gate at decode: the gate
+// logit is a [1] device buffer; previously the host downloaded it, computed
+// sigmoid on the CPU, and re-launched scale_f32 — one blocking dtoh per MoE
+// layer per token. This keeps the whole gate on-device (no host sync, no
+// per-call alloc), folding the sigmoid + scale into one launch. The scalar is
+// read once per thread from logit[0] (broadcast load, L1-cached).
+extern "C" __global__ void aegis_scale_by_sigmoid_scalar_f32(
+    float* __restrict__ x,
+    const float* __restrict__ logit,
+    const unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float g = logit[0];
+    x[i] = x[i] * (1.0f / (1.0f + expf(-g)));
+}
+
 // ============================================================================
 // Batched (chunked-prefill) GDN kernels. These process a whole T-token chunk in
 // one launch, mirroring the single-token decode kernels above. The matmuls
