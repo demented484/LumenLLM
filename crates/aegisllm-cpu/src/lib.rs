@@ -2,6 +2,7 @@
 
 pub mod attention;
 pub mod cpu;
+pub mod fp8_gemv;
 pub mod materialization;
 pub mod nvfp4_gemv;
 
