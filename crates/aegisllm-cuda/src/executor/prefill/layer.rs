@@ -259,6 +259,26 @@ pub(super) fn forward_cuda_layer_prefill_chunk_device(
     // full-attention layers each have their own batched-prefill forward that
     // writes the post-mixer residual into `prefill.hidden` directly (mirroring
     // the decode path). They both fall through to the SAME dense-MLP code below.
+    // M-RoPE routing validation (AEGIS_DUMP_MROPE=1): logs, once per chunk for
+    // each layer, which mixer the layer dispatches to and whether M-RoPE is
+    // applied. Qwen3-Next is hybrid — GDN (linear_attention) layers are
+    // position-free (no RoPE at all) and only the gated full-attention layers
+    // consume the 3-component (T,H,W) M-RoPE positions. This proves the
+    // mrope-on-full-attn-only routing is correct by construction.
+    if std::env::var("AEGIS_DUMP_MROPE").is_ok() {
+        let kind = if layer.gdn.is_some() {
+            "GDN (linear_attn, position-free, NO RoPE)"
+        } else if layer.attn_output_gate {
+            if prefill.mrope_active {
+                "FULL-ATTN (gated) → M-RoPE APPLIED"
+            } else {
+                "FULL-ATTN (gated) → 1-D RoPE (no image / collapsed)"
+            }
+        } else {
+            "dense-attn"
+        };
+        eprintln!("[mrope-route] L{:>2} {}", layer_idx, kind);
+    }
     if layer.gdn.is_some() {
         let mixer_start = Instant::now();
         crate::executor::gdn::forward_gdn_mixer_prefill_chunk(

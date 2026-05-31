@@ -81,6 +81,32 @@ impl CudaLlamaExecutor {
             state.mrope_positions = Some([
                 to_u32(&pos.comp[0]), to_u32(&pos.comp[1]), to_u32(&pos.comp[2]),
             ]);
+            // M-RoPE position validation dump (AEGIS_DUMP_MROPE=<path>): write the
+            // 3-component (T,H,W) position ids + the decode delta as raw i64 LE so
+            // the host get_rope_index can be cross-checked against HF for the real
+            // image prompt. The position construction is model-agnostic, so the
+            // 35B uses the same HF-validated get_rope_index as the 9B.
+            if let Ok(p) = std::env::var("AEGIS_DUMP_MROPE") {
+                if p != "1" {
+                    let mut bytes = Vec::new();
+                    for comp in pos.comp.iter() {
+                        for &v in comp.iter() { bytes.extend_from_slice(&v.to_le_bytes()); }
+                    }
+                    let _ = std::fs::write(format!("{p}.mrope_pos.i64.bin"), &bytes);
+                    let mut tok_bytes = Vec::new();
+                    for &t in prompt_tokens.iter() {
+                        tok_bytes.extend_from_slice(&(t as u32).to_le_bytes());
+                    }
+                    let _ = std::fs::write(format!("{p}.tokens.u32.bin"), &tok_bytes);
+                    let _ = std::fs::write(
+                        format!("{p}.mrope_meta.txt"),
+                        format!("seq_len={} delta={} grid_t={} grid_h={} grid_w={} merge={} image_token_id={}\n",
+                            prompt_tokens.len(), pos.position_delta(), gt, gh, gw, merge, state.image_token_id),
+                    );
+                    eprintln!("[mrope-dump] wrote {} positions (delta={}) → {p}.mrope_pos.i64.bin",
+                        prompt_tokens.len(), pos.position_delta());
+                }
+            }
         } else {
             state.mrope_positions = None;
             state.mrope_decode_delta = 0;
