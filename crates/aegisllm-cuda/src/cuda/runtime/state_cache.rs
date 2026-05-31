@@ -158,6 +158,130 @@ impl CudaRuntime {
         Ok(())
     }
 
+    // ===== Batched (chunked-prefill) GDN launchers =====
+
+    /// Batched delta-rule over a T-token chunk (warp per (head, d_v-row); loops
+    /// the T tokens through the recurrence — same math as the decode step).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_deltanet_prefill_step(
+        &self,
+        state: &mut DeviceBuffer<f32>,
+        q: &DeviceBuffer<f32>, k: &DeviceBuffer<f32>, v: &DeviceBuffer<f32>,
+        beta: &DeviceBuffer<f32>, g: &DeviceBuffer<f32>, output: &mut DeviceBuffer<f32>,
+        seq_len: usize, num_heads: usize, head_dim_k: usize, head_dim_v: usize,
+    ) -> Result<()> {
+        if seq_len == 0 || num_heads == 0 { return Ok(()); }
+        let warps = (num_heads * head_dim_v) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: ((warps + 7) / 8, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream.launch_builder(&self.kernels.gated_deltanet_prefill)
+                .arg(&mut state.slice).arg(&q.slice).arg(&k.slice).arg(&v.slice)
+                .arg(&beta.slice).arg(&g.slice).arg(&mut output.slice)
+                .arg(&(seq_len as u32)).arg(&(num_heads as u32))
+                .arg(&(head_dim_k as u32)).arg(&(head_dim_v as u32))
+                .launch(cfg)
+        }.map_err(map_cuda_err("gated_deltanet_prefill"))?;
+        Ok(())
+    }
+
+    /// Batched depthwise causal conv1d + SiLU over a T-token chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv1d_prefill(
+        &self, x: &DeviceBuffer<f32>, conv_state: &mut DeviceBuffer<f32>,
+        conv_weight: &DeviceBuffer<f32>, out: &mut DeviceBuffer<f32>,
+        seq_len: usize, channels: usize, kernel: usize,
+    ) -> Result<()> {
+        let cfg = LaunchConfig {
+            grid_dim: ((channels as u32 + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0,
+        };
+        unsafe {
+            self.stream.launch_builder(&self.kernels.gdn_conv1d_prefill)
+                .arg(&x.slice).arg(&mut conv_state.slice).arg(&conv_weight.slice).arg(&mut out.slice)
+                .arg(&(seq_len as u32)).arg(&(channels as u32)).arg(&(kernel as u32))
+                .launch(cfg)
+        }.map_err(map_cuda_err("gdn_conv1d_prefill"))?;
+        Ok(())
+    }
+
+    /// Batched qk-norm + GQA-expand over T tokens. Grid (n_v, T).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_qk_norm_expand_batched(
+        &self, q_in: &DeviceBuffer<f32>, k_in: &DeviceBuffer<f32>,
+        q_out: &mut DeviceBuffer<f32>, k_out: &mut DeviceBuffer<f32>,
+        seq_len: usize, n_k: usize, n_v: usize, d_k: usize, expand: usize,
+    ) -> Result<()> {
+        let block = (d_k as u32).next_power_of_two().min(256);
+        let cfg = LaunchConfig {
+            grid_dim: (n_v as u32, seq_len as u32, 1), block_dim: (block, 1, 1),
+            shared_mem_bytes: block * 4,
+        };
+        unsafe {
+            self.stream.launch_builder(&self.kernels.gdn_qk_norm_expand_batched)
+                .arg(&q_in.slice).arg(&k_in.slice).arg(&mut q_out.slice).arg(&mut k_out.slice)
+                .arg(&(n_k as u32)).arg(&(d_k as u32)).arg(&(expand as u32))
+                .launch(cfg)
+        }.map_err(map_cuda_err("gdn_qk_norm_expand_batched"))?;
+        Ok(())
+    }
+
+    /// Batched gate (beta, g) over T tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_gate_batched(
+        &self, b: &DeviceBuffer<f32>, a: &DeviceBuffer<f32>, a_log: &DeviceBuffer<f32>,
+        dt_bias: &DeviceBuffer<f32>, beta_out: &mut DeviceBuffer<f32>, g_out: &mut DeviceBuffer<f32>,
+        seq_len: usize, n_v: usize,
+    ) -> Result<()> {
+        let total = (seq_len * n_v) as u32;
+        let cfg = LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            self.stream.launch_builder(&self.kernels.gdn_gate_batched)
+                .arg(&b.slice).arg(&a.slice).arg(&a_log.slice).arg(&dt_bias.slice)
+                .arg(&mut beta_out.slice).arg(&mut g_out.slice)
+                .arg(&(seq_len as u32)).arg(&(n_v as u32))
+                .launch(cfg)
+        }.map_err(map_cuda_err("gdn_gate_batched"))?;
+        Ok(())
+    }
+
+    /// Batched gated RMSNorm over T tokens. Grid (n_v, T).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_gated_rmsnorm_batched(
+        &self, o: &DeviceBuffer<f32>, z: &DeviceBuffer<f32>, weight: &DeviceBuffer<f32>,
+        out: &mut DeviceBuffer<f32>, seq_len: usize, n_v: usize, d_v: usize, eps: f32,
+    ) -> Result<()> {
+        let block = (d_v as u32).next_power_of_two().min(1024);
+        let cfg = LaunchConfig {
+            grid_dim: (n_v as u32, seq_len as u32, 1), block_dim: (block, 1, 1), shared_mem_bytes: block * 4,
+        };
+        unsafe {
+            self.stream.launch_builder(&self.kernels.gdn_gated_rmsnorm_batched)
+                .arg(&o.slice).arg(&z.slice).arg(&weight.slice).arg(&mut out.slice)
+                .arg(&(d_v as u32)).arg(&eps)
+                .launch(cfg)
+        }.map_err(map_cuda_err("gdn_gated_rmsnorm_batched"))?;
+        Ok(())
+    }
+
+    /// Strided 2D copy: split a [rows, src_stride] buffer into a [rows, copy_len] one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn strided_copy_2d(
+        &self, src: &DeviceBuffer<f32>, dst: &mut DeviceBuffer<f32>,
+        rows: usize, copy_len: usize, src_stride: usize, dst_stride: usize, src_off: usize,
+    ) -> Result<()> {
+        let total = (rows * copy_len) as u32;
+        let cfg = LaunchConfig { grid_dim: ((total + 255) / 256, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 };
+        unsafe {
+            self.stream.launch_builder(&self.kernels.strided_copy_2d)
+                .arg(&src.slice).arg(&mut dst.slice)
+                .arg(&(rows as u32)).arg(&(copy_len as u32)).arg(&(src_stride as u32))
+                .arg(&(dst_stride as u32)).arg(&(src_off as u32))
+                .launch(cfg)
+        }.map_err(map_cuda_err("strided_copy_2d"))?;
+        Ok(())
+    }
+
     /// L2-normalize q,k over `head_dim_k` and GQA-expand from `n_k` key heads to
     /// `n_v` value heads, scaling q by 1/√head_dim_k. Outputs are `[n_v, d_k]`.
     /// `head_dim_k` must be a power of 2 and ≤ 256.
