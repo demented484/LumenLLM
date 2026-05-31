@@ -303,6 +303,19 @@ impl ChatTemplate {
         // dicts and strings (.get(), .split(), .strip(), .upper()) that
         // minijinja doesn't ship by default.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        // Some HF chat templates (e.g. Qwen3.x tool-calling) serialize a tool
+        // schema / argument value with the Jinja `tojson` filter, which this
+        // minijinja build doesn't expose publicly. Register an equivalent that
+        // serializes the value to a JSON string — without it tool-calling
+        // requests fail to render ("unknown filter: tojson").
+        env.add_filter("tojson", |value: minijinja::Value| -> std::result::Result<minijinja::Value, minijinja::Error> {
+            serde_json::to_string(&value)
+                .map(minijinja::Value::from)
+                .map_err(|e| minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    format!("tojson: {e}"),
+                ))
+        });
         env.set_lstrip_blocks(true);
         env.set_trim_blocks(true);
         env.add_template("chat", &self.inner.template).map_err(|e| {
