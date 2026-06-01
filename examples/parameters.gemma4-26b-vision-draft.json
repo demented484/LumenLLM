@@ -1,0 +1,38 @@
+{
+  "model": {
+    "path": "/path/to/models/Gemma-4-26B-A4B-NVFP4",
+    "compute": "cuda:0",
+    "store": "vram",
+
+    "input-layer":  { "compute": "cuda:0", "store": "ram" },
+    "output-layer": { "compute": "cuda:0", "store": "vram" },
+    "attention":    { "mechanism": "aegis-varlen", "compute": "cuda:0", "store": "vram" },
+
+    "hidden-layers": {
+      "compute": "cuda:0",
+      "store": "ram",
+      "kv-cache": {
+        "context-size": 262144,
+        "store": "vram",
+        "type-k": "f16",
+        "type-v": "f16"
+      }
+    },
+
+    "other-parameters": {
+      "temperature": 1.0,
+      "top-p": 0.95,
+      "top-k": 50,
+      "min-p": 0.05
+    }
+  },
+
+  "vision": { "compute": "cuda:0", "store": "vram" },
+
+  "draft": {
+    "path": "/path/to/models/Gemma-4-E2B-NVFP4",
+    "compute": "cuda:0",
+    "store": "vram",
+    "num-draft-tokens": 4
+  }
+}

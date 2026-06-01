@@ -61,7 +61,7 @@ cargo run --release -- generate --config examples/parameters.qwen35-9b.json \
 cargo run --release -- serve --config examples/parameters.qwen36-35b.json
 ```
 
-A config is a small JSON describing the model path and per-component `compute`/`store` placement and KV-cache settings (see `examples/`).
+A config is a small JSON describing the model path and per-component `compute`/`store` placement and KV-cache settings. **See the [Configuration Guide](docs/CONFIG.md)** for every field, plus the annotated [`examples/`](examples/) — including a Gemma-4-26B config with vision **and** a speculative-decode draft model.
 
 ## Roadmap
 
