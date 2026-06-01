@@ -203,6 +203,10 @@ pub(crate) struct CudaKernelFunctions {
     /// GPU multinomial sampler: single fused single-block kernel — iterated
     /// parallel top-k over the full vocab + temp/top-p/min-p + multinomial draw.
     pub(crate) sampler_topk_fused: CudaFunction,
+    /// Fast top-k sampler (radix-threshold select): same exact top-k set + draw
+    /// as `sampler_topk_fused` but ~4-6 vocab passes instead of `k` serial
+    /// argmax rounds. Default production path; legacy reachable via env flag.
+    pub(crate) sampler_topk_fast: CudaFunction,
     /// Speculative decoding: sparse lm_head matvec over an explicit candidate-row
     /// list (centroid-masked draft head). Registered alongside the sampling kernels.
     pub(crate) spec_sparse_lm_head_matvec: CudaFunction,
@@ -761,6 +765,7 @@ impl CudaKernelFunctions {
             argmax_blocks: load(&module, "aegis_argmax_f32_blocks")?,
             argmax_finalize: load(&module, "aegis_argmax_f32_finalize")?,
             sampler_topk_fused: load(&module, "aegis_sampler_topk_fused")?,
+            sampler_topk_fast: load(&module, "aegis_sampler_topk_fast")?,
             spec_sparse_lm_head_matvec: load(&module, "aegis_spec_sparse_lm_head_matvec")?,
             axpy_f32: load(&module, "aegis_axpy_f32")?,
             moe_gather_experts: load(&module, "aegis_moe_gather_experts")?,

@@ -50,9 +50,38 @@ impl CudaRuntime {
         let vocab = logits.len() as u32;
         let top_k_u = top_k as u32;
         let block_dim = SAMPLER_BLOCK_DIM;
-        // Shared: reduction scratch (block_dim × (val,idx)) + winner set
-        // (KCAP × (val,idx)). All f32/u32 (4 bytes each).
-        let shared = (block_dim + SAMPLER_KCAP) * (std::mem::size_of::<f32>() as u32 * 2);
+        // Legacy iterated-argmax sampler: kept reachable via AEGIS_SAMPLER_LEGACY
+        // for A/B against the fast radix-threshold path. The fast path produces
+        // the IDENTICAL top-k set + draw (validated in tests) in ~4-6 vocab
+        // passes instead of `k` serial argmax rounds, so it is the default.
+        let legacy = matches!(std::env::var("AEGIS_SAMPLER_LEGACY").as_deref(), Ok(v) if !v.is_empty());
+        if legacy {
+            // Shared: reduction scratch (block_dim × (val,idx)) + winner set
+            // (KCAP × (val,idx)). All f32/u32 (4 bytes each).
+            let shared = (block_dim + SAMPLER_KCAP) * (std::mem::size_of::<f32>() as u32 * 2);
+            let cfg = LaunchConfig {
+                grid_dim: (1, 1, 1),
+                block_dim: (block_dim, 1, 1),
+                shared_mem_bytes: shared,
+            };
+            unsafe {
+                self.stream
+                    .launch_builder(&self.kernels.sampler_topk_fused)
+                    .arg(&logits.slice)
+                    .arg(&vocab)
+                    .arg(&top_k_u)
+                    .arg(&temperature)
+                    .arg(&top_p)
+                    .arg(&min_p)
+                    .arg(&u)
+                    .arg(&mut out_token.slice)
+                    .launch(cfg)
+            }
+            .map_err(map_cuda_err("launch fused gpu sampler"))?;
+            return Ok(());
+        }
+        // Fast path. Shared: hist[256] u32 + winner set (KCAP × (val,idx)).
+        let shared = (256u32 + SAMPLER_KCAP * 2) * std::mem::size_of::<f32>() as u32;
         let cfg = LaunchConfig {
             grid_dim: (1, 1, 1),
             block_dim: (block_dim, 1, 1),
@@ -60,7 +89,7 @@ impl CudaRuntime {
         };
         unsafe {
             self.stream
-                .launch_builder(&self.kernels.sampler_topk_fused)
+                .launch_builder(&self.kernels.sampler_topk_fast)
                 .arg(&logits.slice)
                 .arg(&vocab)
                 .arg(&top_k_u)
@@ -71,7 +100,7 @@ impl CudaRuntime {
                 .arg(&mut out_token.slice)
                 .launch(cfg)
         }
-        .map_err(map_cuda_err("launch fused gpu sampler"))?;
+        .map_err(map_cuda_err("launch fast gpu sampler"))?;
         Ok(())
     }
 

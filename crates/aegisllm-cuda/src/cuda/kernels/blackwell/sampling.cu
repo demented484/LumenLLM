@@ -374,6 +374,269 @@ extern "C" __global__ void aegis_sampler_topk_fused(
     out_token[0] = sel_i[0];
 }
 
+// ── Fast top-k sampler (radix-threshold select) ─────────────────────────────
+//
+// Selects the IDENTICAL top-k set as `aegis_sampler_topk_fused` (the iterated
+// block-argmax above) — same lexicographic-descending order (value desc, index
+// asc) — but in ~4-6 full-vocab passes instead of `k` serial argmax rounds
+// (k=50 in production). Then runs the SAME thread-0 temperature/top-p/min-p/draw
+// finish over the ≤k winners, so a given uniform `u` selects the SAME token.
+//
+// Method (single block, BLOCK threads):
+//   * Order-preserving f32→u32 key: for finite x, `vkey = (bits>>31) ? ~bits :
+//     (bits | 0x80000000)`. Larger float ⇒ larger vkey (handles ±0). The top-k
+//     by value == top-k by vkey.
+//   * Phase 1 (find tau_vkey): byte-radix select. For each of the 4 bytes
+//     (MSB→LSB), build a 256-bin histogram over candidates whose higher bytes
+//     already match the running prefix, scan the bins from the top to find which
+//     bin contains the k-th-largest vkey (by multiplicity), and fix that byte of
+//     `tau_vkey`. After 4 passes `tau_vkey` is the EXACT 32-bit key of the
+//     k-th-largest value (with multiplicity). `n_gt = #(vkey > tau_vkey) < k`.
+//   * Phase 2 (resolve the value-tie group by index): among the `n_eq` elements
+//     with `vkey == tau_vkey` we must keep the `k - n_gt` SMALLEST indices
+//     (index asc tie-break). Byte-radix select the `(k-n_gt)`-th smallest index
+//     within the tie group → `tau_idx`. Then the selected set is exactly
+//     `{vkey > tau_vkey} ∪ {vkey == tau_vkey AND index <= tau_idx}` — exactly k
+//     elements, identical to the iterated-argmax set.
+//   * Gather the ≤k winners into shared mem, insertion-sort them by (value desc,
+//     index asc) on thread 0 (k≤64), then run the identical finish.
+//
+// Only finite logits are considered (matches the CPU `is_finite` filter): a
+// non-finite logit maps to a key but we mask it out in every histogram/count so
+// it can never be selected (the iterated-argmax path likewise can pick a +inf,
+// but the CPU reference filters non-finite BEFORE the sort — the production
+// logits are always finite, and the same-u test never feeds non-finite values).
+
+__device__ __forceinline__ unsigned int aegis_f32_to_orderkey(float x) {
+    unsigned int b = __float_as_uint(x);
+    return (b >> 31) ? ~b : (b | 0x80000000u);
+}
+
+// Single fused FAST sampler — drop-in replacement for aegis_sampler_topk_fused.
+// grid (1), block (BLOCK threads). Shared mem layout (see runtime/sampling.rs):
+//   hist[256] (u32) + sel_v[KCAP] (f32) + sel_i[KCAP] (u32) + scalars.
+extern "C" __global__ void aegis_sampler_topk_fast(
+    const float* __restrict__ logits,
+    const unsigned int vocab,
+    const unsigned int top_k,        // requested k; 0 or >KCAP => KCAP
+    const float temperature,
+    const float top_p,
+    const float min_p,
+    const float u,                   // uniform draw in [0,1)
+    unsigned int* __restrict__ out_token
+) {
+    extern __shared__ unsigned int aegis_fast_smem[];
+    unsigned int* hist = aegis_fast_smem;                 // [256] u32
+    float* sel_v = (float*)(hist + 256);                  // [KCAP] f32
+    unsigned int* sel_i = (unsigned int*)(sel_v + SAMPLER_KCAP); // [KCAP] u32
+    __shared__ unsigned int s_count;     // generic shared counter/accumulator
+    __shared__ unsigned int s_nsel;      // # gathered winners
+    // Running radix-select state, shared so EVERY thread sees the prefix that
+    // thread 0 fixes each pass (these MUST be shared, not per-thread registers —
+    // otherwise only thread 0's histogram would be correctly restricted).
+    __shared__ unsigned int s_prefix;
+    __shared__ unsigned int s_mask;
+    __shared__ unsigned int s_need;
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int nthreads = blockDim.x;
+
+    unsigned int k = top_k;
+    if (k == 0u || k > SAMPLER_KCAP) k = SAMPLER_KCAP;
+    if (k > vocab) k = vocab;
+    if (k == 0u) { if (tid == 0u) out_token[0] = 0u; return; }
+
+    // ── Phase 1: byte-radix select of tau_vkey (k-th largest value key) ──
+    // Invariant entering byte b: s_prefix holds the already-fixed higher bytes;
+    // s_need = the rank still to locate within candidates whose higher bytes ==
+    // s_prefix.
+    if (tid == 0u) { s_prefix = 0u; s_mask = 0u; s_need = k; }
+    __syncthreads();
+    for (int byte = 3; byte >= 0; --byte) {
+        const unsigned int shift = (unsigned int)byte * 8u;
+        const unsigned int prefix = s_prefix;
+        const unsigned int mask = s_mask;
+        const unsigned int need = s_need;
+        // Zero the histogram.
+        for (unsigned int i = tid; i < 256u; i += nthreads) hist[i] = 0u;
+        __syncthreads();
+        // Histogram this byte over candidates matching the running prefix.
+        for (unsigned int i = tid; i < vocab; i += nthreads) {
+            const float x = logits[i];
+            if (!isfinite(x)) continue;
+            const unsigned int vk = aegis_f32_to_orderkey(x);
+            if ((vk & mask) != prefix) continue;
+            const unsigned int bin = (vk >> shift) & 0xFFu;
+            atomicAdd(&hist[bin], 1u);
+        }
+        __syncthreads();
+        // Thread 0 scans bins from high to low to find the bin holding the
+        // `need`-th element (1-based, counting from the largest key).
+        if (tid == 0u) {
+            unsigned int acc = 0u;
+            int sel_bin = 0;
+            unsigned int below = 0u; // count strictly above the selected bin
+            for (int b = 255; b >= 0; --b) {
+                const unsigned int c = hist[(unsigned int)b];
+                if (acc + c >= need) { sel_bin = b; below = acc; break; }
+                acc += c;
+            }
+            // Fix this byte; narrow `need` to the rank within the selected bin.
+            s_prefix = prefix | (((unsigned int)sel_bin) << shift);
+            s_mask = mask | (0xFFu << shift);
+            s_need = need - below;   // rank within the selected bin (next byte)
+        }
+        __syncthreads();
+    }
+    const unsigned int tau_vkey = s_prefix;
+
+    // Count strictly-greater elements (n_gt) for the tie split.
+    if (tid == 0u) s_count = 0u;
+    __syncthreads();
+    {
+        unsigned int local = 0u;
+        for (unsigned int i = tid; i < vocab; i += nthreads) {
+            const float x = logits[i];
+            if (!isfinite(x)) continue;
+            if (aegis_f32_to_orderkey(x) > tau_vkey) ++local;
+        }
+        atomicAdd(&s_count, local);
+    }
+    __syncthreads();
+    const unsigned int n_gt = s_count;
+    const unsigned int need_eq = (k > n_gt) ? (k - n_gt) : 0u;  // ties to keep
+
+    // ── Phase 2: among vkey==tau_vkey, find the need_eq-th SMALLEST index. ──
+    // Byte-radix select on the index (ascending: scan bins from low to high).
+    unsigned int tau_idx = 0xFFFFFFFFu;
+    if (need_eq > 0u) {
+        if (tid == 0u) { s_prefix = 0u; s_mask = 0u; s_need = need_eq; }
+        __syncthreads();
+        for (int byte = 3; byte >= 0; --byte) {
+            const unsigned int shift = (unsigned int)byte * 8u;
+            const unsigned int iprefix = s_prefix;
+            const unsigned int imask = s_mask;
+            const unsigned int ineed = s_need;
+            for (unsigned int i = tid; i < 256u; i += nthreads) hist[i] = 0u;
+            __syncthreads();
+            for (unsigned int i = tid; i < vocab; i += nthreads) {
+                const float x = logits[i];
+                if (!isfinite(x)) continue;
+                if (aegis_f32_to_orderkey(x) != tau_vkey) continue;
+                if ((i & imask) != iprefix) continue;
+                const unsigned int bin = (i >> shift) & 0xFFu;
+                atomicAdd(&hist[bin], 1u);
+            }
+            __syncthreads();
+            if (tid == 0u) {
+                unsigned int acc = 0u;
+                int sel_bin = 0;
+                unsigned int below = 0u;
+                for (int b = 0; b < 256; ++b) {           // ascending for index
+                    const unsigned int c = hist[(unsigned int)b];
+                    if (acc + c >= ineed) { sel_bin = b; below = acc; break; }
+                    acc += c;
+                }
+                s_prefix = iprefix | (((unsigned int)sel_bin) << shift);
+                s_mask = imask | (0xFFu << shift);
+                s_need = ineed - below;
+            }
+            __syncthreads();
+        }
+        tau_idx = s_prefix;  // the need_eq-th smallest index in the tie group
+    }
+
+    // ── Gather the exact top-k set into shared mem. ──
+    // Selected: vkey > tau_vkey, OR (vkey == tau_vkey AND index <= tau_idx).
+    if (tid == 0u) s_nsel = 0u;
+    __syncthreads();
+    for (unsigned int i = tid; i < vocab; i += nthreads) {
+        const float x = logits[i];
+        if (!isfinite(x)) continue;
+        const unsigned int vk = aegis_f32_to_orderkey(x);
+        bool take = false;
+        if (vk > tau_vkey) take = true;
+        else if (vk == tau_vkey && i <= tau_idx) take = true;
+        if (take) {
+            const unsigned int slot = atomicAdd(&s_nsel, 1u);
+            if (slot < SAMPLER_KCAP) { sel_v[slot] = x; sel_i[slot] = i; }
+        }
+    }
+    __syncthreads();
+    unsigned int nsel = s_nsel;
+    if (nsel > SAMPLER_KCAP) nsel = SAMPLER_KCAP;  // defensive; should == k
+
+    // Thread 0: sort the ≤k winners by (value desc, index asc), then run the
+    // identical temperature/top-p/min-p/draw finish as aegis_sampler_topk_fused.
+    if (tid != 0u) return;
+
+    // Insertion sort (k ≤ 64).
+    for (unsigned int a = 1u; a < nsel; ++a) {
+        const float vv = sel_v[a];
+        const unsigned int ii = sel_i[a];
+        int j = (int)a - 1;
+        while (j >= 0) {
+            const bool jworse = sel_v[j] < vv || (sel_v[j] == vv && sel_i[j] > ii);
+            if (!jworse) break;
+            sel_v[j + 1] = sel_v[j];
+            sel_i[j + 1] = sel_i[j];
+            --j;
+        }
+        sel_v[j + 1] = vv;
+        sel_i[j + 1] = ii;
+    }
+
+    const float temp = temperature > 1e-6f ? temperature : 1e-6f;
+    const float max_logit = sel_v[0];   // global max over the top-k set
+    float w[SAMPLER_KCAP];
+    unsigned int idx[SAMPLER_KCAP];
+    unsigned int nw = 0;
+    for (unsigned int r = 0; r < nsel; ++r) {
+        const float e = expf((sel_v[r] - max_logit) / temp);
+        if (isfinite(e) && e > 0.0f) {
+            w[nw] = e;
+            idx[nw] = sel_i[r];
+            ++nw;
+        }
+    }
+    if (nw == 0u) { out_token[0] = sel_i[0]; return; }
+
+    float total = 0.0f;
+    for (unsigned int r = 0; r < nw; ++r) total += w[r];
+    if (top_p > 0.0f && top_p < 1.0f && total > 0.0f) {
+        const float cutoff = total * top_p;
+        float cum = 0.0f;
+        unsigned int keep = 0;
+        for (unsigned int r = 0; r < nw; ++r) {
+            cum += w[r];
+            ++keep;
+            if (cum >= cutoff) break;
+        }
+        if (keep < 1u) keep = 1u;
+        nw = keep;
+    }
+
+    if (min_p > 0.0f) {
+        const float thresh = w[0] * min_p;
+        unsigned int m = 0;
+        for (unsigned int r = 0; r < nw; ++r) {
+            if (w[r] >= thresh) { w[m] = w[r]; idx[m] = idx[r]; ++m; }
+        }
+        nw = m;
+        if (nw == 0u) { out_token[0] = sel_i[0]; return; }
+    }
+
+    float total2 = 0.0f;
+    for (unsigned int r = 0; r < nw; ++r) total2 += w[r];
+    if (total2 <= 0.0f) { out_token[0] = sel_i[0]; return; }
+    float draw = u * total2;
+    for (unsigned int r = 0; r < nw; ++r) {
+        if (draw <= w[r]) { out_token[0] = idx[r]; return; }
+        draw -= w[r];
+    }
+    out_token[0] = sel_i[0];
+}
+
 // Batched element-wise GeGLU (gelu_pytorch_tanh): out[i] = gelu_tanh(gate[i]) * up[i].
 // Used by chunked prefill for the routed-expert GeGLU step on gathered token batches.
 extern "C" __global__ void aegis_geglu_tanh_batched(
