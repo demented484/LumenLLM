@@ -2,7 +2,7 @@
 
 A from-scratch **Rust + CUDA** inference engine for NVIDIA **Blackwell (SM120)**, built to run modern LLMs on a single consumer **16 GB** GPU — including models mainstream engines can't fit.
 
-> **Status: pre-alpha**, single-GPU (RTX 50-series), actively developed. Built and tuned on an RTX 5070 Ti.
+> **Status: alpha · v0.0.1**, single-GPU (RTX 50-series), actively developed. Built and tuned on an RTX 5070 Ti.
 
 ## Core idea — you place everything, explicitly
 
