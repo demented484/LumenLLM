@@ -974,11 +974,25 @@ impl CudaLlamaExecutor {
                 // cuBLASLt BF16 scratch — size for the largest single matmul. Worst
                 // case is shared MLP / down_proj: chunk_size * max(intermediate, hidden,
                 // max_q_width). For Gemma 4 26B: 64 * max(2112, 2816, 8192) = 64*8192 ≈ 1MB.
+                // Qwen3-Next GDN routes its BF16 in/out projections through the same
+                // cuBLASLt path (see `gdn_proj_batched`); the widest such GEMM is
+                // `in_proj_qkv` (output = conv_channels, e.g. 8192) and its
+                // intermediate widths (v_width). Include those so the scratch fits.
                 bf16_in_scratch: self.runtime.alloc_u16(
-                    self.prefill_chunk_size * intermediate.max(self.hidden_size).max(max_q_width)
+                    self.prefill_chunk_size
+                        * intermediate
+                            .max(self.hidden_size)
+                            .max(max_q_width)
+                            .max(gdn_conv_channels)
+                            .max(gdn_v_width)
                 )?,
                 bf16_out_scratch: self.runtime.alloc_u16(
-                    self.prefill_chunk_size * intermediate.max(self.hidden_size).max(max_q_width)
+                    self.prefill_chunk_size
+                        * intermediate
+                            .max(self.hidden_size)
+                            .max(max_q_width)
+                            .max(gdn_conv_channels)
+                            .max(gdn_v_width)
                 )?,
                 // FP8 weight-dequant scratch — sized for the largest single
                 // FP8 projection in the model. Allocated only when at least

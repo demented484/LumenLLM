@@ -287,7 +287,20 @@ pub(super) fn forward_gdn_mixer_prefill_chunk(
     let qk = d.qk_width();
     let v_width = d.v_width();
 
+    let gprof = std::env::var("AEGIS_GDN_PROFILE").is_ok();
+    let gmark = || {
+        if gprof { let _ = runtime.synchronize(); }
+        std::time::Instant::now()
+    };
+    let greport = |t: std::time::Instant, tag: &str| {
+        if gprof {
+            let _ = runtime.synchronize();
+            eprintln!("[GDN_PROF {}] {}us", tag, t.elapsed().as_micros());
+        }
+    };
+
     // 1. input RMSNorm (batched). prefill.input_normed = [batch, hidden].
+    let _t = gmark();
     runtime.rms_norm_batched_device(
         &prefill.hidden,
         &layer.input_norm_weight,
@@ -295,29 +308,38 @@ pub(super) fn forward_gdn_mixer_prefill_chunk(
         rms_norm_eps,
         &mut prefill.input_normed,
     )?;
+    greport(_t, "rmsnorm");
 
     // 2. input projections (batched). FP8-block → native tensor-core GEMM
     //    (no dequant); BF16 → batched reference matmul. in_proj_qkv emits the
     //    contiguous [all_q | all_k | all_v] layout (no de-interleave — see the
     //    decode path comment).
+    let _t = gmark();
     gdn_proj_batched(runtime, &gdn.in_proj_qkv, &prefill.input_normed, batch,
-        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.gdn_qkv)?;
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale,
+        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch, &mut prefill.gdn_qkv)?;
     gdn_proj_batched(runtime, &gdn.in_proj_z, &prefill.input_normed, batch,
-        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.gdn_z)?;
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale,
+        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch, &mut prefill.gdn_z)?;
     gdn_proj_batched(runtime, &gdn.in_proj_b, &prefill.input_normed, batch,
-        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.gdn_b)?;
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale,
+        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch, &mut prefill.gdn_b)?;
     gdn_proj_batched(runtime, &gdn.in_proj_a, &prefill.input_normed, batch,
-        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.gdn_a)?;
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale,
+        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch, &mut prefill.gdn_a)?;
+    greport(_t, "in_projs");
 
     // 3. batched depthwise causal conv1d + SiLU over cat[q,k,v]. Threads the
     //    per-channel conv_state in place across the chunk.
     let conv_state = layer_state.conv_state.as_mut().ok_or_else(|| {
         AegisError::InvalidPlan("forward_gdn_mixer_prefill: missing conv state".into())
     })?;
+    let _t = gmark();
     runtime.gdn_conv1d_prefill(
         &prefill.gdn_qkv, conv_state, &gdn.conv1d_weight, &mut prefill.gdn_conv_out,
         batch, conv_ch, kc,
     )?;
+    greport(_t, "conv1d");
 
     // 4. split q/k/v out of the fused conv output ([batch, conv_ch]).
     runtime.strided_copy_2d(&prefill.gdn_conv_out, &mut prefill.gdn_q_raw, batch, qk, conv_ch, qk, 0)?;
@@ -339,19 +361,24 @@ pub(super) fn forward_gdn_mixer_prefill_chunk(
     let state = layer_state.recurrent.as_mut().ok_or_else(|| {
         AegisError::InvalidPlan("forward_gdn_mixer_prefill: missing recurrent state".into())
     })?;
+    let _t = gmark();
     runtime.gated_deltanet_prefill_step(
         state, &prefill.gdn_q_n, &prefill.gdn_k_n, &prefill.gdn_v,
         &prefill.gdn_beta, &prefill.gdn_g, &mut prefill.gdn_o,
         batch, n_v, d_k, d_v,
     )?;
+    greport(_t, "recurrence");
 
     // 7. gated RMSNorm (gate-first by silu(z)), then out_proj.
+    let _t = gmark();
     runtime.gdn_gated_rmsnorm_batched(
         &prefill.gdn_o, &prefill.gdn_z, &gdn.norm_weight, &mut prefill.gdn_o_norm,
         batch, n_v, d_v, rms_norm_eps,
     )?;
     gdn_proj_batched(runtime, &gdn.out_proj, &prefill.gdn_o_norm, batch,
-        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale, &mut prefill.gdn_mixer_out)?;
+        &mut prefill.fp8_a_q, &mut prefill.fp8_a_scale,
+        &mut prefill.bf16_in_scratch, &mut prefill.bf16_out_scratch, &mut prefill.gdn_mixer_out)?;
+    greport(_t, "rmsnorm_outproj");
 
     // 8. residual add (Qwen is PreOnly — no post-sublayer norm).
     runtime.add_inplace_device_len(&mut prefill.hidden, &prefill.gdn_mixer_out, batch * hidden_size)?;
@@ -359,8 +386,15 @@ pub(super) fn forward_gdn_mixer_prefill_chunk(
 }
 
 /// Batched GDN projection dispatch: FP8-block → native tensor-core GEMM (no
-/// dequant), BF16 → batched reference matmul. NVFP4 GDN projections are not
+/// dequant), BF16 → cuBLASLt tensor-core GEMM (VRAM-resident) or batched
+/// reference matmul (host-resident fallback). NVFP4 GDN projections are not
 /// produced by any current checkpoint (GDN weights are FP8/BF16).
+///
+/// `bf16_in`/`bf16_out` are the prefill cuBLASLt staging buffers (F32→BF16 in,
+/// BF16→F32 out). They must be sized for the widest GDN projection
+/// (`chunk * conv_channels` for `in_proj_qkv`); `full.rs` sizes them to include
+/// `gdn_conv_channels` and `gdn_v_width`.
+#[allow(clippy::too_many_arguments)]
 fn gdn_proj_batched(
     runtime: &CudaRuntime,
     linear: &CudaLinear,
@@ -368,6 +402,8 @@ fn gdn_proj_batched(
     batch: usize,
     a_q: &mut DeviceBuffer<u8>,
     a_scale: &mut DeviceBuffer<f32>,
+    bf16_in: &mut DeviceBuffer<u16>,
+    bf16_out: &mut DeviceBuffer<u16>,
     output: &mut DeviceBuffer<f32>,
 ) -> Result<()> {
     match linear {
@@ -375,7 +411,17 @@ fn gdn_proj_batched(
             runtime.matmul_fp8_block_native_batched(f, input, batch, a_q, a_scale, output)
         }
         CudaLinear::Bf16(m) => {
-            runtime.matmul_bf16_reference_batched_device(m, input, batch, output)
+            // The 35B GDN in/out projections are BF16 and force-VRAM (not in the
+            // mmap expert arena). Run them on cuBLASLt tensor cores like every
+            // other VRAM-resident BF16 GEMM in prefill — the reference batched
+            // matvec (1 block/row, no tensor cores) was ~78% of the GDN-mixer
+            // wall time. Host-resident BF16 falls back to the reference kernel
+            // (which streams the pinned weights into a transient VRAM scratch).
+            if runtime.cublaslt_bf16_enabled_for(m) {
+                runtime.matmul_bf16_cublaslt_device(m, input, batch, bf16_in, bf16_out, output)
+            } else {
+                runtime.matmul_bf16_reference_batched_device(m, input, batch, output)
+            }
         }
         CudaLinear::Fp8(f) => runtime.matmul_fp8_standalone_batched_device(f, input, batch, output),
         CudaLinear::Nvfp4(_) => Err(AegisError::Unsupported(
