@@ -1,83 +1,75 @@
-# aegisllm.rs
+# LumenLLM
 
-Rust inference-engine rewrite focused on explicit storage and compute placement.
+A from-scratch **Rust + CUDA** inference engine for NVIDIA **Blackwell (SM120)**, built to run modern LLMs on a single consumer **16 GB** GPU — including models mainstream engines can't fit.
 
-The important architectural split is:
+> **Status: pre-alpha**, single-GPU (RTX 50-series), actively developed. Built and tuned on an RTX 5070 Ti.
 
-- `hardware`: discovers CPU/RAM and CUDA/VRAM inventory.
-- `artifact` + `tensor`: reads Hugging Face safetensors metadata without loading all weights.
-- `graph`: turns model tensors into stable regions such as embedding, transformer blocks, final norm and lm head.
-- `placement`: resolves manual policy into per-region `store` and `compute` decisions.
-- `memory`: dry-runs persistent RAM/VRAM allocations, file-backed mmap, KV cache, and staging peaks separately.
-- `backend`: records available CPU/CUDA backend capabilities.
-- `layout` + `materialization`: decide whether linear weights stay packed, become native tensor-core resident, or are explicitly repacked for a backend.
-- `runtime`: selects kernel families from backend capabilities and tensor quantization instead of hardcoding one GPU generation.
-- `executor`: provider boundary for `cpu-reference`, `cuda`, and `hybrid` execution plans.
-- `cuda` + `cpu`: backend runtimes with explicit resident tensor loaders and matvec primitives. CUDA runtime config is explicit and can be supplied from `parameters.json`; environment variables are only compatibility defaults for CLI/manual use.
-- `engine`: ties the above together, reports the plan, and only builds an executor for real generation.
+## Core idea — you place everything, explicitly
 
-The current runnable paths are all-CPU, all-CUDA, and correctness-first CPU/CUDA hybrid. CUDA generation keeps weights and activations device-resident, supports BF16 dense tensors, NVFP4 linears, RoPE, RMSNorm, MLP, decode attention, chunked prefill, native Blackwell MXFP4 linear dispatch, and OpenAI/Anthropic/Google-compatible serving adapters.
+LumenLLM never auto-decides anything. **You** specify, by hand in the config, the **compute device** for each component (`cuda:0` / `cpu`) **and** the **storage location** of the weights and everything else (`vram` / `ram`). The engine honors exactly what you write — no hidden heuristics, no automatic offload. That explicit, manual control is what lets you fit and tune a 35B MoE on a 16 GB card: stream the experts from RAM, pin attention in VRAM, compute on the GPU or the CPU — every region, your decision.
 
-`mvp-check` is intentionally stricter than a dry plan: after readiness says a plan is runnable, it builds the real executor so CUDA module compilation, tensor loading, and backend construction failures are caught before serving.
+## Why
 
-Useful commands:
+Run 35B-class MoE and 9B models on one 16 GB RTX 50-series card — including models vLLM OOMs on — with **native NVFP4 / FP8** inference, **hand-written CUDA kernels** (no PyTorch, cuDNN, or TensorRT), and **per-component compute/store placement** you control from a JSON config.
 
-```bash
-cargo run -- inspect-hardware
-cargo run -- serve --config ../parameters.json
-cargo run -- show-plan --config ../parameters.json
-cargo run -- mvp-check --config ../parameters.minimal.json
-cargo run -- cuda-smoke --config ../parameters.cuda.layer1.json
-cargo run -- cuda-dense-smoke --config ../parameters.json
-cargo run -- cuda-chain-smoke --config ../parameters.cuda.layer1.json
-cargo run -- cuda-compare --config ../parameters.cuda.layer1.json
-cargo run -- cuda-prefill-sweep --config ../parameters.json
-cargo run --release -- generate --config ../parameters.minimal.json --prompt "Привет" --max-tokens 1
-cargo run --release -- bench-generate --config ../parameters.minimal.json --prompt "Привет" --prompt-repeat 8 --max-tokens 16 --temperature 0 --format json
-python3 tools/bench_vllm_generate.py --model ../models/Llama-3.1-8B-Instruct-NVFP4 --prompt "Привет" --prompt-repeat 8 --max-tokens 16 --temperature 0
+## Supported models
+
+- **Qwen 3.5 / 3.6** — Gated-DeltaNet (linear attention) + periodic full-attention + MoE / dense MLP, with the Qwen3-VL native vision tower. (9B-FP8, 35B-A3B-NVFP4.)
+- **Gemma 4** — 26B-A4B, E4B, E2B, 31B dense, with the SigLIP vision tower.
+- **Text + vision** (image understanding), **reasoning** (thinking mode), and **tool-calling** (OpenAI + Anthropic chat APIs).
+
+## Measured performance — RTX 5070 Ti, 16 GB, SM120
+
+| Model | Decode | Prefill | Notes |
+|---|---|---|---|
+| **Qwen3.5-9B-FP8** | **61.8 tps** (vLLM eager 48.5) | **1350 tok/s** (vLLM 844) | beats vLLM both directions |
+| **Qwen3.6-35B-A3B-NVFP4** | **~50 tps** greedy | **968–1640 tok/s** | runs where vLLM **OOMs**; vision + reasoning + tool-calling verified |
+| **Gemma-4 26B-A4B** | ~40 tps | ~3000 tok/s | NVFP4 grouped-MoE prefill |
+
+All numbers measured on-device. Sampling runs through an **on-device GPU sampler** (top-k / top-p / min-p), validated bit-faithful to the reference distribution. Vision verified by per-stage HF cross-dump (cos > 0.99) and real images (OCR-accurate descriptions).
+
+## Features
+
+- **Quantization:** native **NVFP4** (4-bit FP, block-scaled) + **FP8** (E4M3) + BF16, with hand-written SM120 kernels.
+- **Placement:** config-driven per-component **compute** (`cuda:0` / `cpu`) and **store** (`vram` / `ram`) — e.g. stream MoE experts from host RAM, or compute them on the CPU.
+- **Kernels:** CUDA-graph decode, FlashAttention-2 + native **FP8 MMA** attention, **CUTLASS NVFP4 grouped-MoE** prefill, cuBLASLt tensor-core GEMMs, warp-shuffle GEMVs, FP8 KV cache, Gated-DeltaNet linear attention.
+- **Vision:** Qwen3-VL native ViT + interleaved M-RoPE, and Gemma SigLIP — HF cross-validated.
+- **Backends:** CUDA (primary), CPU (AVX-512 / VNNI), wgpu / Vulkan (experimental).
+- **Serving:** OpenAI- and Anthropic-compatible chat-completions server with tool-calling and reasoning extraction.
+
+## Build
+
+Requirements: Rust (stable), CUDA toolkit + CUTLASS, an SM120 GPU (RTX 50-series).
+
+```
+cargo build --release
 ```
 
-`serve` exposes `/health` and `/v1/models` for all compatibility modes. With `server-api=openai` it exposes `/v1/completions` and `/v1/chat/completions`; with `server-api=anthropic` it exposes `/v1/messages`; with `server-api=google` it exposes `/v1beta/models/{model}:generateContent`. If the selected provider is not runnable yet, the server still starts in degraded mode and generation requests return a structured `executor_not_ready` error with the current readiness limitations.
+## Run
 
-CUDA notes:
+```
+# text
+cargo run --release -- generate --config examples/parameters.qwen35-9b.json \
+  --prompt "Explain Rayleigh scattering." --max-tokens 200
 
-- Blackwell FP4 prefill can use the CUTLASS resident layout (`CUDA_R_4F_E2M1`
-  payload plus UE4M3 scales) for Q/K/V/O and MLP projections. The CUTLASS
-  bridge does not own CUDA allocations; Rust allocates and lifetime-manages
-  payloads, scales, workspaces and outputs.
-- Experimental native MXFP4 repack/inference is opt-in via:
-  - `cuda.native-mxfp4-repack`
-  - `cuda.native-mxfp4-inference`
-  - CLI equivalents: `--native-mxfp4-repack` and `--native-mxfp4-inference`
-- Native MXFP4 repack writes a per-model cache under `.aegis-cache/mxfp4-v1` so repeated benchmark runs do not spend most of their time repacking weights on the host. Set `AEGISLLM_NATIVE_MXFP4_CACHE=0` to disable it.
-- Chunked CUDA prefill uses `AEGIS_CUDA_PREFILL_CHUNK` for the token chunk size. The default is `128`; values are clamped to `1..=2048`.
-- CUDA prefill attention is selected by `cuda.prefill-attention` (`auto`, `off`, `fa2`, `fa3`, `fa4`, or `aegis-varlen`) or the legacy `other-parameters.flash-attention` boolean. `flash-varlen` remains a compatibility alias for `aegis-varlen`. Explicit `cuda.prefill-attention` wins over the legacy flag. `auto` follows the architecture policy (Ampere/Ada -> FA2 target, Hopper -> FA3 target, Blackwell -> FA4 target) but uses correctness-preserving fallbacks to the Aegis paged-varlen path until those production kernels are enabled. `fa4` is currently an explicit Blackwell-only tiled paged-varlen prototype; `fa2` and `fa3` are reserved backend names and return clear unsupported errors until implemented.
-- The paged varlen prefill path uses an FA-compatible 256-token page table and
-  a transient f16 query view while keeping f32 outputs for the surrounding
-  residual/MLP path. The current fast path is a single-sequence block-Q
-  online-softmax kernel with shared K/V reuse and warp reductions; multi-request
-  and mixed scheduler paths still fall back to the more general varlen kernel.
-- An experimental split-K prefill attention scaffold exists for future
-  long-context tuning. It is opt-in with
-  `AEGISLLM_CUDA_EXPERIMENTAL_SPLIT_K_ATTENTION=1`; by default its large partial
-  accumulator scratch is not allocated.
-- CUTLASS FP4 MLP prefill fuses SwiGLU directly into the down-projection FP4
-  activation layout, avoiding a transient f32 SwiGLU buffer before the down GEMM.
-- Set `AEGISLLM_CUDA_STAGE_TIMINGS=1` to print per-stage prefill timings plus QKV/MLP TFLOPS estimates.
-- Recent RTX 5070 Ti smoke numbers with the CUTLASS FP4 config and one generated
-  token: prompt-repeat 16 / 202 prompt tokens ≈ 4.4k prefill tok/s,
-  prompt-repeat 64 / 778 prompt tokens ≈ 2.6k prefill tok/s,
-  prompt-repeat 128 / 1546 prompt tokens ≈ 1.7k prefill tok/s. The long-context
-  drop is expected until the attention kernel grows a true block-K split/reduce
-  FlashAttention path.
-- Reports distinguish planned families from effective dispatch. With native MXFP4 disabled, planned native FP4 regions still run through the CUDA NVFP4 reference path.
-- KV cache defaults to f16 and is stored as f16 in the CUDA reference executor. q8/fp8 KV kernels are not implemented yet and are rejected by CUDA readiness.
-- The explicit storage/compute plan is still authoritative: full CUDA, full CPU, and host-orchestrated hybrid plans run without silently falling back to one backend.
+# vision (image understanding)
+cargo run --release -- generate --config examples/parameters.qwen35-9b.json \
+  --prompt "<|vision_start|><|image_pad|><|vision_end|>Describe this image." \
+  --image path/to/image.png --max-tokens 200
 
-Memory policy notes:
+# server (OpenAI / Anthropic endpoints)
+cargo run --release -- serve --config examples/parameters.qwen36-35b.json
+```
 
-- Prefer `mmap` for cold/spilled weights so CPU RAM is not consumed by a second copy.
-- Count KV cache before deciding how many layers can live in VRAM.
-- Report staging peaks separately from persistent allocations.
-- Treat usable RAM/VRAM budget overflows as engine-build errors for MVP paths.
-- Use `weights-store vram` only when the whole selected residency fits; otherwise let the planner spill to `mmap`.
+A config is a small JSON describing the model path and per-component `compute`/`store` placement and KV-cache settings (see `examples/`).
+
+## Roadmap
+
+- 35B MoE **prefill** to grouped-MoE parity with the 26B (~3k tok/s) — per-expert variable-grid NVFP4 GEMM + chunked GDN recurrence.
+- **Speculative decode (MTP)** — works for dense models; on MoE it needs the grouped-MoE verify path above.
+- True **file-mmap** weight storage (lower host RAM footprint).
+- Additional architectures (Nemotron 3 Nano).
+
+## Status & caveats
+
+Pre-alpha. Single-GPU, SM120-tuned, specific architectures. Not production-ready. **License: TBD** — to be added before wider distribution. Contributions and issues welcome.

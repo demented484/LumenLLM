@@ -1,0 +1,36 @@
+{
+  "model": {
+    "path": "/home/daniil/LM-experements/models/Qwen3.5-9B-FP8",
+    "compute": "cuda:0",
+    "store": "ram",
+    "input-layer": {
+      "compute": "cuda:0",
+      "store": "ram"
+    },
+    "output-layer": {
+      "compute": "cuda:0",
+      "store": "vram"
+    },
+    "attention": {
+      "mechanism": "aegis-varlen",
+      "compute": "cuda:0",
+      "store": "vram"
+    },
+    "hidden-layers": {
+      "compute": "cuda:0",
+      "store": "vram",
+      "kv-cache": {
+        "context-size": 4096,
+        "store": "vram",
+        "type-k": "f16",
+        "type-v": "f16"
+      }
+    },
+    "other-parameters": {
+      "temperature": 1.0,
+      "top-p": 0.95,
+      "top-k": 50,
+      "min-p": 0.05
+    }
+  }
+}
