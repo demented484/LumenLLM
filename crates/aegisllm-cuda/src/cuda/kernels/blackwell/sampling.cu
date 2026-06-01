@@ -187,6 +187,193 @@ extern "C" __global__ void aegis_bf16_matmul_reference_batched(
     }
 }
 
+// ── GPU multinomial sampler (temperature → top-k → top-p → min-p → draw) ─────
+//
+// Replaces the per-token "download all 248K vocab logits to the host + sort +
+// top-k/top-p/min-p on the CPU" path with ONE fused single-block kernel that
+// keeps the logits on device and downloads only the sampled token id.
+//
+// Design: a single block of `BLOCK` threads, launched once per decode token.
+//   * Top-k by iterated block-parallel argmax: for each of the `k` rounds
+//     (k = min(top_k, KCAP) — NOT a fixed 64; we only ever do as many rounds as
+//     the config's top_k), the whole block cooperatively finds the best logit
+//     strictly worse than the previous round's winner (lexicographic-descending
+//     order: value desc, index asc). This naturally handles duplicate logits
+//     (index breaks ties) without per-element bookkeeping and matches the CPU's
+//     stable sort+truncate ranking exactly. Cost ≈ k full-vocab parallel
+//     reductions; with BLOCK=512 and 248K vocab each round is ~485 reads/thread
+//     plus a log2(BLOCK) shared-mem reduction.
+//   * Thread 0 then applies temperature → top-p → min-p → renormalise → draw
+//     over the ≤k winners (a tiny set) with the host-supplied uniform `u ∈
+//     [0,1)` — the SAME `rand::random::<f32>()` draw the CPU path uses.
+//
+// SEMANTICS — byte-for-byte the CPU `sample_next_token` order:
+//   * top-k is a pure logit ranking (pre-exp), exactly like the CPU sort+truncate.
+//     Ties broken by SMALLER index (matches `total_cmp` desc + the stable sort:
+//     equal logits keep ascending index, so the lower index ranks first).
+//   * weight = expf((logit - max_logit) / temperature)  (max == the round-0
+//     winner = the global max over the top-k set, same as the CPU).
+//   * top-p: walk the desc weights, keep the shortest prefix whose cumulative
+//     weight ≥ top_p * total; keep at least 1.
+//   * min-p: keep weights ≥ min_p * weight_max (weight_max == weights[0]).
+//   * draw over the post-min-p `total` (NOT a forced 1.0): `draw = u * total;
+//     for each survivor: if draw <= w return idx; draw -= w`. This is the
+//     identical event to the CPU's `u * total_raw <= w_raw` walk given the same
+//     `u`, so the selected token is the same.
+//
+// SAMPLER_KCAP bounds the top-k we support. The config uses top_k ≤ 50.
+#define SAMPLER_KCAP 64
+
+// Block-parallel argmax-with-threshold for one round. Each thread scans its
+// strided slice of [0,vocab) keeping the best element STRICTLY worse than
+// (thr_v,thr_i) under lexicographic-descending order, then the block reduces to
+// a single winner via shared memory. `have_thr=false` (round 0) accepts all.
+// Returns the winner in (out_v,out_i) for every thread (broadcast via smem[0]).
+__device__ __forceinline__ void aegis_sampler_round_argmax(
+    const float* __restrict__ logits,
+    unsigned int vocab,
+    bool have_thr,
+    float thr_v,
+    unsigned int thr_i,
+    float* red_val,            // [blockDim.x] shared scratch
+    unsigned int* red_idx,     // [blockDim.x] shared scratch
+    float* out_v,
+    unsigned int* out_i)
+{
+    const unsigned int tid = threadIdx.x;
+    const unsigned int nthreads = blockDim.x;
+    float best = -3.402823466e38f;
+    unsigned int besti = 0xffffffffu;
+    for (unsigned int i = tid; i < vocab; i += nthreads) {
+        const float v = logits[i];
+        if (have_thr) {
+            const bool worse_than_thr = v < thr_v || (v == thr_v && i > thr_i);
+            if (!worse_than_thr) continue;
+        }
+        if (v > best || (v == best && i < besti)) { best = v; besti = i; }
+    }
+    red_val[tid] = best;
+    red_idx[tid] = besti;
+    __syncthreads();
+    for (unsigned int stride = nthreads >> 1; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            const float ov = red_val[tid + stride];
+            const unsigned int oi = red_idx[tid + stride];
+            const bool take = ov > red_val[tid] || (ov == red_val[tid] && oi < red_idx[tid]);
+            if (take) { red_val[tid] = ov; red_idx[tid] = oi; }
+        }
+        __syncthreads();
+    }
+    *out_v = red_val[0];
+    *out_i = red_idx[0];
+    __syncthreads();   // protect red_* before the next round overwrites it
+}
+
+// Single fused sampler kernel — grid (1), block (BLOCK threads). Selects the
+// global top-`k` (k = min(top_k, KCAP)) by iterated parallel argmax, then thread
+// 0 does temperature/top-p/min-p/draw over the ≤k winners with uniform `u`.
+extern "C" __global__ void aegis_sampler_topk_fused(
+    const float* __restrict__ logits,
+    const unsigned int vocab,
+    const unsigned int top_k,        // requested k; 0 or >KCAP => KCAP
+    const float temperature,
+    const float top_p,
+    const float min_p,
+    const float u,                   // uniform draw in [0,1)
+    unsigned int* __restrict__ out_token
+) {
+    extern __shared__ float aegis_sampler_smem[];
+    float* red_val = aegis_sampler_smem;                       // blockDim
+    unsigned int* red_idx = (unsigned int*)(red_val + blockDim.x);
+    // Winners live in shared mem so thread 0 can read them after the rounds.
+    float* sel_v = (float*)(red_idx + blockDim.x);             // KCAP
+    unsigned int* sel_i = (unsigned int*)(sel_v + SAMPLER_KCAP);// KCAP
+
+    unsigned int k = top_k;
+    if (k == 0u || k > SAMPLER_KCAP) k = SAMPLER_KCAP;
+    if (k > vocab) k = vocab;
+
+    float thr_v = 3.402823466e38f;
+    unsigned int thr_i = 0u;
+    bool have_thr = false;
+    for (unsigned int r = 0; r < k; ++r) {
+        float win_v;
+        unsigned int win_i;
+        aegis_sampler_round_argmax(logits, vocab, have_thr, thr_v, thr_i,
+                                   red_val, red_idx, &win_v, &win_i);
+        if (threadIdx.x == 0) {
+            sel_v[r] = win_v;
+            sel_i[r] = win_i;
+        }
+        thr_v = win_v;
+        thr_i = win_i;
+        have_thr = true;
+    }
+    __syncthreads();
+
+    // Serial finish over the tiny ≤k winner set on thread 0.
+    if (threadIdx.x != 0) return;
+    if (k == 0u) { out_token[0] = 0u; return; }
+
+    const float temp = temperature > 1e-6f ? temperature : 1e-6f;
+    const float max_logit = sel_v[0];   // round-0 winner == global max over top-k
+    float w[SAMPLER_KCAP];
+    unsigned int idx[SAMPLER_KCAP];
+    unsigned int nw = 0;
+    for (unsigned int r = 0; r < k; ++r) {
+        // Precise libm expf (NOT fast __expf) so the post-temperature weights
+        // match the CPU reference's `f32::exp()` — the top-p/min-p cutoffs and
+        // the draw walk compare these weights, so a fast-math approximation
+        // would diverge from the CPU sampler at boundary candidates.
+        const float e = expf((sel_v[r] - max_logit) / temp);
+        if (isfinite(e) && e > 0.0f) {
+            w[nw] = e;
+            idx[nw] = sel_i[r];
+            ++nw;
+        }
+    }
+    if (nw == 0u) { out_token[0] = sel_i[0]; return; }
+
+    // top-p (nucleus): keep shortest desc prefix with cumulative >= top_p*total.
+    float total = 0.0f;
+    for (unsigned int r = 0; r < nw; ++r) total += w[r];
+    if (top_p > 0.0f && top_p < 1.0f && total > 0.0f) {
+        const float cutoff = total * top_p;
+        float cum = 0.0f;
+        unsigned int keep = 0;
+        for (unsigned int r = 0; r < nw; ++r) {
+            cum += w[r];
+            ++keep;
+            if (cum >= cutoff) break;
+        }
+        if (keep < 1u) keep = 1u;
+        nw = keep;
+    }
+
+    // min-p: keep w >= min_p * w_max  (w_max == w[0], the global max weight).
+    if (min_p > 0.0f) {
+        const float thresh = w[0] * min_p;
+        unsigned int m = 0;
+        for (unsigned int r = 0; r < nw; ++r) {
+            if (w[r] >= thresh) { w[m] = w[r]; idx[m] = idx[r]; ++m; }
+        }
+        nw = m;
+        if (nw == 0u) { out_token[0] = sel_i[0]; return; }
+    }
+
+    // Multinomial draw — identical to the CPU cumulative walk over `total`.
+    float total2 = 0.0f;
+    for (unsigned int r = 0; r < nw; ++r) total2 += w[r];
+    if (total2 <= 0.0f) { out_token[0] = sel_i[0]; return; }
+    float draw = u * total2;
+    for (unsigned int r = 0; r < nw; ++r) {
+        if (draw <= w[r]) { out_token[0] = idx[r]; return; }
+        draw -= w[r];
+    }
+    // FP-rounding fallthrough — the CPU returns argmax(logits) == sel_i[0].
+    out_token[0] = sel_i[0];
+}
+
 // Batched element-wise GeGLU (gelu_pytorch_tanh): out[i] = gelu_tanh(gate[i]) * up[i].
 // Used by chunked prefill for the routed-expert GeGLU step on gathered token batches.
 extern "C" __global__ void aegis_geglu_tanh_batched(

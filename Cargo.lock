@@ -77,6 +77,7 @@ dependencies = [
  "half",
  "libc",
  "memmap2",
+ "rand",
  "rayon",
  "serde",
  "serde_json",

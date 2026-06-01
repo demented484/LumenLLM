@@ -314,6 +314,26 @@ impl CudaLlamaExecutor {
             &mut state.logits,
         )?;
         let non_greedy = sampling.temperature > 0.0 && sampling.top_k != 1;
+        // GPU sampler (no soft-cap): config-driven (model.compute == cuda:0),
+        // sample on device and download just the token id.
+        if non_greedy && self.lm_head_softcap.is_none() && gpu_sampler_enabled() {
+            let u = rand::random::<f32>();
+            self.runtime.sample_token_device(
+                &state.logits,
+                sampling.top_k,
+                sampling.temperature,
+                sampling.top_p,
+                sampling.min_p,
+                u,
+                &mut state.sampled_token,
+            )?;
+            let token = self.runtime.download_u32(&state.sampled_token)?;
+            return token
+                .first()
+                .copied()
+                .map(|t| t as usize)
+                .ok_or_else(|| AegisError::InvalidPlan("GPU sampler returned no token".into()));
+        }
         if non_greedy || self.lm_head_softcap.is_some() {
             let mut logits = self.runtime.download_f32(&state.logits)?;
             if let Some(cap) = self.lm_head_softcap {
@@ -488,6 +508,41 @@ impl CudaLlamaExecutor {
         // stream sync and any time it spends waiting is GPU-side.
         let t_cpu_done = t_step_start.map(|_| std::time::Instant::now());
 
+        // GPU sampler: when sampling is requested and there is no lm_head
+        // soft-cap (soft-cap models e.g. Gemma-4 must transform logits on the
+        // host first), do the whole temperature → top-k → top-p → min-p → draw
+        // ON DEVICE and download only the single sampled token id — instead of
+        // DtoH'ing the full ~248K-vocab logit vector and sorting it on the CPU.
+        // This is the config-driven production path: being in the CUDA executor
+        // means `model.compute == cuda:0`, so the sampler runs on cuda:0. The
+        // `gpu_sampler_enabled()` check is only the debug A/B escape hatch.
+        if non_greedy && self.lm_head_softcap.is_none() && gpu_sampler_enabled() {
+            // SAME RNG draw the CPU path uses, so a given draw picks the same
+            // token on GPU and CPU.
+            let u = rand::random::<f32>();
+            self.runtime.sample_token_device(
+                &state.logits,
+                sampling.top_k,
+                sampling.temperature,
+                sampling.top_p,
+                sampling.min_p,
+                u,
+                &mut state.sampled_token,
+            )?;
+            let token = self.runtime.download_u32(&state.sampled_token)?;
+            if let (Some(t0), Some(t_cpu)) = (t_step_start, t_cpu_done) {
+                let h2d = crate::cuda::staging::STAGING_H2D_BYTES
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .wrapping_sub(h2d_bytes_start.unwrap_or(0));
+                report_decode_split(t0, t_cpu, h2d);
+            }
+            return token
+                .first()
+                .copied()
+                .map(|t| t as usize)
+                .ok_or_else(|| AegisError::InvalidPlan("GPU sampler returned no token".into()));
+        }
+
         if non_greedy || self.lm_head_softcap.is_some() {
             // Download all logits and sample on CPU (also needed for soft-cap).
             let mut logits = self.runtime.download_f32(&state.logits)?;
@@ -517,6 +572,25 @@ impl CudaLlamaExecutor {
             .map(|token| token as usize)
             .ok_or_else(|| AegisError::InvalidPlan("CUDA decode argmax returned no token".into()))
     }
+}
+
+/// Whether the on-device sampler runs for this (CUDA) executor.
+///
+/// PRODUCTION SELECTION IS CONFIG-DRIVEN, NOT FLAG-DRIVEN: reaching this code
+/// means we are inside the `CudaLlamaExecutor`, which is only built when the
+/// model's resolved `compute` placement is `cuda:0` (the strict default per the
+/// design principles). The sampler therefore follows `model.compute` exactly
+/// like `experts.compute` — `compute = cuda:0` ⇒ GPU sampler. The `compute =
+/// cpu` case never reaches here; it builds the hybrid/CPU executor, which
+/// samples on the host via `sample_next_token`. So there is intentionally NO
+/// production env flag for placement.
+///
+/// `AEGIS_GPU_SAMPLER=0` exists ONLY as a debug / A-B-correctness escape hatch:
+/// it forces this CUDA executor down the CPU reference path (full-vocab DtoH +
+/// host `sample_next_token`) so the two samplers can be compared on identical
+/// runs. It must never be needed in production.
+fn gpu_sampler_enabled() -> bool {
+    !matches!(std::env::var("AEGIS_GPU_SAMPLER").as_deref(), Ok("0"))
 }
 
 /// Print the CPU-issuing vs GPU-waiting split for one decode token.

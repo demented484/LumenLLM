@@ -22,7 +22,7 @@ pub(crate) mod memory;
 mod moe_gpu_driven;
 mod ops;
 mod quant;
-mod sampling;
+pub(crate) mod sampling;
 pub(super) mod state_cache;
 
 #[derive(Debug)]
