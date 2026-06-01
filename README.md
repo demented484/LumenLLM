@@ -72,4 +72,4 @@ A config is a small JSON describing the model path and per-component `compute`/`
 
 ## Status & caveats
 
-Pre-alpha. Single-GPU, SM120-tuned, specific architectures. Not production-ready. **License: TBD** — to be added before wider distribution. Contributions and issues welcome.
+Pre-alpha. Single-GPU, SM120-tuned, specific architectures. Not production-ready. Licensed under the **[MIT License](LICENSE)**. Contributions and issues welcome.
