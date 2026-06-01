@@ -75,8 +75,18 @@ impl StreamingParser {
             return Vec::new();
         }
         self.accumulated.push_str(delta_text);
-        let cur = parse_gemma_streaming(&self.accumulated);
-        let cur_completed = count_occurrences(&self.accumulated, "<tool_call|>");
+        let (cur, cur_completed) = match self.kind {
+            ParserKind::Qwen => (
+                parse_qwen_streaming(&self.accumulated),
+                count_occurrences(&self.accumulated, "</tool_call>"),
+            ),
+            // Gemma (and any future marker-based kind) re-use the Gemma
+            // streaming path; `None` is handled by the early return above.
+            _ => (
+                parse_gemma_streaming(&self.accumulated),
+                count_occurrences(&self.accumulated, "<tool_call|>"),
+            ),
+        };
         let mut events = Vec::new();
 
         // Content delta: cur.content extends prev.content.
@@ -359,6 +369,18 @@ pub enum ParserKind {
     /// `<|channel>thought\n…<channel|>` for reasoning,
     /// `<|tool_call>call:name{key:val,…}<tool_call|>` for tool calls.
     Gemma,
+    /// Qwen 3.5 / 3.6. `<think>…</think>` for reasoning, and an XML-ish
+    /// tool-call DSL:
+    /// ```text
+    /// <tool_call>
+    /// <function=NAME>
+    /// <parameter=KEY>
+    /// VALUE
+    /// </parameter>
+    /// </function>
+    /// </tool_call>
+    /// ```
+    Qwen,
     /// Pass-through: the whole output is `content`. Used when the model
     /// either has no special markers or its chat template doesn't expose
     /// any. Tool calls will not be detected.
@@ -369,8 +391,15 @@ impl ParserKind {
     /// Detect the parser kind by scanning the model's chat_template source
     /// for tokens it emits in the assistant turn. Falls back to `None`.
     pub fn detect(chat_template: &str) -> Self {
+        // Gemma's markers carry the leading/trailing pipe (`<|tool_call>` /
+        // `<|channel>`); check them first so a template that mentions both
+        // never mis-detects.
         if chat_template.contains("<|tool_call>") || chat_template.contains("<|channel>") {
             Self::Gemma
+        } else if chat_template.contains("<tool_call>") && chat_template.contains("<function=") {
+            // Qwen 3.5/3.6: the `<function=` opener is unique to the Qwen
+            // tool-call DSL and never appears in the Gemma format.
+            Self::Qwen
         } else {
             Self::None
         }
@@ -379,6 +408,7 @@ impl ParserKind {
     pub fn parse_assistant(self, raw: &str) -> ParsedAssistant {
         match self {
             Self::Gemma => parse_gemma(raw),
+            Self::Qwen => parse_qwen(raw),
             Self::None => ParsedAssistant {
                 content: raw.trim().to_string(),
                 ..Default::default()
@@ -495,6 +525,310 @@ fn parse_gemma(raw: &str) -> ParsedAssistant {
         },
         tool_calls,
     }
+}
+
+/// Streaming-tolerant variant of [`parse_qwen`]. Emits in-progress
+/// reasoning for an open `<think>` block, holds back tool calls until their
+/// `</tool_call>` close arrives (so `arguments` deltas stay prefix-monotonic
+/// for OpenAI clients), and trims any trailing partial-marker bytes from
+/// content so a half-arrived `<tool_call>` opener never leaks to the user.
+fn parse_qwen_streaming(raw: &str) -> ParsedAssistant {
+    // 1. Reasoning channels, tolerant of an unterminated `<think>`.
+    let mut content_buf = String::with_capacity(raw.len());
+    let mut reasoning_buf = String::new();
+    let mut cursor = raw;
+    while let Some(open_idx) = cursor.find("<think>") {
+        content_buf.push_str(&cursor[..open_idx]);
+        let after_open = &cursor[open_idx + "<think>".len()..];
+        if let Some(close_rel) = after_open.find("</think>") {
+            let body = after_open[..close_rel].trim();
+            if !body.is_empty() {
+                if !reasoning_buf.is_empty() {
+                    reasoning_buf.push('\n');
+                }
+                reasoning_buf.push_str(body);
+            }
+            cursor = &after_open[close_rel + "</think>".len()..];
+        } else {
+            // Open think block. Trim both ends so the in-progress reasoning
+            // is a prefix of the eventually-terminated body — this keeps the
+            // streaming diff in `push` prefix-monotonic.
+            let body = after_open.trim();
+            if !body.is_empty() {
+                if !reasoning_buf.is_empty() {
+                    reasoning_buf.push('\n');
+                }
+                reasoning_buf.push_str(body);
+            }
+            cursor = "";
+            break;
+        }
+    }
+    content_buf.push_str(cursor);
+
+    // 2. Tool calls — only completed (`</tool_call>`-terminated) blocks.
+    let mut tool_calls = Vec::new();
+    let mut clean_content = String::with_capacity(content_buf.len());
+    let mut cursor: &str = &content_buf;
+    let mut tc_idx = 0usize;
+    while let Some(open_idx) = cursor.find("<tool_call>") {
+        clean_content.push_str(&cursor[..open_idx]);
+        let after_open = &cursor[open_idx + "<tool_call>".len()..];
+        if let Some(close_rel) = after_open.find("</tool_call>") {
+            let body = &after_open[..close_rel];
+            if let Some(tc) = parse_qwen_tool_call(body, tc_idx) {
+                tool_calls.push(tc);
+                tc_idx += 1;
+            }
+            cursor = &after_open[close_rel + "</tool_call>".len()..];
+        } else {
+            // Partial tool call — emit atomically when `</tool_call>` lands.
+            cursor = "";
+            break;
+        }
+    }
+    clean_content.push_str(cursor);
+
+    // 3. Strip stray full markers, then trim any trailing partial-marker
+    //    prefix so streamed content never contains bytes that may yet become
+    //    part of a structural marker.
+    let mut final_content = clean_content;
+    for marker in ["<tool_call>", "</tool_call>", "<think>", "</think>"] {
+        final_content = final_content.replace(marker, "");
+    }
+    let final_content = trim_qwen_partial_marker_suffix(&final_content).to_string();
+
+    ParsedAssistant {
+        content: final_content.trim_end().to_string(),
+        reasoning: if reasoning_buf.is_empty() {
+            None
+        } else {
+            Some(reasoning_buf)
+        },
+        tool_calls,
+    }
+}
+
+/// Trim from the end any prefix of a known Qwen structural marker, so
+/// streamed content doesn't contain bytes that may later turn out to be the
+/// start of `<tool_call>` / `<think>` / etc.
+fn trim_qwen_partial_marker_suffix(s: &str) -> &str {
+    const MARKERS: &[&str] = &["<tool_call>", "</tool_call>", "<think>", "</think>"];
+    let mut max_trim = 0;
+    for m in MARKERS {
+        let mlen = m.len();
+        for plen in 1..mlen {
+            let prefix = &m[..plen];
+            if s.ends_with(prefix) && plen > max_trim {
+                max_trim = plen;
+            }
+        }
+    }
+    &s[..s.len() - max_trim]
+}
+
+/// Parse a Qwen 3.5/3.6 assistant turn.
+///
+/// Reasoning is wrapped in `<think>…</think>`; tool calls use the XML-ish
+/// block documented on [`ParserKind::Qwen`]. Multiple `<tool_call>` blocks
+/// and multiple `<parameter=…>` entries per function are supported, and any
+/// surrounding/interleaved prose is preserved as `content`.
+fn parse_qwen(raw: &str) -> ParsedAssistant {
+    // 1. Extract and strip `<think>…</think>` reasoning channels. Concatenate
+    //    all bodies into one reasoning string (mirrors the Gemma path).
+    let mut content_buf = String::with_capacity(raw.len());
+    let mut reasoning_buf = String::new();
+    let mut cursor = raw;
+    while let Some(open_idx) = cursor.find("<think>") {
+        content_buf.push_str(&cursor[..open_idx]);
+        let after_open = &cursor[open_idx + "<think>".len()..];
+        if let Some(close_rel) = after_open.find("</think>") {
+            let body = after_open[..close_rel].trim();
+            if !body.is_empty() {
+                if !reasoning_buf.is_empty() {
+                    reasoning_buf.push('\n');
+                }
+                reasoning_buf.push_str(body);
+            }
+            cursor = &after_open[close_rel + "</think>".len()..];
+        } else {
+            // Unterminated think block — model cut off mid-thought.
+            let body = after_open.trim();
+            if !body.is_empty() {
+                if !reasoning_buf.is_empty() {
+                    reasoning_buf.push('\n');
+                }
+                reasoning_buf.push_str(body);
+            }
+            cursor = "";
+            break;
+        }
+    }
+    content_buf.push_str(cursor);
+
+    // 2. Extract `<tool_call>…</tool_call>` blocks.
+    let mut tool_calls = Vec::new();
+    let mut clean_content = String::with_capacity(content_buf.len());
+    let mut cursor: &str = &content_buf;
+    let mut tc_idx = 0usize;
+    while let Some(open_idx) = cursor.find("<tool_call>") {
+        clean_content.push_str(&cursor[..open_idx]);
+        let after_open = &cursor[open_idx + "<tool_call>".len()..];
+        if let Some(close_rel) = after_open.find("</tool_call>") {
+            let body = &after_open[..close_rel];
+            if let Some(tc) = parse_qwen_tool_call(body, tc_idx) {
+                tool_calls.push(tc);
+                tc_idx += 1;
+            }
+            cursor = &after_open[close_rel + "</tool_call>".len()..];
+        } else {
+            // Unterminated tool call — drop it; the close marker never
+            // arrived (model was truncated).
+            cursor = "";
+            break;
+        }
+    }
+    clean_content.push_str(cursor);
+
+    // 3. Strip any stray structural markers the model overshot into the
+    //    content tail (e.g. starting a fake tool response).
+    let mut final_content = clean_content;
+    for marker in [
+        "<tool_call>",
+        "</tool_call>",
+        "<think>",
+        "</think>",
+    ] {
+        final_content = final_content.replace(marker, "");
+    }
+
+    ParsedAssistant {
+        content: final_content.trim().to_string(),
+        reasoning: if reasoning_buf.is_empty() {
+            None
+        } else {
+            Some(reasoning_buf)
+        },
+        tool_calls,
+    }
+}
+
+/// Parse the body of a single `<tool_call>…</tool_call>` block.
+///
+/// Body looks like:
+/// ```text
+/// <function=NAME>
+/// <parameter=KEY>
+/// VALUE
+/// </parameter>
+/// (repeat per parameter)
+/// </function>
+/// ```
+fn parse_qwen_tool_call(body: &str, index: usize) -> Option<ToolCall> {
+    let open = body.find("<function=")?;
+    let after_name = &body[open + "<function=".len()..];
+    // The function name runs until the closing `>` of the opener.
+    let gt = after_name.find('>')?;
+    let name = after_name[..gt].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    // Parameters live between the opener and `</function>` (or end of body
+    // if the model omitted the close, which we tolerate).
+    let params_region = &after_name[gt + 1..];
+    let params_region = match params_region.find("</function>") {
+        Some(i) => &params_region[..i],
+        None => params_region,
+    };
+
+    let mut entries: Vec<(String, String)> = Vec::new();
+    let mut cursor = params_region;
+    while let Some(p_open) = cursor.find("<parameter=") {
+        let after_p = &cursor[p_open + "<parameter=".len()..];
+        let Some(p_gt) = after_p.find('>') else { break };
+        let key = after_p[..p_gt].trim().to_string();
+        let value_region = &after_p[p_gt + 1..];
+        let Some(p_close) = value_region.find("</parameter>") else {
+            break;
+        };
+        // Values are emitted as `\nVALUE\n` between the tags; trim the
+        // surrounding newlines/whitespace but keep interior content intact.
+        let value = value_region[..p_close].trim().to_string();
+        if !key.is_empty() {
+            entries.push((key, value));
+        }
+        cursor = &value_region[p_close + "</parameter>".len()..];
+    }
+
+    Some(ToolCall {
+        id: format!("call_{index}"),
+        call_type: "function".to_string(),
+        function: ToolCallFunction {
+            name,
+            arguments: qwen_params_to_json(&entries),
+        },
+    })
+}
+
+/// Build a JSON-encoded arguments string from `(key, value)` pairs.
+///
+/// Values arrive as raw strings. We coerce unquoted numbers and booleans
+/// to their JSON scalar form (matching the Gemma path, which keeps numeric
+/// and bool values unquoted), and JSON values (objects/arrays) verbatim;
+/// everything else is emitted as a JSON string.
+fn qwen_params_to_json(entries: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(2);
+    out.push('{');
+    for (i, (key, value)) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&json_escape(key));
+        out.push_str("\":");
+        out.push_str(&coerce_value_to_json(value));
+    }
+    out.push('}');
+    out
+}
+
+/// Coerce a raw string value to its best-fit JSON representation. Numbers
+/// and booleans become bare scalars; valid JSON objects/arrays pass through
+/// unchanged; anything else is a quoted JSON string.
+fn coerce_value_to_json(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed == "true" || trimmed == "false" || trimmed == "null" {
+        return trimmed.to_string();
+    }
+    if is_json_number(trimmed) {
+        return trimmed.to_string();
+    }
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        // Only treat as raw JSON if it actually parses; otherwise quote it.
+        if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+            return trimmed.to_string();
+        }
+    }
+    // Quote as a JSON string. Preserve interior whitespace exactly (the
+    // caller already trimmed the surrounding `\n`s).
+    let mut s = String::with_capacity(value.len() + 2);
+    s.push('"');
+    s.push_str(&json_escape(value));
+    s.push('"');
+    s
+}
+
+/// True when `s` is a syntactically valid JSON number (and nothing else).
+fn is_json_number(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    matches!(
+        serde_json::from_str::<serde_json::Value>(s),
+        Ok(serde_json::Value::Number(_))
+    )
 }
 
 /// Parse the body of a single `<|tool_call>...<tool_call|>` block.
@@ -815,5 +1149,200 @@ mod tests {
         let template = "...{{- '<|tool_call>call:' + name + '{' -}}...";
         assert_eq!(ParserKind::detect(template), ParserKind::Gemma);
         assert_eq!(ParserKind::detect("{{ messages }}"), ParserKind::None);
+    }
+
+    // ---- Qwen 3.5/3.6 parser ----
+
+    #[test]
+    fn detect_chooses_qwen_for_qwen_template() {
+        // The Qwen chat template renders both `<tool_call>` and
+        // `<function=` openers.
+        let template = "...{{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}...";
+        assert_eq!(ParserKind::detect(template), ParserKind::Qwen);
+    }
+
+    #[test]
+    fn detect_prefers_gemma_when_both_pipe_and_plain_markers() {
+        // A template carrying Gemma's piped markers must stay Gemma even if
+        // it happens to mention a bare `<tool_call>` somewhere.
+        let template = "<|tool_call> ... <tool_call> <function=";
+        assert_eq!(ParserKind::detect(template), ParserKind::Gemma);
+    }
+
+    #[test]
+    fn qwen_parses_verbatim_model_output() {
+        // EXACT verbatim output captured from both the 9B and 35B models.
+        let raw = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        let p = ParserKind::Qwen.parse_assistant(raw);
+        assert_eq!(p.content, "");
+        assert!(p.reasoning.is_none());
+        assert_eq!(p.tool_calls.len(), 1);
+        let tc = &p.tool_calls[0];
+        assert_eq!(tc.function.name, "get_weather");
+        assert_eq!(tc.id, "call_0");
+        assert_eq!(tc.call_type, "function");
+        assert_eq!(tc.function.arguments, r#"{"city":"Paris"}"#);
+    }
+
+    #[test]
+    fn qwen_detect_then_parse_drives_finish_reason() {
+        // detect → parse → non-empty tool_calls is exactly what the HTTP
+        // layer checks to set finish_reason=tool_calls for both endpoints.
+        let template = "<tool_call>\n<function=";
+        let kind = ParserKind::detect(template);
+        let raw = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        let p = kind.parse_assistant(raw);
+        assert!(!p.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn qwen_multi_param() {
+        let raw = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=units>\ncelsius\n</parameter>\n</function>\n</tool_call>";
+        let p = ParserKind::Qwen.parse_assistant(raw);
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(
+            p.tool_calls[0].function.arguments,
+            r#"{"city":"Paris","units":"celsius"}"#
+        );
+    }
+
+    #[test]
+    fn qwen_coerces_numbers_and_bools() {
+        let raw = "<tool_call>\n<function=book>\n<parameter=guests>\n3\n</parameter>\n<parameter=pet_friendly>\ntrue\n</parameter>\n<parameter=name>\nGrand Hotel\n</parameter>\n</function>\n</tool_call>";
+        let p = ParserKind::Qwen.parse_assistant(raw);
+        assert_eq!(
+            p.tool_calls[0].function.arguments,
+            r#"{"guests":3,"pet_friendly":true,"name":"Grand Hotel"}"#
+        );
+    }
+
+    #[test]
+    fn qwen_multiple_tool_calls() {
+        let raw = "<tool_call>\n<function=f>\n<parameter=a>\n1\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=g>\n<parameter=b>\nx\n</parameter>\n</function>\n</tool_call>";
+        let p = ParserKind::Qwen.parse_assistant(raw);
+        assert_eq!(p.tool_calls.len(), 2);
+        assert_eq!(p.tool_calls[0].id, "call_0");
+        assert_eq!(p.tool_calls[0].function.name, "f");
+        assert_eq!(p.tool_calls[0].function.arguments, r#"{"a":1}"#);
+        assert_eq!(p.tool_calls[1].id, "call_1");
+        assert_eq!(p.tool_calls[1].function.name, "g");
+        assert_eq!(p.tool_calls[1].function.arguments, r#"{"b":"x"}"#);
+    }
+
+    #[test]
+    fn qwen_text_before_call() {
+        let raw = "I'll check the weather for you.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        let p = ParserKind::Qwen.parse_assistant(raw);
+        assert_eq!(p.content, "I'll check the weather for you.");
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(p.tool_calls[0].function.arguments, r#"{"city":"Paris"}"#);
+    }
+
+    #[test]
+    fn qwen_reasoning_then_tool_call() {
+        let raw = "<think>\nThe user wants the weather. I should call get_weather with city=Paris.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        let p = ParserKind::Qwen.parse_assistant(raw);
+        assert_eq!(p.content, "");
+        assert_eq!(
+            p.reasoning.as_deref(),
+            Some("The user wants the weather. I should call get_weather with city=Paris.")
+        );
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(p.tool_calls[0].function.name, "get_weather");
+        assert_eq!(p.tool_calls[0].function.arguments, r#"{"city":"Paris"}"#);
+    }
+
+    #[test]
+    fn qwen_prose_reasoning_then_tool_call() {
+        // Qwen permits plain-prose reasoning BEFORE the call (per the
+        // template's <IMPORTANT> block), with no <think> wrapper.
+        let raw = "Let me look that up.\n<tool_call>\n<function=search>\n<parameter=q>\nrust lifetimes\n</parameter>\n</function>\n</tool_call>";
+        let p = ParserKind::Qwen.parse_assistant(raw);
+        assert_eq!(p.content, "Let me look that up.");
+        assert_eq!(p.tool_calls.len(), 1);
+        assert_eq!(p.tool_calls[0].function.arguments, r#"{"q":"rust lifetimes"}"#);
+    }
+
+    #[test]
+    fn qwen_multiline_value_preserved() {
+        let raw = "<tool_call>\n<function=write>\n<parameter=text>\nline one\nline two\n</parameter>\n</function>\n</tool_call>";
+        let p = ParserKind::Qwen.parse_assistant(raw);
+        assert_eq!(
+            p.tool_calls[0].function.arguments,
+            r#"{"text":"line one\nline two"}"#
+        );
+    }
+
+    #[test]
+    fn qwen_passthrough_when_no_markers() {
+        let p = ParserKind::Qwen.parse_assistant("just a normal answer");
+        assert_eq!(p.content, "just a normal answer");
+        assert!(p.reasoning.is_none());
+        assert!(p.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn qwen_streaming_emits_tool_call_atomic() {
+        let mut p = StreamingParser::new(ParserKind::Qwen);
+        let mut ev = Vec::new();
+        drive(
+            &mut ev,
+            &mut p,
+            &[
+                "<tool_call>\n<function=get_weather>\n<parameter=ci",
+                "ty>\nParis\n</parameter>\n</function>\n</tool_call>",
+            ],
+        );
+        let begins: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallBegin { name, id, .. } => Some((name.clone(), id.clone())),
+                _ => None,
+            })
+            .collect();
+        let args: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallArgsDelta { partial, .. } => Some(partial.clone()),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<_> = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCallEnd { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(begins, vec![("get_weather".to_string(), "call_0".to_string())]);
+        assert_eq!(args, vec![r#"{"city":"Paris"}"#.to_string()]);
+        assert_eq!(ends, vec![0usize]);
+    }
+
+    #[test]
+    fn qwen_streaming_reasoning_then_text() {
+        let mut p = StreamingParser::new(ParserKind::Qwen);
+        let mut ev = Vec::new();
+        drive(
+            &mut ev,
+            &mut p,
+            &["<think>\nthink", "ing hard\n</think>\n\n", "final answer"],
+        );
+        let texts: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Text(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        let reasoning: String = ev
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Reasoning(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts.trim(), "final answer");
+        assert!(reasoning.contains("thinking hard"));
     }
 }

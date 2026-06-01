@@ -159,7 +159,10 @@ impl TextProcessor {
     /// rather than hallucinating a fake tool response.
     pub fn tool_call_stop_token_ids(&self) -> Vec<usize> {
         let mut ids = Vec::new();
-        for marker in ["<tool_call|>", "<turn|>"] {
+        // Gemma close markers + Qwen 3.5/3.6 `</tool_call>`. We add all
+        // known closers regardless of family; only the ones present in the
+        // tokenizer resolve to an id, so unrelated markers are no-ops.
+        for marker in ["<tool_call|>", "<turn|>", "</tool_call>"] {
             if let Some(id) = self.token_id_of(marker) {
                 ids.push(id);
             }
